@@ -151,7 +151,7 @@ func createVia(files fileHost, path string, opts databaseOptions) (*engine, erro
 	// Both slots carry the bootstrap txid, so the floor slot is txid & 1 (format.md, *Slot alternation*).
 	p.floorSlot = uint32(db.committed.txid & 1)
 	p.codec = codec
-	db.paging = newSharedPaging(p, cacheLeaves(defaultCacheBytes, db.pageSize))
+	db.paging = newSharedPaging(p, cacheBudget(defaultCacheBytes))
 	db.committed.storePaging = db.paging
 	return db, nil
 }
@@ -161,11 +161,10 @@ func createVia(files fileHost, path string, opts databaseOptions) (*engine, erro
 // file, so a different host may reopen the same file with different ones.
 type OpenOptions struct {
 	// CacheBytes is the buffer-pool budget in bytes: roughly the maximum memory the resident leaf cache
-	// holds at once (spec/design/pager.md §3, P6.4b/c). Bytes, not a page count, so the budget does not
-	// silently scale with the file's page size; the engine converts it to a leaf-page capacity by the
-	// file's page size as max(1, CacheBytes / pageSize) (cacheLeaves). The bound that lets a database far
-	// larger than RAM be served (pager.md §1); it never changes what a query observes (§3/§5). 0 →
-	// DefaultCacheBytes (256 MiB).
+	// holds at once (spec/design/pager.md §3, P6.4b/c). Bytes, not a page count: the pool charges each
+	// resident leaf the heap it holds (its used payload and its structs) and evicts until a new leaf
+	// fits, keeping at least one. The bound that lets a database far larger than RAM be served (pager.md
+	// §1); it never changes what a query observes (§3/§5). 0 → DefaultCacheBytes (256 MiB).
 	CacheBytes int
 	// ReadOnly opens the file read-only (api.md §2.1). The handle then behaves like PostgreSQL
 	// hot standby: every transaction defaults to READ ONLY, an explicit READ WRITE request and
@@ -242,7 +241,7 @@ func open(path string) (*engine, error) {
 //
 // The demand-paged loader builds only the interior B-tree skeleton resident, faulting each leaf through
 // the bounded buffer pool on access, so the resident set is bounded by the pool — not the file size
-// (P6.4b). The byte budget is converted to a leaf-page capacity by the file's page size (cacheLeaves).
+// (P6.4b). The pool charges each resident leaf the bytes it holds against the byte budget.
 // The budget is a handle setting, not stored in the file (§3). Later commits write through the same
 // pager kept open for the handle's life.
 func openWithOptions(path string, opts OpenOptions) (*engine, error) {
@@ -273,9 +272,7 @@ func openViaHeld(files fileHost, path string, opts OpenOptions, held *pageCodec)
 		_ = store.close()
 		return nil, err
 	}
-	// Convert the byte budget to a leaf-page capacity by the file's page size; LoadEnginePaged
-	// rejects an out-of-range page size as corrupt (cacheLeaves clamps the divisor so a malformed
-	// pageSize = 0 cannot divide by zero before that check runs).
+	// LoadEnginePaged rejects an out-of-range page size as corrupt.
 	env := opts.Environment
 	if env == nil {
 		env = NewEnvironment()
@@ -283,7 +280,7 @@ func openViaHeld(files fileHost, path string, opts OpenOptions, held *pageCodec)
 	var db *engine
 	if held != nil {
 		if err = adoptHeldCodec(p, held); err == nil {
-			db, err = loadEngineSharedPaging(newSharedPaging(p, cacheLeaves(cacheBytes, p.pageSize)), env)
+			db, err = loadEngineSharedPaging(newSharedPaging(p, cacheBudget(cacheBytes)), env)
 			// A meta the held key cannot authenticate means the owner rekeyed the file before it left:
 			// 28P04, so the host reopens with the credential (spec/fileformat/encrypted.md §14).
 			var e *EngineError
@@ -292,7 +289,7 @@ func openViaHeld(files fileHost, path string, opts OpenOptions, held *pageCodec)
 			}
 		}
 	} else {
-		db, err = loadEnginePagedCredential(p, cacheLeaves(cacheBytes, p.pageSize), env, opts.Credential)
+		db, err = loadEnginePagedCredential(p, cacheBudget(cacheBytes), env, opts.Credential)
 	}
 	if err != nil {
 		_ = store.close()
@@ -385,8 +382,9 @@ func (db *engine) persist(snap *snapshot) error {
 }
 
 // ResidentLeaves is the number of leaf pages currently resident in the buffer pool — 0 for an
-// in-memory database (it is fully resident, nothing to page). The read-only gauge the
-// OpenOptions.CacheBytes budget bounds (≤ CacheBytes / pageSize by construction; spec/design/pager.md §3).
+// in-memory database (it is fully resident, nothing to page). The OpenOptions.CacheBytes budget bounds
+// the bytes those leaves are charged together (or one leaf, whatever the budget — spec/design/pager.md
+// §3), so the count is at most about CacheBytes divided by a leaf's resident size.
 func (db *engine) ResidentLeaves() int {
 	if db.paging == nil {
 		return 0

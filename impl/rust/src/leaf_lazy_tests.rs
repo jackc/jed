@@ -3,7 +3,7 @@
 //! the conformance corpus's reach.
 use super::*;
 use crate::file::Locking;
-use crate::format::leaf_patch_check;
+use crate::format::{leaf_patch_check, pfor_test};
 use crate::pmap::{leaf_lazy, leaf_sizes_check};
 use crate::{CreateOptions, OpenOptions};
 
@@ -473,5 +473,164 @@ fn lazy_shrunk_root_matches_eager_in_memory() {
     assert_eq!(
         lazy, eager,
         "storage or results differ between lazy and eager leaves"
+    );
+}
+
+/// Base-plus-offsets columns with outliers, through inserts, in-place updates that create and
+/// remove outliers, and deletes, in a file-backed database, committing between statements: the
+/// query results and the file's bytes after a final reopen. `exceptions` says kind 6 regions may be
+/// written (otherwise kind 1 alone).
+fn exceptions_workload(lazy: bool, exceptions: bool) -> (String, Vec<u8>) {
+    leaf_lazy::set(lazy);
+    pfor_test::set_off(!exceptions);
+    let path = std::env::temp_dir().join(format!(
+        "jed_leaf_pfor_{}_{}_{}.jed",
+        std::process::id(),
+        if lazy { "lazy" } else { "eager" },
+        if exceptions { "exc" } else { "plain" }
+    ));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::create(CreateOptions {
+        path: Some(path.clone()),
+        page_size: 4096,
+        skip_fsync: true,
+        locking: Locking::Exclusive,
+        ..CreateOptions::default()
+    })
+    .unwrap();
+    let mut sess = db.session(SessionOptions::default());
+    let mut out = String::new();
+
+    macro_rules! exec {
+        ($($arg:tt)*) => {{
+            let sql = format!($($arg)*);
+            if let Err(e) = sess.query_outcome(&sql, &[]) {
+                panic!("{sql}: {e:?}");
+            }
+        }};
+    }
+    macro_rules! query {
+        ($sql:expr) => {{
+            out.push_str($sql);
+            out.push('\n');
+            let rows: Vec<_> = sess
+                .query($sql, &[])
+                .unwrap()
+                .collect::<Result<_>>()
+                .unwrap();
+            for row in rows {
+                let cells: Vec<String> = row.iter().map(|v| v.render()).collect();
+                out.push_str("  ");
+                out.push_str(&cells.join("|"));
+                out.push('\n');
+            }
+        }};
+    }
+    macro_rules! reopen {
+        () => {{
+            drop(sess);
+            db.close().unwrap();
+            db = Database::open_with_options(&path, open_options()).unwrap();
+            sess = db.session(SessionOptions::default());
+        }};
+    }
+
+    exec!(
+        "CREATE TABLE f (id bigint PRIMARY KEY, a integer, b bigint, c smallint, d date, e bigint,
+        g bigint)"
+    );
+    exec!(
+        "INSERT INTO f SELECT x, x % 7, CASE WHEN x % 97 = 0 THEN 9000000000 + x ELSE x % 50 END,
+        CASE WHEN x % 13 = 0 THEN NULL ELSE 3 END, DATE '2024-01-01' + (x % 3),
+        CASE WHEN x % 29 = 0 THEN NULL ELSE x * 1000 + x % 3 END,
+        CASE WHEN x % 19 = 0 THEN 5000000000 + x WHEN x % 23 = 0 THEN -7000000000 - x
+        ELSE x % 200 END
+        FROM generate_series(1, 3000) AS g(x)"
+    );
+    reopen!();
+    exec!("UPDATE f SET a = 2000000000 WHERE id = 10");
+    exec!("UPDATE f SET c = -32000 WHERE id = 500");
+    exec!("UPDATE f SET a = -2000000000 WHERE id IN (1200, 1201)");
+    for i in 0..12 {
+        exec!(
+            "UPDATE f SET a = {} WHERE id = {}",
+            1_000_000 * (i + 1),
+            1500 + i
+        );
+    }
+    reopen!();
+    query!("SELECT count(*), sum(a), sum(b), sum(c), min(d), max(d), sum(e), sum(g) FROM f");
+    exec!("UPDATE f SET a = 3 WHERE id = 10");
+    exec!("UPDATE f SET g = 1 WHERE id % 19 = 0 AND id < 1000");
+    exec!("DELETE FROM f WHERE id % 97 = 0 AND id < 1500");
+    exec!(
+        "INSERT INTO f VALUES (5000, 1, 7000000000000, NULL, DATE '1999-12-31', 123456789012, 0)"
+    );
+    for i in 0..20 {
+        exec!(
+            "UPDATE f SET g = {} WHERE id = {}",
+            -(i as i64) * 1_000_000_007,
+            2200 + 3 * i
+        );
+    }
+    reopen!();
+    query!("SELECT count(*), sum(a), sum(b), sum(c), min(d), max(d), sum(e), sum(g) FROM f");
+    exec!("UPDATE f SET e = -5 WHERE id % 300 = 7");
+    exec!("DELETE FROM f WHERE id BETWEEN 2000 AND 2100");
+    exec!("DELETE FROM f WHERE id % 23 = 0 AND id > 2500");
+    reopen!();
+    query!("SELECT count(*), sum(e), min(e), max(e), sum(g), min(g), max(g) FROM f");
+    query!("SELECT * FROM f ORDER BY id");
+    drop(sess);
+    db.close().unwrap();
+    let file = std::fs::read(&path).unwrap();
+
+    let engine = Engine::open_with_options(&path, open_options()).unwrap();
+    let leaves = engine.committed().store("f").check_packed_leaves();
+    assert!(leaves > 0, "no packed leaf was checked");
+    drop(engine);
+    pfor_test::set_off(false);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(path.with_extension("jed.lock"));
+    (out, file)
+}
+
+/// Base-plus-offsets regions with exceptions (kind 6, leaf_pfor.rs) read back the rows they were
+/// written from, and a leaf's size from its page equals the size measured from its rows, through
+/// the workload above with the size-fact and encoder cross-checks on: the query results agree with
+/// kind 1 alone, and lazy leaves write the eager paths' bytes.
+#[test]
+fn exception_regions_round_trip() {
+    leaf_sizes_check::set(true);
+    leaf_patch_check::set(true);
+    let (plain, _) = exceptions_workload(true, false);
+    let (regions, exceptions) = pfor_test::written();
+    let (lazy_rows, lazy_file) = exceptions_workload(true, true);
+    let (regions, exceptions) = (
+        pfor_test::written().0 - regions,
+        pfor_test::written().1 - exceptions,
+    );
+    assert!(regions > 0, "the workload wrote no region with exceptions");
+    assert!(
+        exceptions > regions,
+        "the workload wrote no region with more than one exception"
+    );
+    let (eager_rows, eager_file) = exceptions_workload(false, true);
+    leaf_lazy::set(true);
+    leaf_sizes_check::set(false);
+    leaf_patch_check::set(false);
+    assert_eq!(
+        lazy_rows, plain,
+        "rows with exceptions differ from kind 1 alone"
+    );
+    assert_eq!(
+        lazy_rows, eager_rows,
+        "query results differ between lazy and eager leaves"
+    );
+    assert!(
+        lazy_file == eager_file,
+        "file bytes differ between lazy and eager leaves ({} and {} bytes)",
+        lazy_file.len(),
+        eager_file.len()
     );
 }

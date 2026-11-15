@@ -235,7 +235,7 @@ export function parseCommitMeta(
   const dv = view(block);
   if (
     dv.getUint32(0, false) !== 0x4a454442 ||
-    dv.getUint16(4, false) !== 53 || // format_version (format.ts FORMAT_VERSION)
+    dv.getUint16(4, false) !== 54 || // format_version (format.ts FORMAT_VERSION)
     dv.getUint32(8, false) !== pageSize ||
     dv.getUint32(32, false) !== metaChecksum(block)
   )

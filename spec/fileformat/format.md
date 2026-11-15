@@ -17,12 +17,20 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 53)
+## Version scope (`format_version` 54)
 
 > **The encrypted variant** ([encrypted.md](encrypted.md)) is the same `format_version` with a
 > nonzero `suite` byte at meta offset 6; it amends this layout only where encrypted.md says (page
 > capacity, bound pointers, the key block at pages 2–3, the authenticated meta). A reader that
 > predates it rejects that byte as a nonzero reserved field.
+
+`format_version` **54** — **a base-plus-offsets region with exceptions** (patched base plus offsets,
+[../design/leaf-write-cost.md](../design/leaf-write-cost.md) §8–§9). A column that may take base plus
+offsets (kind 1) may instead store up to 16 of its present values whole, so that a few outliers no
+longer widen every offset of the column: region kind `6` (*Leaf node*), taken when it saves more than
+kind 1. A leaf's size gains that saving, so split points, and the bytes of a file with such a column,
+change; a column whose outliers do not pay is byte-identical to v53. Every from-scratch image changes by its version byte and its meta CRC. Readers accept only
+the exact current version.
 
 `format_version` **53** — **deferred interior pages, the narrow commit manifest, and the page stamp**
 ([../design/deferred-interior.md](../design/deferred-interior.md) §9,
@@ -1547,7 +1555,8 @@ value body it is not storing.
 column's **class** (*Record* above); the other kinds are admitted only for the column types named,
 and a region takes one **exactly when it is smaller than the plain region** (the *saving* below is
 positive). Any other kind, or a kind on a column it does not apply to, is `XX001`. Kinds `3` and
-`5` are reserved.
+`5` are reserved. Of kinds `1` and `6`, which apply to the same columns, a region takes the one with the
+larger saving, kind `1` on a tie.
 
 - **Kind 0, fixed-width column** — a **null bitmap** of `ceil(N/8)` bytes (**MSB-first**: record
   `i`'s NULL bit is `0x80 >> (i mod 8)` of byte `i / 8`; a set bit = NULL — the composite/array
@@ -1577,6 +1586,30 @@ positive). Any other kind, or a kind on a column it does not apply to, is `XX001
   ```
   saving = N·(w − bw) − (w + 1)        when bw < w and this is positive, else 0
   ```
+- **Kind 6, base plus offsets with exceptions** (**new in v54**) — the columns of kind 1, when storing
+  up to 16 present values whole lets every other take narrower offsets. After the null bitmap come the
+  **base** (`w` bytes), the `u8` **offset width** `bw`, the `u8` **exception count** `E`, `E`
+  **exception rows** (`u16` each, strictly ascending), the exceptions' `E` **value bodies** (`w` bytes
+  each, in the order of their rows), and `N` offsets of `bw` bytes: exception `k`'s record has the
+  `k`-th stored body, every other present record `i` has `base + offset[i]`; the exceptions' offsets
+  and the NULLs' are zero. `1 ≤ E ≤ 16`, every exception row is below `N` and present (its NULL bit
+  clear), and `bw` is one of `0, 1, 2, 4` and below `w`.
+
+  A **layout** is an offset width `bw` narrower than kind 1's (the narrowest width holding
+  `largest − smallest`, or `w`; and below `w`) and a **base** that is one of the present values; its
+  exceptions are the present values below the base or above `base + 2^(8·bw) − 1`, and it is
+  admissible when there are at most 16 of them (at least one, since the full span does not fit `bw`).
+  Region kind 6 takes the admissible layout of least size `(E + 1)·(w + 2) + N·bw`, the narrower `bw`
+  first and then the lower base on a tie. Its exceptions are therefore some of the column's 16
+  smallest and 16 largest present values (counted as a multiset), so a writer measures a column from
+  its 17 smallest and 17 largest present values alone.
+
+  ```
+  saving = N·(w − bw) − (E + 1)·(w + 2)       for the chosen layout, when this is positive, else 0
+  ```
+
+  A region's size stays nondecreasing as records are added, which *Fan-out* needs (the argument is
+  there).
 - **Kind 2, dictionary** — a `text`, `bytea` or `json` column. A `u16` **entry count** `D`
   (`1 … 256`), `D` end offsets, the **entries** concatenated, then `N` one-byte **codes**: value
   `i`'s span is entry `code[i]`. An entry is a value's whole kind-0 span, tag included; the empty
@@ -1792,7 +1825,11 @@ records `[0, m)` — `Σ_{i<m} record_size(i) + leafOverhead(m, cols) − saving
 half with its own prefix, bases, widths and dictionaries; `rightpayload(m)` symmetrically over
 `[m, N)`. Both are nondecreasing in the number of records in the half (a record adds at least its
 stored bytes, a prefix can only shorten, an offset width only widen, and a region's size is the
-smaller of nondecreasing sizes), which is what the `m_min` / `m_max` / `m_balanced` scan relies on.
+smallest of nondecreasing sizes — for kind 6, a layout of the larger set gives one of the smaller set
+no larger: keep its width and raise its base to the smaller set's least value at or above it (or its largest), which
+excepts only values the larger layout excepted; and when that width is not narrower than kind 1's of
+the smaller set, kind 1 there is smaller still), which is what the `m_min` / `m_max` / `m_balanced`
+scan relies on.
 Both sides are non-empty by the range; both must fit, or the split is multi-way (above). Records
 that reach the disposition target have the two-record-fit guarantee below. Every insertion,
 including irreducible records above that target, must produce fitting leaves or fail `0A000`
@@ -2321,7 +2358,7 @@ the interior-node format and the split contract.
 | `statistics_decimal_table.jed` | **statistics over a fixed-width `numeric(p,s)` column** (v51) — a `numeric(6,2)` column analyzed: its leaf values are 4-byte slots, while its MCV values in the statistics entries use the self-describing decimal codec |
 | `decimal_fixed_table.jed` | **fixed-width stored `numeric(p,s)`** (v51) — a `numeric(4,2)` (2-byte slot), `numeric(9,0)` (4-byte), and `numeric(18,6)` (8-byte) column beside a `numeric(19,2)` column, which keeps the variable-width codec; each column's largest and smallest value, zero, a NULL (bitmap bit + zero-filled slot), and enough rows for a two-leaf tree |
 | `compact_leaf_table.jed` | **the compact leaf** (v52) — table `t(tenant i32, id i64, status text, amount numeric(10,2), ts timestamp, tags i32[], note text, PRIMARY KEY (tenant, id))` with an index on `status`, 60 rows inserted in key order (`tenant = 7`, `id = 1000 + i`, `status` cycling `open`/`closed`/`void`, `amount = (100 + i).(i as two digits)`, `ts = 2024-01-01 00:00:00 + i minutes`, `tags` NULL when `i mod 10 = 0`, `'{}'` when `1`, else `ARRAY[i mod 5, i mod 7]`, `note = 'n'` when `i mod 20 = 3` else NULL): a fixed-key tree (`leaf flags` `03`, key length 12, an 11-byte prefix, 10 bytes in the leaf that spans ids 1023–1024), both key columns elided, dictionary regions (`status`, and `note` with its NULL entry), base-plus-offsets regions over a `numeric` slot and a timestamp, and packed integer arrays with NULLs and empty arrays; `t_status_idx` is filled in row order, so its leaves split by the balanced rule with each half measured under its own prefix; then table `u(name text PRIMARY KEY, n i16, flag boolean, z i32)` with 30 rows `('user/alpha/NN', 5, NULL, NULL)`, `NN = 00 … 29`: variable-length keys with a shared prefix and a key directory, a plain variable region (`name`, distinct values), an offset width of 0 over equal values, and all-NULL columns (`z` is base-plus-offsets with base 0; `flag` is plain) |
-| `multiway_split.jed` | **the multi-way leaf split** (v52, *Fan-out*) — a tree shaped by single-row edits, one statement each, in this order. Table `a(id i32 PRIMARY KEY, v i64)`: `INSERT (i, 7)` for `i = 1 … 600` except 400, ascending (leaves `1–192`, `193–294`, `295–487`, `488–589`, `590–600`; `v` stores no offsets); `UPDATE a SET v = 4000000000000 WHERE id = 60` — a **replace** in the middle of the dense first leaf gives every row an 8-byte offset, no two-way split fits, and the leaf becomes `1–59 \| 60–83 \| 84–192`; `INSERT INTO a VALUES (400, -4000000000000)` — the same on the **insert** path, `295–487` becoming `295–399 \| 400–423 \| 424–487`; the root absorbs two separators each time. Table `b(k text PRIMARY KEY, n i32)`: `INSERT ('customer/acct/NNN', 1)` for `NNN = 000 … 063`, ascending (eight leaves of eight rows); then `('a', 2)` (the first leaf loses its 16-byte key prefix and splits two-way by the balanced arm, `a,000–003 \| 004–007`), `('z', 3)` (right edge of the full last leaf: `056–063 \| z`), `('customer/b', 5)` (the end of leaf `056–063`, whose prefix would fall from 15 bytes to 9: `056–063 \| customer/b`, and the root interior splits, growing the tree to height 3), `('customer/a', 4)` (into the first leaf, no split). A key that shortens a leaf's prefix arrives only at an end of the leaf, so those splits are two-way; the reference asserts each edit's split arity |
+| `multiway_split.jed` | **the multi-way leaf split** (v52, *Fan-out*) — a tree shaped by single-row edits, one statement each, in this order, at **page size 512** (since v54: an edited leaf must hold 32 values stored whole beside enough rows). Table `a(id i32 PRIMARY KEY, v i64, x i64)` (`T = 4000000000000`): `INSERT (i, 7, 7)` for `i = 1 … 600` except 160, ascending, except that rows 2–17 have `v = T`, rows 90–105 `x = T`, rows 115–130 `v = −T` and rows 175–190 `x = −T` (leaves `1–110`, `111–221`, `222–425`, `426–600`; each group is its leaf's **kind 6** exceptions in that column, and every other value stores no offset); `UPDATE a SET v = 2T, x = 2T WHERE id = 60` — a **replace** in the middle of the first leaf: any half holding row 60 holds 17 distant values in `v` (with rows 2–17) or in `x` (with rows 90–105), more than kind 6 keeps, so every row of it takes an 8-byte slot in that column, no two-way split fits, and the leaf becomes `1–59 \| 60–104 \| 105–110`; `INSERT INTO a VALUES (160, −2T, −2T)` — the same on the **insert** path, `111–221` becoming `111–159 \| 160–192 \| 193–221`. (Through v53 one distant value did this alone.) Table `b(k text PRIMARY KEY, n i32)`: `INSERT ('customer/acct/NNN', 1)` for `NNN = 000 … 305`, ascending (eighteen leaves of seventeen rows); then `('a', 2)` (the first leaf loses its 15-byte key prefix and splits two-way by the balanced arm, `a,000–008 \| 009–016`), `('z', 3)` (right edge of the full last leaf: `289–305 \| z`, and the root interior splits, growing the tree to height 3), `('customer/b', 5)` (the end of leaf `289–305`, whose prefix would fall from 14 bytes to 9: it is evened out with the one-row `z` leaf, `289–301 \| 302–305, customer/b, z`), `('customer/a', 4)` (into the first leaf, no split). A key that shortens a leaf's prefix arrives only at an end of the leaf, so those splits are two-way; the reference asserts each edit's split arity |
 | `bytea_table.jed` | a bytea column — the bytea branch; empty value, embedded `0x00`, a high byte, a NULL |
 | `uuid_table.jed` | a **uuid PRIMARY KEY** (the first non-integer stored key — the §8 cross-core key-path proof) + a nullable uuid column |
 | `default_table.jed` | columns with a **constant** `DEFAULT` — the `has_default` flag (bit2) + default value codec written after the typmod |

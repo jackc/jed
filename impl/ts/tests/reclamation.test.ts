@@ -17,7 +17,7 @@ import type { BlockStore } from "../src/blockstore.ts";
 import { FileBlockStore } from "../src/fileblockstore.ts";
 import { loadEnginePaged } from "../src/format.ts";
 import { Pager } from "../src/pager.ts";
-import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "../src/paging.ts";
+import { cacheBudget, DEFAULT_CACHE_BYTES, SharedPaging } from "../src/paging.ts";
 import { close, create, type Engine, execute, open } from "../src/tooling.ts";
 
 const PS = 256;
@@ -291,7 +291,7 @@ test("open reads the interior spine, not every leaf", () => {
     // Open through the counting store and tally the block reads open performs.
     const store = new CountingStore(new FileBlockStore(openSync(path, "r+")));
     const pager = Pager.fromStore(store);
-    loadEnginePaged(new SharedPaging(pager, cacheLeaves(DEFAULT_CACHE_BYTES, pager.pageSize)));
+    loadEnginePaged(new SharedPaging(pager, cacheBudget(DEFAULT_CACHE_BYTES)));
     // The ceiling is deliberately loose (< leaves) — the point is that open does NOT read every leaf,
     // and in practice reads ≪ leaves (only the spine + a peek per bottom-level interior).
     assert.ok(

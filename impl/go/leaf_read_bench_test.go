@@ -48,8 +48,8 @@ func leafReadValues(pattern string, n int) []uint64 {
 func leafReadCases(b *testing.B) []readCase {
 	const n, w = 476, 8
 	var out []readCase
-	savedRuns, savedFORX, savedBlocks, savedExc := leafRuns, leafFORX, leafBlocks, leafBlocksExc
-	defer func() { leafRuns, leafFORX, leafBlocks, leafBlocksExc = savedRuns, savedFORX, savedBlocks, savedExc }()
+	savedRuns, savedPFOR, savedBlocks, savedExc := leafRuns, leafPFOR, leafBlocks, leafBlocksExc
+	defer func() { leafRuns, leafPFOR, leafBlocks, leafBlocksExc = savedRuns, savedPFOR, savedBlocks, savedExc }()
 	for _, pattern := range []string{"drift", "outlier", "random"} {
 		vals := leafReadValues(pattern, n)
 		vb := make([][]byte, n)
@@ -58,19 +58,20 @@ func leafReadCases(b *testing.B) []readCase {
 			vb[i] = make([]byte, w)
 			putBEUint(vb[i], v)
 		}
-		add := func(name string, runs int, forx bool, force byte, blocks int, exc bool) {
-			leafRuns, leafFORX, leafBlocks, leafBlocksExc = runs, forx, blocks, exc
+		add := func(name string, runs int, pfor int, force byte, blocks int, exc bool) {
+			leafRuns, leafPFOR, leafBlocks, leafBlocksExc = runs, pfor, blocks, exc
 			r := newRunsRange(w)
 			for _, v := range vals {
 				r.add(v)
 			}
 			var reg []byte
 			switch force {
-			case regionFORX:
-				if _, _, ok := forExc(w, r); !ok {
+			case regionPFOR:
+				pp, _ := r.pf.plan(n, w)
+				if !pp.ok {
 					return
 				}
-				reg = encodeFORX(w, n, vb, nulls, r)
+				reg = encodePFOR(w, n, vb, nulls, pp)
 			case regionRuns:
 				reg = encodeRuns(w, n, vb, nulls, r.runs())
 			case regionBlocks:
@@ -83,13 +84,13 @@ func leafReadCases(b *testing.B) []readCase {
 				region: reg[1:], kind: reg[0], runsIdx: runs, blocks: blocks,
 			})
 		}
-		add("kind1", leafRunsOff, false, 0, 0, false)
-		add("exception", leafRunsOff, true, regionFORX, 0, false)
-		add("runs-search", leafRunsSearch, false, regionRuns, 0, false)
-		add("runs-rank", leafRunsRank, false, regionRuns, 0, false)
-		add("blocks64", leafRunsOff, false, regionBlocks, 64, false)
-		add("blocks64-exc", leafRunsOff, false, regionBlocks, 64, true)
-		add("blocks32-exc", leafRunsOff, false, regionBlocks, 32, true)
+		add("kind1", leafRunsOff, 0, 0, 0, false)
+		add("exceptions", leafRunsOff, pforMaxK, regionPFOR, 0, false)
+		add("runs-search", leafRunsSearch, 0, regionRuns, 0, false)
+		add("runs-rank", leafRunsRank, 0, regionRuns, 0, false)
+		add("blocks64", leafRunsOff, 0, regionBlocks, 64, false)
+		add("blocks64-exc", leafRunsOff, 0, regionBlocks, 64, true)
+		add("blocks32-exc", leafRunsOff, 0, regionBlocks, 32, true)
 	}
 	return out
 }
@@ -110,22 +111,12 @@ func (c readCase) inPlace() func(i int) uint64 {
 			return func(int) uint64 { return base }
 		}
 		return func(i int) uint64 { return base + beUintN(offs[i*bw:], bw) }
-	case regionFORX:
-		p := bm
-		base := beUint(reg[p : p+w])
-		bw := int(reg[p+w])
-		exc := int(reg[p+w+1])<<8 | int(reg[p+w+2])
-		excV := beUint(reg[p+w+3 : p+2*w+3])
-		offs := reg[p+2*w+3:]
-		return func(i int) uint64 {
-			if i == exc {
-				return excV
-			}
-			if bw == 0 {
-				return base
-			}
-			return base + beUintN(offs[i*bw:], bw)
+	case regionPFOR:
+		r, err := parsePFOR(reg, 0, len(reg), n, w)
+		if err != nil {
+			panic(err)
 		}
+		return func(i int) uint64 { return r.forValue(i) }
 	case regionRuns:
 		saved := leafRuns
 		leafRuns = c.runsIdx

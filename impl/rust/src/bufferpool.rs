@@ -1,7 +1,8 @@
 //! Bounded buffer pool — a CLOCK (second-chance) cache of decoded pages keyed by on-disk page id
 //! (spec/design/pager.md §3). The demand-paging read path (P6.4b) faults a leaf page through
-//! [`BufferPool::get_or_load`]; the pool bounds how many pages are resident at once, evicting under
-//! CLOCK when full.
+//! [`BufferPool::get_or_load`]; the pool bounds what the resident pages hold, in bytes — each value
+//! charged its [`Weigh::weigh`] — evicting under CLOCK until a new one fits. At least one value stays
+//! resident whatever the budget.
 //!
 //! **No pins.** Eviction only drops the cache *entry* — any in-flight `Arc` still keeps that node
 //! alive, and a clean node is immutable so a re-load is a harmless duplicate (pager.md §4). A
@@ -20,12 +21,29 @@ use std::sync::{Arc, Condvar, Mutex};
 use crate::error::Result;
 
 /// Bound the eager page-id index reservation. 8,192 entries cover the diagnosed 6,900-leaf cold
-/// population without turning the default 32,768-leaf cache ceiling (or a caller's much larger
-/// budget) into an oversized allocation before a leaf is touched.
+/// population without turning the default 256 MiB budget (or a caller's much larger one) into an
+/// oversized allocation before a leaf is touched.
 const MAX_INITIAL_INDEX_CAPACITY: usize = 8 * 1024;
 
 fn initial_index_capacity(capacity: usize) -> usize {
     capacity.min(MAX_INITIAL_INDEX_CAPACITY)
+}
+
+/// The bytes a page-sized leaf is assumed to hold when sizing the initial index from a byte budget.
+const INDEX_ENTRY_BYTES: usize = 8 * 1024;
+
+/// What a cached value holds, which the pool charges against its budget (pager.md §3): a resident
+/// leaf's bytes. A value weighs the same for as long as it is cached.
+pub(crate) trait Weigh {
+    fn weigh(&self) -> usize;
+}
+
+/// A test value is one unit, so a budget of `k` holds `k` of them.
+#[cfg(test)]
+impl Weigh for u32 {
+    fn weigh(&self) -> usize {
+        1
+    }
 }
 
 /// One resident page: its id, the cached value, and the CLOCK reference bit (set on access, cleared
@@ -33,6 +51,8 @@ fn initial_index_capacity(capacity: usize) -> usize {
 struct Slot<T> {
     page_id: u32,
     value: Arc<T>,
+    /// What the value is charged ([`Weigh::weigh`] at insertion).
+    bytes: usize,
     referenced: bool,
 }
 
@@ -84,7 +104,9 @@ impl<T> LoadFlight<T> {
 /// The short-critical-section CLOCK state. Physical read, checksum, and PAX parsing never run while
 /// this mutex is held.
 struct PoolState<T> {
+    /// The most the resident values are charged together (≥ 1); `used` is their sum.
     capacity: usize,
+    used: usize,
     slots: Vec<Slot<T>>,
     index: HashMap<u32, usize>,
     hand: usize,
@@ -96,15 +118,19 @@ pub(crate) struct BufferPool<T> {
     state: Mutex<PoolState<T>>,
 }
 
-impl<T> BufferPool<T> {
-    /// A pool holding at most `capacity` pages (clamped to ≥ 1).
+impl<T: Weigh> BufferPool<T> {
+    /// A pool whose resident values are charged at most `capacity` (clamped to ≥ 1) together, or
+    /// one value when a single one weighs more.
     pub(crate) fn new(capacity: usize) -> Self {
         let capacity = capacity.max(1);
         BufferPool {
             state: Mutex::new(PoolState {
                 capacity,
+                used: 0,
                 slots: Vec::new(),
-                index: HashMap::with_capacity(initial_index_capacity(capacity)),
+                index: HashMap::with_capacity(initial_index_capacity(
+                    (capacity / INDEX_ENTRY_BYTES).max(1),
+                )),
                 hand: 0,
                 loading: HashMap::new(),
             }),
@@ -169,7 +195,7 @@ impl<T> BufferPool<T> {
         state.index.contains_key(&page_id) || state.loading.contains_key(&page_id)
     }
 
-    /// The most pages the pool holds at once.
+    /// The pool's budget: the most its resident values are charged together.
     pub(crate) fn capacity(&self) -> usize {
         self.state
             .lock()
@@ -177,27 +203,33 @@ impl<T> BufferPool<T> {
             .capacity
     }
 
-    /// Re-bound the pool to `capacity` pages (clamped to ≥ 1), evicting under CLOCK until the resident
-    /// set fits — a spilled temp domain's pool tightens from pinned to `temp_buffers`
-    /// (spec/design/temp-tables.md §6).
+    /// Re-bound the budget (clamped to ≥ 1), evicting under CLOCK until the resident set fits,
+    /// keeping at least one value — a spilled temp domain's pool tightens from pinned to
+    /// `temp_buffers` (spec/design/temp-tables.md §6).
     pub(crate) fn set_capacity(&self, capacity: usize) {
         let mut state = self.state.lock().expect("buffer pool mutex poisoned");
         state.capacity = capacity.max(1);
-        while state.slots.len() > state.capacity {
+        while state.slots.len() > 1 && state.used > state.capacity {
             let victim = state.evict_slot();
             let page = state.slots[victim].page_id;
             state.invalidate(page);
         }
     }
 
-    /// The number of pages currently resident — the bound the pool enforces (`≤ capacity`), surfaced
-    /// publicly via [`crate::Engine::resident_leaves`] (P6.4c, spec/design/pager.md §3).
+    /// The number of pages currently resident, surfaced publicly via
+    /// [`crate::Engine::resident_leaves`] (P6.4c, spec/design/pager.md §3).
     pub(crate) fn resident(&self) -> usize {
         self.state
             .lock()
             .expect("buffer pool mutex poisoned")
             .slots
             .len()
+    }
+
+    /// What the resident values are charged together — the bound the pool enforces (≤ the budget,
+    /// or one value).
+    pub(crate) fn charged(&self) -> usize {
+        self.state.lock().expect("buffer pool mutex poisoned").used
     }
 
     /// Drop any cached entry for `page`, then mark and detach an in-flight load. Detaching prevents a
@@ -213,12 +245,13 @@ impl<T> BufferPool<T> {
     }
 }
 
-impl<T> BufferPool<T> {
+impl<T: Weigh> BufferPool<T> {
     /// Drop every cached page and detach every in-flight load — a page client told by the owner
     /// that its whole cache may be stale (spec/pageservice/README.md §3.2).
     pub(crate) fn invalidate_all(&self) {
         let mut state = self.state.lock().expect("buffer pool mutex poisoned");
         state.slots.clear();
+        state.used = 0;
         state.index.clear();
         state.hand = 0;
         for (_, flight) in state.loading.drain() {
@@ -227,26 +260,24 @@ impl<T> BufferPool<T> {
     }
 }
 
-impl<T> PoolState<T> {
-    /// Insert a freshly-loaded page, evicting one under CLOCK if at capacity.
+impl<T: Weigh> PoolState<T> {
+    /// Insert a freshly-loaded page, evicting under CLOCK until it fits the budget or nothing is left
+    /// to evict: a value heavier than the whole budget is still admitted, alone.
     fn insert(&mut self, page_id: u32, value: Arc<T>) {
-        if self.slots.len() < self.capacity {
-            self.index.insert(page_id, self.slots.len());
-            self.slots.push(Slot {
-                page_id,
-                value,
-                referenced: false,
-            });
-            return;
+        let bytes = value.weigh();
+        while !self.slots.is_empty() && self.used + bytes > self.capacity {
+            let victim = self.evict_slot();
+            let page = self.slots[victim].page_id;
+            self.invalidate(page);
         }
-        let victim = self.evict_slot();
-        self.index.remove(&self.slots[victim].page_id);
-        self.index.insert(page_id, victim);
-        self.slots[victim] = Slot {
+        self.index.insert(page_id, self.slots.len());
+        self.slots.push(Slot {
             page_id,
             value,
+            bytes,
             referenced: false,
-        };
+        });
+        self.used += bytes;
     }
 
     /// Advance the CLOCK hand, clearing the reference bit of each page it passes (a second chance),
@@ -274,8 +305,9 @@ impl<T> PoolState<T> {
         let Some(i) = self.index.remove(&page) else {
             return;
         };
-        // Swap the last slot into the hole so the Vec stays dense (capacity accounting + the CLOCK hand
-        // stay well-formed), then pop.
+        self.used -= self.slots[i].bytes;
+        // Swap the last slot into the hole so the Vec stays dense (the CLOCK hand stays well-formed),
+        // then pop.
         let last = self.slots.len() - 1;
         if i != last {
             self.slots.swap(i, last);
@@ -392,7 +424,7 @@ mod tests {
         assert_eq!(initial_index_capacity(8_192), 8_192);
         assert_eq!(initial_index_capacity(usize::MAX), 8_192);
 
-        let pool = BufferPool::<u32>::new(6_900);
+        let pool = BufferPool::<u32>::new(6_900 * INDEX_ENTRY_BYTES);
         assert!(
             pool.state.lock().unwrap().index.capacity() >= 6_900,
             "constructor must apply the initial index reservation"
@@ -402,7 +434,7 @@ mod tests {
         // pool. Pin the allocation property directly: that population must not grow/rehash the
         // eagerly reserved page-id index.
         let value = Arc::new(0u32);
-        let pool = BufferPool::new(32_768);
+        let pool = BufferPool::new(32_768 * INDEX_ENTRY_BYTES);
         let mut state = pool.state.lock().unwrap();
         let reserved = state.index.capacity();
         for page in 0..6_900 {

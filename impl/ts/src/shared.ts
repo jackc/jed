@@ -1903,7 +1903,7 @@ function* rekeyStorageSteps(
   try {
     paging = yield* withPrefetchSteps(old, snap, function* () {
       // The scratch domain spills past the handle's page-cache budget, like a temp domain.
-      const budget = Math.max(Math.min(capacity * st.pageSize, Number.MAX_SAFE_INTEGER), 1 << 20);
+      const budget = Math.max(capacity, 1 << 20);
       const built = snap.emptied(capOf(st.pageSize, target !== null), build.paging!);
       snap.rebuildRows(built, resident ? Infinity : Math.floor(budget / 4), (s) => {
         if (resident) return;

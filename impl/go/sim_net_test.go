@@ -183,8 +183,12 @@ func (e *simConnEnd) Write(p []byte) (int, error) {
 	if e.closed || e.eof {
 		return 0, net.ErrClosed
 	}
-	n.frames++
-	if n.disconnectAt > 0 && n.frames == n.disconnectAt {
+	// A page read and its reply are not counted: which pages a client fetches depends on what its
+	// buffer pool holds, which is each core's own (spec/design/simulation-testing.md, S8 Faults).
+	if !simPageReadFrame(p) {
+		n.frames++
+	}
+	if n.disconnectAt > 0 && n.frames == n.disconnectAt && !simPageReadFrame(p) {
 		n.disconnected = true
 		e.dropLocked()
 		n.cond.Broadcast()
@@ -200,6 +204,12 @@ func (e *simConnEnd) Write(p []byte) (int, error) {
 		n.cond.Wait()
 	}
 	return len(p), nil
+}
+
+// simPageReadFrame reports whether frame p is a read_pages request (code 0x03) or its pages reply
+// (0x43): length u32 | code u8 | request_id u32 | body (spec/pageservice/README.md §2).
+func simPageReadFrame(p []byte) bool {
+	return len(p) > 4 && (p[4] == 0x03 || p[4] == 0x43)
 }
 
 // dropLocked ends the connection without closing either end: both readers see end of stream and

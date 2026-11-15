@@ -95,30 +95,67 @@ above are per-host (storage.md §2).
 
 ## 3. The buffer pool
 
-A fixed-capacity cache mapping `page_id → decoded page`, with:
+A byte-bounded cache mapping `page_id → decoded page`, with:
 
-- **A memory budget** — a configurable bound on resident leaf memory (the resident-set bound),
-  stated in **bytes** at the handle (`open`'s `cache_bytes`, [api.md](api.md) §2.1) and converted
-  to a leaf-page capacity by the file's page size: `cache_leaves = max(1, cache_bytes / page_size)`.
-  Bytes, not a page count, so the caller's budget does not silently scale with the file's `page_size`
-  (a page count would mean a 256× different footprint across page sizes); the `max(1, …)` floor keeps
-  one leaf resident even when `cache_bytes < page_size`. Default sized so a RAM-sized working set stays
-  fully cache-resident (§1) — `DEFAULT_CACHE_BYTES = 256 MiB`. (Originally 8 MiB — the historical
-  1024-leaf count at the 8192 page size — which contradicted this sizing rule: a typical RAM-sized
-  database thrashed the pool under the default, paying a fault + leaf decode on most point lookups.
-  256 MiB keeps the dominant RAM-sized case fully resident; a host that wants the old bound passes
-  `cache_bytes` explicitly.) The budget is a *handle* setting, not an
-  on-disk parameter. A resident clean leaf is the retained page block plus thin PAX region
-  descriptors; the key and variable-value end-offset directories remain validated byte ranges in
-  that block and are read big-endian on access instead of being copied into integer arrays. Rows
-  decode by touched column, keys are borrowed spans of the key blob, and record weights derive
-  lazily. It owns no per-record key, row, weight, or directory objects, so resident leaf memory is
-  `≈ cache_leaves × page_size` and the byte budget means what it says. This Packed representation is
-  results/cost/byte-neutral above the seam ([packed-leaf.md](packed-leaf.md)). Rust and Go give the
-  page-id index an initial capacity hint of `min(cache_leaves, 8192)`: enough to populate the measured
-  million-row table's roughly 6,900 leaves without a rehash, but bounded so a very large caller cache
-  budget does not become an equally large eager allocation before any page is touched. This is
-  implementation machinery, not part of the memory-budget or observable-behavior contract.
+- **A memory budget, in bytes** — a configurable bound on resident leaf memory (the resident-set
+  bound), stated in **bytes** at the handle (`open`'s `cache_bytes`, [api.md](api.md) §2.1). Bytes,
+  not a page count, so the caller's budget does not silently scale with the file's `page_size`.
+  Default sized so a RAM-sized working set stays fully cache-resident (§1) — `DEFAULT_CACHE_BYTES =
+  256 MiB`. (Originally 8 MiB — the historical 1024-leaf count at the 8192 page size — which
+  contradicted this sizing rule: a typical RAM-sized database thrashed the pool under the default,
+  paying a fault + leaf decode on most point lookups. 256 MiB keeps the dominant RAM-sized case fully
+  resident; a host that wants the old bound passes `cache_bytes` explicitly.) The budget is a *handle*
+  setting, not an on-disk parameter.
+- **Each leaf is charged what it holds, and the pool evicts by bytes.** A resident leaf is charged the
+  memory this core actually holds for it: its page buffer and its structures (the node, the leaf's
+  directory views, one region descriptor per column, a packed-array region's row index). The pool
+  admits a newly faulted leaf by evicting under CLOCK until the sum of the resident leaves' charges
+  plus the new one fits the budget; **at least one leaf stays resident whatever the budget** (the
+  minimum to walk a root→leaf path), so a budget smaller than one leaf holds exactly one. A charge
+  is fixed when the leaf is faulted: nothing a read does builds anything on the leaf (below), so no
+  leaf grows while it is resident and no re-charge is needed. (Go's held symbol-table prototype,
+  off by default, still rebuilds a region on first use; it is not charged.) Until this change
+  `cache_bytes` was converted to a leaf count, `max(1, cache_bytes / page_size)`, which ignored what a
+  leaf really held — measured at about twice its page once read — so a 256 MiB budget could hold
+  about 500 MiB.
+
+  How each core measures the charge: **Go** sums `unsafe.Sizeof` of the node, leaf and region structs
+  and the payload's allocation, each rounded to the runtime's size classes (`heapAllocSize`, an
+  approximation of the allocator kept beside it); **Rust** sums `size_of` of the node and region
+  descriptors, the `Arc`/`Vec` headers and the buffer's capacity; **TypeScript** cannot read object
+  sizes in V8, so it charges the payload's bytes plus a per-leaf and per-region object estimate,
+  calibrated against the heap with `impl/ts/tests/zz_mem_probe.ts`. The charge is implementation
+  machinery like the rest of the pool (next section): it changes which leaves are resident, never
+  what a query observes.
+- **A resident leaf holds its used payload, read in place.** The checksum is verified over the whole
+  page; then a page read fresh for the fault keeps only its used payload (`colStart[K]` bytes after
+  the header), so the page's unused tail — 5.7% of the measured database's leaf pages, more on churned
+  data — is freed. A store that hands out its own retained blocks (the in-memory host,
+  `MemoryBlockStore`) is not copied: the pool charges the block, which the store holds anyway. Every
+  region is read in place: plain slots, a base-plus-offsets column (base plus the offset, one load of
+  its width), an elided key column (bytes of the stored key, or the shared prefix), a dictionary, and
+  a packed integer array (decoded one value at a time, from a row index of one `u32` per 16 rows built
+  at the parse). Keys under a shared prefix are compared prefix-aware in place (point lookups, range
+  bounds); a full key is built only as a transient for the reader that asks for one (a scan builds
+  64 at a time into a buffer it holds). The key and variable-value end-offset directories remain
+  validated byte ranges in that block and are read big-endian on access instead of being copied into
+  integer arrays. Rows decode by touched column, and record weights derive lazily. A resident leaf
+  owns no per-record key, row, weight, or directory objects and no rebuilt region, so the bytes it is
+  charged are what it holds. This Packed representation is results/cost/byte-neutral above the seam
+  ([packed-leaf.md](packed-leaf.md)). Rust and Go give the page-id index an initial capacity hint of
+  `min(cache_bytes / 8 KiB, 8192)`: enough to populate the measured million-row table's roughly 6,900
+  leaves without a rehash, but bounded so a very large caller cache budget does not become an equally
+  large eager allocation before any page is touched. This is implementation machinery, not part of
+  the memory-budget or observable-behavior contract.
+
+  Measured on the generated 145 MB database of `TestSuperBlockExperiment` (`impl/go/zz_superblock_test.go`):
+  after every row of every table is read and every index range-scanned, Go's resident leaves hold
+  1.16× their page bytes (2.06× before; index leaves 0.89×, being trimmed), Rust's 1.04× (1.91×) and
+  TypeScript's 1.30× (2.11×). Opened with `cache_bytes` of 16 and 64 MiB, the heap beyond the open
+  handle is 16.1 and 64.3 MB in Go (`TestSuperBlockPoolBound`), 16.2 and 64.5 MB in Rust
+  (`examples/zz_mem_probe.rs` with `JED_MEM_PROBE_CACHE`) and 15.1 and 64.1 MB in TypeScript
+  (`impl/ts/tests/zz_mem_probe.ts`), against 21–52 and up to 122 MB in Rust before. The pool's charge
+  is within 1% of the measured heap in every core.
 - **Concurrent miss coordination — per-page single flight.** In the threaded Rust and Go cores, the
   pool mutex covers only the page-id hit/miss lookup, in-flight registration, and CLOCK insertion;
   it is **not held** across the physical page read, CRC validation, or PAX parse. Misses for different
@@ -258,8 +295,9 @@ change lands alone, on a frozen seam:
   `create`, `XX001` on `open` — so a corrupt or hostile file cannot record a multi-gigabyte `page_size`
   and force that allocation before its content is validated (CLAUDE.md §13; format.md *Page model*). A large-file test in each core opens a database
   whose leaf pages far exceed a tiny budget and confirms it scans, mutates, and round-trips correctly
-  while the resident leaf count stays `≤ cache_leaves` throughout (including under a repeated-lookup
-  workload), plus a `page_size > cache_bytes` case that keeps exactly one leaf resident.
+  while the bytes its resident leaves are charged stay within the budget throughout (including under a
+  repeated-lookup workload), plus a `cache_bytes` smaller than one leaf, which keeps exactly one leaf
+  resident.
 
 Deferred follow-ons (none foreclosed): **paging the interior skeleton too** (for a file whose
 interior alone exceeds RAM — a multi-TB extreme; needs `node_count`/cost to move to per-node-visit

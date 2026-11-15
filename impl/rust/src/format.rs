@@ -175,8 +175,10 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // ciphertext) and the chain digest at meta offset 48 is a CRC-32; page header offset 2 is the low 16
 // bits of the writing commit's txid, checked against the commit window during manifest validation;
 // and meta offset 60 counts a (parent, slot) remap list in the manifest area's last third, which lets
-// a commit keep an interior whose only change is a child's page, and its catalog chain.
-pub(crate) const FORMAT_VERSION: u16 = 53;
+// a commit keep an interior whose only change is a child's page, and its catalog chain. v54: a
+// base-plus-offsets region may store up to 16 values whole as exceptions (region kind 6), taken when
+// it saves more than kind 1 (format.md "Leaf node"; spec/design/leaf-write-cost.md §8–§9).
+pub(crate) const FORMAT_VERSION: u16 = 54;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 #[path = "remap.rs"]
@@ -186,13 +188,15 @@ pub(crate) use remap::{CatState, RemapState};
 mod leaf_compact;
 #[path = "leaf_lazy.rs"]
 mod leaf_lazy;
+#[path = "leaf_pfor.rs"]
+mod leaf_pfor;
 #[cfg(test)]
 use leaf_compact::leaf_saving;
 use leaf_compact::{
-    ArrAcc, DictAcc, ForRange, Item, LEAF_FLAG_FIXED_KEY, LEAF_FLAG_PREFIX, REGION_ARR,
+    ArrAcc, DictAcc, ForFacts, Item, LEAF_FLAG_FIXED_KEY, LEAF_FLAG_PREFIX, REGION_ARR,
     REGION_DICT, REGION_FOR, TAG_INLINE_BARE, arr_bits, arr_elem_width, arr_elems, arr_saving,
-    be_uint, dict_saving, for_saving, for_width, get_bits, leaf_prefix_len, put_be_uint, put_bits,
-    span_item, string_payload,
+    be_uint, dict_saving, for_kind1_saving, for_width, get_bits, leaf_prefix_len, put_be_uint,
+    put_bits, span_item, string_payload,
 };
 pub(crate) use leaf_compact::{
     DistinctGroup, LeafScan, LeafShape, LeafSizes, SplitFacts, index_shape, leaf_overhead,
@@ -201,6 +205,9 @@ pub(crate) use leaf_compact::{
 #[cfg(test)]
 pub(crate) use leaf_lazy::leaf_patch_check;
 pub(crate) use leaf_lazy::{LazyView, replaced_columns, row_all_inline};
+#[cfg(test)]
+pub(crate) use leaf_pfor::pfor_test;
+use leaf_pfor::{PFOR_MAX_K, REGION_PFOR, encode_pfor};
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 pub(crate) const PAGE_HEADER: usize = 16;
@@ -2267,7 +2274,8 @@ fn serialize_node(
         // `to_image` canonical / compaction), so the clones are acceptable (packed-leaf.md §7).
         let leaf_rows = node.decoded_rows()?;
         let rows: Vec<&[Value]> = leaf_rows.iter().map(Vec::as_slice).collect();
-        let keys: Vec<&[u8]> = (0..node.len()).map(|i| node.key_at(i)).collect();
+        let owned: Vec<Cow<'_, [u8]>> = (0..node.len()).map(|i| node.key_at(i)).collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| &**k).collect();
         let mut src = ChainSource {
             paging: store.paging(),
             share: false,
@@ -4891,8 +4899,9 @@ fn encode_leaf_keys<K: AsRef<[u8]>>(
 }
 
 /// Append stored column `c`'s region for `n` values (format.md "Leaf node"), led by its kind byte:
-/// the plain region of the column's class (kind 0), or base plus offsets (1), a dictionary (2) or
-/// packed integer arrays (4), each taken exactly when the size rule says it is smaller.
+/// the plain region of the column's class (kind 0), or base plus offsets (1), a dictionary (2),
+/// packed integer arrays (4) or base plus offsets with exceptions (6), each taken exactly when the
+/// size rule says it is smaller.
 ///
 /// A fixed-width column gives `body` as `n` dense slots (zeros for NULL) and no `ends`; a
 /// variable-width column gives its tagged spans laid end to end in `body` (nothing for NULL) and
@@ -4915,13 +4924,26 @@ fn encode_region(
         let mut narrow = None;
         let mut saving = 0;
         if shape.for_cols.iter().any(|fc| fc.col == c) {
-            let mut r = ForRange::default();
+            let mut f = ForFacts::default();
             for i in (0..n).filter(|&i| !nulls[i]) {
-                r.add(be_uint(&body[i * w..(i + 1) * w]));
+                f.add(be_uint(&body[i * w..(i + 1) * w]));
             }
-            saving = for_saving(n, w, r);
+            let kind1 = for_kind1_saving(n, w, f.r);
+            let plan = f.pf.plan(n, w);
+            let kind6 = plan.map_or(0, |(_, size)| (n * w).saturating_sub(size));
+            saving = kind1.max(kind6);
             if saving > 0 {
-                narrow = Some((r.lo, for_width(w, r)));
+                narrow = Some((f.r.lo, for_width(w, f.r)));
+            }
+            // Values stored whole (kind 6) when that saves more than kind 1; kind 1 on a tie.
+            if let Some((p, _)) = plan.filter(|_| kind6 > kind1) {
+                encode_pfor(w, n, body, nulls, p, out);
+                debug_assert_eq!(
+                    out.len() - start,
+                    plain - saving,
+                    "a region's measured size"
+                );
+                return;
             }
         }
         out.push(if narrow.is_some() { REGION_FOR } else { 0 });
@@ -6068,8 +6090,7 @@ pub(crate) fn sim_open_with_gist(
     )))?;
     let env = crate::environment::Environment::default();
     let codec = unlock_pager(&mut pager, credential, &env)?;
-    let capacity =
-        crate::paging::cache_leaves(crate::paging::DEFAULT_CACHE_BYTES, pager.page_size());
+    let capacity = crate::paging::cache_budget(crate::paging::DEFAULT_CACHE_BYTES);
     let paging = SharedPaging::with_codec(pager, capacity, codec);
     let gist = std::cell::RefCell::new(Vec::new());
     let hook = |p: u32| gist.borrow_mut().push(p);
@@ -6548,6 +6569,16 @@ fn page_block(image: &[u8], ps: usize, index: u32) -> Result<Vec<u8>> {
     Ok(image[off..off + ps].to_vec())
 }
 
+/// The shift that puts each of `n` rows in one of 64 buckets of a kind 6 region's exception mask
+/// (`RegionDir::For`): every row `i < n` has `i >> shift < 64`.
+fn exc_bucket_shift(n: usize) -> u8 {
+    let mut shift = 0u8;
+    while n.saturating_sub(1) >> shift >= 64 {
+        shift += 1;
+    }
+    shift
+}
+
 /// One leaf column region's parsed shape (spec/fileformat/format.md "Leaf node"), by its kind. A
 /// plain fixed-width region is a null bitmap + dense untagged slots; a plain variable region is an
 /// end-offset value directory + tagged codec bytes (NULL = zero-length span).
@@ -6561,8 +6592,9 @@ enum RegionDir {
         /// Payload offset of slot 0; slot `i` is `width` bytes at `body + i·width`.
         body: usize,
     },
-    /// Base plus offsets (kind 1): record `i`'s slot is `base + offset[i]` at `width`. The dense
-    /// slots are rebuilt the first time the column is read.
+    /// Base plus offsets (kind 1, or kind 6 with exceptions): record `i`'s slot is
+    /// `base + offset[i]` at `width`, or for an exception row its stored body, read in place
+    /// ([`PaxDirs::for_value`]); nothing is rebuilt.
     For {
         width: usize,
         bitmap: usize,
@@ -6570,7 +6602,14 @@ enum RegionDir {
         /// The offset width, and the payload offset of offset 0.
         bw: usize,
         offs: usize,
-        slots: OnceLock<Vec<u8>>,
+        /// Kind 6: the payload offset of the `exc_n` exception rows (`u16`, ascending), whose
+        /// bodies follow them. `exc_mask` has bit `b` set when some exception row `r` has
+        /// `r >> exc_shift == b`, so a row in a clear bucket is no exception
+        /// ([`exc_bucket_shift`]). Kind 1: no exceptions, a zero mask.
+        exc: usize,
+        exc_n: u8,
+        exc_shift: u8,
+        exc_mask: u64,
     },
     Var {
         /// Payload offset of the `N` big-endian `u16` end offsets into the value blob. The
@@ -6587,37 +6626,36 @@ enum RegionDir {
         codes: usize,
     },
     /// Packed integer arrays (kind 4): `N` count bytes at `counts`, and the elements as
-    /// `element − base` in `bits` bits each from `data`. The plain form (end offsets and tagged
-    /// array bodies) is rebuilt the first time a value of the column is read.
+    /// `element − base` in `bits` bits each from `data`. A value is decoded alone when read
+    /// ([`PaxDirs::arr_value`]); `starts[k]` is the element index at which row
+    /// `ARR_INDEX_ROWS·k`'s elements start, built at the parse, so finding a row's elements sums at
+    /// most `ARR_INDEX_ROWS − 1` counts.
     Arr {
         width: usize,
         counts: usize,
         base: u64,
         bits: usize,
         data: usize,
-        plain: OnceLock<ArrPlain>,
+        starts: Box<[u32]>,
     },
 }
 
-/// A packed-array region rebuilt as a plain variable region: `N` end offsets and the tagged spans.
-/// The spans are shared (`Arc`) with every deferred value read from them.
-struct ArrPlain {
-    ends: Vec<u32>,
-    body: Arc<Vec<u8>>,
-}
+/// How many rows one entry of a packed-array region's row index covers.
+const ARR_INDEX_ROWS: usize = 16;
 
 /// Where a variable-width value's stored span lives.
 enum VarSpan<'a> {
     /// In the page payload, at this offset.
     Page(usize, &'a [u8]),
-    /// In a rebuilt packed-array region, at this offset of its body.
-    Rebuilt(&'a Arc<Vec<u8>>, usize, &'a [u8]),
+    /// A packed array value decoded alone into its plain tagged form, owned by the reader.
+    Owned(Vec<u8>),
 }
 
-impl<'a> VarSpan<'a> {
-    fn bytes(&self) -> &'a [u8] {
+impl VarSpan<'_> {
+    fn bytes(&self) -> &[u8] {
         match self {
-            VarSpan::Page(_, b) | VarSpan::Rebuilt(_, _, b) => b,
+            VarSpan::Page(_, b) => b,
+            VarSpan::Owned(b) => b,
         }
     }
 }
@@ -6639,8 +6677,6 @@ struct PaxDirs {
     /// The payload's content length, `colStart[K]`: the leaf's size.
     end: usize,
     regions: Vec<RegionDir>, // K regions, in declaration order
-    /// The full keys laid end to end, rebuilt on first use when the page stores a prefix.
-    full_keys: OnceLock<Vec<u8>>,
 }
 
 impl PaxDirs {
@@ -6688,23 +6724,39 @@ impl PaxDirs {
         self.prefix_len + hi - lo
     }
 
-    /// Key `i` as one span: of the page, or of the leaf's rebuilt keys when it stores a prefix.
-    fn key<'a>(&'a self, payload: &'a [u8], i: usize) -> &'a [u8] {
+    /// Key `i`: a view of the page, or — when the page stores a shared prefix — a key built for the
+    /// caller (the leaf keeps no rebuilt keys).
+    fn key<'a>(&self, payload: &'a [u8], i: usize) -> Cow<'a, [u8]> {
+        if self.prefix_len == 0 {
+            return Cow::Borrowed(self.suffix(payload, i));
+        }
+        Cow::Owned(self.key_owned(payload, i))
+    }
+
+    /// Key `i` as a span: of the page, or — under a shared prefix — built into `buf`.
+    fn key_into<'a>(&self, payload: &'a [u8], i: usize, buf: &'a mut Vec<u8>) -> &'a [u8] {
         if self.prefix_len == 0 {
             return self.suffix(payload, i);
         }
-        let full = self.full_keys.get_or_init(|| {
-            let prefix = self.prefix(payload);
-            let (_, blob) = self.suffix_span(payload, self.n - 1);
-            let mut full = Vec::with_capacity(self.n * self.prefix_len + blob);
-            for i in 0..self.n {
-                full.extend_from_slice(prefix);
-                full.extend_from_slice(self.suffix(payload, i));
-            }
-            full
-        });
-        let (lo, hi) = self.suffix_span(payload, i);
-        &full[i * self.prefix_len + lo..(i + 1) * self.prefix_len + hi]
+        buf.clear();
+        buf.extend_from_slice(self.prefix(payload));
+        buf.extend_from_slice(self.suffix(payload, i));
+        buf
+    }
+
+    /// `key(i).cmp(probe)`, without building key `i`: the probe is compared with the shared prefix,
+    /// then with the stored suffix.
+    fn cmp_key(&self, payload: &[u8], i: usize, probe: &[u8]) -> std::cmp::Ordering {
+        let prefix = self.prefix(payload);
+        if probe.len() < prefix.len() {
+            return prefix[..probe.len()]
+                .cmp(probe)
+                .then(std::cmp::Ordering::Greater);
+        }
+        let (head, rest) = probe.split_at(prefix.len());
+        prefix
+            .cmp(head)
+            .then_with(|| self.suffix(payload, i).cmp(rest))
     }
 
     /// An owned copy of key `i`, without rebuilding the leaf's other keys.
@@ -6767,46 +6819,34 @@ impl PaxDirs {
         }
     }
 
-    /// The untagged value body of `(record i, column c)` of a fixed-width column. A NULL's slot is
-    /// never read (the bitmap is the sole authority).
-    fn slot<'a>(&'a self, payload: &'a [u8], c: usize, i: usize) -> &'a [u8] {
+    /// The untagged value body of `(record i, column c)` of a fixed-width column: a view of the
+    /// page, or built into `buf` from a base and offset or from the key. A NULL's slot is never
+    /// read (the bitmap is the sole authority).
+    fn slot<'a>(&self, payload: &'a [u8], c: usize, i: usize, buf: &'a mut [u8; 16]) -> &'a [u8] {
         match &self.regions[c] {
             RegionDir::Elided { width, at } => {
                 // The bytes of the key at the column's key offset: of the shared prefix, of the
-                // stored suffix, or — straddling the two — of the rebuilt key.
+                // stored suffix, or — straddling the two — the two parts joined in `buf`.
                 let (at, w, kp) = (*at, *width, self.prefix_len);
                 if at + w <= kp {
                     &payload[self.prefix + at..self.prefix + at + w]
                 } else if at >= kp {
                     &self.suffix(payload, i)[at - kp..at - kp + w]
                 } else {
-                    &self.key(payload, i)[at..at + w]
+                    let head = kp - at;
+                    buf[..head].copy_from_slice(&payload[self.prefix + at..self.prefix + kp]);
+                    buf[head..w].copy_from_slice(&self.suffix(payload, i)[..w - head]);
+                    &buf[..w]
                 }
             }
             RegionDir::Fixed { width, body, .. } => {
                 &payload[body + i * width..body + (i + 1) * width]
             }
-            RegionDir::For {
-                width,
-                bitmap,
-                base,
-                bw,
-                offs,
-                slots,
-            } => {
-                let (w, bw) = (*width, *bw);
-                let slots = slots.get_or_init(|| {
-                    let mut slots = vec![0u8; self.n * w];
-                    for i in 0..self.n {
-                        if payload[bitmap + i / 8] & (0x80 >> (i % 8)) != 0 {
-                            continue; // a NULL's slot stays zero-filled
-                        }
-                        let off = be_uint(&payload[offs + i * bw..offs + (i + 1) * bw]);
-                        put_be_uint(&mut slots[i * w..(i + 1) * w], base.wrapping_add(off));
-                    }
-                    slots
-                });
-                &slots[i * w..(i + 1) * w]
+            RegionDir::For { width, .. } => {
+                // One 8-byte store, so the decoder's load of the low `w` bytes forwards from it.
+                let w = *width;
+                buf[..8].copy_from_slice(&self.for_value(payload, c, i).to_be_bytes());
+                &buf[8 - w..8]
             }
             RegionDir::Var { .. } | RegionDir::Dict { .. } | RegionDir::Arr { .. } => {
                 unreachable!("a variable-width region has no slots")
@@ -6814,50 +6854,162 @@ impl PaxDirs {
         }
     }
 
-    /// A packed-array region rebuilt as end offsets and tagged array bodies (format.md "Leaf node",
-    /// kind 4). The region's extent was validated when the page was parsed.
-    fn arr_plain<'a>(&'a self, payload: &[u8], c: usize) -> &'a ArrPlain {
+    /// A base-plus-offsets value `(record i, column c)`: the base plus offset `i`, one load of the
+    /// offset's width.
+    #[inline]
+    fn for_value(&self, payload: &[u8], c: usize, i: usize) -> u64 {
+        let RegionDir::For {
+            width,
+            base,
+            bw,
+            offs,
+            exc,
+            exc_n,
+            exc_shift,
+            exc_mask,
+            ..
+        } = &self.regions[c]
+        else {
+            unreachable!("not a base-plus-offsets region")
+        };
+        if (exc_mask >> (i >> exc_shift)) & 1 != 0
+            && let Some(at) = Self::pfor_exc(payload, *exc, *exc_n as usize, *width, i)
+        {
+            return be_uint(&payload[at..at + width]);
+        }
+        let at = offs + i * bw;
+        let off = match bw {
+            0 => 0,
+            1 => payload[at] as u64,
+            2 => u16::from_be_bytes([payload[at], payload[at + 1]]) as u64,
+            _ => u32::from_be_bytes([
+                payload[at],
+                payload[at + 1],
+                payload[at + 2],
+                payload[at + 3],
+            ]) as u64,
+        };
+        base.wrapping_add(off)
+    }
+
+    /// The payload offset of row `i`'s exception body in a kind 6 region whose `e` exception rows
+    /// are at `rows` (bodies of width `w` after them); `None` when row `i` is not an exception.
+    fn pfor_exc(payload: &[u8], rows: usize, e: usize, w: usize, i: usize) -> Option<usize> {
+        let row = |k: usize| u16::from_be_bytes([payload[rows + 2 * k], payload[rows + 2 * k + 1]]);
+        let (mut lo, mut hi) = (0, e);
+        while lo < hi {
+            let m = (lo + hi) / 2;
+            if (row(m) as usize) < i {
+                lo = m + 1;
+            } else {
+                hi = m;
+            }
+        }
+        (lo < e && row(lo) as usize == i).then(|| rows + 2 * e + lo * w)
+    }
+
+    /// A present stored fixed-width value of width at most 8 read as a big-endian unsigned integer,
+    /// without building its body.
+    fn fixed_u64(&self, payload: &[u8], c: usize, i: usize) -> u64 {
+        match &self.regions[c] {
+            RegionDir::For { .. } => self.for_value(payload, c, i),
+            _ => {
+                let mut buf = [0u8; 16];
+                be_uint(self.slot(payload, c, i, &mut buf))
+            }
+        }
+    }
+
+    /// Where row `i`'s elements start in a packed-array region: the bit offset of its first one.
+    fn arr_first_bit(&self, payload: &[u8], c: usize, i: usize) -> usize {
+        let RegionDir::Arr {
+            counts,
+            bits,
+            starts,
+            ..
+        } = &self.regions[c]
+        else {
+            unreachable!("not a packed-array region")
+        };
+        let k = i / ARR_INDEX_ROWS;
+        let start = starts[k] as usize
+            + payload[counts + k * ARR_INDEX_ROWS..counts + i]
+                .iter()
+                .filter(|&&m| m != 255)
+                .map(|&m| m as usize)
+                .sum::<usize>();
+        start * bits
+    }
+
+    /// Present value `(record i, column c)` of a packed-array region, decoded alone straight from
+    /// its packed elements: the value its plain span ([`arr_span`](Self::arr_span)) decodes to.
+    fn arr_value(&self, payload: &[u8], c: usize, i: usize) -> Value {
         let RegionDir::Arr {
             width,
             counts,
             base,
             bits,
             data,
-            plain,
+            ..
         } = &self.regions[c]
         else {
             unreachable!("not a packed-array region")
         };
-        plain.get_or_init(|| {
-            let (w, bits) = (*width, *bits);
-            let data = &payload[*data..];
-            let mut ends = Vec::with_capacity(self.n);
-            let mut body = Vec::new();
-            let mut bit = 0usize;
-            for i in 0..self.n {
-                match Self::arr_count(payload, *counts, i) {
-                    None => {}
-                    Some(0) => body.extend_from_slice(&[0x00, 0, 0]),
-                    Some(m) => {
-                        body.extend_from_slice(&[0x00, 1, 0]);
-                        body.extend_from_slice(&(m as u32).to_be_bytes());
-                        body.extend_from_slice(&1u32.to_be_bytes());
-                        for _ in 0..m {
-                            let at = body.len();
-                            body.resize(at + w, 0);
-                            let v = base.wrapping_add(get_bits(data, bit, bits));
-                            put_be_uint(&mut body[at..], v);
-                            bit += bits;
-                        }
-                    }
+        let m = payload[counts + i] as usize;
+        if m == 0 {
+            return Value::Array(ArrayVal::empty());
+        }
+        let (w, bits) = (*width, *bits);
+        let data = &payload[*data..];
+        let mut bit = self.arr_first_bit(payload, c, i);
+        let half = 1u64 << (8 * w - 1);
+        let mut elements = Vec::with_capacity(m);
+        for _ in 0..m {
+            let u = base.wrapping_add(get_bits(data, bit, bits));
+            elements.push(Value::Int(u.wrapping_sub(half) as i64));
+            bit += bits;
+        }
+        Value::Array(ArrayVal::one_dim(elements))
+    }
+
+    /// Value `(record i, column c)` of a packed-array region in its plain tagged form (format.md
+    /// "Leaf node", kind 4), decoded alone for the caller: nothing for NULL, the empty array, or the
+    /// one-dimensional array of its elements.
+    fn arr_span(&self, payload: &[u8], c: usize, i: usize) -> Vec<u8> {
+        let RegionDir::Arr {
+            width,
+            counts,
+            base,
+            bits,
+            data,
+            ..
+        } = &self.regions[c]
+        else {
+            unreachable!("not a packed-array region")
+        };
+        let (w, bits) = (*width, *bits);
+        match Self::arr_count(payload, *counts, i) {
+            None => Vec::new(),
+            Some(0) => vec![0x00, 0, 0],
+            Some(m) => {
+                let mut body = Vec::with_capacity(11 + m * w);
+                body.extend_from_slice(&[0x00, 1, 0]);
+                body.extend_from_slice(&(m as u32).to_be_bytes());
+                body.extend_from_slice(&1u32.to_be_bytes());
+                let data = &payload[*data..];
+                let mut bit = self.arr_first_bit(payload, c, i);
+                for _ in 0..m {
+                    let at = body.len();
+                    body.resize(at + w, 0);
+                    put_be_uint(
+                        &mut body[at..],
+                        base.wrapping_add(get_bits(data, bit, bits)),
+                    );
+                    bit += bits;
                 }
-                ends.push(body.len() as u32);
+                body
             }
-            ArrPlain {
-                ends,
-                body: Arc::new(body),
-            }
-        })
+        }
     }
 
     /// The stored span of value `(record i, column c)` of a variable-width column: its tagged
@@ -6872,16 +7024,7 @@ impl PaxDirs {
                 let (lo, hi) = Self::dir_span(payload, *ends, payload[codes + i] as usize);
                 VarSpan::Page(body + lo, &payload[body + lo..body + hi])
             }
-            RegionDir::Arr { .. } => {
-                let plain = self.arr_plain(payload, c);
-                let lo = if i == 0 {
-                    0
-                } else {
-                    plain.ends[i - 1] as usize
-                };
-                let hi = plain.ends[i] as usize;
-                VarSpan::Rebuilt(&plain.body, lo, &plain.body[lo..hi])
-            }
+            RegionDir::Arr { .. } => VarSpan::Owned(self.arr_span(payload, c, i)),
             RegionDir::Elided { .. } | RegionDir::Fixed { .. } | RegionDir::For { .. } => {
                 unreachable!("a fixed-width region has no spans")
             }
@@ -6895,7 +7038,10 @@ impl PaxDirs {
         if matches!(self.regions[c], RegionDir::Arr { .. }) || self.is_null(payload, c, i) {
             return None;
         }
-        Some(self.var_span(payload, c, i).bytes())
+        match self.var_span(payload, c, i) {
+            VarSpan::Page(_, b) => Some(b),
+            VarSpan::Owned(_) => None,
+        }
     }
 
     /// The bytes value `(record i, column c)` contributes to `record_size` — nothing for an elided
@@ -6930,10 +7076,9 @@ impl PaxDirs {
 /// same [`read_value_lazy`] the eager fault ran, over the O(1) column spans PAX writes on disk. The
 /// `block` `Arc` is the buffer-pool pin (§7): a reconstructed `Unfetched::Inline` value clones it, so
 /// its bytes outlive pool eviction. Resident cost is `≈ page_size` (§9) — the page block, thin
-/// per-column descriptors with page offsets, and a shared `Arc` to the table's leaf shape — plus
-/// what a reader makes it rebuild (format.md "Leaf node"): the full keys of a leaf that stores a
-/// prefix, the dense slots of a base-plus-offsets column, and the plain form of a packed-array
-/// column, each on first use.
+/// per-column descriptors with page offsets, a packed-array region's small row index, and a shared
+/// `Arc` to the table's leaf shape. Nothing is rebuilt on use (format.md "Leaf node"): keys under a
+/// shared prefix, base-plus-offsets and elided key columns, and packed arrays are read in place.
 pub(crate) struct PackedLeaf {
     /// The whole page image (one `page_size` buffer). Shared across every reconstructed inline value.
     block: Arc<Vec<u8>>,
@@ -6956,6 +7101,9 @@ pub(crate) struct PackedLeaf {
     /// Whether every variable-width value is NULL or inline-plain, found on first use
     /// (leaf_lazy.rs `inline_only`).
     inline: OnceLock<bool>,
+    /// The heap this resident leaf holds, which the buffer pool charges (pager.md §3): its page
+    /// buffer and its descriptors. Nothing is built on a read, so it does not grow.
+    held: usize,
 }
 
 impl PackedLeaf {
@@ -6963,16 +7111,54 @@ impl PackedLeaf {
         self.n
     }
 
+    /// What this leaf holds on the heap: the node and leaf themselves, the page buffer (its `Vec`
+    /// and `Arc` headers and capacity — a buffer shared with a store is still counted, since the pool
+    /// holds it), one region descriptor per column, and each packed-array region's row index.
+    fn measure_held(&self) -> usize {
+        let arc_header = 2 * std::mem::size_of::<usize>();
+        let mut held = std::mem::size_of::<crate::pmap::Node>()
+            + arc_header
+            + std::mem::size_of::<Vec<u8>>()
+            + self.block.capacity()
+            + self.dirs.regions.capacity() * std::mem::size_of::<RegionDir>();
+        for r in &self.dirs.regions {
+            if let RegionDir::Arr { starts, .. } = r {
+                held += starts.len() * std::mem::size_of::<u32>();
+            }
+        }
+        held
+    }
+
+    /// The bytes [`measure_held`](Self::measure_held) found when the leaf was faulted.
+    pub(crate) fn held(&self) -> usize {
+        self.held
+    }
+
     #[inline]
     fn payload(&self) -> &[u8] {
         &self.block[self.payload_off..]
     }
 
-    /// Borrow key `i`: a view of the retained page block, or — when the page stores a shared
-    /// prefix — of the leaf's keys rebuilt on first use. Directory bounds were validated when the
-    /// leaf faulted, so this accessor is infallible for a resident Packed leaf.
-    pub(crate) fn key(&self, i: usize) -> &[u8] {
+    /// Key `i`: a view of the retained page block, or — when the page stores a shared prefix — a
+    /// key built for the caller. Directory bounds were validated when the leaf faulted, so this
+    /// accessor is infallible for a resident Packed leaf.
+    pub(crate) fn key(&self, i: usize) -> Cow<'_, [u8]> {
         self.dirs.key(self.payload(), i)
+    }
+
+    /// Key `i` as a span: of the page, or — under a shared prefix — built into `buf`.
+    pub(crate) fn key_into<'a>(&'a self, i: usize, buf: &'a mut Vec<u8>) -> &'a [u8] {
+        self.dirs.key_into(self.payload(), i, buf)
+    }
+
+    /// `key(i).cmp(probe)` without building key `i`.
+    pub(crate) fn cmp_key(&self, i: usize, probe: &[u8]) -> std::cmp::Ordering {
+        self.dirs.cmp_key(self.payload(), i, probe)
+    }
+
+    /// Whether the page stores a shared key prefix (so [`key`](Self::key) builds its result).
+    pub(crate) fn has_prefix(&self) -> bool {
+        self.dirs.prefix_len != 0
     }
 
     /// An owned copy of key `i`, without rebuilding the leaf's other keys.
@@ -7016,27 +7202,37 @@ impl PackedLeaf {
             // fixed-width scalar buys nothing, lazy-record.md §6).
             Some(_) => read_inline_body(
                 ty,
-                self.dirs.slot(payload, c, i),
+                self.dirs.slot(payload, c, i, &mut [0u8; 16]),
                 &mut 0,
                 DecodeMode::Construct,
             ),
             // A variable value's span is its tagged codec bytes — the lazy tag path. A deferred
-            // inline body shares the page block, or the rebuilt region it was read from.
-            None => {
-                let (block, at, span) = match self.dirs.var_span(payload, c, i) {
-                    VarSpan::Page(at, span) => (&self.block, self.payload_off + at, span),
-                    VarSpan::Rebuilt(body, at, span) => (body, at, span),
-                };
-                read_value_lazy(
+            // inline body shares the page block; a packed array's plain span, decoded alone, is a
+            // small buffer of its own (the degenerate form (a), as for a value read back from a
+            // spill run), so an untouched array costs no element values.
+            None => match self.dirs.var_span(payload, c, i) {
+                VarSpan::Page(at, span) => read_value_lazy(
                     &self.shape.col_types,
                     c,
-                    block,
-                    at,
+                    &self.block,
+                    self.payload_off + at,
                     span,
                     self.cap,
                     &self.paging,
-                )
-            }
+                ),
+                VarSpan::Owned(span) => {
+                    let own = Arc::new(span);
+                    read_value_lazy(
+                        &self.shape.col_types,
+                        c,
+                        &own,
+                        0,
+                        &own,
+                        self.cap,
+                        &self.paging,
+                    )
+                }
+            },
         }
     }
 
@@ -7054,12 +7250,16 @@ impl PackedLeaf {
         if fixed_value_width(ty).is_some() {
             return read_inline_body(
                 ty,
-                self.dirs.slot(payload, c, i),
+                self.dirs.slot(payload, c, i, &mut [0u8; 16]),
                 &mut 0,
                 DecodeMode::Construct,
             );
         }
-        let span = self.dirs.var_span(payload, c, i).bytes();
+        if matches!(self.dirs.regions[c], RegionDir::Arr { .. }) {
+            return Ok(self.dirs.arr_value(payload, c, i));
+        }
+        let span = self.dirs.var_span(payload, c, i);
+        let span = span.bytes();
         match span.split_first() {
             // The present-inline-plain tag, then the body.
             Some((0x00, body)) if !string_payload(ty) => {
@@ -7083,6 +7283,21 @@ impl PackedLeaf {
             .collect()
     }
 
+    /// Row `i` with only the columns `mask` touches read; every other column is NULL — the form the
+    /// masked scans hold (the touched set is every column the query reads, cost.md §3). A column
+    /// past the mask's end is read.
+    pub(crate) fn row_masked(&self, i: usize, mask: &[bool]) -> Result<Vec<Value>> {
+        (0..self.shape.col_types.len())
+            .map(|c| {
+                if mask.get(c).copied().unwrap_or(true) {
+                    self.value(c, i)
+                } else {
+                    Ok(Value::Null)
+                }
+            })
+            .collect()
+    }
+
     /// Whether value `(record i, column c)` is NULL — read from the region bitmap or zero-length span,
     /// with no value decode (packed-leaf.md §11 Track A4).
     pub(crate) fn is_null(&self, c: usize, i: usize) -> bool {
@@ -7092,16 +7307,25 @@ impl PackedLeaf {
     /// The stored bytes of a non-NULL value `(record i, column c)`, borrowed from the leaf: a
     /// variable column's tagged codec bytes (presence tag + inline body or out-of-line pointer), a
     /// fixed-width column's untagged slot. `None` for NULL. A region the page stores in another
-    /// kind answers with its plain form: the rebuilt slot of an elided or base-plus-offsets column,
-    /// the entry of a dictionary, the rebuilt body of a packed array.
-    pub(crate) fn value_span(&self, c: usize, i: usize) -> Option<&[u8]> {
+    /// kind answers with its plain form, built for the caller where the page does not hold it: the
+    /// slot of an elided or base-plus-offsets column, the entry of a dictionary, the plain body of
+    /// a packed array.
+    pub(crate) fn value_span(&self, c: usize, i: usize) -> Option<Cow<'_, [u8]>> {
         let payload = self.payload();
         if self.dirs.is_null(payload, c, i) {
             return None;
         }
         Some(match fixed_value_width(&self.shape.col_types[c]) {
-            Some(_) => self.dirs.slot(payload, c, i),
-            None => self.dirs.var_span(payload, c, i).bytes(),
+            Some(_) => match &self.dirs.regions[c] {
+                RegionDir::Fixed { width, body, .. } => {
+                    Cow::Borrowed(&payload[body + i * width..body + (i + 1) * width])
+                }
+                _ => Cow::Owned(self.dirs.slot(payload, c, i, &mut [0; 16]).to_vec()),
+            },
+            None => match self.dirs.var_span(payload, c, i) {
+                VarSpan::Page(_, b) => Cow::Borrowed(b),
+                VarSpan::Owned(b) => Cow::Owned(b),
+            },
         })
     }
 
@@ -7275,7 +7499,62 @@ fn parse_pax_leaf(payload: &[u8], n: usize, shape: &LeafShape) -> Result<PaxDirs
                     base,
                     bw,
                     offs: p,
-                    slots: OnceLock::new(),
+                    exc: p,
+                    exc_n: 0,
+                    exc_shift: exc_bucket_shift(n),
+                    exc_mask: 0,
+                });
+            }
+            (REGION_PFOR, Some(width)) if shape.for_cols.iter().any(|fc| fc.col == c) => {
+                // Base plus offsets with exceptions: the bitmap, the base, the offset width, the
+                // exception count, the exceptions' rows and bodies, then N offsets (the
+                // exceptions' zero). Nothing is rebuilt but the bucket mask.
+                let bad = || corrupt("PAX leaf narrow region with exceptions is malformed");
+                let bitmap = p;
+                p += n.div_ceil(8);
+                if p + width + 2 > end {
+                    return Err(bad());
+                }
+                let base = be_uint(&payload[p..p + width]);
+                let bw = payload[p + width] as usize;
+                let e = payload[p + width + 1] as usize;
+                p += width + 2;
+                if !matches!(bw, 0 | 1 | 2 | 4)
+                    || bw >= width
+                    || !(1..=PFOR_MAX_K).contains(&e)
+                    || p + e * (width + 2) + n * bw != end
+                {
+                    return Err(bad());
+                }
+                let (rows, offs) = (p, p + e * (width + 2));
+                let shift = exc_bucket_shift(n);
+                let mut mask = 0u64;
+                let mut prev = None;
+                for k in 0..e {
+                    let i = u16::from_be_bytes([payload[rows + 2 * k], payload[rows + 2 * k + 1]])
+                        as usize;
+                    if prev.is_some_and(|q| i <= q)
+                        || i >= n
+                        || payload[bitmap + i / 8] & (0x80 >> (i % 8)) != 0
+                        || payload[offs + i * bw..offs + (i + 1) * bw]
+                            .iter()
+                            .any(|&b| b != 0)
+                    {
+                        return Err(bad());
+                    }
+                    prev = Some(i);
+                    mask |= 1 << (i >> shift);
+                }
+                regions.push(RegionDir::For {
+                    width,
+                    bitmap,
+                    base,
+                    bw,
+                    offs,
+                    exc: rows,
+                    exc_n: e as u8,
+                    exc_shift: shift,
+                    exc_mask: mask,
                 });
             }
             (REGION_DICT, None) if string_payload(ty) => {
@@ -7313,13 +7592,23 @@ fn parse_pax_leaf(payload: &[u8], n: usize, shape: &LeafShape) -> Result<PaxDirs
                 if bits > 8 * width || data + (total * bits).div_ceil(8) != end {
                     return Err(bad());
                 }
+                let mut starts = Vec::with_capacity(n.div_ceil(ARR_INDEX_ROWS));
+                let mut seen = 0u32;
+                for (j, &m) in payload[counts..counts + n].iter().enumerate() {
+                    if j % ARR_INDEX_ROWS == 0 {
+                        starts.push(seen);
+                    }
+                    if m != 255 {
+                        seen += m as u32;
+                    }
+                }
                 regions.push(RegionDir::Arr {
                     width,
                     counts,
                     base,
                     bits,
                     data,
-                    plain: OnceLock::new(),
+                    starts: starts.into_boxed_slice(),
                 });
             }
             // Kinds 3 and 5 are reserved; any other kind, or a kind on a column it does not apply
@@ -7338,7 +7627,6 @@ fn parse_pax_leaf(payload: &[u8], n: usize, shape: &LeafShape) -> Result<PaxDirs
         col_dir,
         end: start,
         regions,
-        full_keys: OnceLock::new(),
     })
 }
 
@@ -7399,11 +7687,17 @@ pub(crate) fn decode_leaf_node(
     // directories alone (§3) — the weight is `key_len + Σ_c value_len(c, i)` (the v24 record_size),
     // exactly what the writer split on — so the resident leaf is `≈ page_size` (§9), never an
     // inflated row vector.
-    let shared = block;
-    let payload = &shared[PAGE_HEADER..];
-    let dirs = parse_pax_leaf(payload, n, &shape)?;
-    let packed = PackedLeaf {
-        block: Arc::clone(&shared),
+    let mut shared = block;
+    let dirs = parse_pax_leaf(&shared[PAGE_HEADER..], n, &shape)?;
+    // A page read fresh for this fault (not a store's retained block) keeps only its used payload:
+    // the unused tail is freed, the checksum having been verified over the whole page (pager.md §3).
+    // Every directory offset lies below the content end, so nothing moves.
+    if let Some(block) = Arc::get_mut(&mut shared) {
+        block.truncate(PAGE_HEADER + dirs.end);
+        block.shrink_to_fit();
+    }
+    let mut packed = PackedLeaf {
+        block: shared,
         payload_off: PAGE_HEADER,
         dirs,
         shape,
@@ -7411,7 +7705,9 @@ pub(crate) fn decode_leaf_node(
         cap,
         n,
         inline: OnceLock::new(),
+        held: 0,
     };
+    packed.held = packed.measure_held();
     Ok(Node::leaf_loaded_packed(packed, page))
 }
 
@@ -10717,8 +11013,15 @@ mod tests {
                 "all reconstructed inline values share the Packed leaf's one page block"
             );
         }
-        // The shared block is the whole page, not a per-value copy.
-        assert_eq!(leaf_block.len(), ps, "the shared block is the whole page");
+        // The shared block is the page — its header and used payload, the unused tail trimmed
+        // (pager.md §3) — not a per-value copy.
+        let packed = node.packed.as_ref().unwrap();
+        assert_eq!(
+            leaf_block.len(),
+            PAGE_HEADER + packed.payload_len(),
+            "the shared block is the page up to its content end"
+        );
+        assert!(leaf_block.len() <= ps);
 
         // The reconstructed values still resolve to exactly the originals (reconstruction is
         // decode-neutral — the byte-identical result the eager path produced, moved to touch-time §8).
@@ -10844,7 +11147,19 @@ mod tests {
         for i in 0..rows.len() {
             assert_eq!(packed.search(&keys[i]), Ok(i));
         }
-        assert!(packed.dirs.full_keys.get().is_none());
+        // Range bounds compare in place: the prefix-aware comparison agrees with the full keys'.
+        assert!(packed.has_prefix());
+        for i in 0..rows.len() {
+            for probe in [
+                &keys[0][..],
+                &keys[i][..],
+                &keys[rows.len() - 1][..],
+                &[0u8][..],
+                &[0xffu8; 3][..],
+            ] {
+                assert_eq!(packed.cmp_key(i, probe), keys[i].as_slice().cmp(probe));
+            }
+        }
         for i in 0..rows.len() {
             assert_eq!(
                 packed.record_weight(i) as usize,

@@ -36,7 +36,7 @@ import { growthStep, Pager } from "../pager.ts";
 import type { PageClient } from "../pageservice/client.ts";
 import { readFreeListChain } from "../pageservice/delta.ts";
 import { ServiceHandoff } from "../pageservice/handoff.ts";
-import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "../paging.ts";
+import { cacheBudget, DEFAULT_CACHE_BYTES, SharedPaging } from "../paging.ts";
 import { persistImpl, setDurability } from "../persist.ts";
 import { Environment } from "../environment.ts";
 import { type ClockSource, osRandomSource, type RandomSource, SeededRandom } from "../seam.ts";
@@ -1000,7 +1000,7 @@ export class SimRunner {
     } else codec = runSync(unlockPagerSteps(pager, this.credential(this.main()), env));
     let e: Engine;
     try {
-      e = loadEnginePaged(new SharedPaging(pager, cacheLeaves(cache, pager.pageSize), codec), env);
+      e = loadEnginePaged(new SharedPaging(pager, cacheBudget(cache), codec), env);
     } catch (err) {
       // A meta the held key cannot authenticate: the owner rekeyed the file before it left (28P04,
       // spec/fileformat/encrypted.md §14), as openVia reports it.
@@ -2223,10 +2223,7 @@ export class SimRunner {
       const pager = Pager.fromStore(new MemoryBlockStore(image.slice()));
       const codec = runSync(unlockPagerSteps(pager, this.credential(d), env));
       copy = Database.fromEngine(
-        loadEnginePaged(
-          new SharedPaging(pager, cacheLeaves(DEFAULT_CACHE_BYTES, pager.pageSize), codec),
-          env,
-        ),
+        loadEnginePaged(new SharedPaging(pager, cacheBudget(DEFAULT_CACHE_BYTES), codec), env),
         null,
       );
     } catch (e) {

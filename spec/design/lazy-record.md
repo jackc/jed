@@ -278,15 +278,31 @@ first-class concern" + "must not foreclose larger-than-RAM"):
   tagged enum plus any heap payload (a `String`, a `Vec`, a `Decimal` digit-vec, a whole
   `JsonNode` / array / composite tree). A narrow row of small integers is several × its on-disk
   bytes; a document/array value is many ×.
-- The buffer pool ([pager.md §3](pager.md)) bounds **page/leaf count**, but each resident leaf
-  currently holds the **inflated decoded form**, so true resident bytes run well above
+- The buffer pool ([pager.md §3](pager.md)) bounded **page/leaf count** when this was written, and
+  each resident leaf held the **inflated decoded form**, so true resident bytes ran well above
   `resident_leaves × page_size`. Under (a) a resident leaf is **≈ its page block** — so resident
   memory becomes `≈ pinned_pages × page_size`, the clean, predictable bound the `cache_bytes`
-  budget already promises. This makes the budget *mean what it says* and is a real step toward the
+  budget promises (the pool now charges each leaf its bytes). This makes the budget *mean what it says* and is a real step toward the
   larger-than-RAM end state (a faulted leaf holds compact bytes, not expanded trees).
 
 So the reshape is not only "decode less, clone less" but "**hold less**" — the dividend the narrow
 S5 could never reach.
+
+**The compact leaf's regions are read in place too (2026-11-14).** The compact leaf of format v52
+([leaf-structural.md](leaf-structural.md)) at first broke this bound: a reader rebuilt a
+base-plus-offsets column and an elided key column as a full-width copy per leaf, a leaf that stores a
+shared key prefix rebuilt every full key on its first key read, and a packed integer-array region was
+rebuilt to its plain form on first use. Each copy stayed with the leaf, so a read leaf held about
+twice its page (Go 2.06×, Rust 1.91× on the 145 MB database of `TestSuperBlockExperiment`). Every
+region is now read where the page stores it: a base-plus-offsets value is the base plus its offset, an
+elided key column's value is bytes of the stored key or the shared prefix, a key under a prefix is
+compared prefix-aware and built only as a transient for the reader that asks for it, and a packed
+array value is decoded alone, as a transient, from a row index of one `u32` per 16 rows built at the
+parse. A deferred packed-array value in Rust owns that transient span (form (b)'s shape, for one
+value); in Go and TS it refers to its region and row and is decoded on resolve. Afterwards a read leaf
+holds 1.16× its page in Go, 1.04× in Rust and 1.30× in TypeScript (2.11× before), the remainder being
+the region descriptors and objects, and the buffer pool charges each leaf what it holds, in bytes
+([pager.md](pager.md) §3).
 
 ---
 

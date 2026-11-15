@@ -27,16 +27,13 @@ use crate::pmap::Node;
 /// [`crate::OpenOptions::cache_bytes`] default (spec/design/pager.md §3, api.md §2.1). Sized so the
 /// dominant case — a RAM-sized database (CLAUDE.md §9) — stays fully cache-resident under the
 /// default; stated in bytes so the budget does not silently scale with a file's page size.
-/// Converted to a leaf-page capacity by [`cache_leaves`].
+/// The pool charges each resident leaf what it holds against it ([`crate::bufferpool::Weigh`]).
 pub(crate) const DEFAULT_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
-/// Convert a byte budget to a resident-leaf-page capacity for a file of `page_size` bytes:
-/// `max(1, cache_bytes / page_size)` (pager.md §3). The `max(1, …)` floor keeps one leaf resident even
-/// when `cache_bytes < page_size` — the minimum to walk a root→leaf path. The divisor is clamped to
-/// ≥ 1 so a malformed `page_size = 0` cannot divide by zero (the loader rejects it separately as
-/// corrupt — format.rs).
-pub(crate) fn cache_leaves(cache_bytes: usize, page_size: u32) -> usize {
-    (cache_bytes / (page_size as usize).max(1)).max(1)
+/// The buffer pool's byte budget for a `cache_bytes` setting: the setting itself, at least 1 (pager.md
+/// §3). The pool keeps one leaf resident whatever the budget — the minimum to walk a root→leaf path.
+pub(crate) fn cache_budget(cache_bytes: usize) -> usize {
+    cache_bytes.max(1)
 }
 
 /// One database's pager + leaf buffer pool, shared (`Arc`) by all its stores and snapshots.
@@ -52,6 +49,8 @@ pub(crate) struct SharedPaging {
     codec: Option<Arc<crate::crypto::PageCodec>>,
     /// The capacities the file's variant implies (format.md *Page model*, encrypted.md §1).
     cap: Cap,
+    /// The file's page size, which read-ahead divides the byte budget by.
+    page_size: u32,
     /// Deferral (spec/design/deferred-interior.md §9): the committed generation's remap list, which
     /// interior reads of the live generation resolve through, and the catalog chain it committed, which
     /// a deferring commit keeps when its bytes are unchanged. Both are set when an engine is loaded
@@ -62,7 +61,7 @@ pub(crate) struct SharedPaging {
 }
 
 impl SharedPaging {
-    /// Wrap an open `pager` with a CLOCK pool of `capacity` leaves.
+    /// Wrap an open `pager` with a CLOCK pool whose resident leaves hold at most `capacity` bytes.
     pub(crate) fn new(pager: Pager, capacity: usize) -> Arc<SharedPaging> {
         SharedPaging::with_codec(pager, capacity, None)
     }
@@ -75,12 +74,14 @@ impl SharedPaging {
     ) -> Arc<SharedPaging> {
         let batches = pager.batches_reads();
         let cap = Cap::of(pager.page_size(), codec.is_some());
+        let page_size = pager.page_size();
         Arc::new(SharedPaging {
             pager: Mutex::new(pager),
             pool: BufferPool::new(capacity),
             batches,
             codec,
             cap,
+            page_size,
             remap: Mutex::new(Arc::default()),
             cat: Mutex::new(None),
         })
@@ -236,7 +237,7 @@ impl SharedPaging {
         if !self.batches {
             return;
         }
-        let limit = (self.pool.capacity() / 4).max(1);
+        let limit = (self.pool.capacity() / (self.page_size as usize).max(1) / 4).max(1);
         let missing: Vec<PageRef> = pages
             .iter()
             .copied()
@@ -299,13 +300,13 @@ impl SharedPaging {
         pager.poison();
     }
 
-    /// The pool's leaf-page capacity — carried over to the replacement pool when compaction
-    /// reopens the database (spec/design/api.md §2.6).
+    /// The pool's byte budget — carried over to the replacement pool when compaction reopens the
+    /// database (spec/design/api.md §2.6).
     pub(crate) fn capacity(&self) -> usize {
         self.pool.capacity()
     }
 
-    /// Re-bound the pool to `capacity` leaves, evicting until the resident set fits (a spilled temp
+    /// Re-bound the pool to `capacity` bytes, evicting until the resident set fits (a spilled temp
     /// domain, spec/design/temp-tables.md §6).
     pub(crate) fn set_capacity(&self, capacity: usize) {
         self.pool.set_capacity(capacity);
@@ -316,5 +317,10 @@ impl SharedPaging {
     /// spec/design/pager.md §3).
     pub(crate) fn resident_leaves(&self) -> usize {
         self.pool.resident()
+    }
+
+    /// The bytes the resident leaves are charged together (≤ the budget, or one leaf).
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.pool.charged()
     }
 }

@@ -777,20 +777,39 @@ function decimalFixedTableDB(): Engine {
 // (with NULLs and empty arrays), a mostly-NULL text column, and an index over status. Table u:
 // variable-length text keys with a shared prefix and a key directory, a column of one value (offset
 // width 0), and all-NULL columns. Rows are inserted in key order, one statement each.
+// goldenPageSizeOf is a plaintext golden's page size: GOLDEN_PAGE_SIZE but for multiway_split.jed,
+// whose edited leaves must hold 32 values stored whole beside enough rows (spec/fileformat/verify.rb).
+function goldenPageSizeOf(name: string): number {
+  return name === "multiway_split.jed" ? 512 : GOLDEN_PAGE_SIZE;
+}
+
 // multiwaySplitDB is a tree shaped by single-row edits that take the multi-way leaf split
-// (format.md "Multi-way split"). Table a: a dense leaf whose v column stores no offsets; one
-// replaced row and one inserted row each widen their leaf, which splits in three. Table b: keys
-// outside a shared prefix land at a leaf's edge and split two-way.
+// (format.md "Multi-way split"), at page size 512. Table a: dense leaves whose v and x columns store
+// no offsets, each edited leaf holding 16 distant v values before the edited row and 16 distant x
+// values after it (each stored whole, region kind 6, which keeps up to 16); one replaced row and one
+// inserted row take distant values in both columns, so a half holding either of them and either
+// group holds 17, which no region stores whole, no two-way split fits, and each leaf splits in three.
+// Table b: keys outside a shared prefix land at a leaf's edge and split two-way.
 function multiwaySplitDB(): Engine {
-  const db = goldenDb();
-  run(db, "CREATE TABLE a (id i32 PRIMARY KEY, v i64)");
+  const db = new Engine(GOLDEN_ENV);
+  db.pageSize = goldenPageSizeOf("multiway_split.jed");
+  run(db, "CREATE TABLE a (id i32 PRIMARY KEY, v i64, x i64)");
+  const far = "4000000000000";
+  const distant = (i: number): [string, string] => {
+    if (i >= 2 && i <= 17) return [far, "7"];
+    if (i >= 90 && i <= 105) return ["7", far];
+    if (i >= 115 && i <= 130) return [`-${far}`, "7"];
+    if (i >= 175 && i <= 190) return ["7", `-${far}`];
+    return ["7", "7"];
+  };
   for (let i = 1; i <= 600; i++) {
-    if (i !== 400) run(db, `INSERT INTO a VALUES (${i}, 7)`);
+    const [v, x] = distant(i);
+    if (i !== 160) run(db, `INSERT INTO a VALUES (${i}, ${v}, ${x})`);
   }
-  run(db, "UPDATE a SET v = 4000000000000 WHERE id = 60");
-  run(db, "INSERT INTO a VALUES (400, -4000000000000)");
+  run(db, "UPDATE a SET v = 8000000000000, x = 8000000000000 WHERE id = 60");
+  run(db, "INSERT INTO a VALUES (160, -8000000000000, -8000000000000)");
   run(db, "CREATE TABLE b (k text PRIMARY KEY, n i32)");
-  for (let i = 0; i < 64; i++) {
+  for (let i = 0; i < 306; i++) {
     run(db, `INSERT INTO b VALUES ('customer/acct/${String(i).padStart(3, "0")}', 1)`);
   }
   run(db, "INSERT INTO b VALUES ('a', 2)");
@@ -1424,7 +1443,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "max_sep_table.jed", build: maxSepTableDB },
   ];
   for (const c of cases) {
-    const image = toImage(c.build(), GOLDEN_PAGE_SIZE, 1n);
+    const image = toImage(c.build(), goldenPageSizeOf(c.name), 1n);
     const want = fixture(c.name);
     assert.ok(
       bytesEqual(image, want),

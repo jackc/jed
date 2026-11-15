@@ -272,7 +272,8 @@ func (a *spanAtom) evalSpan(n *pnode, i int, m *costMeter) (keep, ok bool, err e
 		m.Charge(costs.OperatorEval)
 		return n.colIsNull(i, a.col) != a.negated, true, nil
 	}
-	span, present, packed := n.colSpan(i, a.col)
+	var slot [16]byte
+	span, present, packed := n.colSpan(i, a.col, &slot)
 	if !packed {
 		return false, false, nil
 	}

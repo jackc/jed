@@ -38,7 +38,7 @@ import {
   DEFAULT_ARGON2_PARAMS,
   ENCRYPTED_MIN_PAGE_SIZE,
 } from "./crypto.ts";
-import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
+import { cacheBudget, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager, type PageTransform } from "./pager.ts";
 import { DEFAULT_FLUSH_INTERVAL_MS, type Durability } from "./idle_flush.ts";
 import { persistImpl, repairKeyBlockSteps, setDurability, stopIdleFlush } from "./persist.ts";
@@ -154,11 +154,7 @@ export function* createOpfsWithHandleSteps(
   // Adopt the just-written handle as the open pager + buffer pool, so later commits write through the
   // seam without re-acquiring (spec/design/pager.md). Pager.fromStore reads the page size from the meta
   // header just written.
-  db.paging = new SharedPaging(
-    Pager.fromStore(store),
-    cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize),
-    codec,
-  );
+  db.paging = new SharedPaging(Pager.fromStore(store), cacheBudget(DEFAULT_CACHE_BYTES), codec);
   // Tables built in this session bind this pager at creation (Snapshot.storePaging), so their
   // committed leaves demote at each commit — same residency shape as after a reopen (file.ts create).
   // Both slots carry the bootstrap txid, so the floor slot is txid & 1 (format.md, *Slot alternation*).
@@ -205,7 +201,7 @@ export function* openOpfsWithHandleSteps(
   // a browser, so the unlock and every later seal and open are awaited.
   const codec = yield* unlockPagerSteps(pager, opts.credential, environment);
   const db = yield* loadEnginePagedSteps(
-    new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize), codec),
+    new SharedPaging(pager, cacheBudget(cacheBytes), codec),
     environment,
   );
   // A writable open finishes a credential change a crash interrupted (encrypted.md §5).

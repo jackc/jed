@@ -746,22 +746,49 @@ func compactLeafTableDB(t *testing.T) *Session {
 	return db
 }
 
+// goldenPageSizeOf is a plaintext golden's page size: goldenPageSize but for multiway_split.jed, whose
+// edited leaves must hold 32 values stored whole beside enough rows (spec/fileformat/verify.rb).
+func goldenPageSizeOf(name string) uint32 {
+	if name == "multiway_split.jed" {
+		return 512
+	}
+	return goldenPageSize
+}
+
 // multiwaySplitDB is a tree shaped by single-row edits that take the multi-way leaf split
-// (format.md "Multi-way split"). Table a: a dense leaf whose v column stores no offsets; one
-// replaced row and one inserted row each widen their leaf, which splits in three. Table b: keys
-// outside a shared prefix land at a leaf's edge and split two-way.
+// (format.md "Multi-way split"), at page size 512. Table a: dense leaves whose v and x columns store
+// no offsets, each edited leaf holding 16 distant v values before the edited row and 16 distant x
+// values after it (each stored whole, region kind 6, which keeps up to 16); one replaced row and one
+// inserted row take distant values in both columns, so a half holding either of them and either
+// group holds 17, which no region stores whole, no two-way split fits, and each leaf splits in three.
+// Table b: keys outside a shared prefix land at a leaf's edge and split two-way.
 func multiwaySplitDB(t *testing.T) *Session {
-	db := newInMemoryWithPageSize(goldenPageSize, goldenEnv()).Session(SessionOptions{})
-	run(t, db, "CREATE TABLE a (id i32 PRIMARY KEY, v i64)")
+	db := newInMemoryWithPageSize(512, goldenEnv()).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE a (id i32 PRIMARY KEY, v i64, x i64)")
+	const far = 4000000000000
+	distant := func(i int) [2]int64 {
+		switch {
+		case i >= 2 && i <= 17:
+			return [2]int64{far, 7}
+		case i >= 90 && i <= 105:
+			return [2]int64{7, far}
+		case i >= 115 && i <= 130:
+			return [2]int64{-far, 7}
+		case i >= 175 && i <= 190:
+			return [2]int64{7, -far}
+		}
+		return [2]int64{7, 7}
+	}
 	for i := 1; i <= 600; i++ {
-		if i != 400 {
-			run(t, db, fmt.Sprintf("INSERT INTO a VALUES (%d, 7)", i))
+		if i != 160 {
+			vx := distant(i)
+			run(t, db, fmt.Sprintf("INSERT INTO a VALUES (%d, %d, %d)", i, vx[0], vx[1]))
 		}
 	}
-	run(t, db, "UPDATE a SET v = 4000000000000 WHERE id = 60")
-	run(t, db, "INSERT INTO a VALUES (400, -4000000000000)")
+	run(t, db, "UPDATE a SET v = 8000000000000, x = 8000000000000 WHERE id = 60")
+	run(t, db, "INSERT INTO a VALUES (160, -8000000000000, -8000000000000)")
 	run(t, db, "CREATE TABLE b (k text PRIMARY KEY, n i32)")
-	for i := 0; i < 64; i++ {
+	for i := 0; i < 306; i++ {
 		run(t, db, fmt.Sprintf("INSERT INTO b VALUES ('customer/acct/%03d', 1)", i))
 	}
 	run(t, db, "INSERT INTO b VALUES ('a', 2)")
@@ -1357,7 +1384,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"max_sep_table.jed", maxSepTableDB},
 	}
 	for _, c := range cases {
-		image, err := c.build(t).ToImage(goldenPageSize, 1)
+		image, err := c.build(t).ToImage(goldenPageSizeOf(c.name), 1)
 		if err != nil {
 			t.Fatalf("%s: serialize: %v", c.name, err)
 		}

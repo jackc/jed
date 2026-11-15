@@ -51,6 +51,12 @@ export class MemoryBlockStore implements BlockStore {
     return store;
   }
 
+  // retainsBlocks: readAt hands out the store's own blocks (format.ts decodeLeafNode keeps them whole
+  // rather than copy them, which would double what the store holds).
+  retainsBlocks(): boolean {
+    return true;
+  }
+
   readAt(offset: number, len: number): Uint8Array {
     this.checkOffset(offset);
     if (len < 0 || offset + len > this.length) {

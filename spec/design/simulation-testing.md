@@ -814,7 +814,10 @@ primitive) gets a simulated implementation.
      process's step drove the I/O; a power loss kills every process. `kill p` closes the process's
      listener and connections, as the kernel closes a dead process's sockets, and releases its locks.
      `disconnect p` ends a client's connection; the armed `fault disconnect nth=N` ends the connection
-     carrying the step's `N`th frame (in either direction) instead of delivering it, which lands
+     carrying the step's `N`th frame (in either direction) instead of delivering it, counting every
+     frame but a `read_pages` request and its `pages` reply: which pages a client fetches depends on
+     what its buffer pool holds, and since the pool charges each leaf what that core holds for it
+     (pager.md §3), that differs between cores under a small `cache_bytes`. The fault lands
      before or after a commit's point of no return, so a client resolves a lost acknowledgement by
      re-election: committed, not committed (`08006`), or unknown (`08007`). A disconnect kills no
      process.

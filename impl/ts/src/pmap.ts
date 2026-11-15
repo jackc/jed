@@ -56,8 +56,15 @@ export interface PackedLeaf {
   readonly n: number;
   // The column types the leaf was decoded (and its directories validated) against.
   readonly colTypes: ColType[];
-  // Borrow key i directly from the retained page block and derive its record weight lazily.
+  // Key i: borrowed from the retained page block, or — when the page stores a shared prefix — a key
+  // built for the caller (the leaf keeps no rebuilt keys). Its record weight is derived lazily.
   key(i: number): Uint8Array;
+  // compareKey is compareBytes(key(i), probe) without building key i — set on a leaf that stores a
+  // shared key prefix (format.md "Leaf node").
+  compareKey?(i: number, probe: Uint8Array): number;
+  // keyLen is key i's length; keyInto writes key i at out[at] and returns its length.
+  keyLen(i: number): number;
+  keyInto(i: number, out: Uint8Array, at: number): number;
   weight(i: number): number;
   // Reconstruct the whole value row i — uniformly LAZY (bplus-reshape.md B4): fixed-width columns
   // decode eagerly, variable columns defer as self-resolving unfetched values.
@@ -74,15 +81,16 @@ export interface PackedLeaf {
   // The payload's content length: the leaf's serialized size, content-dependent savings included
   // (format.md "Leaf payload").
   readonly payloadLen: number;
-  // search binary-searches the leaf's keys without rebuilding them — set on a leaf that stores a
-  // shared key prefix (format.md "Leaf node"), whose full keys are otherwise rebuilt on first use.
+  // search binary-searches the leaf's keys without building them — set on a leaf that stores a
+  // shared key prefix (format.md "Leaf node").
   search?(key: Uint8Array): { index: number; found: boolean };
   // Whether column c of row i is NULL — the null bitmap / zero-length span, no value decode.
   isNull(i: number, c: number): boolean;
   // The stored bytes of a non-NULL column c of row i as out.buf[out.start, out.end): a variable
-  // column's tagged bytes, a fixed-width column's untagged slot. out.buf is the page payload, or the
-  // buffer a region the page stores in another form was rebuilt into (an elided key column, a
-  // base-plus-offsets or packed-array region — format.md "Leaf node"). False for NULL.
+  // column's tagged bytes, a fixed-width column's untagged slot. out.buf is the page payload, or a
+  // buffer of the caller's own holding a value the page stores in another form (a base-plus-offsets
+  // value, an elided key column's value under a shared prefix, a packed array — format.md "Leaf
+  // node"). False for NULL.
   span(i: number, c: number, out: Span): boolean;
   // recordWeights is weight(i) for every record, read column by column from the directories.
   recordWeights(): number[];
@@ -93,6 +101,9 @@ export interface PackedLeaf {
   hasChains(): boolean;
   // dirs is the format layer's parsed directories of the page (opaque here; format.ts PaxDirs).
   readonly dirs: unknown;
+  // held is the bytes this resident leaf holds, which the buffer pool charges (pager.md §3): its
+  // retained payload and an estimate of its objects. Nothing is built on a read, so it does not grow.
+  readonly held: number;
 }
 
 // A stored value's bytes: buf[start, end).
@@ -279,8 +290,53 @@ export function nodeLen(n: PNode): number {
   return n.packed?.n ?? n.keys.length;
 }
 
+// keyAt is key i: borrowed, or built for the caller when a Packed leaf stores a shared key prefix. A
+// reader that only compares uses compareKeyAt; one that emits many keys a keyChunker.
 export function keyAt(n: PNode, i: number): Uint8Array {
   return n.packed ? n.packed.key(i) : n.keys[i]!;
+}
+
+// compareKeyAt is compareBytes(keyAt(n, i), probe) without building a prefixed leaf's key.
+function compareKeyAt(n: PNode, i: number, probe: Uint8Array): number {
+  const cmp = n.packed?.compareKey;
+  return cmp !== undefined ? cmp(i, probe) : compareBytes(keyAt(n, i), probe);
+}
+
+// KEY_CHUNK_ROWS is the most keys a keyChunker builds at once from a prefixed leaf; it starts at
+// KEY_CHUNK_FIRST in each leaf and grows fourfold, so a probe that emits one key builds few.
+const KEY_CHUNK_ROWS = 64;
+const KEY_CHUNK_FIRST = 4;
+
+// keyChunker returns keyAt for a scan that emits keys in one direction: from a Packed leaf that
+// stores a shared prefix it builds keys a chunk at a time into one transient buffer the scan holds
+// (never the leaf), so a scan that stops early builds few. Every other leaf lends its keys.
+function keyChunker(reverse: boolean): (n: PNode, i: number) => Uint8Array {
+  let node: PNode | null = null;
+  let from = 0;
+  let chunk = 0;
+  let keys: Uint8Array[] = [];
+  return (n: PNode, i: number): Uint8Array => {
+    const p = n.packed;
+    if (p === undefined || p.compareKey === undefined) return keyAt(n, i);
+    if (n !== node || i < from || i >= from + keys.length) {
+      chunk = n !== node ? KEY_CHUNK_FIRST : Math.min(chunk * 4, KEY_CHUNK_ROWS);
+      const a = reverse ? Math.max(0, i + 1 - chunk) : i;
+      const b = reverse ? i + 1 : Math.min(p.n, i + chunk);
+      let size = 0;
+      for (let j = a; j < b; j++) size += p.keyLen(j);
+      const blob = new Uint8Array(size);
+      keys = new Array<Uint8Array>(b - a);
+      let o = 0;
+      for (let j = a; j < b; j++) {
+        const len = p.keyInto(j, blob, o);
+        keys[j - a] = blob.subarray(o, o + len);
+        o += len;
+      }
+      node = n;
+      from = a;
+    }
+    return keys[i - from]!;
+  };
 }
 
 function weightAt(n: PNode, i: number): number {
@@ -890,7 +946,7 @@ function entryWindow(b: KeyBound, n: PNode): [number, number] {
     let hi = nodeLen(n);
     while (lo < hi) {
       const mid = (lo + hi) >> 1;
-      const c = compareBytes(keyAt(n, mid), key);
+      const c = compareKeyAt(n, mid, key);
       if (c < 0 || (greater && c === 0)) lo = mid + 1;
       else hi = mid;
     }
@@ -1287,12 +1343,13 @@ export class PMap {
   ): Steps<{ keys: Uint8Array[]; vals: Row[]; nodes: number }> {
     const keys: Uint8Array[] = [];
     const vals: Row[] = [];
+    const key = keyChunker(false);
     const iterator = new TreeStepIterator(
       this.root,
       b,
       src,
       false,
-      (node, index): [Uint8Array, Row] => [keyAt(node, index), rowAt(node, index)],
+      (node, index): [Uint8Array, Row] => [key(node, index), rowAt(node, index)],
     );
     try {
       for (;;) {
@@ -1456,8 +1513,9 @@ export class PMap {
     reverse = false,
   ): StepIterator<[Uint8Array, Row]> {
     this.freezeMutationGeneration();
+    const key = keyChunker(reverse);
     return new TreeStepIterator(this.root, b, src, reverse, (node, index) => [
-      keyAt(node, index),
+      key(node, index),
       rowAt(node, index),
     ]);
   }

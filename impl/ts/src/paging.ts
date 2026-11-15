@@ -28,16 +28,15 @@ import type { BatchMirror, CommitFault, Pager, PageRead, PageTransform } from ".
 // DEFAULT_CACHE_BYTES is the default memory budget for the resident leaf cache, in bytes (256 MiB) — the
 // OpenOptions.cacheBytes default (spec/design/pager.md §3, api.md §2.1). Sized so the dominant case —
 // a RAM-sized database (CLAUDE.md §9) — stays fully cache-resident under the default; stated in bytes
-// so the budget does not silently scale with a file's page size. Converted to a leaf-page capacity by
-// cacheLeaves.
+// so the budget does not silently scale with a file's page size. The pool charges each resident leaf
+// what it holds (PackedLeaf.held) against it.
 export const DEFAULT_CACHE_BYTES = 256 * 1024 * 1024;
 
-// cacheLeaves converts a byte budget to a resident-leaf-page capacity for a file of pageSize bytes:
-// max(1, floor(cacheBytes / pageSize)) (pager.md §3). The max(1, …) floor keeps one leaf resident even
-// when cacheBytes < pageSize — the minimum to walk a root→leaf path. The divisor is clamped to ≥ 1 so a
-// malformed pageSize = 0 cannot divide by zero (the loader rejects it separately as corrupt — format.ts).
-export function cacheLeaves(cacheBytes: number, pageSize: number): number {
-  return Math.max(1, Math.floor(cacheBytes / Math.max(1, pageSize)));
+// cacheBudget is the buffer pool's byte budget for a cache_bytes setting: the setting itself, at least
+// 1 (pager.md §3). The pool keeps one leaf resident whatever the budget — the minimum to walk a
+// root→leaf path.
+export function cacheBudget(cacheBytes: number): number {
+  return Math.max(1, Math.floor(cacheBytes));
 }
 
 // SharedPaging is one database's pager + leaf buffer pool, shared (reference) by all its stores and
@@ -180,6 +179,7 @@ export class SharedPaging {
         colTypes,
         paging,
         paging.pageCodec === null ? undefined : tag,
+        paging.ownsReads(),
       );
     });
     // The pool is keyed by page alone, so a pointer into another tree's leaf can return a node
@@ -196,7 +196,10 @@ export class SharedPaging {
   // is on. A failure is ignored: the fault that follows reads the page again and reports it.
   prefetchLeaves(pages: { page: number; tag: Uint8Array }[], colTypes: ColType[]): void {
     if (!this.batches) return;
-    const limit = Math.max(Math.floor(this.pool.capacity / 4), 1);
+    const limit = Math.max(
+      Math.floor(this.pool.capacity / Math.max(1, this.pager.pageSize) / 4),
+      1,
+    );
     const missing: { page: number; tag: Uint8Array }[] = [];
     for (const p of pages) {
       if (missing.length === limit) break;
@@ -218,6 +221,7 @@ export class SharedPaging {
             colTypes,
             this,
             this.pageCodec === null ? undefined : tag,
+            this.ownsReads(),
           ),
         );
       } catch {
@@ -408,13 +412,25 @@ export class SharedPaging {
     this.pager.poison();
   }
 
-  // capacity is the pool's leaf-page capacity — carried over to the replacement pool when compaction
-  // reopens the database (spec/design/api.md §2.6).
+  // capacity is the pool's byte budget — carried over to the replacement pool when compaction reopens
+  // the database (spec/design/api.md §2.6).
   capacity(): number {
     return this.pool.capacity;
   }
 
-  // setCapacity re-bounds the pool to capacity leaves, evicting until the resident set fits (a spilled
+  // ownsReads reports whether a page this context reads is a fresh buffer the reader owns: always for
+  // an encrypted file (the opened plaintext is new), otherwise unless the store hands out its own
+  // retained blocks (an in-memory store).
+  ownsReads(): boolean {
+    return this.pageCodec !== null || !this.pager.retainsBlocks();
+  }
+
+  // residentBytes is what the resident leaves are charged together (≤ the budget, or one leaf).
+  residentBytes(): number {
+    return this.pool.residentBytes();
+  }
+
+  // setCapacity re-bounds the pool to capacity bytes, evicting until the resident set fits (a spilled
   // temp domain, spec/design/temp-tables.md §6).
   setCapacity(capacity: number): void {
     this.pool.setCapacity(capacity);

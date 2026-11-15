@@ -100,13 +100,13 @@ func TestSpilledTempDomainMatchesResidentRowsAndCost(t *testing.T) {
 	if !reflect.DeepEqual(resident, spilled) {
 		t.Fatalf("spilling changed rows or cost:\nresident %v\nspilled  %v", resident, spilled)
 	}
-	// The page cache is bounded by tempBuffers (4 leaves at page 256), not pinned.
+	// The page cache is bounded by tempBuffers (bytes), not pinned.
 	paging := sess.engine.tempStorage.paging
-	if got := paging.capacity(); got != 4 {
-		t.Fatalf("spilled pool capacity = %d, want 4", got)
+	if got := paging.capacity(); got != 4*256 {
+		t.Fatalf("spilled pool budget = %d, want %d", got, 4*256)
 	}
-	if got := paging.residentLeaves(); got > 4 {
-		t.Fatalf("spilled pool holds %d leaves, want ≤ 4", got)
+	if got := paging.pool.residentBytes(); got > 4*256 && paging.residentLeaves() > 1 {
+		t.Fatalf("spilled pool is charged %d bytes over %d leaves, over its budget", got, paging.residentLeaves())
 	}
 }
 
@@ -187,7 +187,7 @@ func TestTempPoolCapacityFollowsALaterTempBuffersChange(t *testing.T) {
 	}
 	sess.SetTempBuffers(16 * 256)
 	sessExec(t, sess, "INSERT INTO s VALUES (100000, 1, 'x')")
-	if got := sess.engine.tempStorage.paging.capacity(); got != 16 {
-		t.Fatalf("spilled pool capacity = %d after the change, want 16", got)
+	if got := sess.engine.tempStorage.paging.capacity(); got != 16*256 {
+		t.Fatalf("spilled pool budget = %d after the change, want %d", got, 16*256)
 	}
 }

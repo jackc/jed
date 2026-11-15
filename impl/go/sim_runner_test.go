@@ -956,7 +956,7 @@ func (r *simRunner) openDatabase(env *Environment, coord *fileCoordinator) (*Dat
 	if cache <= 0 {
 		cache = defaultCacheBytes
 	}
-	e, err := loadEnginePagedCredential(p, cacheLeaves(cache, p.pageSize), env, r.credential(r.main()))
+	e, err := loadEnginePagedCredential(p, cacheBudget(cache), env, r.credential(r.main()))
 	if err != nil {
 		return nil, err
 	}
@@ -2338,7 +2338,7 @@ func (r *simRunner) stepBackup(i int, st simStep) {
 		return
 	}
 	// The copy opens with the database's credential at the time of the backup (encrypted.md §13).
-	e, err := loadEnginePagedCredential(bp, cacheLeaves(defaultCacheBytes, bp.pageSize), r.procEnv(), r.credential(d))
+	e, err := loadEnginePagedCredential(bp, cacheBudget(defaultCacheBytes), r.procEnv(), r.credential(d))
 	if err != nil {
 		opens := -2
 		for k := -1; k < 4; k++ {

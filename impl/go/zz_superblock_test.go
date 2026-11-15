@@ -219,16 +219,8 @@ func TestSuperBlockExperiment(t *testing.T) {
 			tr.acct["keys"] += leaf.keyStored
 			tr.acct["column directory"] += 2 * (len(colTypes) + 1)
 			tr.acct["page header"] += 16
-			if leaf.keyPrefix != nil {
-				full := 0
-				for i := 0; i < n; i++ {
-					full += len(leaf.keyPrefix) + len(leaf.suffix(i))
-				}
-				if leaf.keyLen == 0 {
-					full += 4 * n
-				}
-				tr.extra["full keys (on first key read)"] += full
-			}
+			// What a resident leaf holds beyond its page, by cause, besides its structs: a typed-array
+			// region's row index. Keys, base-plus-offsets and elided key columns are read in place.
 			if kind == "index" {
 				// Front coding with a full key every 16: a shared-length byte and a length byte per
 				// key, a u16 restart offset per 16.
@@ -249,16 +241,14 @@ func TestSuperBlockExperiment(t *testing.T) {
 				}
 			}
 			for c, ty := range colTypes {
-				r := &leaf.regions[c]
+				r := expDense(leaf, &leaf.regions[c])
 				switch {
 				case r.elided:
-					tr.extra["elided key column copy (at fault)"] += len(r.body) + len(r.bitmap)
 				case r.width > 0:
 					cur := 1 + len(r.bitmap) + len(r.body)
 					label := "fixed-width, plain"
 					if r.stored != 0 {
 						cur, label = r.stored, "fixed-width, base plus offsets"
-						tr.extra["base-plus-offsets copy (at fault)"] += len(r.body)
 					}
 					used += cur
 					tr.acct[label] += cur
@@ -300,8 +290,7 @@ func TestSuperBlockExperiment(t *testing.T) {
 					cur := 1 + len(r.lazy.raw)
 					used += cur
 					tr.acct["integer arrays, packed"] += cur
-					m := r.lazy.plain()
-					tr.extra["packed array rebuild (on first use)"] += len(m.ends) + len(m.body)
+					tr.extra["typed-array row index"] += 4 * len(r.lazy.arrStart)
 				default:
 					cur := 1 + len(r.ends) + len(r.body)
 					label := "variable-width, plain"
@@ -318,7 +307,7 @@ func TestSuperBlockExperiment(t *testing.T) {
 					}
 					lf := sbLeaf{n: n, cur: cur, spans: make([][]byte, n)}
 					for i := 0; i < n; i++ {
-						sp, err := leaf.value(c, i)
+						sp, err := leaf.value(c, i, nil)
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -383,27 +372,38 @@ func TestSuperBlockExperiment(t *testing.T) {
 		}
 		hBlocks := sbHeap() - h0
 		for i, ref := range refs {
-			nd, err := decodeLeafNode(blocks[i], ref, colTypes, pin.paging)
+			nd, err := decodeLeafNode(blocks[i], ref, colTypes, pin.paging, pin.paging.ownsReads())
 			if err != nil {
 				t.Fatal(err)
 			}
 			kept = append(kept, nd)
+			blocks[i] = nil // what the leaf keeps of its page is its own (trimmed) payload
 		}
 		tr.heapFault = sbHeap() - h0
+		// Scanned: every key compared and emitted and every value read, as the scans do, with the
+		// transients dropped; what the leaves keep afterwards.
 		for _, nd := range kept {
-			if nd.packed.n > 0 {
-				_ = nd.packed.key(0)
+			cn := nd.packed.n
+			if cn > 0 {
+				_ = nd.compareKeyAt(cn/2, nd.keyAt(0))
+				var kc keyChunk
+				for i := 0; i < cn; i++ {
+					_ = kc.at(nd, i, 0, cn, false)
+				}
 			}
-			for c := range colTypes {
-				if r := &nd.packed.dirs.regions[c]; r.lazy != nil {
-					r.lazy.plain()
+			for i := 0; i < cn; i++ {
+				for c := range colTypes {
+					v, err := nd.colAtResolved(i, c)
+					if err != nil {
+						t.Fatal(err)
+					}
+					_ = v
 				}
 			}
 		}
 		tr.heapScanned = sbHeap() - h0
 		_ = hBlocks
 		runtime.KeepAlive(kept)
-		runtime.KeepAlive(blocks)
 	}
 	for _, name := range names {
 		table, store := pin.snap.tables[name], pin.snap.stores[name]
@@ -553,5 +553,58 @@ func TestSuperBlockExperiment(t *testing.T) {
 			fmt.Printf(" %10.1f", float64(per[name][g].both)/rows)
 		}
 		fmt.Println()
+	}
+}
+
+// TestSuperBlockPoolBound measures what the buffer pool bounds: the database TestSuperBlockExperiment
+// built is opened with a cache_bytes budget, every row of every table is read and each index is
+// range-scanned (the statements of the Rust probe, impl/rust/examples/zz_mem_probe.rs), and the live
+// heap beyond the open handle and the pool's charge are compared with the budget.
+//
+//	JED_FORMAT_EXP=1 JED_FORMAT_EXP_DIR=<dir with sb.jed> go test -run TestSuperBlockPoolBound -v .
+func TestSuperBlockPoolBound(t *testing.T) {
+	dir := os.Getenv("JED_FORMAT_EXP_DIR")
+	if os.Getenv("JED_FORMAT_EXP") == "" || dir == "" {
+		t.Skip("set JED_FORMAT_EXP=1 and JED_FORMAT_EXP_DIR to TestSuperBlockExperiment's directory")
+	}
+	path := filepath.Join(dir, "sb.jed")
+	if _, err := os.Stat(path); err != nil {
+		t.Skip("run TestSuperBlockExperiment first")
+	}
+	mb := func(x int) float64 { return float64(x) / (1 << 20) }
+	fmt.Printf("\n== live heap under the buffer pool (Go core) ==\n%-10s %12s %12s %12s %8s\n", "budget", "heap MB", "charged MB", "leaves", "heap/bgt")
+	for _, budget := range []int{1, 16 << 20, 64 << 20, 1 << 30} {
+		h0 := sbHeap()
+		bdb, err := OpenDatabaseWithOptions(path, OpenOptions{CacheBytes: budget, ReadOnly: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		hOpen := sbHeap()
+		sess := bdb.Session(SessionOptions{})
+		qs := []string{}
+		for _, tb := range []string{"orders", "line_items", "events", "users", "sessions", "activity", "samples"} {
+			qs = append(qs, "SELECT count(*) FROM "+tb+" WHERE true", "SELECT * FROM "+tb)
+		}
+		qs = append(qs, "SELECT count(*) FROM orders WHERE customer_id >= 0", "SELECT count(*) FROM orders WHERE status >= ''",
+			"SELECT count(*) FROM line_items WHERE product_id >= 0", "SELECT count(*) FROM events WHERE device_id >= 0",
+			"SELECT count(*) FROM users WHERE email >= ''")
+		for _, q := range qs {
+			rows, err := sess.Query(context.Background(), q)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for rows.Next() {
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+			rows.Close()
+		}
+		held := sbHeap() - hOpen
+		pool := bdb.core.storage.paging.pool
+		fmt.Printf("%7.1f MB %12.1f %12.1f %12d %7.2fx\n", mb(budget), mb(held), mb(pool.residentBytes()), pool.resident(), float64(held)/float64(budget))
+		sess.Close()
+		bdb.Close()
+		_ = h0
 	}
 }

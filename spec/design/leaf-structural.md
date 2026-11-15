@@ -116,9 +116,10 @@ elided; the run stops at the first member that is not, since key offsets after i
   the column directory. Both remain functions of the schema.
 - **Write.** The encoder checks, for every row, that the key bytes equal the value body it is not
   storing, and refuses the page otherwise.
-- **Read.** The parser rebuilds the column's dense slots from the keys when it parses the page, so
-  every reader above it (row decode, lazy decode, columnar scans) is unchanged. The rebuilt slots are
-  a separate allocation: a resident leaf is larger than its page by the bytes the page saved.
+- **Read.** In place (§12 item 3): value `i` is bytes `[key_at, key_at + w)` of key `i`, a view of
+  the stored suffix or of the shared prefix (§7). A value that crosses the prefix's end is joined from
+  its two parts for the reader, as an integer where the type is one. The parser only checks that every
+  key holds the column's bytes.
 - A store's column types carry the key offset (`colType.keyAt`), set when the table is registered, so
   every caller of the leaf parser has it. It is set whether or not the switch is on, so any process
   reads an elided page.
@@ -237,8 +238,10 @@ half is measured with its own prefix), and the underfull test that triggers a me
 the probe with the prefix once and then with suffixes, a key copied out for a mutation is assembled
 from the two parts, and a record's weight adds the two lengths, so point lookups and inserts never
 materialize the keys. Any other reader of a key (range bounds, scans that return keys, serialization
-of a clean leaf) rebuilds all of the leaf's keys into one allocation on first use, and the leaf keeps
-them; such a leaf is larger than its page by the bytes the prefix saved.
+of a clean leaf) once rebuilt all of the leaf's keys on first use, and the leaf kept them. Range
+bounds are now compared prefix-aware in place too, and a full key is built only as a transient for
+the reader that asks for it: a scan that emits keys builds 64 at a time into a buffer it holds, a
+range collection builds its window's keys into one buffer it returns (§12 item 3).
 
 **Result**, all five switches on:
 
@@ -279,8 +282,8 @@ and CRC-32-manifest switches; the randomized comparison test with every switch o
 trip points. Against steps 1 to 4 the new failures are two costs and one `EXPLAIN` estimate. With the
 switches off the unit tests pass.
 
-**Not done.** Interior pages keep whole separators. Range-bound searches and scans still rebuild a
-leaf's keys. The integrity check does not verify that a stored prefix is the longest one.
+**Not done.** Interior pages keep whole separators. The integrity check does not verify that a stored
+prefix is the longest one.
 
 ## 8. Step 6: narrow integers (prototyped)
 
@@ -308,10 +311,9 @@ saving = N·(w − bw) − (w + 1) when positive, else 0
 - One insert can widen `bw` for every row of a column, growing the page by up to `N·(w − 1)` bytes.
   The leaf then splits, as for any overflow.
 
-**Read.** The parser rebuilds the dense full-width slots into one allocation per column, so every
-reader (row decode, lazy decode, columnar scans, in-place filters) is unchanged. A resident leaf is
-larger than its page by the bytes saved. Not done: reading the narrow slots in place, and comparing a
-scan's literal against `literal − base`.
+**Read.** In place (§12 item 3): value `i` is `base + offset[i]`, one load of the offset's width, and
+an integer-typed value is built straight from it. Not done: comparing a scan's literal against
+`literal − base`.
 
 **Result**, all six switches on, against steps 1 to 5 with the overhead correction:
 
@@ -790,7 +792,9 @@ saving = (2·N + 3·e + 11·a + M·w) − (N + w + 1 + ceil(M·b/8)) when positi
 These are sums and a value span, kept per leaf like the narrow-integer facts of §8 and recorded at
 every boundary by the split scan. No table is involved, so the size is a function of the rows.
 
-**Read.** Rebuilt on first use, as in §10.
+**Read.** Value by value (§12 item 3): row `i`'s elements start at the sum of the counts before it,
+which a row index built at the parse (one `u32` per 16 rows, 0.25 byte a row) cuts to at most 15
+counts; the row's elements are then decoded alone, and nothing is kept.
 
 **Result.** In the table above. Per value in the measurement of
 [leaf-encodings-experiment.md](leaf-encodings-experiment.md) §8.2: small values 63.0 → 12.1 bytes,
@@ -806,8 +810,31 @@ Structural:
 1. **Key directory of index trees.** See §5. Worth less after step 5, which already removed the
    shared bytes of those keys.
 2. **Presence tag (under 1%).** See §2.
-3. **Resident size.** Rebuild an elided column lazily, and give range scans the prefix-aware
-   comparison point lookups have, so a resident leaf stays the size of its page.
+3. **Resident size — done (2026-11-14, no format change).** Every region is read in place: a
+   base-plus-offsets column (§8) as base plus offset, an elided key column (§4) from the key, keys
+   under a shared prefix (§7) compared prefix-aware and built only as transients, and packed arrays
+   (§11) a value at a time. No reader builds anything a leaf keeps, and a leaf faulted from a fresh
+   read keeps only its used payload. On the 145 MB database of `TestSuperBlockExperiment` a read leaf
+   held 2.06× its page in Go, 1.91× in Rust and 2.11× in TypeScript before, 1.16×, 1.04× and 1.30×
+   after; the buffer pool now charges each leaf what it holds, in bytes ([pager.md](pager.md) §3).
+   Measured against the base (`a83368a75`) on the bench datasets, alternating runs pinned to one CPU,
+   medians of p50 (v54 code with one exception; the bench datasets have no outliers worth storing whole, so kind 6
+   does not appear in them):
+   - **Go:** scans and aggregates 7–18% faster (`full_scan_agg` −18%, `group_by_agg` −17%,
+     `order_by_limit` −12%), point and index lookups within noise (`index_range` −11%,
+     `secondary_lookup` −7%), packed arrays at parity. Index scans that emit keys under a shared
+     prefix now build them as transients: `index_nested_loop_join` +5%, `bounded_index_limit` +3%,
+     `index_desc_range` +13% on p50 and +7% on the mean, its minimum unchanged (the extra allocation
+     moves GC pauses into the measured runs).
+   - **Rust:** within ±5% except `order_by_limit` +6% and the packed-array cardinality scan +11%
+     (spread 1.14); `gin_member` −12%.
+   - **TypeScript** (noisier, spreads to 1.2): scans and aggregates 0–13% faster
+     (`decimal_sum_scan` −13%, `full_scan_minmax` at parity), packed arrays and `gin_member` at
+     parity, `index_desc_range` +6%.
+   Three implementation lessons: a read buffer that escapes to the heap, or a struct copied by value
+   on the hot path (Go), cost more than the copy saved; reading a value back from bytes just written
+   one at a time stalls on store forwarding, so a base-plus-offsets value is built from its integer;
+   and Go's scan loop is sensitive to code layout, so a change is measured in two link layouts.
 4. **Commit cost per touched leaf.** A commit re-encodes every record of a leaf it changes, so denser
    leaves make random-insert loads slower (§7). Each further density gain adds to this.
 
@@ -842,8 +869,8 @@ Steps 1 to 7 together halve the first database (187.7 to 95.8 MB). Steps 8 and 9
 
 - **Steps 1 to 4: layout only.** A leaf's size stays a function of its records and the schema, so
   the split rule, `RECORD_MAX` and every size argument in `format.md` keep their form with new
-  constants. 36.5 MB (19%) for no measured cost. The one debt is resident size: an elided key
-  column is rebuilt at parse (§12 item 3).
+  constants. 36.5 MB (19%) for no measured cost. The one debt was resident size, an elided key
+  column rebuilt at parse; it is now read in place (§12 item 3).
 - **Steps 5, 6, 7 and 9: content-dependent regions.** A leaf's size gains saving terms computed
   from its rows, and the split scan measures each candidate half. Each rule is a closed formula
   over the rows (a common prefix, a value span, a count of distinct strings, element counts), so

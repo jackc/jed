@@ -6,8 +6,12 @@ import (
 	"time"
 )
 
+// testLeaf is what the pool charges a node that is not a faulted leaf (pnode.residentBytes): the
+// tests' nodes, so a budget of k·testLeaf holds k of them.
+const testLeaf = 8 << 10
+
 func BenchmarkBufferPoolPopulate(b *testing.B) {
-	const capacity = 32_768
+	const capacity = 32_768 * testLeaf
 	const populated = 6_900
 	node := &pnode{}
 	b.ReportAllocs()
@@ -26,8 +30,8 @@ func TestBufferPoolInitialIndexReservationIsBounded(t *testing.T) {
 		want     int
 	}{
 		{capacity: 1, want: 1},
-		{capacity: 6_900, want: 6_900},
-		{capacity: 8_192, want: 8_192},
+		{capacity: 6_900 * testLeaf, want: 6_900},
+		{capacity: 8_192 * testLeaf, want: 8_192},
 		{capacity: int(^uint(0) >> 1), want: 8_192},
 	}
 	for _, tt := range tests {
@@ -58,8 +62,8 @@ func TestBufferPoolSetCapacityEvictsDownAndThenBoundsInserts(t *testing.T) {
 	if got := pool.resident(); got != 10 {
 		t.Fatalf("resident = %d, want 10", got)
 	}
-	pool.setCapacity(3)
-	if got := pool.capacityPages(); got != 3 {
+	pool.setCapacity(3 * testLeaf)
+	if got := pool.capacity(); got != 3*testLeaf {
 		t.Fatalf("capacity = %d, want 3", got)
 	}
 	if got := pool.resident(); got != 3 {
@@ -81,7 +85,7 @@ func TestBufferPoolSetCapacityEvictsDownAndThenBoundsInserts(t *testing.T) {
 
 func TestBufferPoolHitReturnsCachedWithoutReloading(t *testing.T) {
 	t.Parallel()
-	pool := newBufferPool(4)
+	pool := newBufferPool(4 * testLeaf)
 	loads := 0
 	if n, _ := pool.getOrLoad(7, counting(&loads, 70)); n.page != 70 {
 		t.Fatalf("first load: page %d", n.page)
@@ -99,7 +103,7 @@ func TestBufferPoolHitReturnsCachedWithoutReloading(t *testing.T) {
 
 func TestBufferPoolResidentSetNeverExceedsCapacity(t *testing.T) {
 	t.Parallel()
-	pool := newBufferPool(3)
+	pool := newBufferPool(3 * testLeaf)
 	loads := 0
 	for p := uint32(0); p < 100; p++ {
 		pool.getOrLoad(p, counting(&loads, p))
@@ -116,7 +120,7 @@ func TestBufferPoolClockGivesReferencedPageSecondChance(t *testing.T) {
 	t.Parallel()
 	// Fill {0,1,2}; touch 0 (sets its ref bit); inserting 3 should evict 1 (the first unreferenced
 	// under the hand), sparing the recently-touched 0.
-	pool := newBufferPool(3)
+	pool := newBufferPool(3 * testLeaf)
 	loads := 0
 	for p := uint32(0); p < 3; p++ {
 		pool.getOrLoad(p, counting(&loads, p))
@@ -139,7 +143,7 @@ func TestBufferPoolClockGivesReferencedPageSecondChance(t *testing.T) {
 
 func TestBufferPoolCapacityOneEvictsEveryTime(t *testing.T) {
 	t.Parallel()
-	pool := newBufferPool(1)
+	pool := newBufferPool(1 * testLeaf)
 	loads := 0
 	pool.getOrLoad(1, counting(&loads, 1))
 	pool.getOrLoad(2, counting(&loads, 2))
@@ -154,7 +158,7 @@ func TestBufferPoolCapacityOneEvictsEveryTime(t *testing.T) {
 
 func TestBufferPoolDistinctPageLoadersRunOutsidePoolLock(t *testing.T) {
 	t.Parallel()
-	pool := newBufferPool(4)
+	pool := newBufferPool(4 * testLeaf)
 	started := make(chan uint32, 2)
 	release := make(chan struct{})
 	results := make(chan uint32, 2)
@@ -203,7 +207,7 @@ func TestBufferPoolDistinctPageLoadersRunOutsidePoolLock(t *testing.T) {
 
 func TestBufferPoolSamePageMissIsSingleFlight(t *testing.T) {
 	t.Parallel()
-	pool := newBufferPool(4)
+	pool := newBufferPool(4 * testLeaf)
 	var loads atomic.Int32
 	leaderStarted := make(chan struct{})
 	release := make(chan struct{})
@@ -239,7 +243,7 @@ func TestBufferPoolSamePageMissIsSingleFlight(t *testing.T) {
 
 func TestBufferPoolInvalidateDuringLoadPreventsStaleReinsertion(t *testing.T) {
 	t.Parallel()
-	pool := newBufferPool(4)
+	pool := newBufferPool(4 * testLeaf)
 	started := make(chan struct{})
 	release := make(chan struct{})
 	loaded := make(chan *pnode, 1)

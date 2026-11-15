@@ -183,7 +183,7 @@ fn open_client_engine(
         let mut pager =
             crate::pager::Pager::from_store(Box::new(ServiceBlockStore::new(Arc::clone(conn))))?;
         pager.set_trust_meta();
-        let capacity = crate::paging::cache_leaves(opts.cache_bytes, pager.page_size());
+        let capacity = crate::paging::cache_budget(opts.cache_bytes);
         // A client of an encrypted file unlocks with its own credential, from the key-block pages
         // it reads through the service; a reconnecting one keeps the data key it holds, as
         // promotion does, so a credential changed since does not stop it, and a rekey is 28P04

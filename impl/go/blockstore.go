@@ -282,6 +282,10 @@ func (s *memoryBlockStore) grow(n int64) {
 
 func (s *memoryBlockStore) sync() error { return nil }
 
+// retainsBlocks reports that readAt hands out the store's own blocks: a faulted leaf keeps the block
+// as it is rather than a trimmed copy, which would double what the store already holds.
+func (s *memoryBlockStore) retainsBlocks() bool { return true }
+
 func (s *memoryBlockStore) size() (int64, error) { return s.n, nil }
 
 func (s *memoryBlockStore) setSize(n int64) error {

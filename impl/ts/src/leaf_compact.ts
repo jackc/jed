@@ -20,6 +20,7 @@ export const REGION_PLAIN = 0;
 export const REGION_FOR = 1; // base plus offsets
 export const REGION_DICT = 2; // dictionary
 export const REGION_ARR = 4; // packed integer arrays
+// 6 is base plus offsets with exceptions (format v54): leaf_pfor.ts.
 
 // leafPrefixLen is the length of the prefix a leaf of n keys stores once: the common prefix of its
 // first and last key (which every key between shares, keys being sorted) when storing it saves bytes
@@ -204,6 +205,16 @@ export function putBEUintN(b: Uint8Array, at: number, w: number, x: number): voi
 
 // getBitsN is getBits for at most 32 bits, as a number.
 export function getBitsN(b: Uint8Array, at: number, bw: number): number {
+  if (bw === 0) return 0;
+  const p = at >> 3;
+  const sh = at & 7;
+  if (bw + sh <= 32) {
+    // One 32-bit window holds the field (bytes past the end read as zero).
+    const x =
+      (((b[p] ?? 0) << 24) | ((b[p + 1] ?? 0) << 16) | ((b[p + 2] ?? 0) << 8) | (b[p + 3] ?? 0)) >>>
+      0;
+    return ((x << sh) >>> 0) >>> (32 - bw);
+  }
   let v = 0;
   for (let i = 0; i < bw; i++) {
     const p = at + i;

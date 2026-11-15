@@ -86,10 +86,10 @@ test("a spilled temp domain matches the resident one's rows and cost", () => {
     assert.ok(spilled.spilled, "a temp domain past tempBuffers should spill");
     assert.deepStrictEqual(spilled.out, resident.out, "spilling changed rows or cost");
 
-    // The page cache is bounded by tempBuffers (4 leaves at page 256), not pinned.
+    // The page cache is bounded by tempBuffers (bytes), not pinned.
     const paging = tempStorageOf(spilled.sess).paging!;
-    assert.equal(paging.capacity(), 4);
-    assert.ok(paging.residentLeaves() <= 4);
+    assert.equal(paging.capacity(), 4 * 256);
+    assert.ok(paging.residentBytes() <= 4 * 256 || paging.residentLeaves() === 1);
     spilled.sess.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -167,7 +167,7 @@ test("the pool capacity follows a later tempBuffers change", () => {
     assert.ok(r.spilled);
     r.sess.setTempBuffers(16 * 256);
     queryOutcome(r.sess, "INSERT INTO s VALUES (100000, 1, 'x')");
-    assert.equal(tempStorageOf(r.sess).paging!.capacity(), 16);
+    assert.equal(tempStorageOf(r.sess).paging!.capacity(), 16 * 256);
     r.sess.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });

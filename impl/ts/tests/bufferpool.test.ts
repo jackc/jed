@@ -7,13 +7,17 @@ import { test } from "node:test";
 import { BufferPool } from "../src/bufferpool.ts";
 import type { PNode } from "../src/pmap.ts";
 
+// What the pool charges a node that is not a faulted leaf (bufferpool.ts nodeBytes): the tests' nodes,
+// so a budget of k·LEAF holds k of them.
+const LEAF = 8192;
+
 // A sentinel leaf node carrying the page id, so a test can tell which page was returned.
 function leaf(page: number): PNode {
   return { keys: [], vals: [], weights: [], children: [], page };
 }
 
 test("bufferpool: a hit returns the cached node without reloading", () => {
-  const pool = new BufferPool(4);
+  const pool = new BufferPool(4 * LEAF);
   let loads = 0;
   const load = (p: number) => () => {
     loads++;
@@ -26,7 +30,7 @@ test("bufferpool: a hit returns the cached node without reloading", () => {
 });
 
 test("bufferpool: resident set never exceeds capacity", () => {
-  const pool = new BufferPool(3);
+  const pool = new BufferPool(3 * LEAF);
   let loads = 0;
   for (let p = 0; p < 100; p++) {
     pool.getOrLoad(p, () => {
@@ -41,7 +45,7 @@ test("bufferpool: resident set never exceeds capacity", () => {
 test("bufferpool: CLOCK gives a referenced page a second chance", () => {
   // Fill {0,1,2}; touch 0 (sets its ref bit); inserting 3 should evict 1 (the first unreferenced under
   // the hand), sparing the recently-touched 0.
-  const pool = new BufferPool(3);
+  const pool = new BufferPool(3 * LEAF);
   let loads = 0;
   const load = (p: number) => () => {
     loads++;
@@ -59,7 +63,7 @@ test("bufferpool: CLOCK gives a referenced page a second chance", () => {
 });
 
 test("bufferpool: capacity one evicts every time", () => {
-  const pool = new BufferPool(1);
+  const pool = new BufferPool(1 * LEAF);
   let loads = 0;
   const load = (p: number) => () => {
     loads++;
@@ -76,8 +80,8 @@ test("bufferpool: setCapacity evicts down and then bounds inserts", () => {
   const pool = new BufferPool(Number.MAX_SAFE_INTEGER);
   for (let p = 0; p < 10; p++) pool.getOrLoad(p, () => leaf(p));
   assert.equal(pool.resident(), 10);
-  pool.setCapacity(3);
-  assert.equal(pool.capacity, 3);
+  pool.setCapacity(3 * LEAF);
+  assert.equal(pool.capacity, 3 * LEAF);
   assert.equal(pool.resident(), 3);
   for (let p = 10; p < 20; p++) {
     pool.getOrLoad(p, () => leaf(p));

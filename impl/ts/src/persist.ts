@@ -35,7 +35,7 @@ import {
   incrOrphans,
   type IncrPlan,
 } from "./incr_reclaim.ts";
-import { cacheLeaves } from "./paging.ts";
+import { cacheBudget } from "./paging.ts";
 import {
   capacity as remapCapacity,
   deferOn as remapDeferOn,
@@ -938,9 +938,7 @@ export function stageTemp(
   }
   if (db.spilled) {
     // Re-applied every commit, so a later temp_buffers change takes effect.
-    paging.setCapacity(
-      tempBuffers === 0 ? Number.MAX_SAFE_INTEGER : cacheLeaves(tempBuffers, db.pageSize),
-    );
+    paging.setCapacity(tempBuffers === 0 ? Number.MAX_SAFE_INTEGER : cacheBudget(tempBuffers));
   }
   return staged;
 }

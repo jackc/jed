@@ -27,7 +27,8 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 53 # v53: deferred interior pages, narrow commit-manifest entries and the page stamp (format.md
+VERSION = 54 # v54: a base-plus-offsets region may store up to 16 values whole as exceptions (region kind 6,
+# format.md "Leaf node"; leaf-write-cost.md §8–§9). v53: deferred interior pages, narrow commit-manifest entries and the page stamp (format.md
 # "Version scope", deferred-interior.md §9, manifest-crc32.md). v52: the compact leaf (format.md "Leaf node", leaf-structural.md) — a leaf payload leads with a
 # flags byte and every leaf directory entry is a u16; a table column that is a leading key-derivable
 # primary-key member has no region; a fixed-key table tree stores its key length once and no key
@@ -710,36 +711,45 @@ COMPACT_LEAF_TABLES = [
 # `multiway_split`: the multi-way leaf split (format.md "Multi-way split", v52) — a tree whose shape
 # is the result of single-row edits, not of an ascending load. Each `ops` entry is one statement, in
 # order; the third element asserts what the edit did to its leaf (build_ops_tree), so this fixture
-# cannot silently stop taking the paths it exists for. The cores build it at page size 256 via
-#   CREATE TABLE a (id i32 PRIMARY KEY, v i64);
-#   INSERT INTO a VALUES (i, 7)                       for i in 1..600 except 400, ascending, one each;
-#   UPDATE a SET v = 4000000000000 WHERE id = 60;     -- replace: leaf 1..192 -> 1..59 | 60..83 | 84..192
-#   INSERT INTO a VALUES (400, -4000000000000);       -- insert:  leaf 295..487 -> 295..399 | 400..423 | 424..487
+# cannot silently stop taking the paths it exists for. The cores build it at page size 512 via
+#   CREATE TABLE a (id i32 PRIMARY KEY, v i64, x i64);
+#   INSERT INTO a VALUES (i, 7, 7)                    for i in 1..600 except 160, ascending, one each,
+#     except v = T for rows 2..17, x = T for rows 90..105, v = -T for rows 115..130 and
+#     x = -T for rows 175..190 (T = 4000000000000);
+#   UPDATE a SET v = 2T, x = 2T WHERE id = 60;        -- replace: leaf 1..110 -> 1..59 | 60..104 | 105..110
+#   INSERT INTO a VALUES (160, -2T, -2T);             -- insert:  leaf 111..221 -> 111..159 | 160..192 | 193..221
 #   CREATE TABLE b (k text PRIMARY KEY, n i32);
-#   INSERT INTO b VALUES ('customer/acct/NNN', 1)     for NNN in 000..063, ascending, one each;
-#   INSERT INTO b VALUES ('a', 2);                    -- first leaf loses its 16-byte key prefix: two-way, balanced
-#   INSERT INTO b VALUES ('z', 3);                    -- right edge of the full last leaf: [8 rows | z]
-#   INSERT INTO b VALUES ('customer/b', 5);           -- end of the full leaf 056..063: prefix 15 -> 9, [8 rows | b]; the root splits
+#   INSERT INTO b VALUES ('customer/acct/NNN', 1)     for NNN in 000..305, ascending, one each;
+#   INSERT INTO b VALUES ('a', 2);                    -- first leaf loses its 15-byte key prefix: two-way, balanced
+#   INSERT INTO b VALUES ('z', 3);                    -- right edge of the full last leaf: [17 rows | z]; the root splits
+#   INSERT INTO b VALUES ('customer/b', 5);           -- end of the full leaf 289..305: prefix 14 -> 9, evened out with the z leaf
 #   INSERT INTO b VALUES ('customer/a', 4);           -- into the prefix-less first leaf
-# In table a every v is 7, so the base-plus-offsets region stores no offsets and a leaf holds up to
-# 192 rows; one row with a distant v gives every row of its leaf an 8-byte offset, and neither half
-# holding that row fits however the leaf is divided. A key that shortens a leaf's shared prefix
-# can only arrive at an end of the leaf (a key between two keys shares their common prefix), where
-# the edited record alone is a fitting side, so those edits split two-way; table b pins that.
+# In table a nearly every v and x is 7, so the base-plus-offsets regions store no offsets, and a
+# column's distant values are stored whole (region kind 6, v54), up to 16 of them, at a few bytes each.
+# Each edited leaf holds 16 distant values in v before the edited row and 16 in x after it. The edit
+# gives its row distant values in both columns, so any half holding it and either group holds 17 in
+# that column: every row of the half takes an 8-byte slot there, and neither half holding the edited
+# row fits however the leaf is divided. (Through v53 one distant value did this; v54 needs 17, which a
+# 256-byte page cannot hold beside enough rows.) A key that shortens a leaf's shared prefix can only
+# arrive at an end of the leaf (a key between two keys shares their common prefix), where the edited
+# record alone is a fitting side, so those edits split two-way; table b pins that.
 def ops_final_rows(ops)
   ops.each_with_object({}) { |(_, row), h| h[row[0]] = row }.values
 end
 
-MULTIWAY_A_OPS = (((1..600).to_a - [400]).map { |i| [:insert, [i, 7]] } +
-  [[:update, [60, 4_000_000_000_000], { ways: 3 }],
-   [:insert, [400, -4_000_000_000_000], { ways: 3 }]]).freeze
-MULTIWAY_B_OPS = ((0...64).map { |i| [:insert, [format("customer/acct/%03d", i), 1]] } +
+MULTIWAY_T = 4_000_000_000_000
+MULTIWAY_A_DISTANT = [[2..17, [MULTIWAY_T, 7]], [90..105, [7, MULTIWAY_T]], [115..130, [-MULTIWAY_T, 7]],
+                      [175..190, [7, -MULTIWAY_T]]].flat_map { |rs, vx| rs.map { |i| [i, vx] } }.to_h.freeze
+MULTIWAY_A_OPS = (((1..600).to_a - [160]).map { |i| [:insert, [i, *MULTIWAY_A_DISTANT.fetch(i, [7, 7])]] } +
+  [[:update, [60, 2 * MULTIWAY_T, 2 * MULTIWAY_T], { ways: 3 }],
+   [:insert, [160, -2 * MULTIWAY_T, -2 * MULTIWAY_T], { ways: 3 }]]).freeze
+MULTIWAY_B_OPS = ((0...306).map { |i| [:insert, [format("customer/acct/%03d", i), 1]] } +
   [[:insert, ["a", 2], { ways: 2, prefix_shrinks: true }],
    [:insert, ["z", 3], { ways: 2, prefix_shrinks: true }],
    [:insert, ["customer/b", 5], { ways: 2, prefix_shrinks: true }],
    [:insert, ["customer/a", 4], { ways: 1 }]]).freeze
 MULTIWAY_SPLIT_TABLES = [
-  { name: "a", columns: [col("id", "i32", pk: true), col("v", "i64")],
+  { name: "a", columns: [col("id", "i32", pk: true), col("v", "i64"), col("x", "i64")],
     ops: MULTIWAY_A_OPS, rows: ops_final_rows(MULTIWAY_A_OPS) },
   { name: "b", columns: [col("k", "text", pk: true), col("n", "i32")],
     ops: MULTIWAY_B_OPS, rows: ops_final_rows(MULTIWAY_B_OPS) }
@@ -2328,7 +2338,7 @@ FIXTURES = ([
   { file: "decimal_table.jed",   page_size: 256, tables: [DECIMAL_TABLE] },
   { file: "decimal_fixed_table.jed", page_size: 256, tables: [DECIMAL_FIXED_TABLE] },
   { file: "compact_leaf_table.jed", page_size: 256, tables: COMPACT_LEAF_TABLES },
-  { file: "multiway_split.jed", page_size: 256, tables: MULTIWAY_SPLIT_TABLES },
+  { file: "multiway_split.jed", page_size: 512, tables: MULTIWAY_SPLIT_TABLES },
   { file: "bytea_table.jed",     page_size: 256, tables: [BYTEA_TABLE] },
   { file: "text_pk_table.jed",   page_size: 256, tables: [TEXT_PK_TABLE] },
   { file: "bytea_pk_table.jed",  page_size: 256, tables: [BYTEA_PK_TABLE] },
@@ -4031,6 +4041,7 @@ LEAF_FIXED_KEY = 1
 LEAF_KEY_PREFIX = 2
 REGION_PLAIN = 0
 REGION_OFFSETS = 1
+REGION_OFFSETS_EXC = 6 # base plus offsets with up to 16 values stored whole (format v54)
 REGION_DICT = 2
 REGION_PACKED = 4
 
@@ -4100,18 +4111,54 @@ def leaf_key_prefix(keys)
 end
 
 # Kind 1 (base plus offsets) over a fixed-width region's slots (nil = NULL): [saving, base, bw].
+def offset_width(d)
+  if d.zero? then 0
+  elsif d < (1 << 8) then 1
+  elsif d < (1 << 16) then 2
+  elsif d < (1 << 32) then 4
+  else 8
+  end
+end
+
+# The most values a kind 6 region stores whole (format.md "Leaf node").
+PFOR_MAX_EXC = 16
+
+# Kind 1 or kind 6 over a base-plus-offsets column's slots (nil = NULL): [saving, base, bw, exc]. exc
+# is nil for kind 1, else the rows kind 6 stores whole, ascending. A kind 6 layout is a width narrower
+# than kind 1's and a base among the present values; its exceptions are the present values outside
+# [base, base + 2^(8·bw) − 1], at most 16. The least size (E + 1)·(w + 2) + N·bw wins, the narrower
+# width and then the lower base on a tie, and kind 6 is taken only when it saves more than kind 1
+# (format.md "Leaf node").
 def offsets_plan(n, w, slots)
   present = slots.compact.map { |s| be_uint(s) }
   base = present.min || 0
-  d = (present.max || 0) - base
-  bw = if d.zero? then 0
-       elsif d < (1 << 8) then 1
-       elsif d < (1 << 16) then 2
-       elsif d < (1 << 32) then 4
-       else 8
-       end
+  bw = [offset_width((present.max || 0) - base), w].min
   saving = bw < w ? n * (w - bw) - (w + 1) : 0
-  [[saving, 0].max, base, bw]
+  saving = [saving, 0].max
+  sorted = present.sort
+  best = nil
+  [0, 1, 2, 4].each do |xbw|
+    break if xbw >= bw
+
+    r = xbw.zero? ? 0 : (1 << (8 * xbw)) - 1
+    sorted.each_with_index do |b, j|
+      next if j.positive? && sorted[j - 1] == b
+      break if j > PFOR_MAX_EXC
+
+      e = j + (sorted.size - (sorted.bsearch_index { |v| v > b + r } || sorted.size))
+      next if e > PFOR_MAX_EXC
+
+      size = (e + 1) * (w + 2) + n * xbw
+      best = [size, xbw, b] if best.nil? || size < best[0]
+    end
+  end
+  if best && n * w - best[0] > saving
+    _, xbw, xb = best
+    r = xbw.zero? ? 0 : (1 << (8 * xbw)) - 1
+    rows = slots.each_index.select { |i| slots[i] && !be_uint(slots[i]).between?(xb, xb + r) }
+    return [n * w - best[0], xb, xbw, rows]
+  end
+  [saving, base, bw, nil]
 end
 
 # Kind 2 (dictionary) over a string region's spans ("" = NULL): [saving, entries, codes]. Two values
@@ -4184,8 +4231,16 @@ def encode_leaf_region(c, n, vals)
     vals.each_with_index { |v, i| bitmap[i / 8] |= (0x80 >> (i % 8)) if v.nil? }
     bitmap = bitmap.pack("C*")
     plain = [REGION_PLAIN].pack("C") + bitmap + vals.map { |v| v || ("\x00".b * w) }.join.b
-    saving, base, bw = offset_col?(c) ? offsets_plan(n, w, vals) : [0]
+    saving, base, bw, exc = offset_col?(c) ? offsets_plan(n, w, vals) : [0]
     return [plain, 0] unless saving.positive?
+
+    if exc
+      out = [REGION_OFFSETS_EXC].pack("C") + bitmap + be_bytes(base, w) + [bw, exc.size].pack("CC")
+      exc.each { |row| out << u16(row) }
+      exc.each { |row| out << vals[row] }
+      vals.each_with_index { |v, i| out << be_bytes(v.nil? || exc.include?(i) ? 0 : be_uint(v) - base, bw) }
+      return [out, saving]
+    end
 
     out = [REGION_OFFSETS].pack("C") + bitmap + be_bytes(base, w) + [bw].pack("C")
     vals.each { |v| out << be_bytes(v.nil? ? 0 : be_uint(v) - base, bw) }
@@ -6468,6 +6523,38 @@ def parse_pax_leaf(payload, n, cols)
           next "\x00".b * w if null.call(i)
 
           v = base + be_uint(rest.byteslice(w + 1 + i * bw, bw))
+          raise "base-plus-offsets value overflows its width" if v >= (1 << (8 * w))
+
+          be_bytes(v, w)
+        end.join.b
+        { width: w, bitmap: bitmap, body: body }
+      when REGION_OFFSETS_EXC
+        raise "base-plus-offsets region on a column it does not apply to" unless offset_col?(c)
+        raise "exception region extent mismatch" if rest.bytesize < w + 2
+
+        base = be_uint(rest.byteslice(0, w))
+        bw = rest.getbyte(w)
+        e = rest.getbyte(w + 1)
+        raise "exception region offset width is invalid" unless [0, 1, 2, 4].include?(bw) && bw < w
+        raise "exception region count is invalid" unless e.between?(1, PFOR_MAX_EXC)
+        offs = w + 2 + e * (w + 2)
+        raise "exception region extent mismatch" unless rest.bytesize == offs + n * bw
+
+        rows = (0...e).map { |k| rest.byteslice(w + 2 + 2 * k, 2).unpack1("n") }
+        raise "exception rows are not strictly ascending" unless rows.each_cons(2).all? { |a, b| a < b }
+
+        exc = {}
+        rows.each_with_index do |row, k|
+          raise "exception row is out of range or NULL" if row >= n || null.call(row)
+          raise "exception row's offset is not zero" unless be_uint(rest.byteslice(offs + row * bw, bw)).zero?
+
+          exc[row] = rest.byteslice(w + 2 + 2 * e + k * w, w)
+        end
+        body = (0...n).map do |i|
+          next "\x00".b * w if null.call(i)
+          next exc[i] if exc.key?(i)
+
+          v = base + be_uint(rest.byteslice(offs + i * bw, bw))
           raise "base-plus-offsets value overflows its width" if v >= (1 << (8 * w))
 
           be_bytes(v, w)

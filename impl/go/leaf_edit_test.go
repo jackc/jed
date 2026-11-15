@@ -224,9 +224,9 @@ func TestLeafWidenGrowth(t *testing.T) {
 	if os.Getenv("JED_LEAF_SHAPES") == "" {
 		t.Skip("set JED_LEAF_SHAPES=1")
 	}
-	savedSlack, savedFORX, savedRuns, savedBlocks, savedExc := leafSlack, leafFORX, leafRuns, leafBlocks, leafBlocksExc
+	savedSlack, savedPFOR, savedRuns, savedBlocks, savedExc := leafSlack, leafPFOR, leafRuns, leafBlocks, leafBlocksExc
 	defer func() {
-		leafSlack, leafFORX, leafRuns, leafBlocks, leafBlocksExc = savedSlack, savedFORX, savedRuns, savedBlocks, savedExc
+		leafSlack, leafPFOR, leafRuns, leafBlocks, leafBlocksExc = savedSlack, savedPFOR, savedRuns, savedBlocks, savedExc
 	}()
 	cases := []struct {
 		name   string
@@ -250,25 +250,24 @@ func TestLeafWidenGrowth(t *testing.T) {
 	modes := []struct {
 		name   string
 		slack  int
-		forx   bool
+		pfor   int
 		runs   int
 		blocks int
 		bexc   bool
 	}{
-		{"v53", 0, false, 0, 0, false},
-		{"slack32", 32, false, 0, 0, false},
-		{"slack16", 16, false, 0, 0, false},
-		{"forx", 0, true, 0, 0, false},
-		{"runs-s", 0, false, leafRunsSearch, 0, false},
-		{"runs-r", 0, false, leafRunsRank, 0, false},
-		{"blk64", 0, false, 0, 64, false},
-		{"blk64x", 0, false, 0, 64, true},
-		{"blk32x", 0, false, 0, 32, true},
-		{"blk64x+fx", 0, true, 0, 64, true},
+		{"v53", 0, 0, 0, 0, false},
+		{"slack32", 32, 0, 0, 0, false},
+		{"slack16", 16, 0, 0, 0, false},
+		{"v54", 0, pforMaxK, 0, 0, false},
+		{"runs-s", 0, 0, leafRunsSearch, 0, false},
+		{"runs-r", 0, 0, leafRunsRank, 0, false},
+		{"blk64", 0, 0, 0, 64, false},
+		{"blk64x", 0, 0, 0, 64, true},
+		{"blk32x", 0, 0, 0, 32, true},
 	}
 	for _, c := range cases {
 		for _, m := range modes {
-			leafSlack, leafFORX, leafRuns, leafBlocks, leafBlocksExc = m.slack, m.forx, m.runs, m.blocks, m.bexc
+			leafSlack, leafPFOR, leafRuns, leafBlocks, leafBlocksExc = m.slack, m.pfor, m.runs, m.blocks, m.bexc
 			path := filepath.Join(t.TempDir(), c.name+".jed")
 			db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
 			if err != nil {

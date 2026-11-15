@@ -66,9 +66,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 			t.Fatalf("row %d = (%d, %d)", i, row[0].Int, row[1].Int)
 		}
 	}
-	if db.ResidentLeaves() > cap {
-		t.Fatalf("resident leaves %d exceed the pool budget %d", db.ResidentLeaves(), cap)
-	}
+	assertPoolBounded(t, db, cap*256)
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -87,9 +85,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if db.ResidentLeaves() > cap {
-		t.Fatalf("mutations should keep residency bounded; resident = %d", db.ResidentLeaves())
-	}
+	assertPoolBounded(t, db, cap*256)
 	if err := db.Close(); err != nil { // autocommit already persisted each statement
 		t.Fatal(err)
 	}
@@ -175,9 +171,7 @@ func TestMemoryBudgetBoundsResidencyUnderLookups(t *testing.T) {
 		if len(out.Rows) != 1 || out.Rows[0][0].Int != int64(k+1) {
 			t.Fatalf("query at k=%d: %v", k, out.Rows)
 		}
-		if db.ResidentLeaves() > cap {
-			t.Fatalf("resident leaves %d exceed the budget %d at k=%d", db.ResidentLeaves(), cap, k)
-		}
+		assertPoolBounded(t, db, cap*256)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -410,4 +404,27 @@ func TestInSessionTableJoinsResidencyFlip(t *testing.T) {
 		defer db.Close()
 		run(t, db)
 	})
+}
+
+// assertPoolBounded fails unless the leaves resident in db's pool are charged at most budget bytes
+// together, or are a single leaf (pager.md §3: one leaf stays resident whatever the budget), and the
+// pool's running charge equals the sum of what each resident leaf holds.
+func assertPoolBounded(t *testing.T, db *engine, budget int) {
+	t.Helper()
+	pool := db.paging.pool
+	pool.mu.Lock()
+	used, leaves, sum := pool.used, len(pool.slots), 0
+	for _, s := range pool.slots {
+		sum += s.node.residentBytes()
+	}
+	pool.mu.Unlock()
+	if used != sum {
+		t.Fatalf("the pool's charge %d is not the sum %d of its leaves' held bytes", used, sum)
+	}
+	if used > budget && leaves > 1 {
+		t.Fatalf("%d resident leaves are charged %d bytes, over the %d-byte budget", leaves, used, budget)
+	}
+	if leaves == 0 {
+		t.Fatalf("no leaf resident after reading the table")
+	}
 }

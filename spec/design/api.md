@@ -106,12 +106,10 @@ sets the **buffer-pool budget in bytes**: the approximate maximum memory the dem
 holds resident at once (the resident-set bound that lets a database far larger than RAM be served —
 pager.md §1). Bytes, not a page count, because a page count silently scales with the file's `page_size`
 (the same number means a 256× different footprint across page sizes) — the budget belongs to the
-*caller's* memory, so it is stated in the caller's unit and the engine converts it using the file's
-page size, known once the file is open: **`cache_leaves = max(1, cache_bytes / page_size)`** (integer
-floor). The `max(1, …)` is the floor for the `page_size > cache_bytes` case — a budget smaller than one
-page still keeps **one** leaf resident, the minimum to walk a root→leaf path. (The bound is on *cached
-on-disk page bytes* — a proxy for resident memory, since a cached leaf is held *decoded*, whose heap
-size depends on row content; it bounds the leaf count deterministically, not bytes exactly.) It is a
+*caller's* memory, so it is stated in the caller's unit. The pool charges each resident leaf the
+memory the core holds for it — its used payload and its structures, read in place with nothing rebuilt
+— and evicts until a newly faulted leaf fits (pager.md §3). A budget smaller than one leaf still keeps
+**one** leaf resident, the minimum to walk a root→leaf path. It is a
 **handle** setting, **not** stored in the file (unlike `page_size`): a different host may reopen the
 same file with a different budget. Default **256 MiB** (`DEFAULT_CACHE_BYTES` — sized so the dominant
 RAM-sized-database case stays fully cache-resident, pager.md §3). The budget bounds only the **leaf
@@ -119,7 +117,7 @@ cache** — the
 interior B-tree skeleton is always resident (pager.md §1/§4) — and it **never changes what a query
 observes** (results and cost are invariant to it, pager.md §3/§5), so it is purely a memory/throughput
 knob. A read-only gauge, **`resident_leaves`**, reports how many leaf pages are currently
-resident — `≤ cache_leaves` by construction for a file; a **real count** for an in-memory
+resident — for a file, as many as the budget holds at each leaf's charge; a **real count** for an in-memory
 database too (bplus-reshape.md B3 — its pool is pinned/unbounded, so the gauge tracks its
 faulted set). An in-memory database ignores the
 budget (it is fully resident, nothing to page). Same shape across cores (Rust `OpenOptions {

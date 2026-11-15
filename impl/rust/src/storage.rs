@@ -631,9 +631,31 @@ impl TableStore {
         key: &[u8],
         mask: &[bool],
     ) -> Result<(Option<Row>, usize, usize)> {
+        self.get_with_units_inner(key, mask, false)
+    }
+
+    /// [`get_with_units`](Self::get_with_units) for a reader whose `mask` is its touched set — every
+    /// column it reads (cost.md §3): only those columns are read from the page, and the others are
+    /// NULL, as the masked scans hold them.
+    pub(crate) fn get_with_units_touched(
+        &self,
+        key: &[u8],
+        mask: &[bool],
+    ) -> Result<(Option<Row>, usize, usize)> {
+        self.get_with_units_inner(key, mask, true)
+    }
+
+    fn get_with_units_inner(
+        &self,
+        key: &[u8],
+        mask: &[bool],
+        touched_only: bool,
+    ) -> Result<(Option<Row>, usize, usize)> {
         let src = make_src(&self.paging, &self.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
-        let (row, mut pages, _rows_reconstructed) = self.rows.get_counted(key, src_ref)?;
+        let (row, mut pages, _rows_reconstructed) =
+            self.rows
+                .get_counted_masked(key, src_ref, touched_only.then_some(mask))?;
         let mut slabs = 0usize;
         if let Some(row) = &row
             && crate::format::any_spillable_masked(&self.col_types, mask)

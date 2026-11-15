@@ -366,7 +366,7 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 	// Fault the leaf → Packed form (packed-leaf.md §5): the block + PAX directories are retained and
 	// NO value is decoded (the decoded row vector is empty), so rows are reconstructed on demand.
 	// Reconstruction produces the same inline-deferred Unfetched (form (a)) the eager fault used to.
-	node, err := decodeLeafNode(block, plainRef(2), colTypes, nil)
+	node, err := decodeLeafNode(block, plainRef(2), colTypes, nil, false)
 	if err != nil {
 		t.Fatalf("decodeLeafNode: %v", err)
 	}
@@ -470,7 +470,7 @@ func TestPackedLeafValidatesPageBackedDirectoriesAtFault(t *testing.T) {
 	assertFaultCorrupt := func(payload []byte) {
 		t.Helper()
 		block := makePage(8192, pageLeaf, uint32(len(rows)), 0, payload)
-		if _, err := decodeLeafNode(block, plainRef(2), colTypes, nil); err == nil {
+		if _, err := decodeLeafNode(block, plainRef(2), colTypes, nil, false); err == nil {
 			t.Fatal("descending PAX directory must fail at leaf fault")
 		} else if ee, ok := err.(*EngineError); !ok || ee.Code() != "XX001" {
 			t.Fatalf("descending PAX directory: want XX001, got %v", err)
@@ -528,7 +528,7 @@ func TestPackedLeafTouchedColumnsAndSelfResolution(t *testing.T) {
 		t.Fatalf("values must stay inline, got %d overflow pages", len(ovf))
 	}
 	block := makePage(ps, pageLeaf, uint32(len(rows)), 0, payload)
-	node, err := decodeLeafNode(block, plainRef(2), colTypes, nil)
+	node, err := decodeLeafNode(block, plainRef(2), colTypes, nil, false)
 	if err != nil {
 		t.Fatalf("decodeLeafNode: %v", err)
 	}

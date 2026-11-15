@@ -4,7 +4,9 @@ import "sync"
 
 // Bounded buffer pool — a CLOCK (second-chance) cache of decoded leaf nodes keyed by on-disk page id
 // (spec/design/pager.md §3). The demand-paging read path (P6.4b) faults a leaf through getOrLoad; the
-// pool bounds how many leaves are resident at once, evicting under CLOCK when full.
+// pool bounds the bytes resident leaves hold (cache_bytes), each leaf charged what this core holds for
+// it (pnode.residentBytes), evicting under CLOCK until a new leaf fits. At least one leaf stays
+// resident whatever the budget.
 //
 // No pins. Eviction only drops the cache entry — any node still referenced by a live tree or an
 // in-flight read stays alive via GC, and a clean node is immutable so a re-load is a harmless
@@ -15,19 +17,23 @@ import "sync"
 // P5.3's per-core concurrency.
 
 // maxInitialBufferPoolIndexCapacity bounds the eager page-id map reservation. 8,192 entries cover
-// the diagnosed 6,900-leaf cold population without turning the default 32,768-leaf cache ceiling (or
-// a caller's much larger budget) into an oversized allocation before a leaf is touched.
+// the diagnosed 6,900-leaf cold population without turning the default 256 MiB budget (or a caller's
+// much larger one) into an oversized allocation before a leaf is touched.
 const maxInitialBufferPoolIndexCapacity = 8 * 1024
 
-func initialBufferPoolIndexCapacity(capacity int) int {
-	return min(capacity, maxInitialBufferPoolIndexCapacity)
+// bpIndexEntryBytes is the bytes a page-sized leaf is assumed to hold when sizing the initial index.
+const bpIndexEntryBytes = 8 << 10
+
+func initialBufferPoolIndexCapacity(budget int) int {
+	return min(max(budget/bpIndexEntryBytes, 1), maxInitialBufferPoolIndexCapacity)
 }
 
-// bpSlot is one resident page: its id, the cached node, and the CLOCK reference bit (set on access,
-// cleared by the sweeping hand to grant a second chance).
+// bpSlot is one resident page: its id, the cached node, the bytes it is charged, and the CLOCK
+// reference bit (set on access, cleared by the sweeping hand to grant a second chance).
 type bpSlot struct {
 	page       uint32
 	node       *pnode
+	bytes      int
 	referenced bool
 }
 
@@ -42,25 +48,28 @@ type bpLoad struct {
 	invalidated bool
 }
 
-// bufferPool is a bounded CLOCK cache from page id to a decoded leaf node.
+// bufferPool is a CLOCK cache from page id to a decoded leaf node, bounded in bytes.
 type bufferPool struct {
-	mu       sync.Mutex
-	capacity int
-	slots    []bpSlot
-	index    map[uint32]int
-	hand     int
-	loading  map[uint32]*bpLoad
+	mu sync.Mutex
+	// budget is the most bytes the resident leaves are charged together (≥ 1); used is their sum.
+	budget  int
+	used    int
+	slots   []bpSlot
+	index   map[uint32]int
+	hand    int
+	loading map[uint32]*bpLoad
 }
 
-// newBufferPool returns a pool holding at most capacity pages (clamped to ≥ 1).
-func newBufferPool(capacity int) *bufferPool {
-	if capacity < 1 {
-		capacity = 1
+// newBufferPool returns a pool whose resident leaves hold at most budget bytes (clamped to ≥ 1), or
+// one leaf when a single leaf is larger.
+func newBufferPool(budget int) *bufferPool {
+	if budget < 1 {
+		budget = 1
 	}
 	return &bufferPool{
-		capacity: capacity,
-		index:    make(map[uint32]int, initialBufferPoolIndexCapacity(capacity)),
-		loading:  make(map[uint32]*bpLoad),
+		budget:  budget,
+		index:   make(map[uint32]int, initialBufferPoolIndexCapacity(budget)),
+		loading: make(map[uint32]*bpLoad),
 	}
 }
 
@@ -111,7 +120,7 @@ func (p *bufferPool) contains(page uint32) bool {
 	return resident || loading
 }
 
-// insert adds a freshly-loaded page, evicting one under CLOCK if at capacity.
+// insert adds a freshly-loaded page, evicting under CLOCK until it fits.
 func (p *bufferPool) insert(page uint32, node *pnode) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -119,15 +128,19 @@ func (p *bufferPool) insert(page uint32, node *pnode) {
 }
 
 func (p *bufferPool) insertLocked(page uint32, node *pnode) {
-	if len(p.slots) < p.capacity {
-		p.index[page] = len(p.slots)
-		p.slots = append(p.slots, bpSlot{page: page, node: node})
-		return
+	bytes := node.residentBytes()
+	p.fitLocked(bytes)
+	p.index[page] = len(p.slots)
+	p.slots = append(p.slots, bpSlot{page: page, node: node, bytes: bytes})
+	p.used += bytes
+}
+
+// fitLocked evicts under CLOCK until bytes more fit the budget, or nothing is left to evict: a leaf
+// larger than the whole budget is still admitted, alone.
+func (p *bufferPool) fitLocked(bytes int) {
+	for len(p.slots) > 0 && p.used+bytes > p.budget {
+		p.invalidateLocked(p.slots[p.evictSlot()].page)
 	}
-	victim := p.evictSlot()
-	delete(p.index, p.slots[victim].page)
-	p.index[page] = victim
-	p.slots[victim] = bpSlot{page: page, node: node}
 }
 
 // evictSlot advances the CLOCK hand, clearing the reference bit of each page it passes (a second
@@ -168,8 +181,10 @@ func (p *bufferPool) invalidate(page uint32) {
 func (p *bufferPool) invalidateAll() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	clear(p.slots)
 	p.slots = p.slots[:0]
-	p.index = make(map[uint32]int, initialBufferPoolIndexCapacity(p.capacity))
+	p.used = 0
+	p.index = make(map[uint32]int, initialBufferPoolIndexCapacity(p.budget))
 	p.hand = 0
 	for page, flight := range p.loading {
 		flight.invalidated = true
@@ -183,14 +198,16 @@ func (p *bufferPool) invalidateLocked(page uint32) {
 		return
 	}
 	delete(p.index, page)
-	// Swap the last slot into the hole so the slice stays dense (capacity accounting + the CLOCK hand
-	// stay well-formed), then shrink.
+	p.used -= p.slots[i].bytes
+	// Swap the last slot into the hole so the slice stays dense (the CLOCK hand stays well-formed),
+	// then shrink.
 	last := len(p.slots) - 1
 	if i != last {
 		moved := p.slots[last]
 		p.slots[i] = moved
 		p.index[moved.page] = i
 	}
+	p.slots[last] = bpSlot{} // no evicted node stays reachable from the slice's spare capacity
 	p.slots = p.slots[:last]
 	if len(p.slots) == 0 {
 		p.hand = 0
@@ -199,32 +216,40 @@ func (p *bufferPool) invalidateLocked(page uint32) {
 	}
 }
 
-// capacityPages is the most pages the pool holds at once (set at construction, re-bounded only by
-// setCapacity).
-func (p *bufferPool) capacityPages() int {
+// capacity is the pool's byte budget (set at construction, re-bounded only by setCapacity).
+func (p *bufferPool) capacity() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.capacity
+	return p.budget
 }
 
-// setCapacity re-bounds the pool to capacity pages (clamped to ≥ 1), evicting under CLOCK until the
-// resident set fits — a spilled temp domain's pool tightens from pinned to tempBuffers
-// (spec/design/temp-tables.md §6). An in-flight load still inserts afterward, evicting as usual.
-func (p *bufferPool) setCapacity(capacity int) {
+// setCapacity re-bounds the pool to budget bytes (clamped to ≥ 1), evicting under CLOCK until the
+// resident set fits, keeping at least one leaf — a spilled temp domain's pool tightens from pinned to
+// tempBuffers (spec/design/temp-tables.md §6). An in-flight load still inserts afterward, evicting as
+// usual.
+func (p *bufferPool) setCapacity(budget int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if capacity < 1 {
-		capacity = 1
+	if budget < 1 {
+		budget = 1
 	}
-	p.capacity = capacity
-	for len(p.slots) > p.capacity {
+	p.budget = budget
+	for len(p.slots) > 1 && p.used > p.budget {
 		p.invalidateLocked(p.slots[p.evictSlot()].page)
 	}
 }
 
-// resident is the number of pages currently resident — the bound the pool enforces (≤ capacity).
+// resident is the number of pages currently resident.
 func (p *bufferPool) resident() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.slots)
+}
+
+// residentBytes is the bytes the resident leaves are charged together — the bound the pool enforces
+// (≤ budget, or one leaf).
+func (p *bufferPool) residentBytes() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.used
 }

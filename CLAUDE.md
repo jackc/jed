@@ -910,6 +910,20 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   bytes of a single-row commit ([spec/design/deferred-interior.md](spec/design/deferred-interior.md)
   §9, [spec/design/manifest-crc32.md](spec/design/manifest-crc32.md); format.md *Remap list*,
   *Deferral*, *Commit manifest*).
+- **Exceptions in a base-plus-offsets region (format v54).** A column that may take base plus offsets
+  may store up to 16 of its present values whole — region kind 6, patched base plus offsets, taken
+  when it saves more than kind 1 — so a few outliers (a sentinel among real dates, backfilled rows,
+  glitches) no longer widen every offset of their column. The cap K = 16 was chosen over 8 and over
+  one exception on realistic distributions (2026-11-14): its size facts are a column's 17 smallest
+  and 17 largest values, and no benchmark moves; a column crossing the cap falls back to kind 1
+  ([spec/design/leaf-write-cost.md](spec/design/leaf-write-cost.md) §8–§9; format.md *Leaf node*).
+- **Resident leaves are their used page, read in place (no format bump).** No reader builds anything a
+  leaf keeps: base-plus-offsets and elided key columns, keys under a shared prefix and packed arrays
+  are read where the page stores them, a fresh page is trimmed to its used payload, and the buffer
+  pool charges each leaf the bytes it holds against `cache_bytes` (one leaf stays resident whatever
+  the budget). A read leaf holds 1.16× its page in Go, 1.04× in Rust and 1.30× in TS, against about 2×
+  before
+  ([spec/design/pager.md](spec/design/pager.md) §3, leaf-structural.md §12 item 3).
 - **Evening out leaves (no format bump).** A leaf that overflows on insert is evened out with an
   adjacent sibling that has room before it is split, so leaves filled in arrival order (an index
   maintained by DML, a table with random keys) settle near 84% full instead of two-thirds. It changes

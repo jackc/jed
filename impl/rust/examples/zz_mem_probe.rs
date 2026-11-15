@@ -1,8 +1,11 @@
 //! EXPERIMENT (not part of the core's test contract): live heap held by a file database after its
 //! tables have been read, against the bytes of the pages read. Skipped unless `JED_MEM_PROBE` names a
-//! database file (the Go experiment's `sb.jed`).
+//! database file (the Go experiment's `sb.jed`). `JED_MEM_PROBE_CACHE` sets the open handle's
+//! `cache_bytes` (default 1 GiB, which holds every leaf); a smaller budget shows the live heap the
+//! buffer pool bounds (pager.md §3).
 //!
 //!     JED_MEM_PROBE=/path/sb.jed cargo run --release --example zz_mem_probe
+//!     JED_MEM_PROBE=/path/sb.jed JED_MEM_PROBE_CACHE=67108864 cargo run --release --example zz_mem_probe
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -45,12 +48,20 @@ fn main() {
     };
     println!("size_of::<Value>() = {}", std::mem::size_of::<Value>());
     let file_mb = std::fs::metadata(&path).unwrap().len() as f64 / (1 << 20) as f64;
+    let cache_bytes = std::env::var("JED_MEM_PROBE_CACHE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1usize << 30);
+    println!(
+        "cache_bytes {:.1} MB",
+        cache_bytes as f64 / (1 << 20) as f64
+    );
     let base = live_mb();
     let db = Database::open_with_options(
         &path,
         OpenOptions {
             read_only: true,
-            cache_bytes: 1 << 30,
+            cache_bytes,
             ..OpenOptions::default()
         },
     )

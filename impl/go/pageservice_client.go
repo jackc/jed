@@ -580,7 +580,7 @@ func openPageClient(cl *psClient, opts OpenOptions, env *Environment, held *page
 	var db *engine
 	if held != nil {
 		if err = adoptHeldCodec(p, held); err == nil {
-			paging := newSharedPaging(p, cacheLeaves(cacheBytes, p.pageSize))
+			paging := newSharedPaging(p, cacheBudget(cacheBytes))
 			if db, err = loadEngineSharedPaging(paging, env); err != nil {
 				var e *EngineError
 				if errors.As(err, &e) && e.Code() == "XX001" && !metaAuthenticates(paging) {
@@ -589,7 +589,7 @@ func openPageClient(cl *psClient, opts OpenOptions, env *Environment, held *page
 			}
 		}
 	} else {
-		db, err = loadEnginePagedCredential(p, cacheLeaves(cacheBytes, p.pageSize), env, opts.Credential)
+		db, err = loadEnginePagedCredential(p, cacheBudget(cacheBytes), env, opts.Credential)
 	}
 	if err != nil {
 		return nil, err

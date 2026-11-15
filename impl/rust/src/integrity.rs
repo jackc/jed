@@ -514,6 +514,7 @@ impl Checker<'_> {
     /// Returns `false` when a value finding stopped the row (its table is then unreadable).
     fn check_row(&mut self, ctx: &TableCtx<'_>, page: u32, node: &Node, i: usize) -> Step<bool> {
         let key = node.key_at(i);
+        let key: &[u8] = &key;
         let Some(row) = self.decode_row(ctx, page, node, i, true)? else {
             return Ok(false);
         };
@@ -590,6 +591,7 @@ impl Checker<'_> {
                 return Err(Halt::Error(e));
             }
             let key = node.key_at(i);
+            let key: &[u8] = &key;
             let column = &ctx.table.columns[c].name;
             let detail = format!("column {column}: {}", e.message);
             let object = Some(ctx.table.name.as_str());
@@ -602,8 +604,8 @@ impl Checker<'_> {
                         && node
                             .col_span(i, c)
                             .flatten()
-                            .and_then(|span| span.first())
-                            .is_some_and(|t| *t == 0x02 || *t == 0x04);
+                            .and_then(|span| span.first().copied())
+                            .is_some_and(|t| t == 0x02 || t == 0x04);
                     let kind = if external {
                         kinds::OVERFLOW_CHAIN_CORRUPT
                     } else {
@@ -679,7 +681,14 @@ impl Checker<'_> {
                     }
                     if mark {
                         let n = seps.len();
-                        self.check_keys(object, page, n, &|i| seps[i].as_slice(), &v.lo, &v.hi)?;
+                        self.check_keys(
+                            object,
+                            page,
+                            n,
+                            &|i| std::borrow::Cow::Borrowed(seps[i].as_slice()),
+                            &v.lo,
+                            &v.hi,
+                        )?;
                     }
                     let seps: Vec<Arc<[u8]>> = seps.into_iter().map(Arc::from).collect();
                     // Pushed last child first, so the walk visits them in child order.
@@ -768,7 +777,7 @@ impl Checker<'_> {
         object: &str,
         page: u32,
         n: usize,
-        key: &dyn Fn(usize) -> &'k [u8],
+        key: &dyn Fn(usize) -> std::borrow::Cow<'k, [u8]>,
         lo: &Option<Arc<[u8]>>,
         hi: &Option<Arc<[u8]>>,
     ) -> Step<()> {
@@ -784,7 +793,7 @@ impl Checker<'_> {
         }
         let outside = (0..n).any(|i| {
             let k = key(i);
-            lo.as_ref().is_some_and(|lo| k < &lo[..]) || hi.as_ref().is_some_and(|hi| k >= &hi[..])
+            lo.as_ref().is_some_and(|lo| *k < lo[..]) || hi.as_ref().is_some_and(|hi| *k >= hi[..])
         });
         if outside {
             let detail = "a key lies outside the bounds its parent gives it".to_string();
@@ -922,7 +931,7 @@ impl Checker<'_> {
                         // A GIN record is a posting run: count its postings from its tail (§3.2).
                         let mut postings = 0u64;
                         for i in 0..node.len() {
-                            match crate::gin_runs::run_postings(node.key_at(i)) {
+                            match crate::gin_runs::run_postings(&node.key_at(i)) {
                                 Ok(n) => postings += n,
                                 Err(e) => {
                                     runs_ok = false;
@@ -1004,6 +1013,7 @@ impl Checker<'_> {
                 for i in 0..node.len() {
                     c.poll()?;
                     let key = node.key_at(i);
+                    let key: &[u8] = &key;
                     let Some(row) = c.decode_row(ctx, page, node, i, false)? else {
                         continue;
                     };
@@ -1141,7 +1151,7 @@ impl Checker<'_> {
                     let Some(row) = c.decode_row(ctx, page, node, i, false)? else {
                         continue;
                     };
-                    f(c, node.key_at(i), &row)?;
+                    f(c, &node.key_at(i), &row)?;
                 }
                 Ok(())
             },
@@ -1325,6 +1335,7 @@ impl Checker<'_> {
             for i in 0..node.len() {
                 c.poll()?;
                 let entry = node.key_at(i);
+                let entry: &[u8] = &entry;
                 let Some((len, has_null)) = split_index_entry(entry, &forms, &orders) else {
                     // An entry that does not split names no key to compare.
                     prev = None;

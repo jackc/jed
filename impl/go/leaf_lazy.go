@@ -171,7 +171,7 @@ func ownKeys(keys [][]byte) [][]byte {
 // lazyCopy returns a dirty copy of leaf n that generation owns, with no row decoded: n is a packed
 // leaf, or a lazy leaf an earlier generation built.
 //
-// The copy's keys are views of the page (or of the keys the packed leaf rebuilt from its prefix). The
+// The copy's keys are views of the page (or, for a prefixed page, keys built into one blob the copy owns). The
 // copy already holds the page through lazyBase, and a page block is never written again. A split or
 // merge copies the keys out first (materialize, decodedParts), so no separator keeps a page alive.
 func lazyCopy(n *pnode, generation *mutationGeneration) *pnode {
@@ -179,10 +179,9 @@ func lazyCopy(n *pnode, generation *mutationGeneration) *pnode {
 	out := &pnode{owner: generation, origin: origin}
 	if p := n.packed; p != nil {
 		out.lazyBase = p
-		out.keys = make([][]byte, p.n)
+		out.keys = p.dirs.keysRange(0, p.n, make([][]byte, 0, p.n))
 		out.lazy = make([]int32, p.n)
-		for i := range out.keys {
-			out.keys[i] = p.key(i)
+		for i := range out.lazy {
 			out.lazy[i] = int32(i)
 		}
 		out.vals = make([]storedRow, p.n)
@@ -272,11 +271,11 @@ func storedSame(ty colType, v Value, p *packedLeaf, c, i int) bool {
 		if v.Kind == ValUnfetched {
 			return false
 		}
-		slot := r.body[i*r.width : (i+1)*r.width]
 		if forEligible(ty) {
-			return beUint(slot) == forSlot(forCol{col: c, w: r.width, dec: ty.DecSlot != 0, scale: ty.DecScale}, v)
+			return l.fixedU64(r, i) == forSlot(forCol{col: c, w: r.width, dec: ty.DecSlot != 0, scale: ty.DecScale}, v)
 		}
-		return bytes.Equal(encodeValue(ty, v)[1:], slot)
+		var buf [16]byte
+		return bytes.Equal(encodeValue(ty, v)[1:], l.fixedSlot(r, i, &buf))
 	}
 	str := stringPayload(ty)
 	var u *Unfetched
@@ -289,7 +288,7 @@ func storedSame(ty colType, v Value, p *packedLeaf, c, i int) bool {
 			return u.lazyIdx == i
 		}
 	}
-	span, err := l.value(c, i)
+	span, err := l.value(c, i, nil)
 	if err != nil || len(span) == 0 {
 		return false
 	}
@@ -460,7 +459,7 @@ func (n *pnode) forRangeOf(fc forCol) (r forRange, count int) {
 			r.addNull()
 			continue
 		}
-		r.add(beUint(reg.body[int(at)*fc.w : (int(at)+1)*fc.w]))
+		r.add(n.lazyBase.dirs.fixedU64(reg, int(at)))
 		count++
 	}
 	return r, count
@@ -516,7 +515,7 @@ func (n *pnode) itemAccOf(shape leafShape, pcap pageCap, j int, scratch []dictIt
 			counts[r.codes[at]]++
 		default:
 			it := dictItem{kind: dictOwn}
-			if span, err := l.value(c, int(at)); err == nil {
+			if span, err := l.value(c, int(at), nil); err == nil {
 				it = spanItem(ty, span)
 			}
 			acc.add(shape, j, it, nil)
@@ -656,7 +655,7 @@ func (sz *leafSizes) replaceCols(n *pnode, i int, key []byte, val storedRow, sha
 				sz.forCnt[j]--
 				r := &sz.fors[j]
 				if sz.forCnt[j] == 0 {
-					*r = forRange{}
+					*r = forRange{pf: newPforAcc()}
 					sz.forStale[j] = false
 				} else if r.forRemoved(forSlot(fc, ov)) {
 					sz.forStale[j] = true
@@ -732,6 +731,7 @@ func (sz *leafSizes) clone() *leafSizes {
 	out.fors = slices.Clone(sz.fors)
 	for j := range out.fors {
 		out.fors[j].pos = out.fors[j].pos.clone() // PROTOTYPE (leaf_runs.go, leaf_blocks.go)
+		out.fors[j].pf = out.fors[j].pf.clone()   // PROTOTYPE (leaf_pfor.go)
 	}
 	out.forCnt = slices.Clone(sz.forCnt)
 	out.forStale = slices.Clone(sz.forStale)
@@ -918,6 +918,10 @@ func patchLeaf(n *pnode, colTypes []colType, keyLen int, seal sealer, src *chain
 		w, fixed := fixedValueWidth(ty)
 		vb := make([][]byte, rows)
 		nulls := make([]bool, rows)
+		var slab []byte // a fixed-width column's page values, which the page may not store whole
+		if fixed {
+			slab = make([]byte, rows*w)
+		}
 		for i, at := range n.lazy {
 			if at >= 0 {
 				// Still the page's record.
@@ -927,8 +931,13 @@ func patchLeaf(n *pnode, colTypes []colType, keyLen int, seal sealer, src *chain
 					if fixed {
 						vb[i] = zero[:w]
 					}
+				case fixed:
+					var buf [16]byte
+					dst := slab[i*w : (i+1)*w]
+					copy(dst, l.fixedSlot(&l.regions[c], int(at), &buf))
+					vb[i] = dst
 				default:
-					span, err := l.value(c, int(at))
+					span, err := l.value(c, int(at), nil)
 					if err != nil {
 						return nil, false // the full encoder reports it
 					}
@@ -1017,7 +1026,11 @@ func encodeRegion(ty colType, n int, vb [][]byte, nulls []bool) []byte {
 				useFOR, base, bw = true, r.lo, forWidth(w, r.lo, r.hi)
 				out[0] = regionFOR
 				k1 := n*(w-bw) - (w + 1)
-				x := forExcSaving(n, w, r)
+				pp, psize := r.pf.plan(n, w)
+				x := 0
+				if pp.ok {
+					x = n*w - psize
+				}
 				rs, bs := r.runs().saving(), r.blocks().saving()
 				if bs > k1 && bs > x && bs > rs {
 					return encodeBlocks(w, n, vb, nulls, r.blocks()) // PROTOTYPE (leaf_blocks.go)
@@ -1026,7 +1039,7 @@ func encodeRegion(ty colType, n int, vb [][]byte, nulls []bool) []byte {
 					return encodeRuns(w, n, vb, nulls, r.runs()) // PROTOTYPE (leaf_runs.go)
 				}
 				if x > k1 {
-					return encodeFORX(w, n, vb, nulls, r) // PROTOTYPE (leaf_forx.go)
+					return encodePFOR(w, n, vb, nulls, pp) // with exceptions (leaf_pfor.go, format v54)
 				}
 			}
 		}

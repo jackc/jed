@@ -125,18 +125,31 @@ test("leaf size facts follow merges and splits", () => {
 
 // A single changed row can widen a whole leaf's encodings so that no two halves fit (format.md
 // "Multi-way split"): the running rule reports no split and the tabled one serves it. Mirrors the
-// multi-way golden's workload (fileformat_golden.test.ts multiwaySplitDB).
+// multi-way golden's workload (fileformat_golden.test.ts multiwaySplitDB): each edited leaf already
+// holds 16 values stored whole (region kind 6) in each of two columns, and the edit adds a 17th.
 test("a leaf with no two fitting halves splits multi-way under the check", () => {
   setLeafSizesCheck(true);
   try {
-    const stmts = ["CREATE TABLE a (id integer PRIMARY KEY, v bigint)"];
+    const far = 4000000000000;
+    const distant = (i: number): [number, number] => {
+      if (i >= 2 && i <= 17) return [far, 7];
+      if (i >= 90 && i <= 105) return [7, far];
+      if (i >= 115 && i <= 130) return [-far, 7];
+      if (i >= 175 && i <= 190) return [7, -far];
+      return [7, 7];
+    };
+    const stmts = ["CREATE TABLE a (id integer PRIMARY KEY, v bigint, x bigint)"];
+    let sum = 0;
     for (let i = 1; i <= 600; i++) {
-      if (i !== 400) stmts.push(`INSERT INTO a VALUES (${i}, 7)`);
+      if (i === 160) continue;
+      const [v, x] = distant(i);
+      stmts.push(`INSERT INTO a VALUES (${i}, ${v}, ${x})`);
+      if (i !== 60) sum += v + x; // row 60 is replaced below, and 160 inserted: they cancel
     }
-    stmts.push("UPDATE a SET v = 4000000000000 WHERE id = 60");
-    stmts.push("INSERT INTO a VALUES (400, -4000000000000)");
-    const db = dbWith(stmts, 256);
-    assert.deepEqual(query(db, "SELECT count(*), sum(v) FROM a"), [["600", "4186"]]);
+    stmts.push("UPDATE a SET v = 8000000000000, x = 8000000000000 WHERE id = 60");
+    stmts.push("INSERT INTO a VALUES (160, -8000000000000, -8000000000000)");
+    const db = dbWith(stmts, 512);
+    assert.deepEqual(query(db, "SELECT count(*), sum(v + x) FROM a"), [["600", String(sum)]]);
   } finally {
     setLeafSizesCheck(false);
   }

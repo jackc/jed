@@ -274,8 +274,10 @@ func forSaving(n, w int, r forRange) int {
 	}
 	bw := forWidth(w, lo, hi)
 	s := n*(w-bw) - (w + 1)
-	if x := forExcSaving(n, w, r); x > s {
-		s = x // PROTOTYPE (leaf_forx.go)
+	if r.pf != nil {
+		if x := r.pf.saving(n, w); x > s {
+			s = x // with exceptions (leaf_pfor.go, format v54)
+		}
 	}
 	if r.pos != nil {
 		if rd := r.pos.rd; rd != nil && len(rd.vals) == n {
@@ -295,8 +297,9 @@ func forSaving(n, w int, r forRange) int {
 	return 0
 }
 
-// forRange accumulates the span of a column's present values. PROTOTYPE (leaf_forx.go): lo2 and hi2
-// are the second smallest and second largest of them (as a multiset), valid once two is set.
+// forRange accumulates the span of a column's present values, and through pf the kind 6 size facts
+// (leaf_pfor.go). For the blocks prototype's exception (leaf_blocks.go): lo2 and hi2 are the second
+// smallest and second largest of them (as a multiset), valid once two is set, kept only then.
 type forRange struct {
 	lo, hi   uint64
 	any      bool
@@ -305,6 +308,7 @@ type forRange struct {
 	// PROTOTYPE (leaf_runs.go, leaf_blocks.go): pos keeps the column's runs or blocks, in those
 	// modes, for ranges built over the rows in order. One pointer, so the range stays small.
 	pos *forPos
+	pf  *pforAcc // kind 6 size facts (leaf_pfor.go)
 }
 
 // forPos is a column's position-dependent measurements (runs, blocks).
@@ -348,6 +352,9 @@ func (r *forRange) addNull() {
 }
 
 func (r *forRange) add(v uint64) {
+	if r.pf != nil {
+		r.pf.add(v)
+	}
 	if p := r.pos; p != nil {
 		if p.rd != nil {
 			p.rd.push(v, true)
@@ -358,6 +365,10 @@ func (r *forRange) add(v uint64) {
 	}
 	if !r.any {
 		r.lo, r.hi, r.any = v, v, true
+		return
+	}
+	if !leafBlocksExc {
+		r.lo, r.hi = min(r.lo, v), max(r.hi, v)
 		return
 	}
 	if !r.two {
@@ -414,7 +425,7 @@ func packedFORSaving(cols []forCol, l *paxLeaf, n int) int {
 				r.addNull()
 				continue
 			}
-			r.add(beUint(reg.body[i*fc.w : (i+1)*fc.w]))
+			r.add(l.fixedU64(reg, i))
 		}
 		total += forSaving(n, fc.w, r)
 	}
@@ -926,7 +937,7 @@ func (sz *leafSizes) removeRow(shape leafShape, pcap pageCap, key []byte, row st
 			r.pos = nil
 			sz.forStale[j], sz.stale = true, true
 		} else if sz.forCnt[j] == 0 {
-			*r = forRange{}
+			*r = newRunsRange(fc.w)
 			sz.forStale[j] = false
 		} else if r.forRemoved(forSlot(fc, v)) {
 			sz.forStale[j] = true

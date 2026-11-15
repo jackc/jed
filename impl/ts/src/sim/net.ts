@@ -147,8 +147,11 @@ export class SimNet implements PageNet {
   // disconnect ended it at this frame.
   write(end: SimEnd, frame: Uint8Array): boolean {
     if (end.closed || end.eof) return false;
-    this.frames++;
-    if (this.disconnectAt > 0 && this.frames === this.disconnectAt) {
+    // A page read and its reply are not counted: which pages a client fetches depends on what its
+    // buffer pool holds, which is each core's own (spec/design/simulation-testing.md, S8 Faults).
+    const read = pageReadFrame(frame);
+    if (!read) this.frames++;
+    if (!read && this.disconnectAt > 0 && this.frames === this.disconnectAt) {
       this.disconnected = true;
       this.close(end);
       this.close(end.peer);
@@ -519,4 +522,10 @@ class SimServed implements ServedDb, OwnerLink {
     this.broadcast(kind, 0n);
     this.net.pump();
   }
+}
+
+// pageReadFrame reports whether frame is a read_pages request (code 0x03) or its pages reply (0x43):
+// length u32 | code u8 | request_id u32 | body (spec/pageservice/README.md §2).
+function pageReadFrame(frame: Uint8Array): boolean {
+  return frame.length > 4 && (frame[4] === 0x03 || frame[4] === 0x43);
 }

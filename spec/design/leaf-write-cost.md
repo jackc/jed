@@ -1,7 +1,7 @@
 # Write costs on dense leaves
 
-**Status: measured; #5's direction is format v54 (§6), awaiting the maintainer's go-ahead.** Go prototypes only, every switch off by
-default; nothing here is in the format. This note measures two write regressions that came with the
+**Status: #5 landed as format v54 (§8), one exception per column per leaf; #4 awaits a decision
+(§6).** The other prototypes are Go only, every switch off by default, and not in the format. This note measures two write regressions that came with the
 compact leaf of format v52 ([leaf-structural.md](leaf-structural.md)) and recommends what to do
 about each (§6). Any format change it proposes is the maintainer's decision; if one is approved,
 the follow-on is format v54, with regenerated goldens in all three cores and the Ruby reference
@@ -292,10 +292,11 @@ guarantee the monotone size the split scan relies on.
 
 ## 4b. Reading a value in place
 
-Today every core rebuilds a base-plus-offsets column, and an elided key column, as a full-width
-copy for the leaf and reads from the copy: Go when it parses the page, Rust and TS on the first read
-of that column in that leaf. The copy costs an O(N) loop and keeps a resident leaf larger than its
-page. Reading in place would avoid both, so the region kinds are compared on that basis too.
+When this was measured every core rebuilt a base-plus-offsets column, and an elided key column, as a
+full-width copy for the leaf and read from the copy: Go when it parsed the page, Rust and TS on the
+first read of that column in that leaf. The copy cost an O(N) loop and kept a resident leaf larger
+than its page. Every core now reads in place (leaf-structural.md §12 item 3), so the region kinds are
+compared on that basis too.
 
 `BenchmarkLeafColumnRead` (`impl/go/leaf_read_bench_test.go`) reads one `bigint` column of 476 rows
 straight from each region's bytes, pinned to one CPU, three runs each (ns; medians). Every reader
@@ -485,7 +486,7 @@ All off by default; the corpus, goldens and `mise run test` pass with them off.
 | `JED_LEAF_EDIT=gap` | `leaf_edit.go` | no | movable gap |
 | `JED_LEAF_EDIT_STATS=1` | `leaf_edit.go` | no | count the slots edits move (tests) |
 | `JED_LEAF_SLACK=d` | `leaf_slack.go` | yes (split points) | slack C/d on right-edge splits |
-| `JED_LEAF_FORX=on` | `leaf_forx.go` | yes (region kind 6) | one exception per base-plus-offsets region |
+| ~~`JED_LEAF_FORX=on`~~ | `leaf_forx.go` | — | one exception per base-plus-offsets region: format v54 since 2026-11-14 (§8), no longer a switch |
 | `JED_LEAF_EVEN=off` | `leaf_even.go` | yes (split points) | no evening, to measure its cost |
 | `JED_LEAF_RUNS=search\|rank` | `leaf_runs.go` | yes (region kind 7) | base-plus-offsets in runs, with a lookup index |
 | `JED_LEAF_BLOCKS=B` | `leaf_blocks.go` | yes (region kind 8) | base-plus-offsets in fixed blocks of `B` rows |
@@ -497,5 +498,214 @@ Tests: `TestLeafEditModes` (the modes write identical bytes), `TestLeafFORXRound
 
 **Not verified.** Rust and TS were not measured. The gap prototype is safe only because one writer
 owns every dirty node; its close-on-freeze path was exercised by the corpus but not under the race
-detector. Kinds 6, 7 and 8 were not run through the simulation sweep, the Ruby reference or `verify.rb`.
-The in-place readers of §4b exist only in the benchmark; no core reads in place yet.
+detector. Kinds 7 and 8 were not run through the simulation sweep, the Ruby reference or `verify.rb`;
+kind 6 now is (§8).
+Since 2026-11-14 every core reads kinds 1 and 6 in place (§8; leaf-structural.md §12 item 3); the
+other readers of §4b exist only in the benchmark.
+
+## 8. The exception region, format v54 (2026-11-14; superseded by §9.2)
+
+> Kind 6 as described here — one exception — was replaced before v54 was published by up to 16
+> exceptions (§9.2). This section is the record of the first landing and its measurements.
+
+**Decision: one exception per column per leaf.** §6 left the choice between one exception and up to
+`k`. One is what was prototyped and measured: it takes the update benchmark from 0.042 to 0.011 ms
+and costs nothing where no column has a lone outlier, and its size is a closed formula over the
+column's two smallest and two largest values, so the split scan's monotonicity argument carries over
+(format.md *Fan-out*). Up to `k` would need the `k + 1` smallest and largest values in every leaf's
+size facts and a rule choosing which of them to except, and was neither prototyped nor read in place;
+the brief that asked for this landing required that it be measured before it is chosen, so it stays an
+open alternative. In `TestLeafWidenGrowth` a second outlier in the same leaf still widens the column
+(the tables grow 20–36% after two widenings, §4).
+
+**What landed.** Region kind 6 (format.md *Leaf node*) in the Go, Rust and TypeScript cores and the Ruby
+reference (`verify.rb`, which also decodes it for `--check-image`), with no switch: a column eligible
+for base plus offsets takes kind 6 when it saves more than kind 1, kind 1 on a tie. Every core reads it
+in place on top of the in-place kind 1 reader (leaf-structural.md §12 item 3): a value is the
+exception's stored body when its row is the exception row, else the base plus its offset. The engines
+read values one at a time, so there is no separate scan loop to patch; the row test is one compare.
+Every golden and integrity fixture is regenerated for the version byte. The generated datasets have no
+lone outliers, so their files are unchanged but for the version. `multiway_split.jed` had to change: a
+single distant value no longer forces a three-way split, since kind 6 absorbs it, so table `a` now
+carries one distant value per column on either side of each edited row (format.md fixture table), and
+its leaves hold kind 6 regions.
+
+**Measured** (`update_untouched_large_rollback`, alternating runs pinned to one CPU against `a83368a75`,
+medians of p50): Go 0.039 → 0.010 ms, Rust 0.035 → 0.0085 ms, TypeScript 0.130 → 0.042 ms (spread
+1.5). The prototype's 0.042 → 0.011 ms in Go is reproduced. Verified with `mise run ci` (new goldens,
+`sim:regress`, `sim:sweep 1..8`) and a further `sim:sweep 1..24` over every profile (528 traces).
+
+## 9. Patched base plus offsets (PFOR), 2026-11-14: investigated, then landed as v54 (§9.2)
+
+**Question.** Is one exception (§8) the right rule, or should a column keep any number of outlying
+values whole (PFOR, patched frame of reference), either sized exactly or under a fixed cap? Measured on
+column distributions shaped like application data rather than the synthetic lone outlier.
+
+**Prototype** (Go only, `impl/go/leaf_pfor.go`, `JED_LEAF_PFOR=K` or `exact`; off by default, nothing
+on disk changes). Region kind 9: null bitmap, base, offset width `bw`, a count `E`, `E` ascending u16
+exception rows, their `E` whole bodies, then `N` offsets. The encoder takes the layout of least size
+over `bw ∈ {0, 1, 2, 4}` and every present value as the base; a value outside the base's window is an
+exception (offset zero). It is chosen only when it saves more than kind 1 (and kind 6), so a column
+with nothing to gain stays kind 1 or plain: the fallback is the existing per-region size choice, not a
+separate rule. The base is a present value and the window starts at it, so the excepted values are
+always some of the smallest and some of the largest. Under a cap `K` the size facts are therefore the
+`K + 1` smallest and `K + 1` largest values, O(K) per added row; uncapped they are every value, sorted.
+Adding a row never lowers any layout's size, so the split scan's monotonicity holds. A reader finds an
+exception by binary search of the row list. Checked with `JED_LEAF_LAZY=check` (every size fact
+compared with a fresh measurement) over the leaf, split, update and reclamation tests, and
+`TestLeafPFORRoundTrip`.
+
+**Experiment** (`impl/go/zz_pfor_dist_test.go`, `JED_PFOR_DIST=1`): 200,000-row tables loaded in key
+order (leaves 99% full) and in shuffled order (leaves ~81% full, as random-key tables settle), then a
+sequence of UPDATE stages, under v53 (kind 1 only), v54 (kind 6), PFOR capped at 4 and 16, PFOR exact,
+and the §4c blocks with and without an exception.
+
+- `orders` (`id bigint` key): `created_at` ascending every ~2 s with 1.5 s jitter and 0.3% backfilled
+  rows hours to days early; `updated_at` = `created_at` + 0–30 s; `customer_id` Zipf over 500k ids
+  scattered by hash; `amount_cents` log-normal (median 2500); `status` 0–3 skewed with 0.1% `99`;
+  `discount_cents` 0 for 85% of rows, else 100–5000; `valid_until` `9999-12-31` for 97%, else a real
+  date; a short note. Stages: `updated_at` touched for 1 row in 200, another 1 in 200, 10% (spread over
+  an hour), the newest 5% (with `status`), `status` for 8%, `amount_cents` ×100 for 0.5%,
+  `valid_until` set for 2%.
+- `events`: `ts` ascending (exponential gaps), `device_id` uniform over 5000, `reading` normal around
+  20000 with 0.5% glitches near 10⁹, a per-device `seq`. Stages: glitches fixed, 0.1% zeroed.
+
+**Region bytes as a share of the plain region, key-order load** (shuffled agrees to a point):
+
+| Column | v53 | v54 | PFOR ≤ 4 | PFOR ≤ 16 | PFOR exact | blocks 64 + exc |
+|---|---|---|---|---|---|---|
+| `created_at` (ascending, backfill) | 72% | 57% | 52% | 52% | 52% | 55% |
+| `updated_at` after the 10% touch | 95% | 95% | 95% | 92% | 62% | 95% |
+| `customer_id` (wide) | 51% | 51% | 51% | 51% | 51% | 51% |
+| `amount_cents` (skewed) | 33% | 28% | 27% | 27% | 27% | 28% |
+| `amount_cents` after the fix | 44% | 31% | 28% | 28% | 28% | 30% |
+| `discount_cents` (85% zero) | 52% | 52% | 52% | 52% | 26% | 52% |
+| `valid_until` (sentinel) | 100% | 98% | 77% | 8% | 8% | 78% |
+| `reading` (0.5% glitches) | 50% | 47% | 32% | 27% | 27% | 34% |
+| `ts`, `device_id`, `seq`, `status` | unchanged | | | | | |
+
+**Leaves** (key-order load → after every stage): `orders` v53 1032 → 1373, v54 958 → 1287, PFOR ≤ 4
+914 → 1249, PFOR ≤ 16 842 → 1140, exact 816 → 1096, blocks + exc 927 → 1319; `events` 332, 328, 297,
+286, 286, 299. PFOR ≤ 16 makes `orders` 18% smaller than v53 and 12% smaller than v54.
+
+**Splits under updates.** Loaded in key order, leaves are 99% full, and the first touch of 1 row in 200
+splits about 30% of leaves under every encoding: an exception costs `w + 2` bytes, which a full leaf
+does not have. The single-row touch rolled back costs ~105 µs under every encoding. Shuffled-loaded
+leaves have slack: the first touch added 40 pages under v53 and v54 (v54 had spent its exception on a
+backfilled row in a third of the leaves), none under PFOR ≤ 4 or ≤ 16, and 2 under exact; the second
+added 37 under v54, 4 under PFOR ≤ 4 and none under ≤ 16. The rolled-back touch: v53 80 µs, v54 55,
+PFOR ≤ 4 33, ≤ 16 38. So an exception avoids a split only where a leaf has room, and the common
+append-loaded table has none; the §6 slack option is the independent lever there.
+
+**Costs.** Key-order load time, `orders`: v53 1.71 s, v54 1.78, PFOR ≤ 4 1.93 (+13%), ≤ 16 2.37 (+39%),
+exact 5.83 (3.4×); `events` (~650 rows a leaf) 0.80, 0.79, 0.97, 1.18, 10.6 (13×). Splits dominate: the
+prototype clones each prefix's and suffix's facts in the split scan, O(N·K) capped and O(N²) exact, and
+a split of a full `events` leaf under exact took 3.4 ms. Capped, that can be made incremental; exact
+cannot cheaply, since every removal re-measures the column and every prefix needs its own optimum. A
+full scan of the measured columns is 4–14% slower than v53 for capped PFOR (`orders` 16–17 ms against
+17.5–19.6) and 40–85% slower for exact, whose `discount_cents` and `updated_at` regions hold 20–36 exceptions a leaf and
+read each value through the binary search.
+
+**Findings.**
+
+- For the shapes in the question, an exception mechanism pays not where data is clumpy but where it is
+  clumpy *with strays*: a roughly ascending timestamp with occasional backfill (half of v53's leaves
+  had to store `created_at` plain), a skewed amount's tail, sensor glitches, and above all a sentinel
+  with real values mixed in (`valid_until`: 100% → 8%). Widely distributed columns gain nothing from
+  any variant; a column whose values are clustered in two places (`updated_at` after many touches)
+  needs exceptions by the dozen.
+- One exception (v54) captures little of this: it handles a leaf's first stray and nothing after.
+  `K = 4` captures most of `created_at`, `amount_cents` and `reading`; `K = 16` also captures the
+  sentinel column and is within about 3% of exact on leaf count (`orders` 842 against 816) except where a column needs dozens of
+  exceptions a leaf (`discount_cents`, touched `updated_at`), which only exact took.
+- Exact is the elegant rule but carries a write cost the capped rule does not; capped at 16 is one rule
+  with O(K) size facts and the same monotonicity argument as kind 6, and kind 6 is its `E = 1` case.
+
+**Not decided.** Replacing kind 6 with capped PFOR would be a format change in every core, the Ruby
+reference and `verify.rb`. Its open questions are taken up in §9.1.
+
+### 9.1 K = 8 against K = 16 (2026-11-14)
+
+**Prototype changes.** The capped facts are now cheap. The least exception count for each offset width
+and the lowest base giving it depend only on the kept extremes, not on the row count, so they are
+cached and a saving query costs four products. A value outside both kept sets, which is nearly every
+value, is rejected by two compares in an inlined test. The kept values live inside the accumulator
+(one allocation). The split scan keeps one running accumulator each way instead of cloning facts per
+prefix. Reads test a 64-bit bucket mask of exception rows, built at parse from the row list, before
+searching. `JED_LEAF_LAZY=check` passes over the leaf, split, update, delete, reclamation, paging and
+merge tests at K = 8 and K = 16. The `sentinels` table (`id` and six dates, `9999-12-31` except for
+1, 2, 4, 6, 8 and 12% real dates) joins the experiment.
+
+**Size** (key-order load, share of plain; `→` after the updates):
+
+| Column | v54 | K = 4 | K = 8 | K = 16 |
+|---|---|---|---|---|
+| `orders.valid_until` (3% real) | 98 → 100% | 77 → 94% | 25 → 52% | 8 → 12% |
+| `sentinels.s1` / `s2` / `s4` / `s6` | 82 / 99 / 100 / 100% | 25 / 84 / 100 / 100% | 7 / 32 / 97 / 100% | 5 / 7 / 63 / 98% |
+| `events.reading` (0.5% glitches) | 47% | 32% | 27% | 27% |
+| `created_at`, `amount_cents` | 57%, 28% | 52%, 27% | 52%, 27% | 52%, 27% |
+
+Leaves: `orders` 958 (v54), 914, 863, 842; `sentinels` 641, 574, 503, 442; `events` 328, 297, 286,
+286. K = 8 and K = 16 differ only on columns with between about 8 and 16 strays a leaf. Since a leaf
+holds 200–700 rows, K = 16 covers a stray rate of roughly 2.5–7%, and K = 8 half that; compression
+raises the rows a leaf holds and with them the strays it sees.
+
+**Time** (pinned to one CPU; key order medians of three runs, shuffled one run):
+
+| | v53 | v54 | K = 8 | K = 16 |
+|---|---|---|---|---|
+| Load, key order (`orders` / `sentinels` / `events`) | 2.12 / 1.75 / 0.96 s | 2.02 / 1.78 / 0.99 | 2.02 / 1.83 / 1.02 | 2.03 / 1.84 / 1.06 |
+| Load, shuffled | 14.9 / 5.9 / 4.9 s | 15.5 / 6.2 / 5.3 | 19.4 / 12.2 / 7.2 | 16.3 / 12.7 / 7.1 |
+| Touch + rollback, full leaf (`orders` / `events`) | 107 / 160 µs | 114 / 166 | 102 / 213 | 111 / 246 |
+| Touch + rollback, leaf with room (`orders` / `events`) | 80 / 211 µs | 57 / 45 | 33 / 39 | 30 / 34 |
+| Full scan of the measured columns | within ±4% of v53 at every K | | | |
+
+The 23-benchmark set (alternating three rounds pinned to one CPU, medians of p50) is within its
+run-to-run spread for both K against v54: the largest deviations, `index_range` +9% and
+`update_untouched_large_rollback` +6.5% under K = 16, sit inside spreads of 1.16 and 1.12. Its
+generated datasets come out byte-identical in all three modes (no column there gains from PFOR), so
+it measures only the reader's mask test and the write path's facts.
+
+**The cap is a cliff.** A column at its K-th exception falls back to kind 1 or plain on the next stray:
+one insert adds up to N × w bytes (about 1.5 KB for a 375-row date column). The leaf overflows, evens
+out with a sibling, and soon does again. Shuffled inserts into `sentinels`, whose columns sweep the
+stray rate through the cap, evened leaves out 6,512 times at K = 16 against v53's 840 in a 60,000-row load,
+which is the 2× shuffled load time above. v53 has the same cliff at the first stray and v54 at the
+second; the cap moves it to the (K+1)-th, so more columns sit near one. The remaining cost of
+splitting a full leaf (`events` +34% at K = 8, +54% at K = 16, against v53) is the running facts of
+every prefix and suffix. Uncapped PFOR has no cliff (each further exception costs `w + 2`) but, as §9
+measured, not cheap facts.
+
+**Reading of the evidence.** K = 16 is never larger than K = 8, gains substantially only on
+sentinel-like columns with 2–7% strays, and costs a little more on full-leaf splits; neither moves any
+benchmark. Random-order inserts into columns near the cap cost up to 2× in load time under either.
+
+### 9.2 Landed: kind 6 with up to 16 exceptions, format v54 (2026-11-14)
+
+**Decision: K = 16** (maintainer, on §9.1). Kind 6 is redefined in place, since v54 was not
+published: `base | bw | E (u8, 1–16) | E rows (u16, ascending) | E bodies | N offsets`, the layout
+of least size `(E + 1)·(w + 2) + N·bw` over widths narrower than kind 1's and bases among the present
+values, the narrower width and then the lower base on a tie, taken when it saves more than kind 1
+(format.md *Leaf node*). Its size is a function of the column's 17 smallest and 17 largest values, and
+the split scan's monotonicity argument is restated for it (format.md *Leaf split*). The one-exception
+code is gone from every core.
+
+**What landed.** The Ruby reference (`verify.rb`, encoder and decoder) and the Go, Rust and TypeScript
+cores. Each core keeps a column's kind 6 size facts as its 17 smallest and 17 largest values with the
+per-width least exception count cached, rejects a value outside them with two compares, feeds the
+split scan from one running accumulator each way, and reads in place behind a 64-bit bucket mask of
+exception rows. `multiway_split.jed` had to be rebuilt: forcing a three-way split now needs 17 distant
+values in a half, so each edited leaf holds 16 in `v` before the edited row and 16 in `x` after it,
+and 32 stored values beside enough rows need 512-byte pages; table `b` was re-tuned for them
+(format.md fixture table). Every golden is regenerated by the reference and matched byte for byte by each core.
+
+
+**Verified and measured.** `mise run ci` passes (new goldens, `conformance:all --checked`, `sim:regress`,
+`sim:sweep 1..8`, the process and e2e suites). Against the one-exception v54 build, alternating three
+rounds pinned to one CPU over the 23-benchmark set (medians of p50; the bench datasets are byte-identical
+under both, since none of their columns has outliers worth storing whole): Rust is within ±4% on every
+benchmark; Go is within each benchmark's run-to-run spread but leans slower on a few
+(`int_array_unnest_scan` +9% at spread 1.16, `index_range_nonselective` +6% at 1.15,
+`update_untouched_large_rollback` +6% at 1.11, `insert_rollback` +6% at 1.19). The update benchmark keeps
+the v54 gain: 0.0099 ms in Go and 0.0081 ms in Rust, against 0.039 and 0.035 ms before v54. TypeScript
+was not measured against the one-exception build, whose TS core was not kept.

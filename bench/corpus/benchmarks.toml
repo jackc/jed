@@ -2455,6 +2455,47 @@ min = 1
 max = 500
 
 [[bench]]
+name = "int_array_unnest_scan"
+description = "Full scan unnesting every bigint[] value of the 200k-row GIN dataset: each array is read and decoded (a packed typed-array region, leaf-structural.md §11)"
+dataset = "gin"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT count(*), max(t) FROM docs, unnest(tags) AS u(t)"
+warmup = 1
+iterations = 10
+seed = 4241
+expect_rows_per_iter = 1
+
+[[bench]]
+name = "int_array_cardinality_scan"
+description = "Full scan summing cardinality(tags) over the 200k-row bigint[] column: every array value read, no index"
+dataset = "gin"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT sum(cardinality(tags)) FROM docs"
+warmup = 3
+iterations = 30
+seed = 4242
+expect_rows_per_iter = 1
+
+[[bench]]
+name = "int_array_point_read"
+description = "PK point read returning one bigint[] value: one array of a resident packed leaf decoded per read"
+dataset = "gin"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT array_to_string(tags, ',') FROM docs WHERE id = $1"
+warmup = 2000
+iterations = 20000
+seed = 4243
+expect_rows_per_iter = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 200000
+
+[[bench]]
 name = "gin_overlaps"
 description = "GIN && (overlaps): rows whose tags array shares ANY query term — a two-posting-list union over a 200k-row bigint[] column (a few thousand rows per query)"
 dataset = "gin"

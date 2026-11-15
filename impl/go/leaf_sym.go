@@ -905,7 +905,87 @@ type lazyRegion struct {
 	// col marks a region coded with its column's table (regionSymCol): tab is that table and the
 	// region holds none.
 	col bool
+	// mat is a symbol-table region rebuilt in plain form, on first use (a held prototype).
 	mat atomic.Pointer[plainRegion]
+	// arrStart, for a typed-array region, is the element index at which row 16·k's elements start,
+	// for each k: built at the parse, so a row's array is decoded alone (arrSpan) and nothing else is
+	// rebuilt.
+	arrStart []uint32
+}
+
+// arrIndexRows is how many rows one arrStart entry covers.
+const arrIndexRows = 16
+
+// buildArrIndex fills arrStart from the counts (checkArrRegion has validated the region).
+func (r *lazyRegion) buildArrIndex() {
+	r.arrStart = make([]uint32, (r.n+arrIndexRows-1)/arrIndexRows)
+	total := uint32(0)
+	for i, c := range r.raw[:r.n] {
+		if i%arrIndexRows == 0 {
+			r.arrStart[i/arrIndexRows] = total
+		}
+		if c != 255 {
+			total += uint32(c)
+		}
+	}
+}
+
+// arrElems locates row i's elements: the element width, base, bit width, packed data and the bit at
+// which the row's first element starts.
+func (r *lazyRegion) arrElems(i int) (w int, base uint64, bw int, data []byte, bit int) {
+	counts := r.raw[:r.n]
+	w = arrElemWidthOf(r.ty)
+	base = beUint(r.raw[r.n : r.n+w])
+	bw = int(r.raw[r.n+w])
+	data = r.raw[r.n+w+1:]
+	k := i / arrIndexRows
+	start := int(r.arrStart[k])
+	for _, cj := range counts[k*arrIndexRows : i] {
+		if cj != 255 {
+			start += int(cj)
+		}
+	}
+	return w, base, bw, data, start * bw
+}
+
+// arrValue is row i's present value of a typed-array region, constructed straight from its packed
+// elements (the value arrSpan's bytes decode to). The row must not be NULL.
+func (r *lazyRegion) arrValue(i int) Value {
+	c := int(r.raw[i])
+	if c == 0 {
+		return arrayValueOf(emptyArray())
+	}
+	w, base, bw, data, bit := r.arrElems(i)
+	half := uint64(1) << (8*w - 1)
+	elems := make([]Value, c)
+	for e := range elems {
+		elems[e] = IntValue(int64(base + getBits(data, bit, bw) - half))
+		bit += bw
+	}
+	return arrayValueOf(&ArrayVal{Dims: []int{c}, Lbounds: []int32{1}, Elements: elems})
+}
+
+// arrSpan is row i's value of a typed-array region in its plain tagged form (as decodeArr writes it),
+// decoded alone into a fresh buffer the caller owns: nothing for NULL, the empty array, or the
+// one-dimensional array of its elements.
+func (r *lazyRegion) arrSpan(i int) []byte {
+	c := r.raw[i]
+	switch c {
+	case 255:
+		return nil
+	case 0:
+		return []byte{0x00, 0, 0}
+	}
+	w, base, bw, data, bit := r.arrElems(i)
+	out := make([]byte, 11+int(c)*w)
+	out[0], out[1], out[2] = 0x00, 1, 0
+	binary.BigEndian.PutUint32(out[3:], uint32(c))
+	binary.BigEndian.PutUint32(out[7:], 1)
+	for e := 0; e < int(c); e++ {
+		putBEUint(out[11+e*w:11+(e+1)*w], base+getBits(data, bit, bw))
+		bit += bw
+	}
+	return out
 }
 
 // plainRegion is a rebuilt region: N u32 end offsets and the spans.
@@ -954,7 +1034,9 @@ func (r *lazyRegion) plain() *plainRegion {
 	if r.kind == regionSym {
 		m.ends, m.body, m.err = r.decodeSym()
 	} else {
+		// A typed-array region is read a value at a time (arrSpan); a whole rebuild is never kept.
 		m.ends, m.body, m.err = r.decodeArr()
+		return m
 	}
 	if r.mat.CompareAndSwap(nil, m) {
 		return m
@@ -1113,6 +1195,25 @@ func arrElemWidthOf(ty colType) int {
 
 // getBits reads bw bits at bit offset at, MSB-first.
 func getBits(b []byte, at, bw int) uint64 {
+	if bw == 0 {
+		return 0
+	}
+	if bw <= 56 {
+		// One big-endian load of the (up to) eight bytes that hold the field.
+		p := at / 8
+		var x uint64
+		if p+8 <= len(b) {
+			x = binary.BigEndian.Uint64(b[p:])
+		} else {
+			for k := 0; k < 8; k++ {
+				x <<= 8
+				if p+k < len(b) {
+					x |= uint64(b[p+k])
+				}
+			}
+		}
+		return (x << (at % 8)) >> (64 - bw)
+	}
 	var v uint64
 	for i := 0; i < bw; i++ {
 		p := at + i
@@ -1138,6 +1239,15 @@ func packedItemSaving(shape leafShape, l *paxLeaf, n int) int {
 	total := 0
 	for j, c := range shape.itemCols {
 		r := &l.regions[c]
+		if r.lazy != nil && r.lazy.kind == regionArr {
+			plain := 1 + l.dw*n
+			ew := arrElemWidthOf(r.lazy.ty)
+			for _, count := range r.lazy.raw[:n] {
+				plain += arrSpanLen(count, ew)
+			}
+			total += plain - r.stored
+			continue
+		}
 		if r.lazy != nil {
 			m := r.lazy.plain()
 			if m.err != nil {
@@ -1152,7 +1262,7 @@ func packedItemSaving(shape leafShape, l *paxLeaf, n int) int {
 		var acc dictAcc
 		header := inlineHeaderLen(shape.colTypes[c])
 		for i := 0; i < n; i++ {
-			span, err := l.value(c, i)
+			span, err := l.value(c, i, nil)
 			if err != nil {
 				return 0
 			}
@@ -1216,7 +1326,7 @@ func (l *paxLeaf) chainSpan(c, i int) (span []byte, skip bool, err error) {
 	if l.isNull(c, i) {
 		return nil, true, nil
 	}
-	span, err = l.value(c, i)
+	span, err = l.value(c, i, nil)
 	return span, false, err
 }
 
@@ -1225,6 +1335,14 @@ func (l *paxLeaf) chainSpan(c, i int) (span []byte, skip bool, err error) {
 func (u *Unfetched) bodyErr() ([]byte, error) {
 	if u.lazy == nil {
 		return u.Comp, nil
+	}
+	if u.lazy.kind == regionArr {
+		// Decoded alone, each time: the leaf keeps no rebuilt region.
+		span := u.lazy.arrSpan(u.lazyIdx)
+		if len(span) < 1 {
+			return nil, newError(DataCorrupted, "PAX leaf value offset out of range")
+		}
+		return span[1:], nil
 	}
 	m := u.lazy.plain()
 	if m.err != nil {

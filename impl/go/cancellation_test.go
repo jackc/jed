@@ -332,7 +332,7 @@ func TestCancellationBatchCheckpoints(t *testing.T) {
 			defer r.Close()
 			paging := db.core.storage.paging
 			oldPool := paging.pool
-			paging.pool = newBufferPool(oldPool.capacity)
+			paging.pool = newBufferPool(oldPool.capacity())
 			store := &cancelOnReadStore{blockStore: paging.pgr.store, done: done}
 			paging.pgr.store = store
 			defer func() { paging.pgr.store, paging.pool = store.blockStore, oldPool }()

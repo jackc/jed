@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::leaf_pfor::PforAcc;
 use super::{
     Cap, ColType, Disp, ScalarType, Unfetched, Value, all_inline_size, fixed_value_width,
     never_inline, plan_dispositions, planning_payload,
@@ -30,6 +31,7 @@ pub(crate) const TAG_INLINE_BARE: u8 = 0x05;
 
 /// Region kind 1: base plus offsets.
 pub(crate) const REGION_FOR: u8 = 1;
+// Region kind 6, base plus offsets with exceptions, is leaf_pfor.rs's `REGION_PFOR`.
 /// Region kind 2: dictionary.
 pub(crate) const REGION_DICT: u8 = 2;
 /// Region kind 4: packed integer arrays. (Kinds 3 and 5 are reserved.)
@@ -275,6 +277,7 @@ pub(crate) struct ForRange {
 }
 
 impl ForRange {
+    #[inline]
     pub(crate) fn add(&mut self, v: u64) {
         if !self.any {
             *self = ForRange {
@@ -286,6 +289,34 @@ impl ForRange {
         }
         self.lo = self.lo.min(v);
         self.hi = self.hi.max(v);
+    }
+}
+
+/// A base-plus-offsets column's size facts: the span of its present values (kind 1) and its kind 6
+/// facts (leaf_pfor.rs).
+#[derive(Clone, Default, Debug)]
+pub(crate) struct ForFacts {
+    pub(crate) r: ForRange,
+    pub(crate) pf: PforAcc,
+}
+
+impl ForFacts {
+    #[inline]
+    pub(crate) fn add(&mut self, v: u64) {
+        self.r.add(v);
+        self.pf.add(v);
+    }
+
+    /// Take out present value `s`: `true` when what the facts record may have changed, so the
+    /// column must be measured again.
+    pub(crate) fn remove(&mut self, s: u64) -> bool {
+        self.pf.remove(s) || s == self.r.lo || s == self.r.hi
+    }
+
+    /// The bytes the column's best base-plus-offsets region saves in a leaf of `n` records: kind 1
+    /// or kind 6, whichever saves more; 0 when the plain region is no larger.
+    pub(crate) fn saving(&mut self, n: usize, w: usize) -> usize {
+        for_kind1_saving(n, w, self.r).max(self.pf.saving(n, w))
     }
 }
 
@@ -307,9 +338,8 @@ pub(crate) fn for_width(w: usize, r: ForRange) -> usize {
     bw.min(w)
 }
 
-/// The bytes a base-plus-offsets region saves in a leaf of `n` records; 0 when the plain region is
-/// no larger.
-pub(crate) fn for_saving(n: usize, w: usize, r: ForRange) -> usize {
+/// The bytes a kind 1 region saves over the plain region (0 when it does not).
+pub(crate) fn for_kind1_saving(n: usize, w: usize, r: ForRange) -> usize {
     (n * (w - for_width(w, r))).saturating_sub(w + 1)
 }
 
@@ -569,6 +599,17 @@ pub(crate) fn arr_saving(n: usize, w: usize, a: &ArrAcc) -> usize {
 
 /// Read `bw` bits at bit offset `at`, MSB-first.
 pub(crate) fn get_bits(b: &[u8], at: usize, bw: usize) -> u64 {
+    if bw == 0 {
+        return 0;
+    }
+    if bw <= 56 {
+        // One big-endian load of the (up to) eight bytes that hold the field.
+        let p = at / 8;
+        let mut w = [0u8; 8];
+        let end = (p + 8).min(b.len());
+        w[..end - p].copy_from_slice(&b[p..end]);
+        return (u64::from_be_bytes(w) << (at % 8)) >> (64 - bw);
+    }
     let mut v = 0u64;
     for p in at..at + bw {
         v = v << 1 | (b[p / 8] >> (7 - p % 8) & 1) as u64;
@@ -697,17 +738,19 @@ pub(super) fn row_items<'a>(
 
 /// The content-dependent size facts of a dirty leaf, kept with the node so an insert,
 /// delete or row replacement updates them for one row instead of measuring the leaf again: each
-/// base-plus-offsets column's value span and each item column's dictionary or packed-array facts.
+/// base-plus-offsets column's value span and kind 6 facts, and each item column's dictionary or
+/// packed-array facts.
 /// [`add_row`](Self::add_row) and [`remove_row`](Self::remove_row) keep them equal to a fresh
 /// measurement of the node's rows.
 #[derive(Clone)]
 pub(crate) struct LeafSizes {
     pub(super) n: usize,
-    pub(super) fors: Vec<ForRange>,
+    pub(super) fors: Vec<ForFacts>,
     /// Each base-plus-offsets column's present values.
     pub(super) for_cnt: Vec<usize>,
-    /// A column whose range lost a value at one of its ends: `fors` then only contains the true
-    /// range, until [`refresh`](Self::refresh) rescans the column. `stale` says any column is.
+    /// A column that lost a value its facts may depend on (an end of its span, or one of the
+    /// smallest or largest values kind 6 keeps): `fors` then no longer describes the column,
+    /// until [`refresh`](Self::refresh) rescans it. `stale` says any column is.
     pub(super) for_stale: Vec<bool>,
     pub(super) stale: bool,
     pub(super) accs: Vec<ColAcc<'static>>,
@@ -747,7 +790,7 @@ impl LeafSizes {
         let (fors, items) = (shape.for_cols.len(), shape.item_cols.len());
         LeafSizes {
             n: 0,
-            fors: vec![ForRange::default(); fors],
+            fors: vec![ForFacts::default(); fors],
             for_cnt: vec![0; fors],
             for_stale: vec![false; fors],
             stale: false,
@@ -845,11 +888,11 @@ impl LeafSizes {
             }
             self.for_cnt[j] -= 1;
             if self.for_cnt[j] == 0 {
-                self.fors[j] = ForRange::default();
+                self.fors[j] = ForFacts::default();
                 self.for_stale[j] = false;
             } else {
                 let s = for_slot(&shape.col_types[fc.col], fc.w, v);
-                if s == self.fors[j].lo || s == self.fors[j].hi {
+                if self.fors[j].remove(s) {
                     self.for_stale[j] = true;
                     self.stale = true;
                 }
@@ -873,7 +916,7 @@ impl LeafSizes {
                 continue;
             }
             let ty = &shape.col_types[fc.col];
-            let mut r = ForRange::default();
+            let mut r = ForFacts::default();
             for i in 0..self.n {
                 let v = &row(i)[fc.col];
                 if !matches!(v, Value::Null) {
@@ -893,26 +936,29 @@ impl LeafSizes {
 
     /// The bytes the leaf's content-dependent regions save. While a column's range is stale the
     /// result is an upper bound: the column is taken at its narrowest offsets.
-    pub(crate) fn saving(&self, shape: &LeafShape) -> usize {
+    ///
+    /// A query may fill the kind 6 facts' cache, so it takes the facts mutably.
+    pub(crate) fn saving(&mut self, shape: &LeafShape) -> usize {
+        // A stale column is taken at kind 1's narrowest offsets, which no kind 6 layout beats.
         const NARROWEST: ForRange = ForRange {
             lo: 0,
             hi: 0,
             any: true,
         };
+        let n = self.n;
         let fors: usize = shape
             .for_cols
             .iter()
+            .zip(self.fors.iter_mut())
             .enumerate()
-            .map(|(j, fc)| {
+            .map(|(j, (fc, f))| {
                 if self.for_frozen[j] {
-                    return self.for_save[j];
-                }
-                let r = if self.for_stale[j] {
-                    NARROWEST
+                    self.for_save[j]
+                } else if self.for_stale[j] {
+                    for_kind1_saving(n, fc.w, NARROWEST)
                 } else {
-                    self.fors[j]
-                };
-                for_saving(self.n, fc.w, r)
+                    f.saving(n, fc.w)
+                }
             })
             .sum();
         let items: usize = self
@@ -960,6 +1006,10 @@ pub(crate) struct SplitFacts<'a, 'k> {
     /// `fors[j][m]`: column `j`'s span over records `[0, m)` (`pre`) or `[m, N)` (`suf`).
     for_pre: Vec<Vec<ForRange>>,
     for_suf: Vec<Vec<ForRange>>,
+    /// `pf_pre[j][m]` / `pf_suf[j][m]`: column `j`'s kind 6 saving over the same records, from one
+    /// running accumulator each way (the spans carry no kind 6 facts).
+    pf_pre: Vec<Vec<usize>>,
+    pf_suf: Vec<Vec<usize>>,
     item_pre: Vec<Vec<ColFacts>>,
     item_suf: Vec<Vec<ColFacts>>,
 }
@@ -974,6 +1024,8 @@ impl<'a, 'k> SplitFacts<'a, 'k> {
     ) -> SplitFacts<'a, 'k> {
         let mut for_pre = Vec::with_capacity(shape.for_cols.len());
         let mut for_suf = Vec::with_capacity(shape.for_cols.len());
+        let mut pf_pre = Vec::with_capacity(shape.for_cols.len());
+        let mut pf_suf = Vec::with_capacity(shape.for_cols.len());
         for fc in &shape.for_cols {
             let ty = &shape.col_types[fc.col];
             let slots: Vec<Option<u64>> = (0..n)
@@ -983,21 +1035,31 @@ impl<'a, 'k> SplitFacts<'a, 'k> {
                 })
                 .collect();
             let mut pre = vec![ForRange::default(); n + 1];
+            let mut pf = vec![0; n + 1];
+            let mut acc = PforAcc::default();
             for i in 0..n {
                 pre[i + 1] = pre[i];
                 if let Some(s) = slots[i] {
                     pre[i + 1].add(s);
+                    acc.add(s);
                 }
+                pf[i + 1] = acc.saving(i + 1, fc.w);
             }
+            for_pre.push(pre);
+            pf_pre.push(pf);
             let mut suf = vec![ForRange::default(); n + 1];
+            let mut pf = vec![0; n + 1];
+            let mut acc = PforAcc::default();
             for i in (0..n).rev() {
                 suf[i] = suf[i + 1];
                 if let Some(s) = slots[i] {
                     suf[i].add(s);
+                    acc.add(s);
                 }
+                pf[i] = acc.saving(n - i, fc.w);
             }
-            for_pre.push(pre);
             for_suf.push(suf);
+            pf_suf.push(pf);
         }
         let mut item_pre = Vec::with_capacity(shape.item_cols.len());
         let mut item_suf = Vec::with_capacity(shape.item_cols.len());
@@ -1032,6 +1094,8 @@ impl<'a, 'k> SplitFacts<'a, 'k> {
             key,
             for_pre,
             for_suf,
+            pf_pre,
+            pf_suf,
             item_pre,
             item_suf,
         }
@@ -1042,13 +1106,14 @@ impl<'a, 'k> SplitFacts<'a, 'k> {
         count: usize,
         at: usize,
         fors: &[Vec<ForRange>],
+        pfs: &[Vec<usize>],
         items: &[Vec<ColFacts>],
     ) -> usize {
         let f: usize = shape
             .for_cols
             .iter()
-            .zip(fors)
-            .map(|(fc, spans)| for_saving(count, fc.w, spans[at]))
+            .zip(fors.iter().zip(pfs))
+            .map(|(fc, (spans, pf))| for_kind1_saving(count, fc.w, spans[at]).max(pf[at]))
             .sum();
         let i: usize = shape
             .item_cols
@@ -1062,13 +1127,20 @@ impl<'a, 'k> SplitFacts<'a, 'k> {
     /// The saving of a left half holding records `[0, m)`.
     pub(crate) fn left(&self, shape: &LeafShape, m: usize) -> usize {
         leaf_prefix_saving(m, (self.key)(0), (self.key)(m - 1))
-            + Self::regions(shape, m, m, &self.for_pre, &self.item_pre)
+            + Self::regions(shape, m, m, &self.for_pre, &self.pf_pre, &self.item_pre)
     }
 
     /// The saving of a right half holding records `[m, N)`.
     pub(crate) fn right(&self, shape: &LeafShape, m: usize) -> usize {
         leaf_prefix_saving(self.n - m, (self.key)(m), (self.key)(self.n - 1))
-            + Self::regions(shape, self.n - m, m, &self.for_suf, &self.item_suf)
+            + Self::regions(
+                shape,
+                self.n - m,
+                m,
+                &self.for_suf,
+                &self.pf_suf,
+                &self.item_suf,
+            )
     }
 }
 
@@ -1339,7 +1411,7 @@ impl<'a> LeafScan<'a> {
             return SplitPass::Found(None);
         };
         let mut run = RunningFacts::new(shape);
-        let right = |run: &RunningFacts, m: usize| {
+        let right = |run: &mut RunningFacts, m: usize| {
             total - prefix[m] + leaf_overhead(n - m, shape)
                 - leaf_prefix_saving(n - m, key(m), key(n - 1))
                 - run.saving(shape, n - m)
@@ -1354,7 +1426,7 @@ impl<'a> LeafScan<'a> {
             for i in (m..n).rev() {
                 run.add(self, shape, row(i), i, false);
             }
-            if right(&run, m) <= cap_bytes {
+            if right(&mut run, m) <= cap_bytes {
                 return SplitPass::Found(Some(m));
             }
             return SplitPass::Full;
@@ -1362,7 +1434,7 @@ impl<'a> LeafScan<'a> {
         let mut m_min = None;
         for m in (1..n).rev() {
             run.add(self, shape, row(m), m, false);
-            if right(&run, m) > cap_bytes {
+            if right(&mut run, m) > cap_bytes {
                 break;
             }
             m_min = Some(m);
@@ -1390,7 +1462,7 @@ enum SplitPass {
 
 /// The content facts of a half that grows by one record at a time ([`LeafScan::split_point`]).
 struct RunningFacts {
-    fors: Vec<ForRange>,
+    fors: Vec<ForFacts>,
     facts: Vec<ColFacts>,
     /// Per item column: the half holds a NULL.
     nulls: Vec<bool>,
@@ -1399,7 +1471,7 @@ struct RunningFacts {
 impl RunningFacts {
     fn new(shape: &LeafShape) -> RunningFacts {
         RunningFacts {
-            fors: vec![ForRange::default(); shape.for_cols.len()],
+            fors: vec![ForFacts::default(); shape.for_cols.len()],
             facts: vec![ColFacts::default(); shape.item_cols.len()],
             nulls: vec![false; shape.item_cols.len()],
         }
@@ -1454,12 +1526,12 @@ impl RunningFacts {
     }
 
     /// The bytes the half's regions save, at `count` records.
-    fn saving(&self, shape: &LeafShape, count: usize) -> usize {
+    fn saving(&mut self, shape: &LeafShape, count: usize) -> usize {
         let fors: usize = shape
             .for_cols
             .iter()
-            .zip(&self.fors)
-            .map(|(fc, &r)| for_saving(count, fc.w, r))
+            .zip(self.fors.iter_mut())
+            .map(|(fc, f)| f.saving(count, fc.w))
             .sum();
         let items: usize = shape
             .item_cols

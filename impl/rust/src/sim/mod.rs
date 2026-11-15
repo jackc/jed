@@ -28,7 +28,7 @@ use crate::executor::Engine;
 use crate::file::{DatabaseOptions, Locking, OpenOptions};
 use crate::format::{sim_free_list, sim_meta_of};
 use crate::pager::Pager;
-use crate::paging::{DEFAULT_CACHE_BYTES, cache_leaves};
+use crate::paging::{DEFAULT_CACHE_BYTES, cache_budget};
 use crate::seam::{ClockSource, RandomSource, SeededRandom, seeded_random_source};
 use crate::shared::{AttachSource, Database, Session};
 use disk::{
@@ -1480,12 +1480,8 @@ impl<'a> Runner<'a> {
             self.cache_bytes as usize
         };
         let page_size = pager.page_size();
-        let mut engine = Engine::open_paged(
-            pager,
-            cache_leaves(cache, page_size),
-            env,
-            self.credential("main"),
-        )?;
+        let mut engine =
+            Engine::open_paged(pager, cache_budget(cache), env, self.credential("main"))?;
         // The path marks the engine durable; the simulated filesystem is its only storage.
         engine.path = Some(PathBuf::from(MAIN_FILE));
         // A writable open finishes a credential change a crash interrupted (encrypted.md §5).
@@ -3198,7 +3194,7 @@ impl<'a> Runner<'a> {
             let ps = pager.page_size();
             Engine::open_paged(
                 pager,
-                cache_leaves(DEFAULT_CACHE_BYTES, ps),
+                cache_budget(DEFAULT_CACHE_BYTES),
                 &self.proc_env(),
                 self.credential("main"),
             )

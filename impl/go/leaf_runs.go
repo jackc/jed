@@ -219,7 +219,7 @@ func (a *runsAcc) runs() (starts []int, widths []int) {
 
 // newRunsRange is a forRange that also keeps runs, for a column of width w, in runs mode.
 func newRunsRange(w int) forRange {
-	var r forRange
+	r := forRange{pf: newPforAcc()} // PROTOTYPE (leaf_pfor.go)
 	if leafRuns == leafRunsOff && leafBlocks == 0 {
 		return r
 	}

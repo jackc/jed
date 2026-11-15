@@ -34,6 +34,7 @@
 //! merge subsumes it; an interior merge whose result cannot 2-way split is **abandoned**,
 //! format.md "Delete").
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -525,11 +526,30 @@ impl Node {
         }
     }
 
-    /// Key `i` as a borrowed span. Packed leaves return a view into the retained page block.
-    pub(crate) fn key_at(&self, i: usize) -> &[u8] {
+    /// Key `i`: a borrowed span (a Packed leaf's into its retained page block), or a key built for
+    /// the caller when the page stores a shared prefix — the leaf keeps no rebuilt keys. A reader
+    /// that only compares uses [`cmp_key_at`](Self::cmp_key_at); one that only borrows each key in
+    /// turn uses [`key_into`](Self::key_into).
+    pub(crate) fn key_at(&self, i: usize) -> Cow<'_, [u8]> {
+        match self.stored(i) {
+            None => Cow::Borrowed(&self.keys[i]),
+            Some((p, at)) => p.key(at),
+        }
+    }
+
+    /// Key `i` as a span: borrowed, or — under a shared prefix — built into `buf`.
+    pub(crate) fn key_into<'a>(&'a self, i: usize, buf: &'a mut Vec<u8>) -> &'a [u8] {
         match self.stored(i) {
             None => &self.keys[i],
-            Some((p, at)) => p.key(at),
+            Some((p, at)) => p.key_into(at, buf),
+        }
+    }
+
+    /// `key_at(i).cmp(probe)` without building a prefixed leaf's key.
+    pub(crate) fn cmp_key_at(&self, i: usize, probe: &[u8]) -> std::cmp::Ordering {
+        match self.stored(i) {
+            None => self.keys[i].as_slice().cmp(probe),
+            Some((p, at)) => p.cmp_key(at, probe),
         }
     }
 
@@ -597,7 +617,7 @@ impl Node {
         if n == 0 {
             return 0;
         }
-        let prefix = leaf_prefix_saving(n, self.key_at(0), self.key_at(n - 1));
+        let prefix = leaf_prefix_saving(n, &self.key_at(0), &self.key_at(n - 1));
         if !shape.content_cols() {
             return prefix;
         }
@@ -606,7 +626,7 @@ impl Node {
         }
         let mut sizes = self.sizes_lock();
         if sizes.as_ref().is_none_or(|sz| sz.len() != n) {
-            let measured =
+            let mut measured =
                 LeafSizes::measure(shape, cap, n, &|i| &self.keys[i], &|i| &self.vals[i]);
             if self.page.load(Ordering::Relaxed) != 0 {
                 return prefix + measured.saving(shape);
@@ -652,8 +672,9 @@ impl Node {
         #[cfg(test)]
         if leaf_sizes_check::on() {
             let rows = self.decoded_rows().expect("a lazy leaf's rows decode");
+            let keys: Vec<Cow<'_, [u8]>> = (0..n).map(|i| self.key_at(i)).collect();
             let fresh =
-                LeafSizes::measure(shape, cap, n, &|i| self.key_at(i), &|i| &rows[i]).saving(shape);
+                LeafSizes::measure(shape, cap, n, &|i| &keys[i], &|i| &rows[i]).saving(shape);
             assert_eq!(
                 regions,
                 fresh,
@@ -688,10 +709,10 @@ impl Node {
                 // A stale range overstates the saving: when even that leaves the leaf at or above
                 // the limit, the columns need no rescan.
                 let n = self.keys.len();
-                let upper = match self.sizes_lock().as_deref() {
+                let upper = match self.sizes_lock().as_deref_mut() {
                     Some(sz) if sz.stale() && sz.len() == n && n > 0 => Some(
                         sz.saving(shape)
-                            + leaf_prefix_saving(n, self.key_at(0), self.key_at(n - 1)),
+                            + leaf_prefix_saving(n, &self.key_at(0), &self.key_at(n - 1)),
                     ),
                     _ => None,
                 };
@@ -717,7 +738,7 @@ impl Node {
         let mut hi = self.len();
         while lo < hi {
             let mid = (lo + hi) / 2;
-            match self.key_at(mid).cmp(key) {
+            match self.cmp_key_at(mid, key) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal => return Ok(mid),
@@ -742,6 +763,15 @@ impl Node {
         match self.stored(i) {
             None => Ok(self.vals[i].clone()),
             Some((p, at)) => p.row(at),
+        }
+    }
+
+    /// [`row_at`](Self::row_at) reading only the columns `mask` touches from a page; the others are
+    /// NULL ([`PackedLeaf::row_masked`]). A Decoded leaf clones its row.
+    pub(crate) fn row_at_masked(&self, i: usize, mask: &[bool]) -> Result<Row> {
+        match self.stored(i) {
+            None => Ok(self.vals[i].clone()),
+            Some((p, at)) => p.row_masked(at, mask),
         }
     }
 
@@ -795,7 +825,7 @@ impl Node {
     /// The stored bytes of column `c` of row `i`, borrowed from a Packed leaf's page (Track A4):
     /// `Some(None)` for NULL, `Some(Some(span))` for the tagged codec bytes. `None` on a Decoded leaf,
     /// which holds values rather than stored bytes.
-    pub(crate) fn col_span(&self, i: usize, c: usize) -> Option<Option<&[u8]>> {
+    pub(crate) fn col_span(&self, i: usize, c: usize) -> Option<Option<Cow<'_, [u8]>>> {
         self.stored(i).map(|(p, at)| p.value_span(c, at))
     }
 
@@ -813,7 +843,7 @@ impl Node {
         let col_types: &[ColType] = &shape.col_types;
         match self.stored(i) {
             None => {
-                crate::format::record_scan_units(shape, self.key_at(i), &self.vals[i], cap, mask)
+                crate::format::record_scan_units(shape, &self.key_at(i), &self.vals[i], cap, mask)
             }
             Some((p, i)) => {
                 let mut units = crate::format::ScanUnits {
@@ -1498,7 +1528,7 @@ fn leaf_split_point<'a>(
     let facts = SplitFacts::new(shape, cap, n, key, row);
     // Both stay monotone in `m`: a record added to a half adds at least its stored bytes, the
     // half's key prefix can only shorten, an offset width only widen, and a region's size is the
-    // smaller of nondecreasing sizes.
+    // smallest of nondecreasing sizes (for kind 6 too: format.md "Leaf split (copy-up)").
     let leftpayload = |m: usize| prefix[m] + leaf_overhead(m, shape) - facts.left(shape, m);
     let rightpayload =
         |m: usize| (total - prefix[m]) + leaf_overhead(n - m, shape) - facts.right(shape, m);
@@ -1516,8 +1546,8 @@ fn leaf_split_point<'a>(
         "BUG: the running split point and the tabled one disagree"
     );
     if let Some(m) = tabled {
-        let halves = leaf_half_sizes(&scan, shape, row, m, n, keep, group);
-        if let Some((left, right)) = &halves {
+        let mut halves = leaf_half_sizes(&scan, shape, row, m, n, keep, group);
+        if let Some((left, right)) = &mut halves {
             assert_eq!(
                 (left.saving(shape), right.saving(shape)),
                 (fresh(0, m), fresh(m, n)),
@@ -1790,9 +1820,9 @@ impl KeyBound {
             while lo < hi {
                 let mid = (lo + hi) / 2;
                 let before = if inclusive {
-                    node.key_at(mid) < key
+                    node.cmp_key_at(mid, key).is_lt()
                 } else {
-                    node.key_at(mid) <= key
+                    node.cmp_key_at(mid, key).is_le()
                 };
                 if before {
                     lo = mid + 1;
@@ -1877,6 +1907,17 @@ impl PMap {
         key: &[u8],
         src: Option<&dyn LeafSource>,
     ) -> Result<(Option<Row>, usize, usize)> {
+        self.get_counted_masked(key, src, None)
+    }
+
+    /// [`get_counted`](Self::get_counted) reading, from a page, only the columns `mask` touches
+    /// ([`Node::row_at_masked`]); `None` reads the whole row.
+    pub(crate) fn get_counted_masked(
+        &self,
+        key: &[u8],
+        src: Option<&dyn LeafSource>,
+        mask: Option<&[bool]>,
+    ) -> Result<(Option<Row>, usize, usize)> {
         // Hold an owned `Arc` to the current node so a faulted leaf outlives the step that reads it.
         let mut cur = match &self.root {
             None => return Ok((None, 0, 0)),
@@ -1888,7 +1929,13 @@ impl PMap {
             nodes += 1;
         }
         match cur.search(key) {
-            Ok(i) => Ok((Some(cur.row_at(i)?), nodes, 1)),
+            Ok(i) => {
+                let row = match mask {
+                    None => cur.row_at(i)?,
+                    Some(mask) => cur.row_at_masked(i, mask)?,
+                };
+                Ok((Some(row), nodes, 1))
+            }
             Err(_) => Ok((None, nodes, 0)),
         }
     }
@@ -2472,7 +2519,7 @@ impl RangeCursor {
     /// cursor itself borrows nothing — see [`RangeCursor`].
     pub(crate) fn next(&mut self, src: Option<&dyn LeafSource>) -> Result<Option<(Vec<u8>, Row)>> {
         self.advance(src, |node, p| {
-            Ok((node.key_at(p).to_vec(), node.row_at(p)?))
+            Ok((node.key_at(p).into_owned(), node.row_at(p)?))
         })
     }
 
@@ -2544,7 +2591,7 @@ const LEAF_EVEN_ROOM: usize = 8;
 /// Whether writing `key` into `leaf` is a **right-edge edit** (format.md "Split point"): the written
 /// record is the leaf's last, because `key` replaces its last key or sorts after it.
 fn at_right_edge(leaf: &Node, key: &[u8]) -> bool {
-    leaf.is_leaf() && leaf.len() > 0 && key >= leaf.key_at(leaf.len() - 1)
+    leaf.is_leaf() && leaf.len() > 0 && leaf.cmp_key_at(leaf.len() - 1, key).is_le()
 }
 
 /// The two leaves and separator that replace children `j`, `j + 1` and separator `j` of a parent.
@@ -3293,7 +3340,7 @@ fn merged_leaf(
 fn collect(node: &Node, src: Option<&dyn LeafSource>, out: &mut Vec<(Vec<u8>, Row)>) -> Result<()> {
     if node.is_leaf() {
         for i in 0..node.len() {
-            out.push((node.key_at(i).to_vec(), node.row_at(i)?));
+            out.push((node.key_at(i).into_owned(), node.row_at(i)?));
         }
         return Ok(());
     }
@@ -3321,7 +3368,7 @@ fn collect_range(
     if node.is_leaf() {
         let (ef, el) = b.entry_window(node);
         for i in ef..el {
-            out.push((node.key_at(i).to_vec(), node.row_at(i)?));
+            out.push((node.key_at(i).into_owned(), node.row_at(i)?));
         }
         return Ok(());
     }
@@ -3383,8 +3430,9 @@ fn walk_range_visit(
 ) -> Result<bool> {
     if node.is_leaf() {
         let (ef, el) = b.entry_window(node);
+        let mut buf = Vec::new(); // a prefixed leaf's key, built for each visit in turn
         for i in ef..el {
-            if !node.with_row(i, |row| visit(node.key_at(i), row))? {
+            if !node.with_row(i, |row| visit(node.key_into(i, &mut buf), row))? {
                 return Ok(false);
             }
         }
@@ -3418,8 +3466,9 @@ fn walk_range_visit_rev(
 ) -> Result<bool> {
     if node.is_leaf() {
         let (ef, el) = b.entry_window(node);
+        let mut buf = Vec::new(); // a prefixed leaf's key, built for each visit in turn
         for i in (ef..el).rev() {
-            if !node.with_row(i, |row| visit(node.key_at(i), row))? {
+            if !node.with_row(i, |row| visit(node.key_into(i, &mut buf), row))? {
                 return Ok(false);
             }
         }
@@ -4152,5 +4201,16 @@ mod leaf_sizes_tests {
         }
         super::leaf_lazy::set(true);
         leaf_sizes_check::set(false);
+    }
+}
+
+/// The buffer pool charges a faulted leaf what it holds ([`PackedLeaf::held`]); the pool caches
+/// only faulted leaves, and any other node is charged a page.
+impl crate::bufferpool::Weigh for Node {
+    fn weigh(&self) -> usize {
+        match &self.packed {
+            Some(p) => p.held(),
+            None => 8 * 1024,
+        }
     }
 }

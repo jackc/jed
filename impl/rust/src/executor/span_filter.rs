@@ -283,7 +283,7 @@ impl SpanAtom<'_> {
                     return Ok(Some(false));
                 };
                 // An inline string in a leaf is its tag and its content (format.md "Leaf node").
-                let Some(payload) = crate::format::inline_string_payload(span) else {
+                let Some(payload) = crate::format::inline_string_payload(&span) else {
                     return Ok(None);
                 };
                 let width = if *text {
@@ -317,7 +317,7 @@ impl SpanAtom<'_> {
                     m.charge(*base);
                     return Ok(Some(false));
                 };
-                let Some(body) = crate::format::inline_plain_body(span) else {
+                let Some(body) = crate::format::inline_plain_body(&span) else {
                     return Ok(None);
                 };
                 let mut spans = spans.borrow_mut();

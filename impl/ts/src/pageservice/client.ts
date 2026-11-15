@@ -38,7 +38,7 @@ import {
 import { runSync } from "../execution.ts";
 import type { Environment } from "../environment.ts";
 import { Pager } from "../pager.ts";
-import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "../paging.ts";
+import { cacheBudget, DEFAULT_CACHE_BYTES, SharedPaging } from "../paging.ts";
 import { persistImpl } from "../persist.ts";
 import type { ClientReadBegun, ClientWriteBegun, PageClientHandle } from "../shared.ts";
 import { FileSpillSink } from "../spillfile.ts";
@@ -843,7 +843,7 @@ export function openPageClient(
   } else codec = runSync(unlockPagerSteps(pager, opts.credential, environment));
   const paging = new SharedPaging(
     pager,
-    cacheLeaves(opts.cacheBytes ?? DEFAULT_CACHE_BYTES, pager.pageSize),
+    cacheBudget(opts.cacheBytes ?? DEFAULT_CACHE_BYTES),
     codec,
   );
   let db: Engine;

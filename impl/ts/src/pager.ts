@@ -779,6 +779,12 @@ export class Pager {
     return this.poisoned || this.durableCommitActive;
   }
 
+  // retainsBlocks reports whether readAt hands out the store's own retained blocks (an in-memory store),
+  // which a faulted leaf then keeps as they are rather than as a trimmed copy.
+  retainsBlocks(): boolean {
+    return (this.store as { retainsBlocks?: () => boolean }).retainsBlocks?.() === true;
+  }
+
   // swapStore replaces the byte backing and returns the old one (compaction, spec/design/api.md §2.6):
   // the caller closes a file before renaming its replacement over it by swapping in a ClosedBlockStore,
   // and swaps the reopened old file back if the rename fails.

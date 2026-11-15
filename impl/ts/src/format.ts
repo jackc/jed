@@ -161,6 +161,7 @@ import {
   REGION_FOR,
   TAG_INLINE_BARE,
 } from "./leaf_compact.ts";
+import { PFOR_MAX_K, PforAcc, type PforPlan, pforStats, REGION_PFOR } from "./leaf_pfor.ts";
 import { SharedPaging } from "./paging.ts";
 import { TableStore, type Row } from "./storage.ts";
 import {
@@ -224,7 +225,7 @@ import {
   STATISTICS_TERM_ENTRIES,
 } from "./estimator_constants.ts";
 
-export const FORMAT_VERSION = 53; // 53 = narrow commit manifests, the page stamp and deferred interior pages (spec/design/manifest-crc32.md, spec/design/deferred-interior.md §9): a manifest entry is page_index u32 ‖ crc32 u32 (a plaintext page's own header checksum, an encrypted page's CRC-32 of its ciphertext) and the chain digest at meta offset 48 is a CRC-32; page header offset 2 is the low 16 bits of the writing commit's txid, checked against the commit window during manifest validation; meta offset 60 counts a (parent, slot) remap list in the manifest area's last third, which lets a commit keep an interior whose only change is a child's page, and its catalog chain; 52 = the compact leaf (spec/design/leaf-structural.md; format.md "Leaf node" / "Fan-out"): a B+tree leaf payload leads with a leaf flags byte (bit0 fixed_key, bit1 key_prefix) and every leaf directory entry is a u16; a fixed-key table tree stores a u16 key length and no key directory; a leaf stores its keys' shared prefix once when that saves bytes; the leading run of key-derivable primary-key columns has no region and no weight (rebuilt from the keys); an inline text / bytea / json value in a leaf is tag 0x05 + its bytes, with no u16 length; and a column region may be base plus offsets (kind 1: integer-like fixed-width columns), a dictionary (kind 2: text / bytea / json) or bit-packed (kind 4: i16[] / i32[] / i64[]), each exactly when that is smaller — so a leaf's payload is Σ record_size + leafOverhead − savings, which the split and merge rules measure; interior, catalog, overflow, free-list, manifest and GiST pages, every key encoding and the single-value codec are unchanged; 51 = a numeric(p,s) table column with p <= 18 is a fixed-width leaf column — a null bitmap and 2/4/8-byte slots holding the value's unscaled integer — instead of the variable-width decimal codec (ColType.fixedDec; spec/design/decimal.md §6a); the catalog is unchanged. 50 = the per-index index_flags byte gains bit5 is_constraint: set on the unique index that backs a UNIQUE constraint, clear on a bare CREATE UNIQUE INDEX (legal only with bit0 unique; spec/design/constraints.md §5.5); 49 = batched durability (spec/design/validated-cow.md §4): a commit writes the meta slot that does not hold the newest durable meta (txid & 1 under synchronous = on, one slot for a whole relaxed batch), and a pending commit's manifest also lists every body page written since that floor; no byte layout change; 48 = view follow-ons (spec/design/views.md §6/§16, format.md *Catalog*): each view output column gains a flags byte (bit0 has_default) followed, when set, by the default's canonical text (u32 len + UTF-8); dep_kind gains 2 = sequence and 3 = type, the dependency list sorted by (name bytes, kind code); a trailing view flags byte (bit0 security_barrier, bit1 security_invoker); a catalog entry longer than a page starts a fresh catalog page and spans consecutive chain pages (the first item_count 1, the rest 0, header byte 1 bit0 continued on every page of the run but the last); 47 = multi-column GIN indexes: a GIN index may list several key columns, and every entry of a multi-column GIN index is column_tag (u8, the 0-based key position) ‖ term ‖ storage key (spec/design/gin.md §4.4); a single-column GIN's entries are unchanged and the catalog bytes do not change; 46 = ordered index keys: the per-index index_flags byte gains bit4 has_key_options, and — only when set — one option byte per key element (bit0 desc, bit1 nulls_first) after the optional timezone dependencies; a DESC / NULLS FIRST key's entry slots use the encoding.md §2.16 ordered slot; an index with only default (ASC NULLS LAST) keys is byte-identical to v45 (spec/design/indexes.md §11); 45 = exclusion-constraint follow-ons (spec/design/gist.md §7.1/§7.2) — no byte layout change; the v27 has_predicate bit (and the v31/v32 dependency lists after it) is now legal on a GiST index that backs an exclusion constraint (the partial EXCLUDE … WHERE (predicate)), and an exclusion constraint may name an ordered (btree, index_kind 0, non-unique) backing index whose every element operator is = (EXCLUDE USING btree); a version-44 reader rejected both shapes as corrupt, hence the version break; 44 = a composite column may carry an expression DEFAULT — column flags bit3 (default_is_expr), with the expr-text (u16 length + UTF-8) after the type name (spec/design/composite.md §12); any other composite column flag but not_null is corrupt; no other byte layout change; 43 = timestamp(p) / interval qualifier typmods: a timestamp / timestamptz column or composite field appends u8 precision (0xFF = none, else 0..6), an interval one u8 interval_fields ‖ u8 precision (fields 0 = no qualifier, else the datetime_units.toml qualifier code) in the typmod slot (spec/design/timestamp.md §8, interval.md §6.1); no other byte layout change; 42 = GIN term statistics: a statistics summary's flags byte gains bit2 term_eligible (set exactly for a jsonb column or an array of a GIN element type), followed — only when set — after histogram_count by term_occurrences i64 ‖ untracked_term_rows i64 ‖ term_count u16, and stats_kind 3 term items (ordinal u16 ‖ rows i64 ‖ term_len u16 ‖ term bytes) follow the histogram items (spec/design/statistics.md §4.5/§7); no other byte layout change; 41 = a composite-type entry admits a range-typed field — field_type_code 17 + the one-byte range element descriptor, before the field flags byte (spec/design/composite.md §3); no other byte layout change; 40 = a foreign key's actions byte gains bit 6 match_full (MATCH FULL; 0 = MATCH SIMPLE — spec/design/constraints.md §6.3/§6.9); bit 7 stays reserved 0; no other byte layout change; 39 = every view entry gains a trailing u8 check_option (0 none, 1 LOCAL, 2 CASCADED — spec/design/views.md §15.6); no other byte layout change; 38 = views: entry_kind 5 view catalog entries emitted last in view-name byte order (spec/design/views.md §3); no other byte layout change; 37 = exact (folded) identifier names: no byte layout change; catalog names are byte-exact and name-ordered groups sort by exact-name bytes; persisted expression text renders bare words folded and quoted identifiers as "…" (spec/design/grammar.md §3); 36 = an array column entry's flags byte gains bit6 has_collation (legal only for a text element), the collation name (u16 len + UTF-8) following the element descriptor; a collated text[] key encodes each present element as its UCA sort key (spec/design/collation.md §1, encoding.md §2.14); 35 = every CHECK catalog entry gains a trailing check_flags byte (bit0 has_host_deps; bits 1-7 reserved 0) followed, when bit0 is set, by the v31 host-function dependency list (spec/design/extensibility.md §7.1.3); 34 = meta offset 56 carries the exact live page count (spec/design/memory.md §8.7); 33 = validated COW commit descriptors; 32 = timezone index dependencies (index-dependencies.md); 31 = host-function index dependencies (spec/design/extensibility.md §8.1, delivery step 4): the per-index index_flags byte gains bit2 has_host_deps, and — only when set — after the v27 predicate a u16 dep_count + per dependency name (u16 len + UTF-8) ‖ arg_count u16 ‖ arg type codes (u8 each) ‖ result type code (u8) ‖ component_id (u16 len + UTF-8) ‖ semantic_version u32, in ascending (name, arg-type codes) order. An index with no host-function key is byte-identical to v30, so a file with no such index moves to v31 only by its version byte + meta CRC. 30 = three-bit FOREIGN KEY action codes for CASCADE / SET NULL / SET DEFAULT; 29 = deterministic per-column statistics (kind 4; spec/design/statistics.md); 28 = exact table row count: each table catalog entry appends a nonnegative i64 row_count after root_data_page, with (root_data_page == 0) == (row_count == 0); on-disk format version (27 = partial-index predicates — spec/design/indexes.md §9: the per-index index_flags byte gains bit1 has_predicate, and (only when set) a u16 length + the canonical predicate text (the *Check-expression text* form) follows index_root_page; on load a partial predicate re-parses that text (XX001 on failure, like a stored CHECK) and a non-btree index with bit1 set is data_corrupted. B-tree only. A non-partial index is byte-identical to v26, so a file with no partial index moves to v27 only by its version byte + meta CRC. 26 = expression index keys — spec/design/indexes.md §1/§6: a per-index key element is a u16 column ordinal OR the 0xFFFF sentinel (never a valid ordinal, col_count ≤ 65535) + a u16 length + the expression's canonical UTF-8 text (the *Check-expression text* form, re-parsed on load — XX001 on failure, like a stored CHECK; a GIN/GiST index with a non-column key is data_corrupted). Only the index-list changes; a plain column index is byte-identical to v6, so a file with no expression index moves to v26 only by its version byte + meta CRC. 25 = on-disk free-list persistence — spec/fileformat/format.md; storage.md §6: meta offset 28 becomes free_list_head (0 = empty), and a page_type 7 free-list page persists the unconsumed free-list so open reads it directly instead of reconstructing it by walking every leaf; paired with continuous within-session reclamation. A from-scratch image (create/goldens) has an EMPTY free-list, so free_list_head = 0 and no page_type 7 page: every golden's only v25 change is its version byte + meta CRC. 24 = the B+tree reshape — spec/design/bplus-reshape.md, spec/fileformat/format.md "The per-table data B+tree": records live ONLY in leaves; an INTERIOR page (page_type 3) is a record-free routing skeleton — N+1 child pointers (u32 BE) ‖ an N-entry END-OFFSET separator directory (u32 BE) ‖ the separator key blob. A separator is a COPY of a boundary key (a leaf split copies the right half's first key up; an interior split pushes its median separator up; leaf merges remove the parent separator, interior merges pull it down — the regenerated "Fan-out" byte contract). The LEAF column regions gain a leading flags byte (reserved 0 — the dictionary door) and split by column CLASS: a FIXED-WIDTH column region is a null bitmap (ceil(N/8), MSB-first, set = NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled); a VARIABLE-WIDTH region is an N-entry end-offset value directory + the v23 tagged codec bytes with NULL a ZERO-LENGTH SPAN — the presence tag 0x01 never appears inside a v24 leaf (the single-value codec elsewhere — catalog defaults, overflow content, composite/array element bodies — is byte-unchanged). Directories throughout drop the redundant leading zero (N end offsets, not N+1 prefix sums). record_size is restated as key_len + Σ value_size (fixed → width, NULL variable → 0; the v23 phantom 2+ is dropped); RECORD_MAX keeps its value (C − max(12, 12+16K))/2, re-derived leaf-only. 23 = PAX leaf layout — a B-tree LEAF page stored its records COLUMN-MAJOR (key directory ‖ key blob ‖ column directory ‖ per column a value directory + tagged bodies, NULL = a 0x01 byte); interior pages stayed row-major and carried full records. 22 = varchar(n) length limits — spec/design/types.md §15: a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints — spec/design/gist.md §7/§8, GX3: a per-table exclusion list after the foreign-key list, each entry the constraint name + its backing GiST index name + a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes — spec/design/gist.md GX1: a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encodeRangeBody(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encodeRangeBody(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index moves to v20 only by its version byte. 19 = storable json/jsonb columns — spec/design/json.md, slice J1/J1b: a column type can be json (type_code 18) or jsonb (type_code 19), plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + unsigned LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicodeVersion + cldrVersion + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+export const FORMAT_VERSION = 54; // 54 = a base-plus-offsets column region may store up to 16 values whole as exceptions (region kind 6: null bitmap, base, offset width, exception count E, E exception rows u16 ascending, E exception bodies, N offsets with the exceptions' zero), taking the layout of least size when it saves more than kind 1 (spec/fileformat/format.md "Leaf node"; spec/design/leaf-write-cost.md §8–§9); 53 = narrow commit manifests, the page stamp and deferred interior pages (spec/design/manifest-crc32.md, spec/design/deferred-interior.md §9): a manifest entry is page_index u32 ‖ crc32 u32 (a plaintext page's own header checksum, an encrypted page's CRC-32 of its ciphertext) and the chain digest at meta offset 48 is a CRC-32; page header offset 2 is the low 16 bits of the writing commit's txid, checked against the commit window during manifest validation; meta offset 60 counts a (parent, slot) remap list in the manifest area's last third, which lets a commit keep an interior whose only change is a child's page, and its catalog chain; 52 = the compact leaf (spec/design/leaf-structural.md; format.md "Leaf node" / "Fan-out"): a B+tree leaf payload leads with a leaf flags byte (bit0 fixed_key, bit1 key_prefix) and every leaf directory entry is a u16; a fixed-key table tree stores a u16 key length and no key directory; a leaf stores its keys' shared prefix once when that saves bytes; the leading run of key-derivable primary-key columns has no region and no weight (rebuilt from the keys); an inline text / bytea / json value in a leaf is tag 0x05 + its bytes, with no u16 length; and a column region may be base plus offsets (kind 1: integer-like fixed-width columns), a dictionary (kind 2: text / bytea / json) or bit-packed (kind 4: i16[] / i32[] / i64[]), each exactly when that is smaller — so a leaf's payload is Σ record_size + leafOverhead − savings, which the split and merge rules measure; interior, catalog, overflow, free-list, manifest and GiST pages, every key encoding and the single-value codec are unchanged; 51 = a numeric(p,s) table column with p <= 18 is a fixed-width leaf column — a null bitmap and 2/4/8-byte slots holding the value's unscaled integer — instead of the variable-width decimal codec (ColType.fixedDec; spec/design/decimal.md §6a); the catalog is unchanged. 50 = the per-index index_flags byte gains bit5 is_constraint: set on the unique index that backs a UNIQUE constraint, clear on a bare CREATE UNIQUE INDEX (legal only with bit0 unique; spec/design/constraints.md §5.5); 49 = batched durability (spec/design/validated-cow.md §4): a commit writes the meta slot that does not hold the newest durable meta (txid & 1 under synchronous = on, one slot for a whole relaxed batch), and a pending commit's manifest also lists every body page written since that floor; no byte layout change; 48 = view follow-ons (spec/design/views.md §6/§16, format.md *Catalog*): each view output column gains a flags byte (bit0 has_default) followed, when set, by the default's canonical text (u32 len + UTF-8); dep_kind gains 2 = sequence and 3 = type, the dependency list sorted by (name bytes, kind code); a trailing view flags byte (bit0 security_barrier, bit1 security_invoker); a catalog entry longer than a page starts a fresh catalog page and spans consecutive chain pages (the first item_count 1, the rest 0, header byte 1 bit0 continued on every page of the run but the last); 47 = multi-column GIN indexes: a GIN index may list several key columns, and every entry of a multi-column GIN index is column_tag (u8, the 0-based key position) ‖ term ‖ storage key (spec/design/gin.md §4.4); a single-column GIN's entries are unchanged and the catalog bytes do not change; 46 = ordered index keys: the per-index index_flags byte gains bit4 has_key_options, and — only when set — one option byte per key element (bit0 desc, bit1 nulls_first) after the optional timezone dependencies; a DESC / NULLS FIRST key's entry slots use the encoding.md §2.16 ordered slot; an index with only default (ASC NULLS LAST) keys is byte-identical to v45 (spec/design/indexes.md §11); 45 = exclusion-constraint follow-ons (spec/design/gist.md §7.1/§7.2) — no byte layout change; the v27 has_predicate bit (and the v31/v32 dependency lists after it) is now legal on a GiST index that backs an exclusion constraint (the partial EXCLUDE … WHERE (predicate)), and an exclusion constraint may name an ordered (btree, index_kind 0, non-unique) backing index whose every element operator is = (EXCLUDE USING btree); a version-44 reader rejected both shapes as corrupt, hence the version break; 44 = a composite column may carry an expression DEFAULT — column flags bit3 (default_is_expr), with the expr-text (u16 length + UTF-8) after the type name (spec/design/composite.md §12); any other composite column flag but not_null is corrupt; no other byte layout change; 43 = timestamp(p) / interval qualifier typmods: a timestamp / timestamptz column or composite field appends u8 precision (0xFF = none, else 0..6), an interval one u8 interval_fields ‖ u8 precision (fields 0 = no qualifier, else the datetime_units.toml qualifier code) in the typmod slot (spec/design/timestamp.md §8, interval.md §6.1); no other byte layout change; 42 = GIN term statistics: a statistics summary's flags byte gains bit2 term_eligible (set exactly for a jsonb column or an array of a GIN element type), followed — only when set — after histogram_count by term_occurrences i64 ‖ untracked_term_rows i64 ‖ term_count u16, and stats_kind 3 term items (ordinal u16 ‖ rows i64 ‖ term_len u16 ‖ term bytes) follow the histogram items (spec/design/statistics.md §4.5/§7); no other byte layout change; 41 = a composite-type entry admits a range-typed field — field_type_code 17 + the one-byte range element descriptor, before the field flags byte (spec/design/composite.md §3); no other byte layout change; 40 = a foreign key's actions byte gains bit 6 match_full (MATCH FULL; 0 = MATCH SIMPLE — spec/design/constraints.md §6.3/§6.9); bit 7 stays reserved 0; no other byte layout change; 39 = every view entry gains a trailing u8 check_option (0 none, 1 LOCAL, 2 CASCADED — spec/design/views.md §15.6); no other byte layout change; 38 = views: entry_kind 5 view catalog entries emitted last in view-name byte order (spec/design/views.md §3); no other byte layout change; 37 = exact (folded) identifier names: no byte layout change; catalog names are byte-exact and name-ordered groups sort by exact-name bytes; persisted expression text renders bare words folded and quoted identifiers as "…" (spec/design/grammar.md §3); 36 = an array column entry's flags byte gains bit6 has_collation (legal only for a text element), the collation name (u16 len + UTF-8) following the element descriptor; a collated text[] key encodes each present element as its UCA sort key (spec/design/collation.md §1, encoding.md §2.14); 35 = every CHECK catalog entry gains a trailing check_flags byte (bit0 has_host_deps; bits 1-7 reserved 0) followed, when bit0 is set, by the v31 host-function dependency list (spec/design/extensibility.md §7.1.3); 34 = meta offset 56 carries the exact live page count (spec/design/memory.md §8.7); 33 = validated COW commit descriptors; 32 = timezone index dependencies (index-dependencies.md); 31 = host-function index dependencies (spec/design/extensibility.md §8.1, delivery step 4): the per-index index_flags byte gains bit2 has_host_deps, and — only when set — after the v27 predicate a u16 dep_count + per dependency name (u16 len + UTF-8) ‖ arg_count u16 ‖ arg type codes (u8 each) ‖ result type code (u8) ‖ component_id (u16 len + UTF-8) ‖ semantic_version u32, in ascending (name, arg-type codes) order. An index with no host-function key is byte-identical to v30, so a file with no such index moves to v31 only by its version byte + meta CRC. 30 = three-bit FOREIGN KEY action codes for CASCADE / SET NULL / SET DEFAULT; 29 = deterministic per-column statistics (kind 4; spec/design/statistics.md); 28 = exact table row count: each table catalog entry appends a nonnegative i64 row_count after root_data_page, with (root_data_page == 0) == (row_count == 0); on-disk format version (27 = partial-index predicates — spec/design/indexes.md §9: the per-index index_flags byte gains bit1 has_predicate, and (only when set) a u16 length + the canonical predicate text (the *Check-expression text* form) follows index_root_page; on load a partial predicate re-parses that text (XX001 on failure, like a stored CHECK) and a non-btree index with bit1 set is data_corrupted. B-tree only. A non-partial index is byte-identical to v26, so a file with no partial index moves to v27 only by its version byte + meta CRC. 26 = expression index keys — spec/design/indexes.md §1/§6: a per-index key element is a u16 column ordinal OR the 0xFFFF sentinel (never a valid ordinal, col_count ≤ 65535) + a u16 length + the expression's canonical UTF-8 text (the *Check-expression text* form, re-parsed on load — XX001 on failure, like a stored CHECK; a GIN/GiST index with a non-column key is data_corrupted). Only the index-list changes; a plain column index is byte-identical to v6, so a file with no expression index moves to v26 only by its version byte + meta CRC. 25 = on-disk free-list persistence — spec/fileformat/format.md; storage.md §6: meta offset 28 becomes free_list_head (0 = empty), and a page_type 7 free-list page persists the unconsumed free-list so open reads it directly instead of reconstructing it by walking every leaf; paired with continuous within-session reclamation. A from-scratch image (create/goldens) has an EMPTY free-list, so free_list_head = 0 and no page_type 7 page: every golden's only v25 change is its version byte + meta CRC. 24 = the B+tree reshape — spec/design/bplus-reshape.md, spec/fileformat/format.md "The per-table data B+tree": records live ONLY in leaves; an INTERIOR page (page_type 3) is a record-free routing skeleton — N+1 child pointers (u32 BE) ‖ an N-entry END-OFFSET separator directory (u32 BE) ‖ the separator key blob. A separator is a COPY of a boundary key (a leaf split copies the right half's first key up; an interior split pushes its median separator up; leaf merges remove the parent separator, interior merges pull it down — the regenerated "Fan-out" byte contract). The LEAF column regions gain a leading flags byte (reserved 0 — the dictionary door) and split by column CLASS: a FIXED-WIDTH column region is a null bitmap (ceil(N/8), MSB-first, set = NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled); a VARIABLE-WIDTH region is an N-entry end-offset value directory + the v23 tagged codec bytes with NULL a ZERO-LENGTH SPAN — the presence tag 0x01 never appears inside a v24 leaf (the single-value codec elsewhere — catalog defaults, overflow content, composite/array element bodies — is byte-unchanged). Directories throughout drop the redundant leading zero (N end offsets, not N+1 prefix sums). record_size is restated as key_len + Σ value_size (fixed → width, NULL variable → 0; the v23 phantom 2+ is dropped); RECORD_MAX keeps its value (C − max(12, 12+16K))/2, re-derived leaf-only. 23 = PAX leaf layout — a B-tree LEAF page stored its records COLUMN-MAJOR (key directory ‖ key blob ‖ column directory ‖ per column a value directory + tagged bodies, NULL = a 0x01 byte); interior pages stayed row-major and carried full records. 22 = varchar(n) length limits — spec/design/types.md §15: a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints — spec/design/gist.md §7/§8, GX3: a per-table exclusion list after the foreign-key list, each entry the constraint name + its backing GiST index name + a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes — spec/design/gist.md GX1: a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encodeRangeBody(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encodeRangeBody(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index moves to v20 only by its version byte. 19 = storable json/jsonb columns — spec/design/json.md, slice J1/J1b: a column type can be json (type_code 18) or jsonb (type_code 19), plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + unsigned LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicodeVersion + cldrVersion + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 export const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const RECORD_MAX_RESERVE = 12; // bytes reserved inside RECORD_MAX beyond the per-column term — independent of PAGE_HEADER (format.md "Why the record cap"). Historically the two-key interior node's 3 child pointers (4·3); since v24 the value is kept as the K=0 floor of the leaf-only re-derivation (a two-record index leaf is exactly 2·(C−12)/2 + 4·2 + 4 = C).
 const PAGE_CATALOG = 1; // page_type for a catalog page
@@ -1510,10 +1511,29 @@ const ITEM_OWN = 2;
 // The value span of one base-plus-offsets column over a set of rows.
 // Values of a column of width 4 or less are held as numbers (nlo / nhi), wider ones as bigints (lo /
 // hi): a 64-bit span does not fit a number, and bigint arithmetic is too slow for the narrow columns.
-type ForRange = { lo: bigint; hi: bigint; nlo: number; nhi: number; any: boolean };
+// pf is a base-plus-offsets column's kind 6 size facts (leaf_pfor.ts), null for a packed-array
+// column's element span.
+type ForRange = {
+  lo: bigint;
+  hi: bigint;
+  nlo: number;
+  nhi: number;
+  any: boolean;
+  pf: PforAcc | null;
+};
 
 function newForRange(): ForRange {
-  return { lo: 0n, hi: 0n, nlo: 0, nhi: 0, any: false };
+  return { lo: 0n, hi: 0n, nlo: 0, nhi: 0, any: false, pf: null };
+}
+
+// newForColRange is an empty range of a base-plus-offsets column of width w, with its kind 6 facts.
+function newForColRange(w: number): ForRange {
+  return { lo: 0n, hi: 0n, nlo: 0, nhi: 0, any: false, pf: new PforAcc(w > 4) };
+}
+
+// cloneForRange copies a range and its kind 6 facts.
+function cloneForRange(r: ForRange): ForRange {
+  return { ...r, pf: r.pf === null ? null : r.pf.clone() };
 }
 
 // One item column's accumulated facts: a dictionary's entry count and repeated bytes, or a packed
@@ -1653,6 +1673,7 @@ function spanItem(it: LeafItem, arrW: number, buf: Uint8Array, start: number, en
 }
 
 function forRangeAdd(r: ForRange, v: bigint): void {
+  if (r.pf !== null) r.pf.add(v);
   if (!r.any) {
     r.lo = v;
     r.hi = v;
@@ -1660,10 +1681,11 @@ function forRangeAdd(r: ForRange, v: bigint): void {
     return;
   }
   if (v < r.lo) r.lo = v;
-  if (v > r.hi) r.hi = v;
+  else if (v > r.hi) r.hi = v;
 }
 
 function forRangeAddN(r: ForRange, v: number): void {
+  if (r.pf !== null) r.pf.add(v);
   if (!r.any) {
     r.nlo = v;
     r.nhi = v;
@@ -1671,7 +1693,15 @@ function forRangeAddN(r: ForRange, v: number): void {
     return;
   }
   if (v < r.nlo) r.nlo = v;
-  if (v > r.nhi) r.nhi = v;
+  else if (v > r.nhi) r.nhi = v;
+}
+
+// forRangeSaving is the bytes a base-plus-offsets column of width w over this range saves in a leaf of
+// n records: kind 1's saving, or the region with exceptions' (kind 6) when that is larger.
+function forRangeSaving(r: ForRange, w: number, n: number): number {
+  const k1 = forSaving(n, w, forRangeBw(r, w));
+  const x = r.pf === null ? 0 : r.pf.saving(n, w);
+  return x > k1 ? x : k1;
 }
 
 // forRangeAddValue adds a present value of a base-plus-offsets column of width w.
@@ -1813,7 +1843,7 @@ class TableLeafSizer implements LeafSizer {
 
   newFacts(addOnly = false): LeafFacts {
     return {
-      fors: this.forCols.map(newForRange),
+      fors: this.forCols.map((fc) => newForColRange(fc.w)),
       forCnt: this.forCols.map(() => 0),
       forStale: this.forCols.map(() => false),
       stale: false,
@@ -2116,25 +2146,26 @@ class TableLeafSizer implements LeafSizer {
     return true;
   }
 
-  // removeFor takes one value out of base-plus-offsets column j: a value at an end of the range
-  // leaves the range stale.
+  // removeFor takes one value out of base-plus-offsets column j: a value at an end of the range, or one
+  // the kind 6 facts keep (PforAcc.remove), leaves the range stale.
   private removeFor(f: LeafFacts, j: number, v: Value): void {
     if (v.kind === "null") return;
     const fc = this.forCols[j]!;
     const r = f.fors[j]!;
     if (--f.forCnt[j]! === 0) {
-      f.fors[j] = newForRange();
+      f.fors[j] = newForColRange(fc.w);
       f.forStale[j] = false;
       return;
     }
+    if (f.forStale[j]) return; // measured again before its facts are read
     const ty = this.colTypes[fc.col]!;
     let end: boolean;
     if (fc.w <= 4) {
       const s = forSlotNum(ty, v);
-      end = s === r.nlo || s === r.nhi;
+      end = s === r.nlo || s === r.nhi || r.pf?.remove(s) === true;
     } else {
       const s = forSlotValue(ty, v);
-      end = s === r.lo || s === r.hi;
+      end = s === r.lo || s === r.hi || r.pf?.remove(s) === true;
     }
     if (end) {
       f.forStale[j] = true;
@@ -2153,7 +2184,7 @@ class TableLeafSizer implements LeafSizer {
       if (!f.forStale[j]) continue;
       const fc = this.forCols[j]!;
       const ty = this.colTypes[fc.col]!;
-      const r = newForRange();
+      const r = newForColRange(fc.w);
       for (const row of rows) {
         const v = row[fc.col]!;
         if (v.kind !== "null") forRangeAddValue(r, ty, fc.w, v);
@@ -2174,7 +2205,7 @@ class TableLeafSizer implements LeafSizer {
       }
       const w = this.forCols[j]!.w;
       // A stale range is taken at its narrowest offsets: an upper bound.
-      total += forSaving(n, w, f.forStale[j] ? forWidthN(w, 0) : forRangeBw(f.fors[j]!, w));
+      total += f.forStale[j] ? forSaving(n, w, forWidthN(w, 0)) : forRangeSaving(f.fors[j]!, w, n);
     }
     for (let j = 0; j < this.itemCols.length; j++) {
       if (f.itemFrozen?.[j]) {
@@ -2213,9 +2244,8 @@ class TableLeafSizer implements LeafSizer {
     const payload = base.payload;
     const d = base.dirs as PaxDirs;
     const reg = d.regions[fc.col] as FixedRegion;
-    const slots = paxFixedSlots(payload, d, reg);
     const lazy = n.lazy!;
-    const r = newForRange();
+    const r = newForColRange(w);
     let count = 0;
     // A slot is the value plus the sign-bit flip.
     const nbias = w <= 4 ? 2 ** (8 * w - 1) : 0;
@@ -2231,9 +2261,9 @@ class TableLeafSizer implements LeafSizer {
         continue;
       }
       if ((payload[reg.bitmap + (at >> 3)]! & (0x80 >> (at % 8))) !== 0) continue;
-      const off = reg.body + at * w;
-      if (w <= 4) forRangeAddN(r, beUintN(slots, off, w) - nbias);
-      else forRangeAdd(r, beUint(slots, off, w) - bias);
+      const u = paxFixedU64(payload, d, reg, at);
+      if (w <= 4) forRangeAddN(r, (u as number) - nbias);
+      else forRangeAdd(r, (u as bigint) - bias);
       count++;
     }
     f.fors[j] = r;
@@ -2431,7 +2461,7 @@ class TableLeafSizer implements LeafSizer {
   cloneFacts(facts: unknown): LeafFacts {
     const f = facts as LeafFacts;
     return {
-      fors: f.fors.map((r) => ({ ...r })),
+      fors: f.fors.map(cloneForRange),
       forCnt: f.forCnt.slice(),
       forStale: f.forStale.slice(),
       stale: f.stale,
@@ -2511,7 +2541,7 @@ class TableLeafSizer implements LeafSizer {
       last,
       dups,
       anyDups,
-      runFors: this.forCols.map(newForRange),
+      runFors: this.forCols.map((fc) => newForColRange(fc.w)),
       runD: new Array<number>(k).fill(0),
       runDup: new Array<number>(k).fill(0),
       runNull: new Array<boolean>(k).fill(false),
@@ -2539,7 +2569,7 @@ class TableLeafSizer implements LeafSizer {
       last: new Array<Uint8Array | null>(k).fill(null),
       dups: new Array<boolean>(k).fill(false),
       anyDups: false,
-      runFors: this.forCols.map(newForRange),
+      runFors: this.forCols.map((fc) => newForColRange(fc.w)),
       runD: new Array<number>(k).fill(0),
       runDup: new Array<number>(k).fill(0),
       runNull: new Array<boolean>(k).fill(false),
@@ -2595,7 +2625,8 @@ class TableLeafSizer implements LeafSizer {
   // scanReset empties the scan's running half.
   scanReset(scan: unknown): void {
     const sc = scan as LeafScan;
-    for (let j = 0; j < this.forCols.length; j++) sc.runFors[j] = newForRange();
+    for (let j = 0; j < this.forCols.length; j++)
+      sc.runFors[j] = newForColRange(this.forCols[j]!.w);
     for (let j = 0; j < this.itemCols.length; j++) {
       sc.runD[j] = 0;
       sc.runDup[j] = 0;
@@ -2657,7 +2688,7 @@ class TableLeafSizer implements LeafSizer {
     let total = 0;
     for (let j = 0; j < this.forCols.length; j++) {
       const w = this.forCols[j]!.w;
-      total += forSaving(count, w, forRangeBw(sc.runFors[j]!, w));
+      total += forRangeSaving(sc.runFors[j]!, w, count);
     }
     for (let j = 0; j < this.itemCols.length; j++) {
       const w = this.itemCols[j]!.arrW;
@@ -2847,11 +2878,11 @@ function storedSame(ty: ColType, v: Value, p: PackedLeaf, c: number, i: number, 
   if (r.kind === "fixed") {
     if (v.kind === "unfetched") return false;
     const w = r.width;
-    const slots = paxFixedSlots(payload, d, r);
-    const at = r.body + i * w;
+    const span: Span = { buf: payload, start: 0, end: 0 };
+    paxFixedSpan(payload, d, r, i, span, FIXED_SPAN_SCRATCH);
     const body = FIXED_SCRATCH;
     writeFixedBody(body, 0, ty, v);
-    for (let b = 0; b < w; b++) if (body[b] !== slots[at + b]) return false;
+    for (let b = 0; b < w; b++) if (body[b] !== span.buf[span.start + b]) return false;
     return true;
   }
   const str = stringPayload(ty);
@@ -3859,20 +3890,21 @@ function assembleLeaf(head: Uint8Array, regions: Uint8Array[]): Uint8Array {
   return out;
 }
 
-// fixedRegion is a fixed-width column's region of n values of width w, given its plain form — kind
-// 0, the null bitmap, the dense slots (zeros for NULL). A base-plus-offsets column is rewritten as
-// kind 1 exactly when that is smaller; any other region is the plain form itself. The one region
-// encoder of both the full leaf encoder and the patch encoder (patchLeaf): the form depends only on
-// the slots.
+// fixedRegion is a fixed-width column's region of n values from its plain form (kind byte, null
+// bitmap, n dense slots): the plain region, base plus offsets (kind 1), or base plus offsets with up
+// to 16 values stored whole (kind 6, leaf_pfor.ts), each exactly when the size rule says it is
+// smaller (format.md "Leaf node"; kind 6 over kind 1 only when it saves more).
 function fixedRegion(ty: ColType, w: number, n: number, plain: Uint8Array): Uint8Array {
   if (!forEligible(ty)) return plain;
   const bm = Math.ceil(n / 8);
   const slots = 1 + bm;
-  // The present slots' range, as unsigned integers held in two halves (a 64-bit slot does not fit a
-  // number): hi is the bytes above the low four.
+  // The present slots as unsigned integers held in two halves (a 64-bit slot does not fit a number):
+  // hi is the bytes above the low four. Kept: the smallest and largest, and the kind 6 facts (an
+  // 8-byte slot's bigint is built only when the facts may keep it).
   const hw = w > 4 ? w - 4 : 0;
   const lw = w - hw;
-  let any = false;
+  const acc = new PforAcc(hw !== 0);
+  let count = 0;
   let minHi = 0;
   let minLo = 0;
   let maxHi = 0;
@@ -3880,34 +3912,38 @@ function fixedRegion(ty: ColType, w: number, n: number, plain: Uint8Array): Uint
   for (let i = 0; i < n; i++) {
     if ((plain[1 + (i >> 3)]! & (0x80 >> (i % 8))) !== 0) continue;
     const at = slots + i * w;
-    const hi = hw === 0 ? 0 : beUintN(plain, at, hw);
     const lo = beUintN(plain, at + hw, lw);
-    if (!any) {
-      any = true;
-      minHi = hi;
-      minLo = lo;
-      maxHi = hi;
-      maxLo = lo;
+    if (hw === 0) {
+      acc.add(lo);
+    } else {
+      const hi = beUintN(plain, at, hw);
+      const approx = hi * 0x1_0000_0000 + lo;
+      if (acc.full && approx > acc.skipLoN && approx < acc.skipHiN) acc.np++;
+      else acc.add((BigInt(hi) << 32n) | BigInt(lo));
+      if (count === 0 || hi < minHi || (hi === minHi && lo < minLo)) {
+        minHi = hi;
+        minLo = lo;
+      }
+      if (count === 0 || hi > maxHi || (hi === maxHi && lo > maxLo)) {
+        maxHi = hi;
+        maxLo = lo;
+      }
+      count++;
       continue;
     }
-    if (hi < minHi || (hi === minHi && lo < minLo)) {
-      minHi = hi;
-      minLo = lo;
-    }
-    if (hi > maxHi || (hi === maxHi && lo > maxLo)) {
-      maxHi = hi;
-      maxLo = lo;
-    }
+    if (count === 0 || lo < minLo) minLo = lo;
+    if (count === 0 || lo > maxLo) maxLo = lo;
+    count++;
   }
-  let bw: number;
-  if (!any) bw = forWidthN(w, 0);
-  else if (hw === 0) bw = forWidthN(w, maxLo - minLo);
-  else {
-    const max = (BigInt(maxHi) << 32n) | BigInt(maxLo);
-    const min = (BigInt(minHi) << 32n) | BigInt(minLo);
-    bw = forWidth(w, max - min);
-  }
-  if (forSaving(n, w, bw) <= 0) return plain;
+  // The offset width of values spanning [a, b]: exact for every span a width can hold (below 2^32).
+  const width = (aH: number, aL: number, bH: number, bL: number): number =>
+    hw === 0 ? forWidthN(w, bL - aL) : forWidthN(w, (bH - aH) * 0x1_0000_0000 + (bL - aL));
+  const bw = count === 0 ? forWidthN(w, 0) : width(minHi, minLo, maxHi, maxLo);
+  const k1 = forSaving(n, w, bw);
+  const plan = acc.plan(n, w);
+  const x = plan === null ? 0 : n * w - plan.size;
+  if (k1 <= 0 && x <= 0) return plain;
+  if (plan !== null && x > k1) return pforRegion(w, n, plain, plan);
   // Base plus offsets: the bitmap, the smallest present slot (zero when no value is present), the
   // offset width, and each value's distance from the base (a NULL's is zero). An offset fits 4 bytes.
   const out = new Uint8Array(1 + bm + w + 1 + n * bw);
@@ -3929,6 +3965,56 @@ function fixedRegion(ty: ColType, w: number, n: number, plain: Uint8Array): Uint
       o += bw;
     }
   }
+  return out;
+}
+
+// pforRegion writes a kind 6 region of n values from the plain form under plan p (leaf_pfor.ts): the
+// null bitmap, the base, the offset width, the exception count, the exceptions' rows and bodies, then
+// each other present value's offset from the base (an exception's and a NULL's are zero).
+function pforRegion(w: number, n: number, plain: Uint8Array, p: PforPlan): Uint8Array {
+  const bm = Math.ceil(n / 8);
+  const slots = 1 + bm;
+  const hw = w > 4 ? w - 4 : 0;
+  const lw = w - hw;
+  const bw = p.bw;
+  const r = bw === 0 ? 0 : 2 ** (8 * bw) - 1;
+  const baseHi = hw === 0 ? 0 : Number((p.base as bigint) >> 32n);
+  const baseLo = hw === 0 ? (p.base as number) : Number((p.base as bigint) & 0xffff_ffffn);
+  const e = p.e;
+  const out = new Uint8Array(1 + bm + (e + 1) * (w + 2) + n * bw);
+  out[0] = REGION_PFOR;
+  out.set(plain.subarray(1, slots), 1);
+  let o = slots;
+  if (hw !== 0) putBEUintN(out, o, hw, baseHi);
+  putBEUintN(out, o + hw, lw, baseLo);
+  o += w;
+  out[o++] = bw;
+  out[o++] = e;
+  let rows = o;
+  let bodies = o + 2 * e;
+  const offs = o + e * (w + 2);
+  let k = 0;
+  for (let i = 0; i < n; i++) {
+    if ((plain[1 + (i >> 3)]! & (0x80 >> (i % 8))) !== 0) continue;
+    const at = slots + i * w;
+    // The distance from the base: exact while it is below 2^53, and on the right side of 0 and of r
+    // whatever its size (one rounding of an exact sum).
+    const d =
+      (hw === 0 ? 0 : (beUintN(plain, at, hw) - baseHi) * 0x1_0000_0000) +
+      (beUintN(plain, at + hw, lw) - baseLo);
+    if (d < 0 || d > r) {
+      if (++k > e) break;
+      out[rows++] = i >> 8;
+      out[rows++] = i & 0xff;
+      out.set(plain.subarray(at, at + w), bodies);
+      bodies += w;
+    } else if (bw !== 0) {
+      putBEUintN(out, offs + i * bw, bw, d);
+    }
+  }
+  if (k !== e) throw new Error("BUG: a kind 6 plan's exception count differs from the encoded one");
+  pforStats.regions++;
+  pforStats.exceptions += e;
   return out;
 }
 
@@ -4190,7 +4276,7 @@ function patchLeaf(
     }
     if (w !== null) {
       const fr = r as FixedRegion;
-      const slots = paxFixedSlots(payload, d, fr);
+      const span: Span = { buf: payload, start: 0, end: 0 };
       const plain = new Uint8Array(1 + bm + rows * w);
       let o = 1 + bm;
       for (let i = 0; i < rows; i++) {
@@ -4200,8 +4286,8 @@ function patchLeaf(
           if ((payload[fr.bitmap + (at >> 3)]! & (0x80 >> (at % 8))) !== 0) {
             plain[1 + (i >> 3)] |= 0x80 >> (i % 8);
           } else {
-            const from = fr.body + at * w;
-            for (let b = 0; b < w; b++) plain[o + b] = slots[from + b]!;
+            paxFixedSpan(payload, d, fr, at, span, FIXED_SPAN_SCRATCH);
+            plain.set(span.buf.subarray(span.start, span.end), o);
           }
         } else {
           const v = n.vals[i]![c]!;
@@ -8145,23 +8231,47 @@ export function parsePage(block: Uint8Array): Page {
 // unless noted; value bytes are read in place where the page holds them, so the lazy decoder's
 // zero-copy view still references the shared page block.
 //
-// A "fixed" region is a null bitmap + dense untagged slots. Its slots are in the page for a plain
-// (kind 0) region; an elided key column's and a base-plus-offsets (kind 1) region's are rebuilt into
-// `buf` the first time a value of the column is read (`lazy` says which, `src`/`bw` how).
+// A "fixed" region is a null bitmap + dense untagged slots for a plain (kind 0) region; an elided key
+// column's values are bytes of the keys, and a base-plus-offsets region's (kind 1, or kind 6 with its
+// exceptions' bodies stored whole) are its base plus narrow offsets (`lazy` says which, `src`/`bw`
+// how). Every form is read in place (paxFixedSpan).
 // A "var" region is an end-offset directory + tagged spans (NULL = a zero-length span); with `codes`
 // set it is a dictionary (kind 2): the directory and spans are the entries', and value i is entry
 // payload[codes + i].
 // An "arr" region is packed integer arrays (kind 4): NULL-ness and span lengths come from the count
-// bytes; the plain spans are rebuilt into `plain` the first time a value is read.
+// bytes, and a value is decoded alone when read (paxArrSpan).
 type FixedRegion = {
   kind: "fixed";
   width: number;
   bitmap: number; // payload offset of the null bitmap, or -1 for a column that is never NULL (elided)
-  buf: Uint8Array | null; // the bytes holding the slots: the payload, a rebuilt buffer, or null until rebuilt
-  body: number; // offset of slot 0 within buf
-  lazy: 0 | 1 | 2; // 0 plain, 1 elided (src = the column's key offset), 2 base plus offsets (src = the base)
+  body: number; // plain: payload offset of slot 0
+  // 0 plain, 1 elided (src = the column's key offset), 2 base plus offsets, kind 1 or 6 (src = the
+  // base's offset).
+  // Every form is read in place (paxFixedSpan); nothing is rebuilt.
+  lazy: 0 | 1 | 2;
   src: number;
-  bw: number; // kind 1: the offset width
+  bw: number; // kinds 1 and 6: the offset width
+  // kinds 1 and 6: the base as its high and low 32 bits (high is 0 below 8 bytes), and offset 0's
+  // offset.
+  baseHi: number;
+  baseLo: number;
+  offs: number;
+  // kind 6: where its exceptions are (null for kind 1 and every other form).
+  pf: PforRegion | null;
+};
+
+// A kind 6 region's exceptions (leaf_pfor.ts), read in place: e exception rows (u16, ascending) at
+// payload offset rows and their e bodies at bodies. Bit b of the 64-bit bucket mask (maskLo holds
+// buckets 0–31, maskHi 32–63) is set when some exception row r has r >>> shift === b, so a row in a
+// clear bucket is no exception without a search. A resident leaf holds one such object per kind 6
+// region (PFOR_OBJECT_BYTES).
+type PforRegion = {
+  e: number;
+  rows: number;
+  bodies: number;
+  maskLo: number;
+  maskHi: number;
+  shift: number;
 };
 type VarRegion = { kind: "var"; ends: number; body: number; codes: number };
 type ArrRegion = {
@@ -8170,8 +8280,13 @@ type ArrRegion = {
   counts: number; // payload offset of the N count bytes
   bits: number;
   data: number; // payload offset of the packed elements
-  plain: { ends: Uint32Array; body: Uint8Array } | null;
+  // starts[k] is the element index at which row ARR_INDEX_ROWS·k's elements start, built at the
+  // parse, so a row's array is decoded alone (paxArrSpan) and nothing else is rebuilt.
+  starts: Uint32Array;
 };
+
+// How many rows one entry of a packed-array region's row index covers.
+const ARR_INDEX_ROWS = 16;
 type RegionDir = FixedRegion | VarRegion | ArrRegion;
 
 // A parsed PAX (column-major) leaf's directories (format.md "Leaf node").
@@ -8181,9 +8296,9 @@ type PaxDirs = {
   keyEnd: number; // payload offset of the N-entry key end-offset directory (absent with keyLen)
   keyLen: number; // the one length of every key (fixed_key), else 0
   // prefix is the bytes every key shares (key_prefix), else null: the key blob then holds the keys
-  // without it, and full holds them rebuilt, on first use.
+  // without it. Keys are compared prefix-aware (paxCompareKey); a full key is built only for the
+  // reader that asks for one (paxKey), never kept by the leaf.
   prefix: Uint8Array | null;
-  full: { blob: Uint8Array; ends: Uint32Array | null } | null;
   regions: RegionDir[]; // K regions, in declaration order
   colDir: number; // payload offset of the column directory: the key section is payload[0, colDir)
   end: number; // colStart[K]: the payload's content length
@@ -8280,11 +8395,14 @@ function parsePaxLeaf(payload: Uint8Array, n: number, colTypes: ColType[]): PaxD
         kind: "fixed",
         width,
         bitmap: -1,
-        buf: null,
         body: 0,
         lazy: 1,
         src: at,
         bw: 0,
+        baseHi: 0,
+        baseLo: 0,
+        offs: 0,
+        pf: null,
       });
       continue;
     }
@@ -8306,11 +8424,63 @@ function parsePaxLeaf(payload: Uint8Array, n: number, colTypes: ColType[]): PaxD
           kind: "fixed",
           width,
           bitmap: p,
-          buf: null,
           body: 0,
           lazy: 2,
           src: base,
           bw,
+          baseHi: width > 4 ? beUintN(payload, base, width - 4) : 0,
+          baseLo: width > 4 ? beUintN(payload, base + width - 4, 4) : beUintN(payload, base, width),
+          offs: base + width + 1,
+          pf: null,
+        });
+      } else if (rkind === REGION_PFOR && forEligible(ty)) {
+        // Base plus offsets with exceptions: the bitmap, the base, the offset width, the exception
+        // count E, E rows (u16, ascending, present), E whole bodies, then N offsets (the exceptions'
+        // zero).
+        const bad = "PAX leaf narrow region with exceptions is malformed";
+        const base = p + bm;
+        if (base + width + 2 > end) throw engineError("data_corrupted", bad);
+        const bw = payload[base + width]!;
+        const e = payload[base + width + 1]!;
+        const rows = base + width + 2;
+        const offs = rows + e * (width + 2);
+        if (
+          (bw !== 0 && bw !== 1 && bw !== 2 && bw !== 4) ||
+          bw >= width ||
+          e < 1 ||
+          e > PFOR_MAX_K ||
+          offs + n * bw !== end
+        )
+          throw engineError("data_corrupted", bad);
+        let shift = 0;
+        while ((n - 1) >> shift >= 64) shift++;
+        let maskLo = 0;
+        let maskHi = 0;
+        let prev = -1;
+        for (let k = 0; k < e; k++) {
+          const i = (payload[rows + 2 * k]! << 8) | payload[rows + 2 * k + 1]!;
+          if (i <= prev || i >= n || (payload[p + (i >> 3)]! & (0x80 >> (i % 8))) !== 0)
+            throw engineError("data_corrupted", bad);
+          for (let b = 0; b < bw; b++) {
+            if (payload[offs + i * bw + b] !== 0) throw engineError("data_corrupted", bad);
+          }
+          prev = i;
+          const bucket = i >> shift;
+          if (bucket < 32) maskLo |= 1 << bucket;
+          else maskHi |= 1 << (bucket - 32);
+        }
+        regions.push({
+          kind: "fixed",
+          width,
+          bitmap: p,
+          body: 0,
+          lazy: 2,
+          src: base,
+          bw,
+          baseHi: width > 4 ? beUintN(payload, base, width - 4) : 0,
+          baseLo: width > 4 ? beUintN(payload, base + width - 4, 4) : beUintN(payload, base, width),
+          offs,
+          pf: { e, rows, bodies: rows + 2 * e, maskLo, maskHi, shift },
         });
       } else if (rkind === 0) {
         const body = p + bm;
@@ -8320,11 +8490,14 @@ function parsePaxLeaf(payload: Uint8Array, n: number, colTypes: ColType[]): PaxD
           kind: "fixed",
           width,
           bitmap: p,
-          buf: payload,
           body,
           lazy: 0,
           src: 0,
           bw: 0,
+          baseHi: 0,
+          baseLo: 0,
+          offs: 0,
+          pf: null,
         });
       } else {
         throw engineError("data_corrupted", "PAX leaf region kind is invalid for its column");
@@ -8365,7 +8538,14 @@ function parsePaxLeaf(payload: Uint8Array, n: number, colTypes: ColType[]): PaxD
       const data = p + n + w + 1;
       if (bits > 8 * w || data + Math.ceil((total * bits) / 8) !== end)
         throw engineError("data_corrupted", "PAX leaf packed-array region extent mismatch");
-      regions.push({ kind: "arr", w, counts: p, bits, data, plain: null });
+      const starts = new Uint32Array(Math.ceil(n / ARR_INDEX_ROWS));
+      let seen = 0;
+      for (let i = 0; i < n; i++) {
+        if (i % ARR_INDEX_ROWS === 0) starts[i / ARR_INDEX_ROWS] = seen;
+        const cnt = payload[p + i]!;
+        if (cnt !== 255) seen += cnt;
+      }
+      regions.push({ kind: "arr", w, counts: p, bits, data, starts });
     } else if (rkind === 0) {
       const vc = { pos: p };
       let vprev = 0;
@@ -8384,7 +8564,7 @@ function parsePaxLeaf(payload: Uint8Array, n: number, colTypes: ColType[]): PaxD
     }
     start = end;
   }
-  return { n, keyBlob, keyEnd, keyLen, prefix, full: null, regions, colDir, end: start };
+  return { n, keyBlob, keyEnd, keyLen, prefix, regions, colDir, end: start };
 }
 
 // paxSuffixLo / paxSuffixHi bound stored key i within the payload: the key, or the key without the
@@ -8410,45 +8590,44 @@ function paxKeyLen(payload: Uint8Array, d: PaxDirs, i: number): number {
   );
 }
 
-// paxFullKeys rebuilds a prefixed leaf's keys on first use: one blob, and an end-offset directory when
-// keys vary in length. A walk that never reads a key (overflow collection, a column scan) does not pay
-// for it.
-function paxFullKeys(
-  payload: Uint8Array,
-  d: PaxDirs,
-): { blob: Uint8Array; ends: Uint32Array | null } {
-  if (d.full !== null) return d.full;
-  const prefix = d.prefix!;
-  const kp = prefix.length;
-  const stored = paxSuffixHi(payload, d, d.n - 1) - d.keyBlob;
-  const blob = new Uint8Array(d.n === 0 ? 0 : stored + d.n * kp);
-  const ends = d.keyLen > 0 ? null : new Uint32Array(d.n);
-  let o = 0;
-  for (let i = 0; i < d.n; i++) {
-    const lo = paxSuffixLo(payload, d, i);
-    const hi = paxSuffixHi(payload, d, i);
-    blob.set(prefix, o);
-    o += kp;
-    blob.set(payload.subarray(lo, hi), o);
-    o += hi - lo;
-    if (ends !== null) ends[i] = o;
-  }
-  d.full = { blob, ends };
-  return d.full;
-}
-
-// Key i: a span of the payload, or of the leaf's rebuilt keys when the page stores a shared prefix.
+// Key i: a span of the payload, or — when the page stores a shared prefix — a key built for the
+// caller (the leaf keeps no rebuilt keys).
 function paxKey(payload: Uint8Array, d: PaxDirs, i: number): Uint8Array {
-  if (d.prefix !== null) {
-    const fk = paxFullKeys(payload, d);
-    if (fk.ends === null) return fk.blob.subarray(i * d.keyLen, (i + 1) * d.keyLen);
-    return fk.blob.subarray(i === 0 ? 0 : fk.ends[i - 1]!, fk.ends[i]!);
-  }
   const lo = paxSuffixLo(payload, d, i);
   const hi = paxSuffixHi(payload, d, i);
   if (lo > hi || hi > payload.length)
     throw engineError("data_corrupted", "PAX leaf key directory out of range");
-  return payload.subarray(lo, hi);
+  if (d.prefix === null) return payload.subarray(lo, hi);
+  const kp = d.prefix.length;
+  const key = new Uint8Array(kp + hi - lo);
+  key.set(d.prefix, 0);
+  key.set(payload.subarray(lo, hi), kp);
+  return key;
+}
+
+// paxCompareKey is compareBytes(paxKey(i), probe) without building key i: the probe is compared with
+// the shared prefix, then with the stored suffix, in place.
+function paxCompareKey(payload: Uint8Array, d: PaxDirs, i: number, probe: Uint8Array): number {
+  const prefix = d.prefix!;
+  const kp = prefix.length;
+  const plen = probe.length;
+  const head = plen < kp ? plen : kp;
+  for (let b = 0; b < head; b++) {
+    const x = prefix[b]!;
+    const y = probe[b]!;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  if (plen < kp) return 1; // key i extends the probe
+  const lo = paxSuffixLo(payload, d, i);
+  const len = paxSuffixHi(payload, d, i) - lo;
+  const rest = plen - kp;
+  const m = len < rest ? len : rest;
+  for (let b = 0; b < m; b++) {
+    const x = payload[lo + b]!;
+    const y = probe[kp + b]!;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return len === rest ? 0 : len < rest ? -1 : 1;
 }
 
 // paxSearchPrefixed binary-searches a prefixed leaf's keys for key: the probe is compared with the
@@ -8505,92 +8684,265 @@ function paxSearchPrefixed(
   return { index: lo, found: false };
 }
 
-// paxFixedSlots returns the buffer holding a fixed region's dense slots (slot i at r.body + i·width),
-// rebuilding an elided key column's from the keys, or a base-plus-offsets region's from its base and
-// offsets, the first time the column is read. A NULL's slot is zero-filled and never read.
-function paxFixedSlots(payload: Uint8Array, d: PaxDirs, r: FixedRegion): Uint8Array {
-  if (r.buf !== null) return r.buf;
-  const n = d.n;
-  const w = r.width;
-  const buf = new Uint8Array(n * w);
-  if (r.lazy === 1) {
-    // The value body is the key's bytes at the column's key offset; bytes below the shared prefix's
-    // length come from the prefix.
-    const prefix = d.prefix;
-    const kp = prefix === null ? 0 : prefix.length;
-    const at = r.src;
-    for (let i = 0; i < n; i++) {
-      const lo = paxSuffixLo(payload, d, i);
-      for (let b = 0; b < w; b++) {
-        const pos = at + b;
-        buf[i * w + b] = pos < kp ? prefix![pos]! : payload[lo + pos - kp]!;
-      }
-    }
-  } else {
-    // The sum is taken at the column's width (the writers keep the low w bytes).
-    const offs = r.src + w + 1;
-    const bw = r.bw;
-    if (w <= 4) {
-      const base = beUintN(payload, r.src, w);
-      for (let i = 0; i < n; i++) {
-        if ((payload[r.bitmap + (i >> 3)]! & (0x80 >> (i % 8))) !== 0) continue;
-        putBEUintN(buf, i * w, w, base + beUintN(payload, offs + i * bw, bw));
-      }
-    } else {
-      const base = beUint(payload, r.src, w);
-      for (let i = 0; i < n; i++) {
-        if ((payload[r.bitmap + (i >> 3)]! & (0x80 >> (i % 8))) !== 0) continue;
-        putBEUint(
-          buf,
-          i * w,
-          w,
-          bw === 0 ? base : base + BigInt(beUintN(payload, offs + i * bw, bw)),
-        );
-      }
-    }
-  }
-  r.buf = buf;
-  return buf;
-}
-
-// paxArrPlain rebuilds a packed-array region's plain form — N end offsets and each value's tagged span
-// (NULL = a zero-length span) — the first time a value of the column is read.
-function paxArrPlain(
+// paxFixedSpan sets out to fixed-width value i's untagged body, read in place: a view of the payload
+// (a plain slot, or an elided key column's bytes of the key or the shared prefix), or bytes built into
+// scratch (at least 16 bytes; valid until it is next written) for a base-plus-offsets value and for an
+// elided value that crosses the shared prefix's end. A NULL's span is never read.
+function paxFixedSpan(
   payload: Uint8Array,
   d: PaxDirs,
-  r: ArrRegion,
-): { ends: Uint32Array; body: Uint8Array } {
-  if (r.plain !== null) return r.plain;
-  const n = d.n;
-  const w = r.w;
-  let size = 0;
-  for (let i = 0; i < n; i++) size += arrSpanLen(payload[r.counts + i]!, w);
-  const ends = new Uint32Array(n);
-  const body = new Uint8Array(size);
-  const base = beUint(payload, r.counts + n, w);
-  const nbase = w <= 4 ? Number(base) : 0;
-  let o = 0;
-  let bit = r.data * 8;
-  for (let i = 0; i < n; i++) {
-    const cnt = payload[r.counts + i]!;
-    if (cnt === 0) {
-      o += 3; // 0x00, ndim 0, flags 0
-    } else if (cnt !== 255) {
-      body[o + 1] = 1; // tag 0x00, ndim 1, flags 0
-      body[o + 6] = cnt; // the u32 element count (at most 254)
-      body[o + 10] = 1; // the u32 lower bound 1
-      o += 11;
-      for (let e = 0; e < cnt; e++) {
-        if (w <= 4) putBEUintN(body, o, w, nbase + getBitsN(payload, bit, r.bits));
-        else putBEUint(body, o, w, base + getBits(payload, bit, r.bits));
-        bit += r.bits;
-        o += w;
+  r: FixedRegion,
+  i: number,
+  out: Span,
+  scratch: Uint8Array,
+): void {
+  const w = r.width;
+  if (r.lazy === 0) {
+    out.buf = payload;
+    out.start = r.body + i * w;
+    out.end = out.start + w;
+    return;
+  }
+  if (r.lazy === 2) {
+    if (r.pf !== null) {
+      const at = pfBody(payload, w, r.pf, i);
+      if (at >= 0) {
+        // An exception's body, stored whole.
+        out.buf = payload;
+        out.start = at;
+        out.end = at + w;
+        return;
       }
     }
-    ends[i] = o;
+    // The base plus the offset, at the column's width (the writers keep the low w bytes).
+    const bw = r.bw;
+    const off = bw === 0 ? 0 : beUintN(payload, r.offs + i * bw, bw);
+    if (w <= 4) {
+      putBEUintN(scratch, 0, w, r.baseLo + off);
+    } else {
+      let lo = r.baseLo + off;
+      let hi = r.baseHi;
+      if (lo >= 0x1_0000_0000) {
+        lo -= 0x1_0000_0000;
+        hi = (hi + 1) % 2 ** (8 * (w - 4));
+      }
+      putBEUintN(scratch, 0, w - 4, hi);
+      putBEUintN(scratch, w - 4, 4, lo);
+    }
+    out.buf = scratch;
+    out.start = 0;
+    out.end = w;
+    return;
   }
-  r.plain = { ends, body };
-  return r.plain;
+  // An elided key column: bytes [at, at + w) of key i.
+  const kp = d.prefix === null ? 0 : d.prefix.length;
+  const at = r.src;
+  const lo = paxSuffixLo(payload, d, i);
+  if (at >= kp) {
+    out.buf = payload;
+    out.start = lo + at - kp;
+  } else if (at + w <= kp) {
+    out.buf = d.prefix!;
+    out.start = at;
+  } else {
+    // Joined byte by byte: no view is allocated per value.
+    const prefix = d.prefix!;
+    const head = kp - at;
+    for (let b = 0; b < head; b++) scratch[b] = prefix[at + b]!;
+    for (let b = head; b < w; b++) scratch[b] = payload[lo + b - head]!;
+    out.buf = scratch;
+    out.start = 0;
+  }
+  out.end = out.start + w;
+}
+
+// pfBody is the payload offset of row i's body in a kind 6 region of width w whose exceptions are
+// pf, or -1 when row i is not an exception: a clear bucket answers at once, else the rows are
+// searched.
+function pfBody(payload: Uint8Array, w: number, pf: PforRegion, i: number): number {
+  const b = i >>> pf.shift;
+  if ((((b < 32 ? pf.maskLo : pf.maskHi) >>> (b & 31)) & 1) === 0) return -1;
+  const rows = pf.rows;
+  let lo = 0;
+  let hi = pf.e;
+  while (lo < hi) {
+    const m = (lo + hi) >> 1;
+    if (((payload[rows + 2 * m]! << 8) | payload[rows + 2 * m + 1]!) < i) lo = m + 1;
+    else hi = m;
+  }
+  if (lo < pf.e && ((payload[rows + 2 * lo]! << 8) | payload[rows + 2 * lo + 1]!) === i) {
+    return pf.bodies + lo * w;
+  }
+  return -1;
+}
+
+// paxFixedU64 is present fixed-width value i of a base-plus-offsets or plain integer-like region (at
+// most 8 bytes) read as a big-endian unsigned integer: a number below 2^53 for w ≤ 4, else a bigint.
+function paxFixedU64(payload: Uint8Array, d: PaxDirs, r: FixedRegion, i: number): number | bigint {
+  const w = r.width;
+  const sp: Span = { buf: payload, start: 0, end: 0 };
+  paxFixedSpan(payload, d, r, i, sp, FIXED_SPAN_SCRATCH);
+  return w <= 4 ? beUintN(sp.buf, sp.start, w) : beUint(sp.buf, sp.start, w);
+}
+
+// paxForValue is present value i of a base-plus-offsets region (not one of its exceptions), built from
+// its integer: the value readInlineBody decodes from the body base + offset, with no bytes written.
+// A body is a sign-flipped i16 / i32 / i64 / date / timestamp / fixed-width numeric slot. null for an
+// 8-byte value whose magnitude is 2^53 or more, which the caller reads through the body's bytes.
+function paxForValue(ty: ColType, r: FixedRegion, payload: Uint8Array, i: number): Value | null {
+  const bw = r.bw;
+  const at = r.offs + i * bw;
+  const off =
+    bw === 0
+      ? 0
+      : bw === 1
+        ? payload[at]!
+        : bw === 2
+          ? (payload[at]! << 8) | payload[at + 1]!
+          : ((payload[at]! << 24) |
+              (payload[at + 1]! << 16) |
+              (payload[at + 2]! << 8) |
+              payload[at + 3]!) >>>
+            0;
+  let x: number;
+  if (r.width <= 4) {
+    x = ((r.baseLo + off) % 2 ** (8 * r.width)) - 2 ** (8 * r.width - 1);
+  } else {
+    // The low and high 32-bit halves, the carry by hand; the sign-flipped high half within ±2^21
+    // keeps the value below 2^53 in magnitude, exact in a number.
+    let lo = r.baseLo + off;
+    let hi = r.baseHi;
+    if (lo >= 0x1_0000_0000) {
+      lo -= 0x1_0000_0000;
+      hi = (hi + 1) % 0x1_0000_0000;
+    }
+    const top = hi - 0x80000000;
+    if (top < -0x200000 || top >= 0x200000) return null;
+    x = top * 0x1_0000_0000 + lo;
+  }
+  if (ty.kind === "scalar" && ty.fixedDec !== undefined) {
+    return decimalValue(Decimal.fromUnscaledNumber(x, ty.fixedDec.scale));
+  }
+  if (ty.kind === "scalar" && isDate(ty.scalar)) return dateValue(BigInt(x));
+  if (ty.kind === "scalar" && isTimestamp(ty.scalar)) return timestampValue(BigInt(x));
+  if (ty.kind === "scalar" && isTimestamptz(ty.scalar)) return timestamptzValue(BigInt(x));
+  return intValue(BigInt(x));
+}
+
+// FIXED_SPAN_SCRATCH holds one fixed-width value a reader decodes at once (the widest is 16 bytes).
+const FIXED_SPAN_SCRATCH = new Uint8Array(16);
+
+// paxArrSpan is packed-array value i in its plain tagged form (NULL = empty), decoded alone into a
+// fresh buffer the caller owns: the region is never rebuilt.
+function paxArrSpan(payload: Uint8Array, r: ArrRegion, i: number): Uint8Array {
+  const cnt = payload[r.counts + i]!;
+  if (cnt === 255) return new Uint8Array(0);
+  if (cnt === 0) return new Uint8Array(3); // 0x00, ndim 0, flags 0
+  const w = r.w;
+  const body = new Uint8Array(11 + cnt * w);
+  body[1] = 1; // tag 0x00, ndim 1, flags 0
+  body[6] = cnt; // the u32 element count (at most 254)
+  body[10] = 1; // the u32 lower bound 1
+  const k = Math.floor(i / ARR_INDEX_ROWS);
+  let start = r.starts[k]!;
+  for (let j = k * ARR_INDEX_ROWS; j < i; j++) {
+    const cj = payload[r.counts + j]!;
+    if (cj !== 255) start += cj;
+  }
+  let bit = r.data * 8 + start * r.bits;
+  let o = 11;
+  if (w <= 4) {
+    const nbase = beUintN(payload, r.counts + paxArrN(r), w);
+    for (let e = 0; e < cnt; e++) {
+      putBEUintN(body, o, w, nbase + getBitsN(payload, bit, r.bits));
+      bit += r.bits;
+      o += w;
+    }
+  } else if (r.bits <= 32) {
+    // An 8-byte element whose offsets fit 32 bits: the base as high and low 32-bit halves, the carry
+    // into the high half by hand, with no bigint per element.
+    const at = r.counts + paxArrN(r);
+    const hw = w - 4;
+    const bhi = beUintN(payload, at, hw);
+    const blo = beUintN(payload, at + hw, 4);
+    for (let e = 0; e < cnt; e++) {
+      let lo = blo + getBitsN(payload, bit, r.bits);
+      let hi = bhi;
+      if (lo >= 0x1_0000_0000) {
+        lo -= 0x1_0000_0000;
+        hi = (hi + 1) % 2 ** (8 * hw);
+      }
+      putBEUintN(body, o, hw, hi);
+      putBEUintN(body, o + hw, 4, lo);
+      bit += r.bits;
+      o += w;
+    }
+  } else {
+    const base = beUint(payload, r.counts + paxArrN(r), w);
+    for (let e = 0; e < cnt; e++) {
+      putBEUint(body, o, w, base + getBits(payload, bit, r.bits));
+      bit += r.bits;
+      o += w;
+    }
+  }
+  return body;
+}
+
+// paxArrValue is present packed-array value i built straight from its packed elements: the value its
+// plain span (paxArrSpan) decodes to, with no span built.
+function paxArrValue(payload: Uint8Array, r: ArrRegion, i: number): Value {
+  const cnt = payload[r.counts + i]!;
+  if (cnt === 0) return emptyArray();
+  const w = r.w;
+  const k = Math.floor(i / ARR_INDEX_ROWS);
+  let start = r.starts[k]!;
+  for (let j = k * ARR_INDEX_ROWS; j < i; j++) {
+    const cj = payload[r.counts + j]!;
+    if (cj !== 255) start += cj;
+  }
+  let bit = r.data * 8 + start * r.bits;
+  const at = r.counts + paxArrN(r);
+  const elements = new Array<Value>(cnt);
+  if (w <= 4) {
+    const nbase = beUintN(payload, at, w);
+    const half = 2 ** (8 * w - 1);
+    for (let e = 0; e < cnt; e++) {
+      elements[e] = intValue(BigInt(nbase + getBitsN(payload, bit, r.bits) - half));
+      bit += r.bits;
+    }
+  } else {
+    // 8-byte elements: as 32-bit halves while the value fits a number exactly, else as a bigint.
+    const bhi = beUintN(payload, at, 4);
+    const blo = beUintN(payload, at + 4, 4);
+    const base = r.bits <= 32 ? 0n : beUint(payload, at, w);
+    for (let e = 0; e < cnt; e++) {
+      if (r.bits <= 32) {
+        let lo = blo + getBitsN(payload, bit, r.bits);
+        let hi = bhi;
+        if (lo >= 0x1_0000_0000) {
+          lo -= 0x1_0000_0000;
+          hi = (hi + 1) % 0x1_0000_0000;
+        }
+        const top = hi - 0x80000000;
+        elements[e] = intValue(
+          top >= -0x200000 && top < 0x200000
+            ? BigInt(top * 0x1_0000_0000 + lo)
+            : BigInt.asIntN(64, ((BigInt(hi) << 32n) | BigInt(lo)) - 0x8000_0000_0000_0000n),
+        );
+      } else {
+        elements[e] = intValue(
+          BigInt.asIntN(64, base + getBits(payload, bit, r.bits) - 0x8000_0000_0000_0000n),
+        );
+      }
+      bit += r.bits;
+    }
+  }
+  return { kind: "array", dims: [cnt], lbounds: [1], elements };
+}
+
+// paxArrN is a packed-array region's record count: its counts run from the region's start to the base.
+function paxArrN(r: ArrRegion): number {
+  return r.data - 1 - r.w - r.counts;
 }
 
 // arrSpanLen is the plain span length of a packed-array value with count byte cnt: nothing for NULL
@@ -8613,21 +8965,20 @@ function paxIsNull(payload: Uint8Array, d: PaxDirs, c: number, i: number): boole
 }
 
 // paxSpan sets out to the stored bytes of value (record i, column c): a fixed-width slot (the untagged
-// body) or a variable value's tagged bytes — in the page, or in the buffer a rebuilt region was
-// rebuilt into. Meaningless for a NULL fixed slot (zero-filled); a NULL variable value's span is empty.
+// body) or a variable value's tagged bytes — in the page, or, for a value the page stores in another
+// form, in a fresh buffer the caller keeps. Meaningless for a NULL fixed slot; a NULL variable value's
+// span is empty.
 function paxSpan(payload: Uint8Array, d: PaxDirs, c: number, i: number, out: Span): void {
   const r = d.regions[c]!;
   if (r.kind === "fixed") {
-    out.buf = paxFixedSlots(payload, d, r);
-    out.start = r.body + i * r.width;
-    out.end = out.start + r.width;
+    // A value the page does not hold whole is built into a buffer of its own, which the caller keeps.
+    paxFixedSpan(payload, d, r, i, out, r.lazy === 0 ? payload : new Uint8Array(16));
     return;
   }
   if (r.kind === "arr") {
-    const m = paxArrPlain(payload, d, r);
-    out.buf = m.body;
-    out.start = i === 0 ? 0 : m.ends[i - 1]!;
-    out.end = m.ends[i]!;
+    out.buf = paxArrSpan(payload, r, i);
+    out.start = 0;
+    out.end = out.buf.length;
     return;
   }
   const j = r.codes < 0 ? i : payload[r.codes + i]!;
@@ -8779,12 +9130,15 @@ function sameValueCodec(a: ColType, b: ColType): boolean {
   }
 }
 
+// own says the caller owns block (a fresh read, not a store's retained buffer): the leaf then keeps a
+// copy of only its used payload, the checksum having been verified over the whole page (pager.md §3).
 export function decodeLeafNode(
   block: Uint8Array,
   page: number,
   colTypes: ColType[],
   paging: SharedPaging | null,
   tag?: Uint8Array,
+  own = false,
 ): PNode {
   // An encrypted file's external pointers end with their chain's first-page tag (encrypted.md §2).
   const tagLen = paging === null ? 0 : paging.cap().tag;
@@ -8800,7 +9154,16 @@ export function decodeLeafNode(
   // key.length + Σ_c valueLen(c, i) (the v24 recordSize), exactly what the writer split on — so a
   // resident leaf is ≈ pageSize (§9), never an inflated row vector.
   const dirs = parsePaxLeaf(pg.payload, n, colTypes);
-  const payload = pg.payload;
+  let payload = pg.payload;
+  if (own && dirs.end < payload.length) {
+    // Every directory is a payload offset below the content end, so only the prefix view moves.
+    const used = payload.slice(0, dirs.end);
+    if (dirs.prefix !== null) {
+      const at = dirs.prefix.byteOffset - payload.byteOffset;
+      dirs.prefix = used.subarray(at, at + dirs.prefix.length);
+    }
+    payload = used;
+  }
   // Reconstruct-on-demand seam (closes over the directories + payload). NULL comes off the region
   // (bitmap / zero span) with no decode; a fixed-width slot is the untagged inline body — decoded
   // eagerly (deferring a fixed-width scalar buys nothing, lazy-record.md §6); a variable value's
@@ -8813,18 +9176,61 @@ export function decodeLeafNode(
   const tyrefs: TypeRef[] = colTypes.map((_, c) => ({ cols: colTypes, idx: c }));
   const fixed: boolean[] = colTypes.map((ty) => fixedValueWidth(ty) !== null);
   const sp: Span = { buf: payload, start: 0, end: 0 };
+  const regions = dirs.regions;
   const col = (i: number, c: number): Value => {
     if (paxIsNull(payload, dirs, c, i)) return nullValue();
+    const reg = regions[c]!;
+    if (
+      reg.kind === "fixed" &&
+      reg.lazy === 2 &&
+      (reg.pf === null || pfBody(payload, reg.width, reg.pf, i) < 0)
+    ) {
+      const v = paxForValue(colTypes[c]!, reg, payload, i);
+      if (v !== null) return v;
+    }
+    if (reg.kind === "arr") {
+      // Deferred over the value's own plain span, decoded alone: its body is the span after the tag.
+      const span = paxArrSpan(payload, reg, i);
+      return {
+        kind: "unfetched",
+        ref: {
+          form: 0x00,
+          firstPage: 0,
+          storedLen: 0,
+          rawLen: 0,
+          comp: span.subarray(1),
+          ty: tyrefs[c]!,
+          paging: null,
+        },
+      };
+    }
+    if (fixed[c]) {
+      // Decoded at once, so the span may be built into the shared scratch.
+      paxFixedSpan(payload, dirs, regions[c] as FixedRegion, i, sp, FIXED_SPAN_SCRATCH);
+      return readInlineBody(colTypes[c]!, sp.buf, { pos: sp.start }, "construct");
+    }
     paxSpan(payload, dirs, c, i, sp);
-    return fixed[c]
-      ? readInlineBody(colTypes[c]!, sp.buf, { pos: sp.start }, "construct")
-      : readValueLazy(tyrefs[c]!, sp.buf, sp.start, sp.end, paging, tagLen);
+    return readValueLazy(tyrefs[c]!, sp.buf, sp.start, sp.end, paging, tagLen);
   };
   // The same value col + resolve produce for an inline body (readValueLazy defers the body's span
   // and resolveUnfetched re-runs this very decoder over it), without the deferred handle.
   const colNow = (i: number, c: number): Value | undefined => {
     if (paxIsNull(payload, dirs, c, i)) return nullValue();
     const ty = colTypes[c]!;
+    const reg = regions[c]!;
+    if (
+      reg.kind === "fixed" &&
+      reg.lazy === 2 &&
+      (reg.pf === null || pfBody(payload, reg.width, reg.pf, i) < 0)
+    ) {
+      const v = paxForValue(ty, reg, payload, i);
+      if (v !== null) return v;
+    }
+    if (reg.kind === "arr") return paxArrValue(payload, reg, i);
+    if (fixed[c]) {
+      paxFixedSpan(payload, dirs, regions[c] as FixedRegion, i, sp, FIXED_SPAN_SCRATCH);
+      return readInlineBody(ty, sp.buf, { pos: sp.start }, "construct");
+    }
     paxSpan(payload, dirs, c, i, sp);
     const cur = { pos: sp.start };
     if (!fixed[c]) {
@@ -8857,6 +9263,24 @@ export function decodeLeafNode(
     key(i: number): Uint8Array {
       return paxKey(payload, dirs, i);
     },
+    compareKey:
+      dirs.prefix === null
+        ? undefined
+        : (i: number, probe: Uint8Array): number => paxCompareKey(payload, dirs, i, probe),
+    keyLen(i: number): number {
+      return paxKeyLen(payload, dirs, i);
+    },
+    keyInto(i: number, out: Uint8Array, at: number): number {
+      const lo = paxSuffixLo(payload, dirs, i);
+      const hi = paxSuffixHi(payload, dirs, i);
+      let o = at;
+      if (dirs.prefix !== null) {
+        out.set(dirs.prefix, o);
+        o += dirs.prefix.length;
+      }
+      out.set(payload.subarray(lo, hi), o);
+      return o + hi - lo - at;
+    },
     search:
       dirs.prefix === null
         ? undefined
@@ -8878,6 +9302,7 @@ export function decodeLeafNode(
       return paxHasChains(payload, dirs);
     },
     dirs,
+    held: leafHeldBytes(payload, dirs),
     col,
     colNow,
     row(i: number): Row {
@@ -8887,6 +9312,27 @@ export function decodeLeafNode(
     },
   };
   return { keys: [], vals: [], weights: [], children: [], packed, page, tag };
+}
+
+// LEAF_OBJECT_BYTES and REGION_OBJECT_BYTES estimate the heap a resident leaf's objects take beyond its
+// payload in V8, which exposes no object sizes: the node, the packed leaf and its closures, the parsed
+// directories, and one region descriptor per column. Measured with impl/ts/tests/zz_mem_probe.ts.
+const LEAF_OBJECT_BYTES = 2432;
+const REGION_OBJECT_BYTES = 96;
+// PFOR_OBJECT_BYTES estimates a kind 6 region's exception descriptor (PforRegion): a small object of
+// six numbers, its masks possibly boxed.
+const PFOR_OBJECT_BYTES = 64;
+
+// leafHeldBytes is what a resident leaf holds: its retained payload, its objects (estimated), each
+// packed-array region's row index, and each kind 6 region's exception descriptor (estimated).
+function leafHeldBytes(payload: Uint8Array, d: PaxDirs): number {
+  let held =
+    PAGE_HEADER + payload.byteLength + LEAF_OBJECT_BYTES + REGION_OBJECT_BYTES * d.regions.length;
+  for (const r of d.regions) {
+    if (r.kind === "arr") held += r.starts.byteLength;
+    else if (r.kind === "fixed" && r.pf !== null) held += PFOR_OBJECT_BYTES;
+  }
+  return held;
 }
 
 type Cursor = { pos: number };

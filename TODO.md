@@ -260,7 +260,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ keep chains on the remaining rewrite paths — `INSERT … ON CONFLICT DO UPDATE`, table rewrites (`ALTER TABLE`), and in-session rows of a table whose single root leaf stays resident after commit. Physical only (no byte or cost change). _(size: S–M)_
 - [x] **The compact leaf (format v52)** — 16-bit leaf directories, elided key columns, fixed-length keys without a directory, inline strings without a length, a shared key prefix, base-plus-offsets integer columns, string dictionaries, and bit-packed integer arrays. → [leaf-structural.md](spec/design/leaf-structural.md)
   - [ ] _decide (maintainer):_ **per-column symbol tables** for text and `jsonb` (step 8 of leaf-structural.md §10, prototyped and held): needs the trainer pinned bit-exactly across cores and the training points restated as a rule over rows and pages. Decide the table's **scope** in the same decision — one leaf, a group of neighbouring leaves (the "super block", as a small table the leaves reference, most naturally held by the lowest interior node; never a group of pages a read must fetch whole), or the column. Measured 2026-11-14 on a generated, stationary 145 MB database (`TestSuperBlockExperiment`, `impl/go/zz_superblock_test.go`), saving as a share of all leaf bytes with a symbol table plus dictionary of each scope: one leaf 17.0%, 8 leaves 28.7%, 64 leaves 31.8%, the column 35.5%; with a symbol table alone, 8 leaves reach about 90% of the column's gain and 64 leaves about 99%. A wider scope helps only text and `jsonb`: with v52's encodings a 64 KiB page file is 1.6% larger than the 8 KiB one. Still to settle: column scope against group scope on data that drifts (a column table saved nothing there until the per-leaf fallback, leaf-structural.md §10.2; a group table adapts locally but has no rule yet for splits and merges, and no engine found does it), and table generations for a column table. Decode symbol-coded values one at a time; a rebuilt plain region gives the RAM back.
-  - [ ] _follow-on:_ keep a resident leaf the size of its page — rebuild an elided key column lazily, and give range scans the prefix-aware comparison point lookups have (leaf-structural.md §12). Physical only. _(size: M)_ Read base-plus-offsets values in place instead of building a full-width copy per column per leaf (every core does today; Go at parse): in Go, kind 1 reads one row in place as fast as from the copy, a scan needs a loop specialised per offset width to match it, and the copy costs about 1.9 µs per column per leaf (leaf-write-cost.md §4b).
+  - [x] _follow-on:_ keep a resident leaf the size of its page — every region read in place in all three cores (base-plus-offsets and elided key columns, keys under a shared prefix compared prefix-aware and built only as transients, packed arrays a value at a time), a fresh page trimmed to its used payload, and the buffer pool charging each leaf its bytes (leaf-structural.md §12 item 3, pager.md §3). A read leaf holds 1.16× its page in Go, 1.04× in Rust and 1.30× in TS, against 2.06×, 1.91× and 2.11×; live heap under a `cache_bytes` budget stays at the budget. Physical only, no format change.
   - [ ] _follow-on:_ an integrity fixture with a stored primary-key column (a `text` key), so `row_key_not_primary_key` is produced again; the v52 fixtures' integer keys are elided and cannot disagree with their rows. _(size: S)_
   - [ ] _follow-on:_ have the integrity check verify the content-dependent choices (the stored prefix is the longest one; each region has its smallest kind). _(size: S)_
   - [ ] _follow-on:_ fixed-length keys for index trees whose key columns are all `NOT NULL` (needs `ALTER TABLE … DROP NOT NULL` to rebuild the index), and a shared prefix in interior pages (leaf-structural.md §5, §7).
@@ -268,10 +268,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     default-off switches; the recommendation awaits a decision. #4 (inserts and removes shifting a
     dirty leaf's arrays): port the shorter-side shift (cascade −29%, range delete −8%, contained in
     the edit helpers), not the movable gap (cascade −47% but insert +12%, and it touches every site
-    that indexes a dirty leaf). #5 (one widened value splitting a full leaf, `update_untouched_large_rollback`
-    2.3× v51): take the base-plus-offsets region with an exception (kind 6, no density cost, update
-    0.011 ms vs v51's 0.018) as format v54, after deciding between one exception and a few; do not
-    adopt slack (+3% to +7% live pages, helps only wide-row leaves) or runs with their own base
+    that indexes a dirty leaf). #5 (one widened value splitting a full leaf) **landed as format v54**
+    (2026-11-14): up to 16 exceptions per base-plus-offsets column per leaf (patched base plus
+    offsets), region kind 6, in all three cores and the Ruby reference (leaf-write-cost.md §8–§9; the
+    cap chosen over one exception and over 8 on realistic distributions). Not adopted:
+    slack (+3% to +7% live pages, helps only wide-row leaves) or runs with their own base
     (−21% on a drifting column, but writes 2–6.5× slower as built and random reads in place 3–5×
     slower). Fixed blocks with the exception on top are the better drift option (−19%, constant-time
     reads in place, no load cost) but re-measure the column on every insert or delete (writes 25–62%
@@ -279,7 +280,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     if drift compression is wanted. Implementation-only follow-ons either way: split a lazy
     leaf from its page instead of decoding every row, and size a failed evening candidate from its
     page. → [leaf-write-cost.md](spec/design/leaf-write-cost.md) _(size: S for the Go shorter side;
-    M for the split path; format v54 with goldens in three cores and the Ruby reference)_
+    M for the split path)_
 - [x] **Format v53: deferred interior pages + the narrow commit manifest** — landed 2026-11-13 as one
   change in all three cores and the Ruby reference, with no switches left: a `(parent, slot) → page`
   remap list lets a commit keep an interior whose only change is a child's page (and its catalog

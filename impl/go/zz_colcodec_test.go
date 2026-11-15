@@ -937,7 +937,7 @@ func ccCollect(t *testing.T, db *Database) (cols []*ccColumn, pages [][]byte) {
 			key.leaves = append(key.leaves, lk)
 			key.rows += n
 			for c := range colTypes {
-				r := &leaf.regions[c]
+				r := expDense(leaf, &leaf.regions[c])
 				col := cs[c]
 				lc := ccLeaf{n: n}
 				col.rows += n

@@ -20,23 +20,15 @@ import "sync"
 // DefaultCacheBytes is the default memory budget for the resident leaf cache, in bytes (256 MiB) — the
 // OpenOptions.CacheBytes default (spec/design/pager.md §3, api.md §2.1). Sized so the dominant case —
 // a RAM-sized database (CLAUDE.md §9) — stays fully cache-resident under the default; stated in bytes
-// so the budget does not silently scale with a file's page size. Converted to a leaf-page capacity by
-// cacheLeaves.
+// so the budget does not silently scale with a file's page size. The pool charges each resident leaf
+// what it holds (pnode.residentBytes) against it.
 const defaultCacheBytes = 256 * 1024 * 1024
 
-// cacheLeaves converts a byte budget to a resident-leaf-page capacity for a file of pageSize bytes:
-// max(1, cacheBytes / pageSize) (pager.md §3). The max(1, …) floor keeps one leaf resident even when
-// cacheBytes < pageSize — the minimum to walk a root→leaf path. The divisor is clamped to ≥ 1 so a
-// malformed pageSize = 0 cannot divide by zero (the loader rejects it separately as corrupt — format.go).
-func cacheLeaves(cacheBytes int, pageSize uint32) int {
-	div := int(pageSize)
-	if div < 1 {
-		div = 1
-	}
-	if n := cacheBytes / div; n > 1 {
-		return n
-	}
-	return 1
+// cacheBudget is the buffer pool's byte budget for a cache_bytes setting: the setting itself, at least
+// 1 (pager.md §3). The pool keeps one leaf resident whatever the budget — the minimum to walk a
+// root→leaf path.
+func cacheBudget(cacheBytes int) int {
+	return max(cacheBytes, 1)
 }
 
 // sharedPaging is one database's pager + leaf buffer pool, shared (pointer) by all its stores and
@@ -54,9 +46,9 @@ type sharedPaging struct {
 	cat   *catState
 }
 
-// newSharedPaging wraps an open pager with a CLOCK pool of capacity leaves.
-func newSharedPaging(p *pager, capacity int) *sharedPaging {
-	return &sharedPaging{pgr: p, pool: newBufferPool(capacity), batches: p.batchesReads()}
+// newSharedPaging wraps an open pager with a CLOCK pool whose leaves hold at most budget bytes.
+func newSharedPaging(p *pager, budget int) *sharedPaging {
+	return &sharedPaging{pgr: p, pool: newBufferPool(budget), batches: p.batchesReads()}
 }
 
 // codec is the database's page codec when its file is encrypted (spec/fileformat/encrypted.md): every
@@ -111,7 +103,7 @@ func (s *sharedPaging) faultLeaf(page pageRef, colTypes []colType) (*pnode, erro
 		// unfetched reference — no chain read, no decompression. The scan layer resolves the
 		// columns a query touches through readBlock below; a deferred value the touched set
 		// missed self-resolves through the paging handle stamped here (bplus-reshape.md §5, B4).
-		return decodeLeafNode(block, page, colTypes, s)
+		return decodeLeafNode(block, page, colTypes, s, s.ownsReads())
 	})
 	if err != nil {
 		return nil, err
@@ -133,7 +125,7 @@ func (s *sharedPaging) prefetchLeaves(pages []pageRef, colTypes []colType) {
 	if !s.batches {
 		return
 	}
-	limit := max(s.pool.capacityPages()/4, 1)
+	limit := max(s.pool.capacity()/int(s.pgr.pageSize)/4, 1)
 	var missing []pageRef
 	for _, page := range pages {
 		if len(missing) == limit {
@@ -163,7 +155,7 @@ func (s *sharedPaging) prefetchLeaves(pages []pageRef, colTypes []colType) {
 			if err != nil {
 				return nil, err
 			}
-			return decodeLeafNode(plain, page, colTypes, s)
+			return decodeLeafNode(plain, page, colTypes, s, s.ownsReads())
 		})
 	}
 }
@@ -245,13 +237,24 @@ func (s *sharedPaging) close() error {
 	return s.pgr.close()
 }
 
-// capacity is the pool's leaf-page capacity — carried over to the replacement pool when compaction
-// reopens the database (spec/design/api.md §2.6).
+// capacity is the pool's byte budget — carried over to the replacement pool when compaction reopens
+// the database (spec/design/api.md §2.6).
 func (s *sharedPaging) capacity() int {
-	return s.pool.capacityPages()
+	return s.pool.capacity()
 }
 
-// setCapacity re-bounds the pool to capacity leaves, evicting until the resident set fits (a spilled
+// ownsReads reports whether a page this context reads is a fresh buffer the reader owns: always for
+// an encrypted file (the opened plaintext is new), otherwise unless the store hands out its own
+// retained blocks (an in-memory store).
+func (s *sharedPaging) ownsReads() bool {
+	if s.pgr.codec != nil {
+		return true
+	}
+	shared, ok := s.pgr.store.(interface{ retainsBlocks() bool })
+	return !ok || !shared.retainsBlocks()
+}
+
+// setCapacity re-bounds the pool to capacity bytes, evicting until the resident set fits (a spilled
 // temp domain, spec/design/temp-tables.md §6).
 func (s *sharedPaging) setCapacity(capacity int) {
 	s.pool.setCapacity(capacity)

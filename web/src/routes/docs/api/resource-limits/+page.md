@@ -170,10 +170,10 @@ That extra space is bounded by how much writing produced it, which `max_cost` an
 ## Page cache
 
 A file-backed database holds its table data in a **page cache** of leaf pages read from the file,
-bounded by the `cache_bytes` / `CacheBytes` / `cacheBytes` open option (default **256 MiB**). The
-budget becomes a page count, `max(1, cache_bytes / page_size)`, so a budget smaller than one page
-still keeps one page cached. When the cache is full, jed evicts a page; it can always read that page
-back from the file. Because of that, **the cache never fails a query**, and its size never changes a
+bounded by the `cache_bytes` / `CacheBytes` / `cacheBytes` open option (default **256 MiB**). Each
+cached page is counted at the memory it actually takes (its used bytes plus a little bookkeeping), and
+a budget smaller than one page still keeps one page cached. When the cache is full, jed evicts a
+page; it can always read that page back from the file. Because of that, **the cache never fails a query**, and its size never changes a
 query's results or cost. It is a memory and speed setting, not a limit an untrusted query can hit.
 
 The budget bounds the cached pages, with two qualifications:

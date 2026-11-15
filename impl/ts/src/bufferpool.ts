@@ -1,6 +1,8 @@
 // Bounded buffer pool — a CLOCK (second-chance) cache of decoded leaf nodes keyed by on-disk page id
 // (spec/design/pager.md §3). The demand-paging read path (P6.4b) faults a leaf through getOrLoad; the
-// pool bounds how many leaves are resident at once, evicting under CLOCK when full.
+// pool bounds the bytes resident leaves hold (cache_bytes), each leaf charged what this core holds for
+// it (nodeBytes), evicting under CLOCK until a new leaf fits. At least one leaf stays resident whatever
+// the budget.
 //
 // No pins. Eviction only drops the cache entry — any node still referenced by a live tree or an
 // in-flight read stays alive via GC, and a clean node is immutable so a re-load is a harmless
@@ -13,15 +15,23 @@
 import type { PNode } from "./pmap.ts";
 import { ioSteps, runSync, type Steps } from "./execution.ts";
 
-// One resident page: its id, the cached node, and the CLOCK reference bit (set on access, cleared by
-// the sweeping hand to grant a second chance).
-type Slot = { page: number; node: PNode; referenced: boolean };
+// One resident page: its id, the cached node, the bytes it is charged, and the CLOCK reference bit (set
+// on access, cleared by the sweeping hand to grant a second chance).
+type Slot = { page: number; node: PNode; bytes: number; referenced: boolean };
 
-// A bounded CLOCK cache from page id to a decoded leaf node.
+// nodeBytes is what the pool charges for a node: a faulted leaf's held bytes (PackedLeaf.held). The
+// pool caches only faulted leaves; any other node is charged a page.
+export function nodeBytes(node: PNode): number {
+  return node.packed?.held ?? 8192;
+}
+
+// A CLOCK cache from page id to a decoded leaf node, bounded in bytes.
 export class BufferPool {
-  // capacity is the most pages the pool holds at once (carried over to the replacement pool when
-  // compaction reopens the database, spec/design/api.md §2.6). Re-bounded only through setCapacity.
+  // capacity is the byte budget the resident leaves are charged against together (carried over to the
+  // replacement pool when compaction reopens the database, spec/design/api.md §2.6). Re-bounded only
+  // through setCapacity. used is what they are charged now.
   capacity: number;
+  private used = 0;
   private slots: Slot[] = [];
   private index = new Map<number, number>();
   private hand = 0;
@@ -57,17 +67,16 @@ export class BufferPool {
     return this.index.has(page);
   }
 
-  // insertSlot adds a freshly-loaded page, evicting one under CLOCK if at capacity.
+  // insertSlot adds a freshly-loaded page, evicting under CLOCK until it fits the budget or nothing is
+  // left to evict: a leaf larger than the whole budget is still admitted, alone.
   private insertSlot(page: number, node: PNode): void {
-    if (this.slots.length < this.capacity) {
-      this.index.set(page, this.slots.length);
-      this.slots.push({ page, node, referenced: false });
-      return;
+    const bytes = nodeBytes(node);
+    while (this.slots.length > 0 && this.used + bytes > this.capacity) {
+      this.drop(this.evictSlot());
     }
-    const victim = this.evictSlot();
-    this.index.delete(this.slots[victim].page);
-    this.index.set(page, victim);
-    this.slots[victim] = { page, node, referenced: false };
+    this.index.set(page, this.slots.length);
+    this.slots.push({ page, node, bytes, referenced: false });
+    this.used += bytes;
   }
 
   // evictSlot advances the CLOCK hand, clearing the reference bit of each page it passes (a second
@@ -82,20 +91,26 @@ export class BufferPool {
     }
   }
 
-  // setCapacity re-bounds the pool to capacity pages (clamped to ≥ 1), evicting under CLOCK until the
-  // resident set fits — a spilled temp domain's pool tightens from pinned to temp_buffers
-  // (spec/design/temp-tables.md §6).
+  // setCapacity re-bounds the budget (clamped to ≥ 1), evicting under CLOCK until the resident set
+  // fits, keeping at least one leaf — a spilled temp domain's pool tightens from pinned to
+  // temp_buffers (spec/design/temp-tables.md §6).
   setCapacity(capacity: number): void {
     this.capacity = Math.max(1, capacity);
-    while (this.slots.length > this.capacity) {
+    while (this.slots.length > 1 && this.used > this.capacity) {
       const victim = this.evictSlot();
       this.invalidate(this.slots[victim].page);
     }
   }
 
-  // resident is the number of pages currently resident — the bound the pool enforces (≤ capacity).
+  // resident is the number of pages currently resident.
   resident(): number {
     return this.slots.length;
+  }
+
+  // residentBytes is what the resident leaves are charged together — the bound the pool enforces
+  // (≤ capacity, or one leaf).
+  residentBytes(): number {
+    return this.used;
   }
 
   // invalidateAll drops every cached page — a page client told by the owner that its whole cache may be
@@ -103,6 +118,7 @@ export class BufferPool {
   invalidateAll(): void {
     this.generation++;
     this.slots = [];
+    this.used = 0;
     this.index = new Map();
     this.hand = 0;
   }
@@ -117,9 +133,14 @@ export class BufferPool {
     this.generation++;
     const i = this.index.get(page);
     if (i === undefined) return;
-    this.index.delete(page);
-    // Swap the last slot into the hole so the array stays dense (capacity accounting + the CLOCK hand
-    // stay well-formed), then shrink.
+    this.drop(i);
+  }
+
+  // drop removes slot i: swap the last slot into the hole so the array stays dense (the CLOCK hand
+  // stays well-formed), then shrink. An eviction is not an invalidation, so it leaves the generation.
+  private drop(i: number): void {
+    this.index.delete(this.slots[i]!.page);
+    this.used -= this.slots[i]!.bytes;
     const last = this.slots.length - 1;
     if (i !== last) {
       const moved = this.slots[last]!;

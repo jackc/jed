@@ -698,7 +698,7 @@ func (w *expWalker) tree(name, kind string, root *pnode, colTypes []colType, col
 			if r.elided {
 				// not stored: rebuilt from the keys
 			} else if r.width > 0 {
-				s = expFixed(r, n)
+				s = expFixed(expDense(leaf, r), n)
 			} else {
 				s = expVariable(r, n, colTypes[c])
 			}

@@ -434,7 +434,8 @@ checksum `f82d3b99ddaff0fb` and hot checksum `28f09c46d56e242a`. The allocation 
 from the retained structure (`1 + V` integer arrays no longer exist); timings remain observational.
 
 **Bounded buffer-pool index reservation result (2026-07-15).** P2 improvement 1 gives the Rust and
-Go page-id indexes a bounded initial capacity hint of `min(cache_leaves, 8192)`. The bound covers the
+Go page-id indexes a bounded initial capacity hint of `min(cache_leaves, 8192)` (since the byte-charged
+pool, `min(cache_bytes / 8 KiB, 8192)` — pager.md §3). The bound covers the
 roughly 6,900 leaves populated by `point_lookup_pk_ramp`, but does not turn the default 32,768-leaf
 ceiling—or a caller's much larger configured ceiling—into an unbounded eager allocation. Five fresh
 opens before and after on the same Intel Core Ultra 9 285K host (Go 1.26.3, rustc 1.92.0) produced

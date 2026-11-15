@@ -333,7 +333,7 @@ impl Engine {
                             meter.checkpoint()?;
                             let row_key = index_entry_row_key(entry_key, prefix_len, &ib.suffix);
                             let (row, pages, slabs) =
-                                store.get_with_units(row_key, &plan.rel_masks[0])?;
+                                store.get_with_units_touched(row_key, &plan.rel_masks[0])?;
                             let row = row.ok_or_else(|| {
                                 crate::error::EngineError::data_corrupted(
                                     "an index entry references a stored row",
@@ -372,7 +372,7 @@ impl Engine {
                             meter.checkpoint()?;
                             let row_key = index_entry_row_key(entry_key, prefix_len, &suffix);
                             let (row, pages, slabs) =
-                                store.get_with_units(row_key, &plan.rel_masks[0])?;
+                                store.get_with_units_touched(row_key, &plan.rel_masks[0])?;
                             let row = row.ok_or_else(|| {
                                 crate::error::EngineError::data_corrupted(
                                     "an index entry references a stored row",
@@ -426,7 +426,7 @@ impl Engine {
                         meter.checkpoint()?;
                         let row = if candidate.is_empty() {
                             let (row, pages, slabs) =
-                                store.get_with_units(&key, &plan.rel_masks[0])?;
+                                store.get_with_units_touched(&key, &plan.rel_masks[0])?;
                             meter.charge_block(pages, slabs);
                             row.ok_or_else(|| {
                                 crate::error::EngineError::data_corrupted(
@@ -479,7 +479,7 @@ impl Engine {
                         meter.checkpoint()?;
                         let row = if candidate.is_empty() {
                             let (row, pages, slabs) =
-                                store.get_with_units(&key, &plan.rel_masks[0])?;
+                                store.get_with_units_touched(&key, &plan.rel_masks[0])?;
                             meter.charge_block(pages, slabs);
                             row.ok_or_else(|| {
                                 crate::error::EngineError::data_corrupted(
@@ -1046,7 +1046,8 @@ impl Engine {
                     // The old up-front slab block already reconstructed spillable point rows here.
                     // Keep that error/cost timing, but retain the row for first pull instead of
                     // descending and reconstructing it again.
-                    let (row, pages, slabs) = store.get_with_units(&key, &plan.rel_masks[0])?;
+                    let (row, pages, slabs) =
+                        store.get_with_units_touched(&key, &plan.rel_masks[0])?;
                     (
                         pages,
                         slabs,
@@ -1364,7 +1365,8 @@ impl Engine {
                     .len()
                     .checked_sub(io.pk_width)
                     .map_or(&[][..], |at| &ekey[at..]);
-                let (row, pages, slabs) = store.get_with_units(row_key, &plan.rel_masks[0])?;
+                let (row, pages, slabs) =
+                    store.get_with_units_touched(row_key, &plan.rel_masks[0])?;
                 let mut row = row.ok_or_else(|| {
                     crate::error::EngineError::data_corrupted(
                         "an index entry references a stored row",

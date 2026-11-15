@@ -31,7 +31,7 @@ import { type GistPageRead, readGistLeafKeysSteps } from "../gist.ts";
 import { integrityCheckSteps, type IntegrityReport } from "../integrity.ts";
 import { MemoryBlockStore } from "../memoryblockstore.ts";
 import { Pager } from "../pager.ts";
-import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "../paging.ts";
+import { cacheBudget, DEFAULT_CACHE_BYTES, SharedPaging } from "../paging.ts";
 import type { Database } from "../shared.ts";
 import type { PNode } from "../pmap.ts";
 import type { Value } from "../value.ts";
@@ -92,7 +92,7 @@ export function checkImage(
     const pager = Pager.fromStore(new MemoryBlockStore(image));
     const environment = new Environment();
     const codec = runSync(unlockPagerSteps(pager, credential, environment));
-    paging = new SharedPaging(pager, cacheLeaves(DEFAULT_CACHE_BYTES, pager.pageSize), codec);
+    paging = new SharedPaging(pager, cacheBudget(DEFAULT_CACHE_BYTES), codec);
     e = loadEnginePagedAt(paging, environment, {});
   } catch (err) {
     throw new CheckError("open: " + message(err), err);
@@ -211,7 +211,7 @@ export function pointerKinds(
   const pager = Pager.fromStore(new MemoryBlockStore(image));
   const environment = new Environment();
   const codec = runSync(unlockPagerSteps(pager, credential, environment));
-  const paging = new SharedPaging(pager, cacheLeaves(DEFAULT_CACHE_BYTES, pager.pageSize), codec);
+  const paging = new SharedPaging(pager, cacheBudget(DEFAULT_CACHE_BYTES), codec);
   const gist: number[] = [];
   const e = loadEnginePagedAt(paging, environment, { gist: (pg) => gist.push(pg) });
   const { meta: mt, protectedPages } = selectMeta(paging);

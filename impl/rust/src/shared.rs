@@ -674,7 +674,7 @@ impl Storage {
             let capacity = if temp_buffers == 0 {
                 usize::MAX
             } else {
-                crate::paging::cache_leaves(temp_buffers, self.page_size)
+                crate::paging::cache_budget(temp_buffers)
             };
             self.paging.set_capacity(capacity);
         }
@@ -1653,10 +1653,8 @@ impl Storage {
         };
         let mut build = Storage::new_scratch(self.page_size, scratch)?;
         let capacity = self.paging.capacity();
-        // The scratch domain spills past the handle's page-cache budget, like a temp domain.
-        let budget = capacity
-            .saturating_mul(self.page_size as usize)
-            .max(1 << 20);
+        // The scratch domain spills past the handle's page-cache budget (bytes), like a temp domain.
+        let budget = capacity.max(1 << 20);
         let mut built = snap.emptied(cap, build.paging());
         snap.rebuild_rows(&mut built, (budget / 4) as i64, &mut |s| {
             let staged = build.stage_temp(s, budget, spill)?;
@@ -7362,10 +7360,10 @@ mod temp_spill_internal_tests {
         assert!(did_spill, "a temp domain past temp_buffers should spill");
         assert_eq!(resident, spilled, "spilling changed rows or cost");
 
-        // The page cache is bounded by temp_buffers (4 leaves at page 256), not pinned.
+        // The page cache is bounded by temp_buffers (bytes), not pinned.
         let ts = sess.engine.temp_storage.as_ref().unwrap();
-        assert_eq!(ts.paging().capacity(), 4);
-        assert!(ts.paging().resident_leaves() <= 4);
+        assert_eq!(ts.paging().capacity(), 4 * 256);
+        assert!(ts.paging().resident_bytes() <= 4 * 256 || ts.paging().resident_leaves() == 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7440,7 +7438,7 @@ mod temp_spill_internal_tests {
         sess.query_outcome("INSERT INTO s VALUES (100000, 1, 'x')", &[])
             .unwrap();
         let ts = sess.engine.temp_storage.as_ref().unwrap();
-        assert_eq!(ts.paging().capacity(), 16);
+        assert_eq!(ts.paging().capacity(), 16 * 256);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

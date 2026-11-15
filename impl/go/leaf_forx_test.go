@@ -8,23 +8,25 @@ import (
 	"testing"
 )
 
-// A base-plus-offsets region with one exception (leaf_forx.go) must read back the rows it was
-// written from, and a leaf's size from its page must equal the size measured from its rows, through
-// inserts, in-place updates that create and remove an outlier, and deletes. The workload runs with
-// the lazy-leaf size and patch cross-checks on, once without exceptions and once with them; the
-// query results must agree.
-func TestLeafFORXRoundTrip(t *testing.T) {
-	saved := leafFORX
-	defer func() { leafFORX = saved }()
-	leafFORX = false
+// A base-plus-offsets region with exceptions (leaf_pfor.go) must read back the rows it was written
+// from, and a leaf's size from its page must equal the size measured from its rows, through inserts,
+// in-place updates that create and remove outliers, and deletes. The workload runs with the lazy-leaf
+// size and patch cross-checks on, without exceptions (kind 1 alone) and under several caps; the query
+// results must agree.
+func TestLeafPFORRoundTrip(t *testing.T) {
+	saved := leafPFOR
+	defer func() { leafPFOR = saved }()
+	leafPFOR = 0
 	plain := forxWorkload(t)
-	leafFORX = true
-	before := forxWritten.Load()
-	if got := forxWorkload(t); got != plain {
-		t.Fatalf("rows with exceptions:\n%s\nwithout:\n%s", got, plain)
-	}
-	if forxWritten.Load() == before {
-		t.Fatal("the workload wrote no region with an exception")
+	for _, k := range []int{1, 4, pforMaxK} {
+		leafPFOR = k
+		before := pforWritten.Load()
+		if got := forxWorkload(t); got != plain {
+			t.Fatalf("cap %d: rows with exceptions:\n%s\nwithout:\n%s", k, got, plain)
+		}
+		if pforWritten.Load() == before {
+			t.Fatalf("cap %d: the workload wrote no region with exceptions", k)
+		}
 	}
 }
 

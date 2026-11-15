@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { close, create, EngineError, execute, loadEngine, open } from "../src/tooling.ts";
 import { residentLeaves } from "../src/file.ts";
+import type { Engine } from "../src/executor.ts";
 import type { Value } from "../src/lib.ts";
 
 function intOf(v: Value): bigint {
@@ -49,10 +50,7 @@ test("demand paging: scans + mutates correctly with bounded residency", () => {
       assert.equal(intOf(rows[i]![0]!), BigInt(i));
       assert.equal(intOf(rows[i]![1]!), BigInt(i * 2));
     }
-    assert.ok(
-      residentLeaves(db2) <= CAP,
-      `resident leaves ${residentLeaves(db2)} exceed budget ${CAP}`,
-    );
+    assertPoolBounded(db2, CAP * 256);
     close(db2);
 
     // Mutate through the pool (each statement faults the leaf it touches), reopen, verify.
@@ -60,7 +58,7 @@ test("demand paging: scans + mutates correctly with bounded residency", () => {
     execute(db2, "DELETE FROM t WHERE k = 100");
     execute(db2, "UPDATE t SET v = 999 WHERE k = 200");
     execute(db2, "INSERT INTO t VALUES (6000, 12000)");
-    assert.ok(residentLeaves(db2) <= CAP, "mutations keep residency bounded");
+    assertPoolBounded(db2, CAP * 256);
     close(db2); // autocommit already persisted each statement
 
     db2 = open(path, { cacheBytes: CAP * 256 });
@@ -113,10 +111,7 @@ test("memory budget: bounds residency under repeated lookups on a large file", (
         assert.equal(o.rows.length, 1);
         assert.equal(intOf(o.rows[0]![0]!), BigInt(k + 1));
       }
-      assert.ok(
-        residentLeaves(db2) <= CAP,
-        `resident ${residentLeaves(db2)} exceeds budget ${CAP} at k=${k}`,
-      );
+      assertPoolBounded(db2, CAP * 256);
     }
     close(db2);
   } finally {
@@ -250,3 +245,15 @@ test("page-size hardening: rejects a page size below the 256 floor", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// assertPoolBounded fails unless the leaves resident in db's pool are charged at most budget bytes
+// together, or are a single leaf (pager.md §3: one leaf stays resident whatever the budget).
+function assertPoolBounded(db: Engine, budget: number): void {
+  const leaves = residentLeaves(db);
+  const bytes = db.paging!.residentBytes();
+  assert.ok(
+    bytes <= budget || leaves === 1,
+    `${leaves} resident leaves are charged ${bytes} bytes, over the ${budget}-byte budget`,
+  );
+  assert.ok(leaves > 0, "no leaf resident after reading the table");
+}

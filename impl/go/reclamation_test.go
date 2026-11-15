@@ -345,7 +345,7 @@ func TestOpenReadsInteriorSpineNotEveryLeaf(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db2, err := loadEnginePaged(p, cacheLeaves(defaultCacheBytes, p.pageSize), NewEnvironment())
+	db2, err := loadEnginePaged(p, cacheBudget(defaultCacheBytes), NewEnvironment())
 	if err != nil {
 		t.Fatal(err)
 	}

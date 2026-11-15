@@ -34,7 +34,7 @@ func recordedCommitEngine(t *testing.T, image []byte) (*engine, *recordingStore,
 	if err != nil {
 		t.Fatal(err)
 	}
-	db, err := loadEnginePaged(p, cacheLeaves(defaultCacheBytes, p.pageSize), NewEnvironment())
+	db, err := loadEnginePaged(p, cacheBudget(defaultCacheBytes), NewEnvironment())
 	if err != nil {
 		t.Fatal(err)
 	}

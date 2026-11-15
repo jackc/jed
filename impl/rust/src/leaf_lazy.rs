@@ -19,10 +19,10 @@
 
 use std::borrow::Cow;
 
-use super::leaf_compact::{ColAcc, ForCol, ForRange, for_eligible, for_slot, row_items};
+use super::leaf_compact::{ColAcc, ForCol, ForFacts, for_eligible, for_slot, row_items};
 use super::{
     Cap, ChainSource, CompressMemo, Disp, Item, LeafShape, LeafSizes, PackedLeaf, PaxDirs,
-    RegionDir, Result, Row, Sealer, Unfetched, Value, all_inline_size, be_uint,
+    RegionDir, Result, Row, Sealer, Unfetched, Value, VarSpan, all_inline_size,
     encode_disposed_value, encode_leaf_keys, encode_leaf_pax, encode_region, encode_value,
     fixed_value_width, payload_bytes, put16, record_max, same_leaf_codecs, span_item,
     string_payload, value_facts,
@@ -64,10 +64,10 @@ impl<'a> LazyView<'a> {
         self.at.len()
     }
 
-    fn key(&self, i: usize) -> &'a [u8] {
+    fn key(&self, i: usize) -> Cow<'a, [u8]> {
         match self.at[i] {
             at if at >= 0 => self.base.key(at as usize),
-            _ => &self.keys[i],
+            _ => Cow::Borrowed(&self.keys[i]),
         }
     }
 
@@ -100,36 +100,17 @@ impl PackedLeaf {
     }
 
     /// The stored span of variable-width value `(record i, column c)`: empty for NULL.
-    fn stored_span(&self, c: usize, i: usize) -> &[u8] {
-        self.dirs.var_span(self.payload(), c, i).bytes()
+    fn stored_span(&self, c: usize, i: usize) -> Cow<'_, [u8]> {
+        match self.dirs.var_span(self.payload(), c, i) {
+            VarSpan::Page(_, b) => Cow::Borrowed(b),
+            VarSpan::Owned(b) => Cow::Owned(b),
+        }
     }
 
-    /// A stored fixed-width column's null bitmap and dense slots (rebuilt, for a base-plus-offsets
-    /// region).
-    fn dense(&self, c: usize) -> (&[u8], &[u8]) {
-        let payload = self.payload();
-        let bits = self.n.div_ceil(8);
-        match &self.dirs.regions[c] {
-            RegionDir::Fixed {
-                width,
-                bitmap,
-                body,
-            } => (
-                &payload[*bitmap..*bitmap + bits],
-                &payload[*body..*body + self.n * width],
-            ),
-            RegionDir::For { bitmap, slots, .. } => {
-                if self.n == 0 {
-                    return (&[], &[]);
-                }
-                self.dirs.slot(payload, c, 0); // rebuilds the slots on first use
-                (
-                    &payload[*bitmap..*bitmap + bits],
-                    slots.get().expect("rebuilt above"),
-                )
-            }
-            _ => unreachable!("not a stored fixed-width region"),
-        }
+    /// Present stored fixed-width value `(record i, column c)` of width at most 8 as a big-endian
+    /// unsigned integer, read in place (a base-plus-offsets region is never rebuilt).
+    fn fixed_u64(&self, c: usize, i: usize) -> u64 {
+        self.dirs.fixed_u64(self.payload(), c, i)
     }
 
     /// [`record_weight`](Self::record_weight) for every record, read column by column from the
@@ -306,11 +287,10 @@ impl PackedLeaf {
             if matches!(v, Value::Unfetched(_)) {
                 return false;
             }
-            let slot = self.dirs.slot(payload, c, i);
             if for_eligible(ty) {
-                return be_uint(slot) == for_slot(ty, w, v);
+                return self.dirs.fixed_u64(payload, c, i) == for_slot(ty, w, v);
             }
-            return encode_value(ty, v)[1..] == *slot;
+            return encode_value(ty, v)[1..] == *self.dirs.slot(payload, c, i, &mut [0; 16]);
         }
         let span = self.stored_span(c, i);
         // The inline form this writer writes: a bare string, or the tag and the body.
@@ -384,13 +364,12 @@ pub(crate) fn row_all_inline(shape: &LeafShape, cap: Cap, key: &[u8], row: &[Val
 
 // --- size facts from the page ---
 
-/// The span and count of base-plus-offsets column `fc`'s present values over a lazy leaf's rows:
-/// dense slots for the rows still on the page, values for the others.
-fn for_range_of(view: &LazyView<'_>, shape: &LeafShape, fc: &ForCol) -> (ForRange, usize) {
+/// The size facts and count of base-plus-offsets column `fc`'s present values over a lazy leaf's
+/// rows: dense slots for the rows still on the page, values for the others.
+fn for_facts_of(view: &LazyView<'_>, shape: &LeafShape, fc: &ForCol) -> (ForFacts, usize) {
     let ty = &shape.col_types[fc.col];
-    let (bitmap, slots) = view.base.dense(fc.col);
     let w = fc.w;
-    let mut r = ForRange::default();
+    let mut r = ForFacts::default();
     let mut count = 0;
     for (i, &at) in view.at.iter().enumerate() {
         if at < 0 {
@@ -402,10 +381,10 @@ fn for_range_of(view: &LazyView<'_>, shape: &LeafShape, fc: &ForCol) -> (ForRang
             continue;
         }
         let at = at as usize;
-        if bitmap[at / 8] & (0x80 >> (at % 8)) != 0 {
+        if view.base.is_null(fc.col, at) {
             continue;
         }
-        r.add(be_uint(&slots[at * w..(at + 1) * w]));
+        r.add(view.base.fixed_u64(fc.col, at));
         count += 1;
     }
     (r, count)
@@ -429,12 +408,13 @@ fn item_acc_of(view: &LazyView<'_>, shape: &LeafShape, cap: Cap, j: usize) -> Co
     for (i, &at) in view.at.iter().enumerate() {
         if at < 0 {
             items.clear();
-            row_items(shape, cap, view.key(i), &view.vals[i], &mut items);
+            row_items(shape, cap, &view.key(i), &view.vals[i], &mut items);
             acc.add(ic, &items[j], |p| Cow::Owned(p.to_vec()));
         } else if let Some((_, _, codes)) = dict {
             counts[payload[codes + at as usize] as usize] += 1;
         } else {
-            let it = span_item(ty, base.stored_span(ic.col, at as usize));
+            let span = base.stored_span(ic.col, at as usize);
+            let it = span_item(ty, &span);
             acc.add(ic, &it, |p| Cow::Owned(p.to_vec()));
         }
     }
@@ -485,7 +465,7 @@ impl LeafSizes {
                 sz.for_save[j] = view.base.region_saving(fc.col);
                 sz.frozen += 1;
             } else {
-                (sz.fors[j], sz.for_cnt[j]) = for_range_of(view, shape, fc);
+                (sz.fors[j], sz.for_cnt[j]) = for_facts_of(view, shape, fc);
             }
         }
         for (j, ic) in shape.item_cols.iter().enumerate() {
@@ -525,7 +505,7 @@ impl LeafSizes {
         }
         for (j, fc) in shape.for_cols.iter().enumerate() {
             if self.for_stale[j] {
-                (self.fors[j], self.for_cnt[j]) = for_range_of(view, shape, fc);
+                (self.fors[j], self.for_cnt[j]) = for_facts_of(view, shape, fc);
                 self.for_stale[j] = false;
             }
         }
@@ -575,11 +555,11 @@ impl LeafSizes {
                 if !matches!(ov, Value::Null) {
                     self.for_cnt[j] -= 1;
                     if self.for_cnt[j] == 0 {
-                        self.fors[j] = ForRange::default();
+                        self.fors[j] = ForFacts::default();
                         self.for_stale[j] = false;
                     } else {
                         let s = for_slot(ty, fc.w, ov);
-                        if s == self.fors[j].lo || s == self.fors[j].hi {
+                        if self.fors[j].remove(s) {
                             self.for_stale[j] = true;
                             self.stale = true;
                         }
@@ -634,7 +614,7 @@ impl LeafSizes {
         redo: Redo,
     ) {
         for j in redo.fors {
-            (self.fors[j], self.for_cnt[j]) = for_range_of(view, shape, &shape.for_cols[j]);
+            (self.fors[j], self.for_cnt[j]) = for_facts_of(view, shape, &shape.for_cols[j]);
             self.for_stale[j] = false;
         }
         for j in redo.items {
@@ -669,7 +649,8 @@ pub(super) fn encode_lazy_leaf(
     };
     let rows = node.decoded_rows()?;
     let rows: Vec<&[Value]> = rows.iter().map(Vec::as_slice).collect();
-    let keys: Vec<&[u8]> = (0..node.len()).map(|i| node.key_at(i)).collect();
+    let owned: Vec<Cow<'_, [u8]>> = (0..node.len()).map(|i| node.key_at(i)).collect();
+    let keys: Vec<&[u8]> = owned.iter().map(|k| &**k).collect();
     // A leaf the patch encoder took holds only inline records, so encoding it again takes no page
     // and keeps no chain.
     let full = encode_leaf_pax(shape, &keys, &rows, seal, take, ovf, src, memo)?;
@@ -732,7 +713,8 @@ fn patch_leaf(
     if lz.same_rows {
         out.extend_from_slice(&payload[..dirs.col_dir]);
     } else {
-        let keys: Vec<&[u8]> = (0..n).map(|i| node.key_at(i)).collect();
+        let owned: Vec<Cow<'_, [u8]>> = (0..n).map(|i| node.key_at(i)).collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| &**k).collect();
         encode_leaf_keys(shape, &keys, &mut out).ok()?; // the full encoder reports it
     }
     let dir = out.len();
@@ -775,8 +757,8 @@ fn patch_leaf(
                 let is_null = dirs.is_null(payload, c, at);
                 match fixed {
                     Some(w) if is_null => body.resize(body.len() + w, 0),
-                    Some(_) => body.extend_from_slice(dirs.slot(payload, c, at)),
-                    None => body.extend_from_slice(base.stored_span(c, at)),
+                    Some(_) => body.extend_from_slice(dirs.slot(payload, c, at, &mut [0; 16])),
+                    None => body.extend_from_slice(&base.stored_span(c, at)),
                 }
                 is_null
             } else {

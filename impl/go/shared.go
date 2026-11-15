@@ -1211,13 +1211,8 @@ func (st *storage) rekey(snap *snapshot, txid uint64, target *pageCodec, spill s
 	}
 	defer build.close()
 	capacity := st.paging.capacity()
-	// The scratch domain spills past the handle's page-cache budget, like a temp domain.
-	budget := 1 << 20
-	if capacity < math.MaxInt/int(st.pageSize) {
-		budget = max(capacity*int(st.pageSize), budget)
-	} else {
-		budget = math.MaxInt
-	}
+	// The scratch domain spills past the handle's page-cache budget (bytes), like a temp domain.
+	budget := max(capacity, 1<<20)
 	built := snap.emptied(capOf(st.pageSize, target != nil), build.paging)
 	err = snap.rebuildRows(built, int64(budget/4), func(s *snapshot) error {
 		staged, err := build.stageTemp(s, budget, spill)
@@ -1492,7 +1487,7 @@ func (st *storage) stageTemp(snap *snapshot, tempBuffers int, spill spillHost) (
 	if st.spilled {
 		capacity := math.MaxInt
 		if tempBuffers > 0 {
-			capacity = cacheLeaves(tempBuffers, st.pageSize)
+			capacity = cacheBudget(tempBuffers)
 		}
 		st.paging.setCapacity(capacity)
 	}

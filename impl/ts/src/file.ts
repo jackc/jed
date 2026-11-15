@@ -49,7 +49,7 @@ import {
   writeImage,
 } from "./format.ts";
 import { runSync, type Steps } from "./execution.ts";
-import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
+import { cacheBudget, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager, type PageTransform } from "./pager.ts";
 import { DEFAULT_FLUSH_INTERVAL_MS, type Durability } from "./idle_flush.ts";
 import {
@@ -224,7 +224,7 @@ export function createVia(files: FileHost, path: string, opts: DatabaseOptions =
     store.close();
     throw e;
   }
-  db.paging = new SharedPaging(pager, cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize), codec);
+  db.paging = new SharedPaging(pager, cacheBudget(DEFAULT_CACHE_BYTES), codec);
   // Both slots carry the bootstrap txid, so the floor slot is txid & 1 (format.md, *Slot alternation*).
   db.paging.setFloorSlot(Number(db.committed.txid & 1n), db.committed.txid);
   db.committed.storePaging = db.paging;
@@ -261,10 +261,10 @@ function writeFullImage(
 // DatabaseOptions (create-time, fixed into the file), these are handle settings — not stored in the
 // file, so a different host may reopen the same file with different ones. cacheBytes is the buffer-pool
 // budget in bytes: roughly the maximum memory the resident leaf cache holds at once (pager.md §3,
-// P6.4b/c). Bytes, not a page count, so the budget does not silently scale with the file's page size;
-// the engine converts it to a leaf-page capacity by the file's page size as max(1, cacheBytes /
-// pageSize) (cacheLeaves). The bound that lets a database far larger than RAM be served (pager.md §1);
-// it never changes what a query observes (§3/§5). Default DEFAULT_CACHE_BYTES (256 MiB).
+// P6.4b/c). Bytes, not a page count: the pool charges each resident leaf the bytes it holds (its used
+// payload and an estimate of its objects) and evicts until a new leaf fits, keeping at least one. The
+// bound that lets a database far larger than RAM be served (pager.md §1); it never changes what a query
+// observes (§3/§5). Default DEFAULT_CACHE_BYTES (256 MiB).
 // readOnly opens the file read-only (api.md §2.1): the handle then behaves like PostgreSQL hot
 // standby — every transaction defaults to READ ONLY, an explicit READ WRITE request and any write
 // statement are 25006, and the file is opened without write access, so it is never written.
@@ -337,7 +337,7 @@ export type OpenOptions = {
 //
 // The demand-paged loader builds only the interior B-tree skeleton resident, faulting each leaf through
 // the bounded buffer pool on access, so the resident set is bounded by the pool — not the file size
-// (P6.4b). The byte budget is converted to a leaf-page capacity by the file's page size (cacheLeaves).
+// (P6.4b). The pool charges each resident leaf the bytes it holds against the byte budget.
 // The budget is a handle setting, not stored in the file (§3). Later commits write through the same
 // pager kept open for the handle's life.
 export function open(path: string, opts: OpenOptions = {}): Engine {
@@ -393,9 +393,7 @@ export function* openViaSteps(
   const readOnly = opts.readOnly ?? false;
   const store = files.openStore(path, opts.skipFsync ?? false, readOnly);
   try {
-    // Read the file's page size first, then convert the byte budget to a leaf-page capacity; the loader
-    // rejects an out-of-range page size as corrupt (cacheLeaves clamps the divisor so a malformed
-    // page_size = 0 cannot divide by zero before that check runs).
+    // Read the file's page size first; the loader rejects an out-of-range page size as corrupt.
     const pager = yield* Pager.fromStoreSteps(store);
     pager.setPageTransform(transform);
     const environment = opts.environment ?? new Environment();
@@ -409,7 +407,7 @@ export function* openViaSteps(
     let db: Engine;
     try {
       db = yield* loadEnginePagedSteps(
-        new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize), codec),
+        new SharedPaging(pager, cacheBudget(cacheBytes), codec),
         environment,
       );
     } catch (e) {
@@ -947,8 +945,9 @@ function startServiceOwner(
 }
 
 // residentLeaves is the number of leaf pages currently resident in the buffer pool — 0 for an
-// in-memory database (it is fully resident, nothing to page). The read-only gauge the
-// OpenOptions.cacheBytes budget bounds (≤ cacheBytes / pageSize by construction; spec/design/pager.md §3).
+// in-memory database (it is fully resident, nothing to page). The OpenOptions.cacheBytes budget bounds
+// the bytes those leaves are charged together (or one leaf, whatever the budget — spec/design/pager.md
+// §3), so the count is at most about cacheBytes over a leaf's resident size.
 export function residentLeaves(db: Engine): number {
   return db.paging === null ? 0 : db.paging.residentLeaves();
 }

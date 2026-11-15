@@ -15,6 +15,16 @@ use std::path::PathBuf;
 /// The page size the goldens are authored at (small, so the hex stays reviewable).
 const GOLDEN_PAGE_SIZE: u32 = 256;
 
+/// A plaintext golden's page size: [`GOLDEN_PAGE_SIZE`] but for `multiway_split.jed`, whose edited
+/// leaves must hold 32 values stored whole beside enough rows (spec/fileformat/verify.rb).
+fn golden_page_size_of(name: &str) -> u32 {
+    if name == "multiway_split.jed" {
+        512
+    } else {
+        GOLDEN_PAGE_SIZE
+    }
+}
+
 /// A function that builds one of the sample databases the goldens correspond to.
 type Builder = fn() -> Session;
 
@@ -1210,27 +1220,44 @@ fn decimal_table_db() -> Session {
 /// variable-length text keys with a shared prefix and a key directory, a column of one value
 /// (offset width 0), and all-NULL columns. Rows are inserted in key order, one statement each.
 /// multiway_split_db is a tree shaped by single-row edits that take the multi-way leaf split
-/// (format.md "Multi-way split"). Table a: a dense leaf whose v column stores no offsets; one
-/// replaced row and one inserted row each widen their leaf, which splits in three. Table b: keys
-/// outside a shared prefix land at a leaf's edge and split two-way.
+/// (format.md "Multi-way split"), at page size 512. Table a: dense leaves whose v and x columns
+/// store no offsets, each edited leaf holding 16 distant v values before the edited row and 16
+/// distant x values after it (each stored whole, region kind 6, which keeps up to 16); one replaced
+/// row and one inserted row take distant values in both columns, so a half holding either of them
+/// and either group holds 17, which no region stores whole, no two-way split fits, and each leaf
+/// splits in three. Table b: keys outside a shared prefix land at a leaf's edge and split two-way.
 fn multiway_split_db() -> Session {
     let mut db = Database::create(CreateOptions {
         environment: golden_env(),
-        page_size: GOLDEN_PAGE_SIZE,
+        page_size: golden_page_size_of("multiway_split.jed"),
         ..Default::default()
     })
     .unwrap()
     .session(SessionOptions::default());
-    run(&mut db, "CREATE TABLE a (id i32 PRIMARY KEY, v i64)");
+    run(&mut db, "CREATE TABLE a (id i32 PRIMARY KEY, v i64, x i64)");
+    const FAR: i64 = 4_000_000_000_000;
     for i in 1..=600 {
-        if i != 400 {
-            run(&mut db, &format!("INSERT INTO a VALUES ({i}, 7)"));
+        let (v, x) = match i {
+            2..=17 => (FAR, 7),
+            90..=105 => (7, FAR),
+            115..=130 => (-FAR, 7),
+            175..=190 => (7, -FAR),
+            _ => (7, 7),
+        };
+        if i != 160 {
+            run(&mut db, &format!("INSERT INTO a VALUES ({i}, {v}, {x})"));
         }
     }
-    run(&mut db, "UPDATE a SET v = 4000000000000 WHERE id = 60");
-    run(&mut db, "INSERT INTO a VALUES (400, -4000000000000)");
+    run(
+        &mut db,
+        "UPDATE a SET v = 8000000000000, x = 8000000000000 WHERE id = 60",
+    );
+    run(
+        &mut db,
+        "INSERT INTO a VALUES (160, -8000000000000, -8000000000000)",
+    );
     run(&mut db, "CREATE TABLE b (k text PRIMARY KEY, n i32)");
-    for i in 0..64 {
+    for i in 0..306 {
         run(
             &mut db,
             &format!("INSERT INTO b VALUES ('customer/acct/{i:03}', 1)"),
@@ -2389,7 +2416,7 @@ fn write_matches_goldens() {
         ("max_sep_table.jed", max_sep_table_db),
     ];
     for (name, build) in cases {
-        let image = build().to_image(GOLDEN_PAGE_SIZE, 1).unwrap();
+        let image = build().to_image(golden_page_size_of(name), 1).unwrap();
         assert_eq!(image, fixture(name), "serialized bytes differ from {name}");
     }
 }

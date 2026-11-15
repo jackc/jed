@@ -1219,7 +1219,8 @@ func (w *integrityTree) checkRow(page uint32, leaf *paxLeaf, i int, key []byte) 
 			row[c] = NullValue()
 			continue
 		}
-		raw, err := leaf.value(c, i)
+		var slot [16]byte
+		raw, err := leaf.value(c, i, &slot)
 		var v Value
 		if err == nil {
 			v, err = decodeIntegrityValue(ty, raw, fetch, k.pcap)
@@ -1423,7 +1424,8 @@ func (k *integrityChecker) scanRows(ref pageRef, colTypes []colType, depth int, 
 					row[c] = NullValue()
 					continue
 				}
-				raw, err := leaf.value(c, i)
+				var slot [16]byte
+				raw, err := leaf.value(c, i, &slot)
 				if err != nil {
 					return err
 				}

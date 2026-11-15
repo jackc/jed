@@ -24,7 +24,7 @@ func simIntegrity(image []byte, want uint64, cred *Credential) (live, pages, fre
 	if err := unlockPager(p, cred, env); err != nil {
 		return 0, 0, 0, fmt.Errorf("open: %w", err)
 	}
-	e, err := loadEngineSharedPaging(newSharedPaging(p, cacheLeaves(defaultCacheBytes, p.pageSize)), env)
+	e, err := loadEngineSharedPaging(newSharedPaging(p, cacheBudget(defaultCacheBytes)), env)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("open: %w", err)
 	}
@@ -173,7 +173,7 @@ func simPointerKinds(image []byte, cred *Credential) (map[string][]uint32, map[u
 	if err := unlockPager(pgr, cred, env); err != nil {
 		return nil, nil, err
 	}
-	paging := newSharedPaging(pgr, cacheLeaves(defaultCacheBytes, pgr.pageSize))
+	paging := newSharedPaging(pgr, cacheBudget(defaultCacheBytes))
 	var gist []uint32
 	e, err := loadEngineSharedPagingAt(paging, env, loadAt{gist: func(pg uint32) { gist = append(gist, pg) }})
 	if err != nil {

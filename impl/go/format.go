@@ -20,13 +20,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"unicode/utf8"
+	"unsafe"
 )
 
 // magic — ASCII "JEDB" (the engine is named `jed`).
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion    uint16 = 53    // 53 = deferred interior pages, narrow commit-manifest entries and the page stamp (spec/fileformat/format.md "Version scope", *Remap list*, *Deferral*, *Commit manifest*, *Page header*; spec/design/deferred-interior.md §9, manifest-crc32.md): a commit writes only the nodes whose own content changed, a retained interior keeping its page with a (parent, slot) → page remap list in the meta's last third (remap_entries at offset 60), folded when it would overflow; a manifest entry is a page id and its own header CRC-32 (an encrypted page's CRC-32 of its ciphertext), the overflow chain's digest a CRC-32; page header bytes 2-3 carry the low 16 bits of the writing commit's txid, checked against the commit window in manifest validation; 52 = the compact leaf (spec/fileformat/format.md "Leaf node", spec/design/leaf-structural.md): a leaf payload leads with a flags byte and every directory entry is a u16; a table column that is a leading primary-key member with a key-recoverable value has no region; a table whose keys all have one length stores that length once and no key directory; an inline text / bytea / json value in a leaf is tag 0x05 + its bytes, without a length; a leaf may store its keys' shared prefix once; and a region may be base-plus-offsets (integer-like fixed-width columns), a dictionary (string columns) or bit-packed (integer arrays), so a leaf's size is Σ record_size + leafOverhead − the savings its keys and rows give; interior, catalog, overflow and GiST pages are unchanged; 51 = a numeric(p,s) table column with p <= 18 is a fixed-width leaf column — a null bitmap and 2/4/8-byte slots holding the value's unscaled integer — instead of the variable-width decimal codec (colType.DecSlot; spec/design/decimal.md §6a); the catalog is unchanged; 50 = the per-index index_flags byte gains bit5 is_constraint: set on the unique index that backs a UNIQUE constraint, clear on a bare CREATE UNIQUE INDEX (legal only with bit0 unique; spec/design/constraints.md §5.5); 49 = batched durability (spec/design/validated-cow.md §4): a commit writes the meta slot that does not hold the newest durable meta (txid & 1 under synchronous = on, one slot for a whole relaxed batch), and a pending commit's manifest also lists every body page written since that floor; no byte layout change; 48 = view column defaults (a per-column flags byte + u32 default text), view dep kinds 2 (sequence) / 3 (type) sorted by (name, kind), a trailing view flags byte (bit0 security_barrier, bit1 security_invoker), and catalog entries longer than a page spanning consecutive catalog pages (header byte 1 bit0 continued; spec/design/views.md §3/§6/§16); 47 = multi-column GIN indexes: a GIN index may list several key columns, and every entry of a multi-column GIN index is column_tag (u8, the 0-based key position) ‖ term ‖ storage key (spec/design/gin.md §4.4); a single-column GIN's entries are unchanged and the catalog bytes do not change; 46 = ordered index keys (spec/design/indexes.md §11, encoding.md §2.16): the per-index index_flags byte gains bit4 has_key_options, and (only when set) one option byte per key element (bit0 desc, bit1 nulls_first) after the optional timezone dependencies; a DESC / NULLS FIRST key's entry slots use the §2.16 ordered slot; an index with only default (ASC NULLS LAST) keys is byte-identical to v45; 45 = exclusion-constraint follow-ons (spec/design/gist.md §7.1/§7.2) — no byte layout change; the v27 has_predicate bit is now legal on a GiST index that backs an exclusion constraint (the partial EXCLUDE … WHERE (predicate)), and an exclusion constraint may name an ordered (btree, index_kind 0, non-unique) backing index whose every element operator is = (EXCLUDE USING btree); a v44 reader rejected both shapes as corrupt, hence the version break; 44 = a composite column may carry an expression DEFAULT — column flags bit3 (default_is_expr), with the expr-text (u16 length + UTF-8) after the type name (spec/design/composite.md §12); any other composite column flag but not_null is corrupt; no other byte layout change; 43 = timestamp(p) / interval qualifier typmods (spec/design/timestamp.md §8, interval.md §6.1): a timestamp / timestamptz column or composite field appends u8 precision (0xFF = none, else 0..6), an interval one u8 interval_fields ‖ u8 precision (fields 0 = no qualifier, else the datetime_units.toml qualifier code) in the typmod slot; no other byte layout change; 42 = GIN term statistics (spec/design/statistics.md §4.5/§7): a statistics summary's flags byte gains bit2 term_eligible, and (only when set) term_occurrences i64 ‖ untracked_term_rows i64 ‖ term_count u16 follow histogram_count; stats_kind 3 term items (ordinal u16, rows i64, term_len u16 + term bytes) follow the histogram items; no other byte layout change; 41 = a composite-type entry admits a range-typed field — field_type_code 17 + the one-byte range element descriptor, before the field flags byte (spec/design/composite.md §3); no other byte layout change; 40 = a foreign key's actions byte gains bit 6 match_full (MATCH FULL; 0 = MATCH SIMPLE — spec/design/constraints.md §6.3/§6.9); bit 7 stays reserved 0; no other byte layout change; 39 = every view entry gains a trailing u8 check_option (0 none, 1 LOCAL, 2 CASCADED; spec/design/views.md §15.6); no other byte layout change; 38 = views: entry_kind 5 view catalog entries emitted last in view-name byte order (spec/design/views.md §3); no other byte layout change; 37 = exact (folded) identifier names: no byte layout change; catalog names are byte-exact and name-ordered groups sort by exact-name bytes; persisted expression text renders bare words folded and quoted identifiers as "…" (spec/design/grammar.md §3); 36 = an array column entry's flags byte gains bit6 has_collation (legal only for a text element), the collation name (u16 len + UTF-8) following the element descriptor; a collated text[] key encodes each present element as its UCA sort key (spec/design/collation.md §1, encoding.md §2.14); 35 = every CHECK catalog entry gains a trailing check_flags byte (bit0 has_host_deps; bits 1-7 reserved 0) followed, when bit0 is set, by the v31 host-function dependency list (spec/design/extensibility.md §7.1.3); 34 = meta offset 56 carries the exact live page count (spec/design/memory.md §8.7); 33 = validated COW commit manifests; 32 = timezone index dependencies (index-dependencies.md); 31 = host-function index dependencies (spec/design/extensibility.md §8.1): the per-index index_flags byte gains bit2 has_host_deps, and (only when set) after the v27 predicate a u16 dep_count + per dependency name (u16 len + UTF-8) ‖ arg_count u16 ‖ arg type codes (u8 each) ‖ result type code (u8) ‖ component_id (u16 len + UTF-8) ‖ semantic_version u32, in ascending (name, arg-type codes) order; an index with no host-function key is byte-identical to v30, so a file with no such index moves to v31 only by its version byte + meta CRC. 30 = three-bit FOREIGN KEY action codes for CASCADE / SET NULL / SET DEFAULT; 29 = deterministic per-column statistics (kind 4; spec/design/statistics.md); 28 = exact table row count: each table catalog entry appends a nonnegative i64 row_count after root_data_page, with (root_data_page == 0) == (row_count == 0);  on-disk format version (27 = partial-index predicates (spec/design/indexes.md §9): the per-index index_flags byte gains bit1 has_predicate, and (only when set) a u16 length + the canonical predicate text (the Check-expression text form) follows index_root_page; on load a partial predicate re-parses that text (XX001 on failure, like a stored CHECK) and a non-btree index with bit1 set is data_corrupted. B-tree only. A non-partial index is byte-identical to v26, so a file with no partial index moves to v27 only by its version byte + meta CRC. 26 = expression index keys (spec/design/indexes.md §1/§6): a per-index key element is a u16 column ordinal OR the 0xFFFF sentinel + a u16 length + the canonical expression text (the Check-expression text form); on load an expression element re-parses that text (XX001 on failure, like a stored CHECK), and a GIN/GiST index with a non-column key is data_corrupted. Only the index-list changes — a plain column index is byte-identical to v6. 25 = on-disk free-list persistence (spec/fileformat/format.md; storage.md §6): meta offset 28 becomes free_list_head (0 = empty), and a page_type 7 free-list page persists the unconsumed free-list so open reads it directly instead of reconstructing it by walking every leaf; paired with continuous within-session reclamation. A from-scratch image (create/goldens) has an EMPTY free-list, so free_list_head = 0 and no page_type 7 page: every golden's only v25 change is its version byte + meta CRC. 24 = the B+tree reshape (spec/design/bplus-reshape.md, slice B1; spec/fileformat/format.md "The per-table data B+tree"): records live ONLY in leaves — an INTERIOR page (page_type 3) is a record-free routing skeleton, N+1 child pointers ‖ an N-entry end-offset separator directory ‖ the separator key blob (a separator is a COPY of a boundary key; leaf splits copy up, interior splits push up, leaf merges remove the parent separator, interior merges pull it down). A LEAF page's column regions each lead with a reserved flags byte (0 — the string-dictionary door) and take a class-determined shape: a FIXED-WIDTH column is a null bitmap (ceil(N/8), MSB-first, set = NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled); a VARIABLE-WIDTH column is an N-entry end-offset value directory + the tagged v23 codec bytes with NULL a ZERO-LENGTH SPAN (no 0x01 tag inside a leaf; the single-value codec elsewhere is unchanged). All directories become N-entry END offsets (the redundant leading 0 of the v23 N+1 prefix sums is dropped). record_size is restated as key_len + Σ value_size (fixed → its width always, variable → 0 when NULL else the tagged encoded size; the v23 phantom 2+ is dropped); RECORD_MAX keeps its v23 value (C − max(12, 12+16K))/2, re-derived leaf-only. Catalog/overflow/GiST pages are byte-identical to v23. 23 = PAX leaf layout (spec/fileformat/format.md "Leaf node"): a B-tree LEAF page (page_type 2) stores its records COLUMN-MAJOR — key directory (N+1 u32 prefix-sum) ‖ key blob ‖ column directory (K+1 u32 region offsets, colStart[K] = payload end) ‖ per column a value directory (N+1 u32 prefix-sum) then that column's N value bodies. The value codec is byte-unchanged (same 1-byte tag + body); interior pages (page_type 3) stay row-major (child pointers ‖ records). 22 = varchar(n) length limits (spec/design/types.md §15): a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints (spec/design/gist.md §7/§8, GX3): a per-table exclusion list after the foreign-key list — each entry the constraint name, its backing GiST index name, and a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes (spec/design/gist.md, GX1): a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encode_range_body(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encode_range_body(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index still moves to v20 only by its version byte. 19 = storable json/jsonb columns (spec/design/json.md, J1/J1b): a column type can be json (type_code 18) or jsonb (type_code 19) — plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column still moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicode_version + cldr_version + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: type_code 17 + an inline element-type descriptor in the catalog — one scalar code, spec/design/ranges.md §3 — and the compact range value body, a flags byte EMPTY/LB_INF/UB_INF/LB_INC/UB_INC + present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+	formatVersion    uint16 = 54    // 54 = a base-plus-offsets column region may store one value whole as an exception (region kind 6: null bitmap, base, offset width, exception row u16, exception body, N offsets with the exception's zero), taken when it saves more than kind 1 (spec/fileformat/format.md "Leaf node"; spec/design/leaf-write-cost.md §4); 53 = deferred interior pages, narrow commit-manifest entries and the page stamp (spec/fileformat/format.md "Version scope", *Remap list*, *Deferral*, *Commit manifest*, *Page header*; spec/design/deferred-interior.md §9, manifest-crc32.md): a commit writes only the nodes whose own content changed, a retained interior keeping its page with a (parent, slot) → page remap list in the meta's last third (remap_entries at offset 60), folded when it would overflow; a manifest entry is a page id and its own header CRC-32 (an encrypted page's CRC-32 of its ciphertext), the overflow chain's digest a CRC-32; page header bytes 2-3 carry the low 16 bits of the writing commit's txid, checked against the commit window in manifest validation; 52 = the compact leaf (spec/fileformat/format.md "Leaf node", spec/design/leaf-structural.md): a leaf payload leads with a flags byte and every directory entry is a u16; a table column that is a leading primary-key member with a key-recoverable value has no region; a table whose keys all have one length stores that length once and no key directory; an inline text / bytea / json value in a leaf is tag 0x05 + its bytes, without a length; a leaf may store its keys' shared prefix once; and a region may be base-plus-offsets (integer-like fixed-width columns), a dictionary (string columns) or bit-packed (integer arrays), so a leaf's size is Σ record_size + leafOverhead − the savings its keys and rows give; interior, catalog, overflow and GiST pages are unchanged; 51 = a numeric(p,s) table column with p <= 18 is a fixed-width leaf column — a null bitmap and 2/4/8-byte slots holding the value's unscaled integer — instead of the variable-width decimal codec (colType.DecSlot; spec/design/decimal.md §6a); the catalog is unchanged; 50 = the per-index index_flags byte gains bit5 is_constraint: set on the unique index that backs a UNIQUE constraint, clear on a bare CREATE UNIQUE INDEX (legal only with bit0 unique; spec/design/constraints.md §5.5); 49 = batched durability (spec/design/validated-cow.md §4): a commit writes the meta slot that does not hold the newest durable meta (txid & 1 under synchronous = on, one slot for a whole relaxed batch), and a pending commit's manifest also lists every body page written since that floor; no byte layout change; 48 = view column defaults (a per-column flags byte + u32 default text), view dep kinds 2 (sequence) / 3 (type) sorted by (name, kind), a trailing view flags byte (bit0 security_barrier, bit1 security_invoker), and catalog entries longer than a page spanning consecutive catalog pages (header byte 1 bit0 continued; spec/design/views.md §3/§6/§16); 47 = multi-column GIN indexes: a GIN index may list several key columns, and every entry of a multi-column GIN index is column_tag (u8, the 0-based key position) ‖ term ‖ storage key (spec/design/gin.md §4.4); a single-column GIN's entries are unchanged and the catalog bytes do not change; 46 = ordered index keys (spec/design/indexes.md §11, encoding.md §2.16): the per-index index_flags byte gains bit4 has_key_options, and (only when set) one option byte per key element (bit0 desc, bit1 nulls_first) after the optional timezone dependencies; a DESC / NULLS FIRST key's entry slots use the §2.16 ordered slot; an index with only default (ASC NULLS LAST) keys is byte-identical to v45; 45 = exclusion-constraint follow-ons (spec/design/gist.md §7.1/§7.2) — no byte layout change; the v27 has_predicate bit is now legal on a GiST index that backs an exclusion constraint (the partial EXCLUDE … WHERE (predicate)), and an exclusion constraint may name an ordered (btree, index_kind 0, non-unique) backing index whose every element operator is = (EXCLUDE USING btree); a v44 reader rejected both shapes as corrupt, hence the version break; 44 = a composite column may carry an expression DEFAULT — column flags bit3 (default_is_expr), with the expr-text (u16 length + UTF-8) after the type name (spec/design/composite.md §12); any other composite column flag but not_null is corrupt; no other byte layout change; 43 = timestamp(p) / interval qualifier typmods (spec/design/timestamp.md §8, interval.md §6.1): a timestamp / timestamptz column or composite field appends u8 precision (0xFF = none, else 0..6), an interval one u8 interval_fields ‖ u8 precision (fields 0 = no qualifier, else the datetime_units.toml qualifier code) in the typmod slot; no other byte layout change; 42 = GIN term statistics (spec/design/statistics.md §4.5/§7): a statistics summary's flags byte gains bit2 term_eligible, and (only when set) term_occurrences i64 ‖ untracked_term_rows i64 ‖ term_count u16 follow histogram_count; stats_kind 3 term items (ordinal u16, rows i64, term_len u16 + term bytes) follow the histogram items; no other byte layout change; 41 = a composite-type entry admits a range-typed field — field_type_code 17 + the one-byte range element descriptor, before the field flags byte (spec/design/composite.md §3); no other byte layout change; 40 = a foreign key's actions byte gains bit 6 match_full (MATCH FULL; 0 = MATCH SIMPLE — spec/design/constraints.md §6.3/§6.9); bit 7 stays reserved 0; no other byte layout change; 39 = every view entry gains a trailing u8 check_option (0 none, 1 LOCAL, 2 CASCADED; spec/design/views.md §15.6); no other byte layout change; 38 = views: entry_kind 5 view catalog entries emitted last in view-name byte order (spec/design/views.md §3); no other byte layout change; 37 = exact (folded) identifier names: no byte layout change; catalog names are byte-exact and name-ordered groups sort by exact-name bytes; persisted expression text renders bare words folded and quoted identifiers as "…" (spec/design/grammar.md §3); 36 = an array column entry's flags byte gains bit6 has_collation (legal only for a text element), the collation name (u16 len + UTF-8) following the element descriptor; a collated text[] key encodes each present element as its UCA sort key (spec/design/collation.md §1, encoding.md §2.14); 35 = every CHECK catalog entry gains a trailing check_flags byte (bit0 has_host_deps; bits 1-7 reserved 0) followed, when bit0 is set, by the v31 host-function dependency list (spec/design/extensibility.md §7.1.3); 34 = meta offset 56 carries the exact live page count (spec/design/memory.md §8.7); 33 = validated COW commit manifests; 32 = timezone index dependencies (index-dependencies.md); 31 = host-function index dependencies (spec/design/extensibility.md §8.1): the per-index index_flags byte gains bit2 has_host_deps, and (only when set) after the v27 predicate a u16 dep_count + per dependency name (u16 len + UTF-8) ‖ arg_count u16 ‖ arg type codes (u8 each) ‖ result type code (u8) ‖ component_id (u16 len + UTF-8) ‖ semantic_version u32, in ascending (name, arg-type codes) order; an index with no host-function key is byte-identical to v30, so a file with no such index moves to v31 only by its version byte + meta CRC. 30 = three-bit FOREIGN KEY action codes for CASCADE / SET NULL / SET DEFAULT; 29 = deterministic per-column statistics (kind 4; spec/design/statistics.md); 28 = exact table row count: each table catalog entry appends a nonnegative i64 row_count after root_data_page, with (root_data_page == 0) == (row_count == 0);  on-disk format version (27 = partial-index predicates (spec/design/indexes.md §9): the per-index index_flags byte gains bit1 has_predicate, and (only when set) a u16 length + the canonical predicate text (the Check-expression text form) follows index_root_page; on load a partial predicate re-parses that text (XX001 on failure, like a stored CHECK) and a non-btree index with bit1 set is data_corrupted. B-tree only. A non-partial index is byte-identical to v26, so a file with no partial index moves to v27 only by its version byte + meta CRC. 26 = expression index keys (spec/design/indexes.md §1/§6): a per-index key element is a u16 column ordinal OR the 0xFFFF sentinel + a u16 length + the canonical expression text (the Check-expression text form); on load an expression element re-parses that text (XX001 on failure, like a stored CHECK), and a GIN/GiST index with a non-column key is data_corrupted. Only the index-list changes — a plain column index is byte-identical to v6. 25 = on-disk free-list persistence (spec/fileformat/format.md; storage.md §6): meta offset 28 becomes free_list_head (0 = empty), and a page_type 7 free-list page persists the unconsumed free-list so open reads it directly instead of reconstructing it by walking every leaf; paired with continuous within-session reclamation. A from-scratch image (create/goldens) has an EMPTY free-list, so free_list_head = 0 and no page_type 7 page: every golden's only v25 change is its version byte + meta CRC. 24 = the B+tree reshape (spec/design/bplus-reshape.md, slice B1; spec/fileformat/format.md "The per-table data B+tree"): records live ONLY in leaves — an INTERIOR page (page_type 3) is a record-free routing skeleton, N+1 child pointers ‖ an N-entry end-offset separator directory ‖ the separator key blob (a separator is a COPY of a boundary key; leaf splits copy up, interior splits push up, leaf merges remove the parent separator, interior merges pull it down). A LEAF page's column regions each lead with a reserved flags byte (0 — the string-dictionary door) and take a class-determined shape: a FIXED-WIDTH column is a null bitmap (ceil(N/8), MSB-first, set = NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled); a VARIABLE-WIDTH column is an N-entry end-offset value directory + the tagged v23 codec bytes with NULL a ZERO-LENGTH SPAN (no 0x01 tag inside a leaf; the single-value codec elsewhere is unchanged). All directories become N-entry END offsets (the redundant leading 0 of the v23 N+1 prefix sums is dropped). record_size is restated as key_len + Σ value_size (fixed → its width always, variable → 0 when NULL else the tagged encoded size; the v23 phantom 2+ is dropped); RECORD_MAX keeps its v23 value (C − max(12, 12+16K))/2, re-derived leaf-only. Catalog/overflow/GiST pages are byte-identical to v23. 23 = PAX leaf layout (spec/fileformat/format.md "Leaf node"): a B-tree LEAF page (page_type 2) stores its records COLUMN-MAJOR — key directory (N+1 u32 prefix-sum) ‖ key blob ‖ column directory (K+1 u32 region offsets, colStart[K] = payload end) ‖ per column a value directory (N+1 u32 prefix-sum) then that column's N value bodies. The value codec is byte-unchanged (same 1-byte tag + body); interior pages (page_type 3) stay row-major (child pointers ‖ records). 22 = varchar(n) length limits (spec/design/types.md §15): a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints (spec/design/gist.md §7/§8, GX3): a per-table exclusion list after the foreign-key list — each entry the constraint name, its backing GiST index name, and a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes (spec/design/gist.md, GX1): a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encode_range_body(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encode_range_body(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index still moves to v20 only by its version byte. 19 = storable json/jsonb columns (spec/design/json.md, J1/J1b): a column type can be json (type_code 18) or jsonb (type_code 19) — plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column still moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicode_version + cldr_version + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: type_code 17 + an inline element-type descriptor in the catalog — one scalar code, spec/design/ranges.md §3 — and the compact range value body, a flags byte EMPTY/LB_INF/UB_INF/LB_INC/UB_INC + present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 	pageHeader              = 16    // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 	recordMaxReserve        = 12    // bytes reserved inside RECORD_MAX beyond the per-column term — independent of pageHeader (format.md "Why the record cap"). Historically the two-key interior node's 3 child pointers (4·3); since v24 the value is kept as the K = 0 floor of the leaf-only re-derivation (a two-record index leaf is exactly 2·(C−12)/2 + 4·2 + 4 = C)
 	pageCatalog      byte   = 1     // page_type for a catalog page
@@ -5967,11 +5968,26 @@ type paxRegion struct {
 	bitmap []byte // fixed: the ceil(N/8) null bitmap span (MSB-first, set = NULL)
 	ends   []byte // variable: zero-copy N×u32 big-endian end-offset directory in the page
 	body   []byte // the value bodies: N×width dense slots (fixed) or the value blob (variable)
-	// elided marks a region the page does not store: its slots were rebuilt from the keys
-	// (leaf_narrow.go) and it contributes nothing to recordSize.
+	// elided marks a region the page does not store (leaf_narrow.go): value i is bytes
+	// [keyAt, keyAt+width) of key i, read from the key in place (fixedSlot). body and bitmap are nil
+	// (a key column is never NULL), and it contributes nothing to recordSize.
 	elided bool
-	// stored, when nonzero, is the region's bytes on the page: its slots were rebuilt from a base and
-	// narrow offsets, or it is a dictionary (leaf_narrow.go).
+	keyAt  int
+	// isFOR marks a base-plus-offsets region (leaf_narrow.go), read in place: value i is
+	// forBase + offset i, the offset forBW bytes (0, 1, 2 or 4) at forOff[i·forBW]. body is nil.
+	isFOR   bool
+	forBW   int
+	forBase uint64
+	forOff  []byte
+	// pfRows and pfBodies, for a base-plus-offsets region with exceptions (kind 6, leaf_pfor.go), are
+	// its ascending u16 exception rows and their whole bodies; nil for kind 1.
+	pfRows, pfBodies []byte
+	// pfMask has bit b set when some exception row r has r >> pfShift == b, so a row in a clear
+	// bucket skips the search (built at parse from the row list; no per-row state).
+	pfMask  uint64
+	pfShift uint8
+	// stored, when nonzero, is the region's bytes on the page: a base plus narrow offsets, or a
+	// dictionary (leaf_narrow.go).
 	stored int
 	// codes, when set, makes this variable region a dictionary: ends and body describe the entries,
 	// and value i is entry codes[i].
@@ -5999,15 +6015,17 @@ type paxLeaf struct {
 	// keyLen, when nonzero, is the one length of every key: the page has no key directory.
 	keyLen int
 	// keyPrefix, when set, is the prefix every key shares: keyBlob and keyEnd hold the keys without
-	// it, and full holds them rebuilt, on first use.
+	// it. Keys are compared prefix-aware (compareKey, searchPrefixed); a full key is built only as a
+	// transient for the row that needs it (key, keysRange), never kept by the leaf.
 	keyPrefix []byte
-	full      atomic.Pointer[paxFullKeys]
 	n         int
 	// keyStored is the bytes the page spends on keys, layout byte included: key length, prefix,
 	// directory and blob.
 	keyStored int
 	// payload is the page payload the views above are slices of (leaf_lazy.go).
 	payload []byte
+	// end is the payload's content length, colStart[K]: the bytes past it are the page's unused tail.
+	end int
 }
 
 // paxDirEnd reads entry i from a directory that parsePaxLeaf already validated in full. Keeping
@@ -6125,33 +6143,25 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 			if start != end {
 				return nil, newError(DataCorrupted, "PAX leaf key column has a stored region")
 			}
+			// The value is read from the key in place (fixedSlot); here every key is checked to hold it.
 			w, _ := fixedValueWidth(ty)
-			body := make([]byte, n*w)
 			at := int(ty.keyAt) - 1
-			// keyBytes holds each key without the leaf's shared prefix: bytes below kp come from it.
 			kp := len(keyPrefix)
-			lo := 0
-			for i := 0; i < n; i++ {
-				hi := lo + sufLen
-				if keyLen == 0 {
-					hi = int(paxDirEnd(keyEnd, i, dw))
-				}
-				if at+w > kp+hi-lo {
+			if keyLen > 0 {
+				if at+w > keyLen {
 					return nil, newError(DataCorrupted, "PAX leaf key too short for its key column")
 				}
-				slot := body[i*w : (i+1)*w]
-				switch {
-				case at+w <= kp:
-					putKeySlot(slot, ty, keyPrefix[at:at+w])
-				case at >= kp:
-					putKeySlot(slot, ty, keyBytes[lo+at-kp:lo+at-kp+w])
-				default:
-					copy(slot, keyPrefix[at:])
-					copy(slot[kp-at:], keyBytes[lo:lo+at+w-kp])
+			} else {
+				lo := uint32(0)
+				for i := 0; i < n; i++ {
+					hi := paxDirEnd(keyEnd, i, dw)
+					if at+w > kp+int(hi-lo) {
+						return nil, newError(DataCorrupted, "PAX leaf key too short for its key column")
+					}
+					lo = hi
 				}
-				lo = hi
 			}
-			regions[c] = paxRegion{width: w, bitmap: make([]byte, (n+7)/8), body: body, elided: true}
+			regions[c] = paxRegion{width: w, elided: true, keyAt: at}
 			continue
 		}
 		p := start
@@ -6173,14 +6183,7 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 			if (bw != 0 && bw != 1 && bw != 2 && bw != 4) || bw >= w || p+n*bw != end {
 				return nil, newError(DataCorrupted, "PAX leaf narrow region extent mismatch")
 			}
-			body := make([]byte, n*w)
-			for i := 0; i < n; i++ {
-				if bitmap[i/8]&(0x80>>(i%8)) != 0 {
-					continue
-				}
-				putBEUint(body[i*w:(i+1)*w], base+beUint(payload[p+i*bw:p+(i+1)*bw]))
-			}
-			regions[c] = paxRegion{width: w, bitmap: bitmap, body: body, stored: end - start}
+			regions[c] = paxRegion{width: w, bitmap: bitmap, isFOR: true, forBW: bw, forBase: base, forOff: payload[p:end], stored: end - start}
 			start = end
 			continue
 		}
@@ -6206,9 +6209,9 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 			start = end
 			continue
 		}
-		if w, fixed := fixedValueWidth(ty); fixed && flags == regionFORX && leafFORX && forEligible(ty) {
-			// PROTOTYPE (leaf_forx.go): base plus offsets with one exception.
-			r, err := parseFORX(payload, p, end, n, w)
+		if w, fixed := fixedValueWidth(ty); fixed && flags == regionPFOR && forEligible(ty) {
+			// Base plus offsets with exceptions (leaf_pfor.go), read in place.
+			r, err := parsePFOR(payload, p, end, n, w)
 			if err != nil {
 				return nil, err
 			}
@@ -6252,13 +6255,15 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 			continue
 		}
 		if (flags == regionArr && arrElemWidth(ty) != 0) || ((flags == regionSym || flags == regionSymCol) && (leafSym || leafSymCol) && symEligible(ty)) {
-			// A symbol-table or typed-array region (leaf_sym.go): kept as its bytes, rebuilt on first use.
+			// A symbol-table or typed-array region (leaf_sym.go): kept as its bytes. A typed-array value
+			// is decoded alone when read; a symbol-table region is rebuilt on first use.
 			lz := &lazyRegion{kind: flags, ty: ty, raw: payload[p:end], n: n, dw: dw}
 			if flags == regionArr {
 				// Validated at the parse, though rebuilt on first use (format.md "Leaf node").
 				if err := checkArrRegion(lz.raw, n, arrElemWidth(ty)); err != nil {
 					return nil, err
 				}
+				lz.buildArrIndex()
 			}
 			if flags == regionSymCol {
 				// Coded with the column's table, which the table's catalog entry holds.
@@ -6307,25 +6312,95 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 		}
 		start = end
 	}
-	return &paxLeaf{keyBlob: keyBytes, keyEnd: keyEnd, regions: regions, dw: dw, keyLen: keyLen, keyPrefix: keyPrefix, n: n, keyStored: keyStored, payload: payload}, nil
+	return &paxLeaf{keyBlob: keyBytes, keyEnd: keyEnd, regions: regions, dw: dw, keyLen: keyLen, keyPrefix: keyPrefix, n: n, keyStored: keyStored, payload: payload, end: start}, nil
 }
 
-// key returns record i's key as a borrowed span: of the retained page block, or of the leaf's rebuilt
-// keys when the page stores a shared prefix.
+// trimTo moves the leaf's views onto used, a copy of payload[:end], so a resident leaf retains only
+// its used payload and the page's unused tail is freed (pager.md §3). Every view is a slice of
+// payload, so each moves by its offset (cap(payload) − cap(view)). A prototype region that holds a
+// rebuilt copy instead (leaf_runs.go, leaf_blocks.go, leaf_forx.go) cannot move; trimLeaves is off
+// while one is switched on.
+func (l *paxLeaf) trimTo(used []byte) {
+	old := l.payload
+	move := func(v []byte) []byte {
+		if v == nil {
+			return nil
+		}
+		off := cap(old) - cap(v)
+		return used[off : off+len(v)]
+	}
+	l.keyBlob, l.keyEnd, l.keyPrefix = move(l.keyBlob), move(l.keyEnd), move(l.keyPrefix)
+	for c := range l.regions {
+		r := &l.regions[c]
+		r.bitmap, r.ends, r.body, r.codes, r.forOff = move(r.bitmap), move(r.ends), move(r.body), move(r.codes), move(r.forOff)
+		r.pfRows, r.pfBodies = move(r.pfRows), move(r.pfBodies)
+		if r.lazy != nil {
+			r.lazy.raw = move(r.lazy.raw)
+		}
+	}
+	l.payload = used
+}
+
+// trimLeaves reports whether a faulted leaf may be trimmed to its used payload: no prototype that
+// keeps rebuilt region copies is switched on (trimTo).
+func trimLeaves() bool {
+	return leafRuns == leafRunsOff && leafBlocks == 0
+}
+
+// key returns record i's key: a borrowed span of the retained page block, or, when the page stores a
+// shared prefix, a fresh copy the caller owns (the leaf keeps no rebuilt keys).
 func (l *paxLeaf) key(i int) []byte {
-	blob, ends, dw := l.keyBlob, l.keyEnd, l.dw
 	if l.keyPrefix != nil {
-		fk := l.fullKeys()
-		blob, ends, dw = fk.blob, fk.ends, 4
+		return l.cloneKey(i)
 	}
 	if l.keyLen > 0 {
-		return blob[i*l.keyLen : (i+1)*l.keyLen]
+		return l.keyBlob[i*l.keyLen : (i+1)*l.keyLen]
 	}
 	lo := uint32(0)
 	if i > 0 {
-		lo = paxDirEnd(ends, i-1, dw)
+		lo = paxDirEnd(l.keyEnd, i-1, l.dw)
 	}
-	return blob[lo:paxDirEnd(ends, i, dw)]
+	return l.keyBlob[lo:paxDirEnd(l.keyEnd, i, l.dw)]
+}
+
+// compareKey is bytes.Compare(key(i), probe), without building key i: the probe is compared with the
+// shared prefix, then with the stored suffix.
+func (l *paxLeaf) compareKey(i int, probe []byte) int {
+	kp := l.keyPrefix
+	if len(probe) < len(kp) {
+		if c := bytes.Compare(kp[:len(probe)], probe); c != 0 {
+			return c
+		}
+		return 1 // key i extends the probe
+	}
+	if c := bytes.Compare(kp, probe[:len(kp)]); c != 0 {
+		return c
+	}
+	return bytes.Compare(l.suffix(i), probe[len(kp):])
+}
+
+// keysRange returns keys [lo, hi) as spans: views of the page, or for a page that stores a shared
+// prefix, keys built into one transient blob the caller holds.
+func (l *paxLeaf) keysRange(lo, hi int, out [][]byte) [][]byte {
+	if l.keyPrefix == nil {
+		for i := lo; i < hi; i++ {
+			out = append(out, l.key(i))
+		}
+		return out
+	}
+	kp := len(l.keyPrefix)
+	size := (hi - lo) * kp
+	for i := lo; i < hi; i++ {
+		size += len(l.suffix(i))
+	}
+	blob := make([]byte, 0, size)
+	for i := lo; i < hi; i++ {
+		at := len(blob)
+		blob = append(blob, l.keyPrefix...)
+		blob = append(blob, l.suffix(i)...)
+		out = append(out, blob[at:len(blob):len(blob)])
+	}
+	return out
 }
 
 // suffix returns record i's stored key bytes: the key, or the key without the leaf's shared prefix.
@@ -6377,49 +6452,12 @@ func (l *paxLeaf) searchPrefixed(key []byte) (int, bool) {
 	return lo, false
 }
 
-// paxFullKeys is a prefixed leaf's keys rebuilt in full: one blob, and a u32 end-offset directory
-// when keys vary in length (full keys can outgrow a u16 offset).
-type paxFullKeys struct {
-	blob, ends []byte
-}
-
-// fullKeys rebuilds a prefixed leaf's keys on first use (leaf_narrow.go). A walk that never reads a
-// key (overflow collection, a column scan) does not pay for it. Concurrent first uses build equal
-// copies and one wins.
-func (l *paxLeaf) fullKeys() *paxFullKeys {
-	if fk := l.full.Load(); fk != nil {
-		return fk
-	}
-	kp := len(l.keyPrefix)
-	fk := &paxFullKeys{blob: make([]byte, 0, len(l.keyBlob)+l.n*kp)}
-	if l.keyLen == 0 {
-		fk.ends = make([]byte, 0, 4*l.n)
-	}
-	lo := 0
-	for i := 0; i < l.n; i++ {
-		hi := lo + l.keyLen - kp
-		if l.keyLen == 0 {
-			hi = int(paxDirEnd(l.keyEnd, i, l.dw))
-		}
-		fk.blob = append(fk.blob, l.keyPrefix...)
-		fk.blob = append(fk.blob, l.keyBlob[lo:hi]...)
-		if l.keyLen == 0 {
-			fk.ends = appendU32(fk.ends, uint32(len(fk.blob)))
-		}
-		lo = hi
-	}
-	if l.full.CompareAndSwap(nil, fk) {
-		return fk
-	}
-	return l.full.Load()
-}
-
 // isNull reports whether value (record i, column c) is NULL — the region bitmap (fixed-width) or
 // the zero-length span (variable), with NO value decode (format.md "Leaf node").
 func (l *paxLeaf) isNull(c, i int) bool {
 	r := &l.regions[c]
 	if r.width > 0 {
-		return r.bitmap[i/8]&(0x80>>(i%8)) != 0
+		return !r.elided && r.bitmap[i/8]&(0x80>>(i%8)) != 0
 	}
 	if r.lazy != nil {
 		null, _, _ := r.lazy.peek(i)
@@ -6439,13 +6477,20 @@ func (l *paxLeaf) isNull(c, i int) bool {
 	return paxDirEnd(ends, i, dw) == lo
 }
 
-// value returns the bytes of value (record i, column c), a view into the page payload: a
-// fixed-width slot (the untagged body) or a variable value's tagged codec bytes. A NULL fixed
-// slot is zero-filled and must never be read (the bitmap is the sole authority — isNull first).
-func (l *paxLeaf) value(c, i int) ([]byte, error) {
+// value returns the bytes of value (record i, column c): a variable value's tagged codec bytes, a
+// view into the page payload, or a fixed-width value's untagged body (fixedSlot), which buf holds
+// when the page does not store it whole. A NULL fixed slot must never be read (the bitmap is the
+// sole authority — isNull first). buf may be nil for a variable column.
+func (l *paxLeaf) value(c, i int, buf *[16]byte) ([]byte, error) {
 	r := &l.regions[c]
 	if r.width > 0 {
-		return r.body[i*r.width : (i+1)*r.width], nil
+		if buf == nil {
+			buf = new([16]byte)
+		}
+		return l.fixedSlot(r, i, buf), nil
+	}
+	if r.lazy != nil && r.lazy.kind == regionArr {
+		return r.lazy.arrSpan(i), nil
 	}
 	if r.codes != nil {
 		i = int(r.codes[i])
@@ -6463,6 +6508,82 @@ func (l *paxLeaf) value(c, i int) ([]byte, error) {
 		return nil, newError(DataCorrupted, "PAX leaf value offset out of range")
 	}
 	return body[lo:hi], nil
+}
+
+// fixedSlot returns fixed-width value i of region r as its untagged value body: a view of the page
+// for a plain region, otherwise built into buf from the base and offset, or from the key. Nothing is
+// built per leaf, so a resident leaf holds only its page (pager.md §3).
+func (l *paxLeaf) fixedSlot(r *paxRegion, i int, buf *[16]byte) []byte {
+	w := r.width
+	switch {
+	case r.isFOR:
+		if r.pfMask>>(uint(i)>>r.pfShift)&1 != 0 {
+			if b := r.pfExc(i); b != nil {
+				return b
+			}
+		}
+		putBEUint(buf[:w], r.forBase+r.forAt(i))
+		return buf[:w]
+	case r.elided:
+		return l.keySlot(i, r.keyAt, w, buf)
+	}
+	return r.body[i*w : (i+1)*w]
+}
+
+// forValue is present value i of a base-plus-offsets region as a big-endian unsigned integer: the
+// exception's stored body, or the base plus offset i.
+func (r *paxRegion) forValue(i int) uint64 {
+	if r.pfMask>>(uint(i)>>r.pfShift)&1 != 0 {
+		if b := r.pfExc(i); b != nil {
+			return beUint(b)
+		}
+	}
+	return r.forBase + r.forAt(i)
+}
+
+// forAt is offset i of a base-plus-offsets region.
+func (r *paxRegion) forAt(i int) uint64 {
+	switch r.forBW {
+	case 1:
+		return uint64(r.forOff[i])
+	case 2:
+		return uint64(binary.BigEndian.Uint16(r.forOff[2*i:]))
+	case 4:
+		return uint64(binary.BigEndian.Uint32(r.forOff[4*i:]))
+	}
+	return 0
+}
+
+// fixedU64 is present fixed-width value i of a region of an integer-like column (forEligible, or a
+// key column of width at most 8) read as a big-endian unsigned integer, without building its body.
+func (l *paxLeaf) fixedU64(r *paxRegion, i int) uint64 {
+	switch {
+	case r.isFOR:
+		return r.forValue(i)
+	case r.elided:
+		var buf [16]byte
+		return beUint(l.keySlot(i, r.keyAt, r.width, &buf))
+	}
+	return beUint(r.body[i*r.width : (i+1)*r.width])
+}
+
+// keySlot returns bytes [at, at+w) of key i: a view of the shared prefix or of the stored suffix, or,
+// for a span that crosses the prefix's end, the two parts joined in buf (allocated when nil).
+func (l *paxLeaf) keySlot(i, at, w int, buf *[16]byte) []byte {
+	kp := len(l.keyPrefix)
+	switch {
+	case at+w <= kp:
+		return l.keyPrefix[at : at+w]
+	case at >= kp:
+		suf := l.suffix(i)
+		return suf[at-kp : at-kp+w]
+	}
+	if buf == nil {
+		buf = new([16]byte)
+	}
+	copy(buf[:], l.keyPrefix[at:])
+	copy(buf[kp-at:w], l.suffix(i))
+	return buf[:w]
 }
 
 // valueLen is the bytes value (record i, column c) contributes to recordSize — the slot width
@@ -6514,6 +6635,64 @@ type packedLeaf struct {
 	n   int
 	// inline caches inlineOnly (leaf_lazy.go): 0 not yet known, 1 yes, 2 no.
 	inline atomic.Uint32
+	// held is the heap this resident leaf holds: its payload's allocation and its structs (pager.md
+	// §3). Nothing is built on a read, so it does not grow.
+	held int
+}
+
+// structBytes is the heap held by the leaf's structs beyond its payload: the node, the leaf and its
+// directories, one region per column, and each typed-array region's state and row index, at the
+// allocator's size classes.
+func (p *packedLeaf) structBytes() int {
+	n := heapAllocSize(int(unsafe.Sizeof(pnode{}))) + heapAllocSize(int(unsafe.Sizeof(packedLeaf{}))) +
+		heapAllocSize(int(unsafe.Sizeof(paxLeaf{}))) +
+		heapAllocSize(cap(p.dirs.regions)*int(unsafe.Sizeof(paxRegion{})))
+	for c := range p.dirs.regions {
+		if lz := p.dirs.regions[c].lazy; lz != nil {
+			n += heapAllocSize(int(unsafe.Sizeof(lazyRegion{}))) + heapAllocSize(4*cap(lz.arrStart))
+		}
+	}
+	return n
+}
+
+// residentBytes is what the buffer pool charges for this node: a faulted leaf's held bytes. The pool
+// holds only faulted (Packed) leaves; any other node is charged a page.
+func (n *pnode) residentBytes() int {
+	if n.packed != nil {
+		return n.packed.held
+	}
+	return 8 << 10
+}
+
+// heapSizeClasses is the Go allocator's small-object size classes (runtime/sizeclasses.go, Go 1.26):
+// an allocation of n bytes holds the first class at least n. Larger objects take whole 8 KiB pages.
+var heapSizeClasses = [...]int{
+	0, 8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224,
+	240, 256, 288, 320, 352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 896, 1024, 1152, 1280, 1408,
+	1536, 1792, 2048, 2304, 2688, 3072, 3200, 3456, 4096, 4864, 5376, 6144, 6528, 6784, 6912, 8192,
+	9472, 9728, 10240, 10880, 12288, 13568, 14336, 16384, 18432, 19072, 20480, 21760, 24576, 27264,
+	28672, 32768,
+}
+
+// heapAllocSize is the bytes an n-byte heap allocation holds (heapSizeClasses). It approximates the
+// runtime's rounding and is used only to charge the buffer pool, never in a result or cost.
+func heapAllocSize(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	if n > 32768 {
+		return (n + 8191) &^ 8191
+	}
+	lo, hi := 0, len(heapSizeClasses)-1
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if heapSizeClasses[mid] < n {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return heapSizeClasses[lo]
 }
 
 func (p *packedLeaf) key(i int) []byte { return p.dirs.key(i) }
@@ -6534,6 +6713,9 @@ func (p *packedLeaf) recordWeight(i int) uint32 {
 // inline-deferred Unfetched (a block view). Byte-identical to the eager value, moved from
 // fault-time to touch-time (§8); a corrupt touched inline body surfaces XX001 here.
 func (p *packedLeaf) value(c, i int) (Value, error) {
+	if r := &p.dirs.regions[c]; r.width > 0 {
+		return p.fixedAt(r, c, i)
+	}
 	if p.dirs.isNull(c, i) {
 		return NullValue(), nil
 	}
@@ -6546,15 +6728,85 @@ func (p *packedLeaf) value(c, i int) (Value, error) {
 		}
 		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: 0x00, lazy: lz, lazyIdx: i, bare: stringPayload(p.colTypes[c]), types: p.colTypes, typeIdx: c}}, nil
 	}
-	vb, err := p.dirs.value(c, i)
+	vb, err := p.dirs.value(c, i, nil)
 	if err != nil {
 		return Value{}, err
 	}
 	pos := 0
-	if _, fixed := fixedValueWidth(p.colTypes[c]); fixed {
-		return readInlineBody(p.colTypes[c], vb, &pos, decodeConstruct)
-	}
 	return readValueLazy(p.colTypes, c, vb, &pos, p.cap, p.paging)
+}
+
+// fixedAt is value (record i, column c) of fixed-width region r: NULL from the bitmap (an elided key
+// column has none and is never NULL), a plain slot decoded from the page, any other through
+// fixedValue. One region load and no call on the plain path, which every fixed-width scan takes.
+func (p *packedLeaf) fixedAt(r *paxRegion, c, i int) (Value, error) {
+	if r.bitmap != nil && r.bitmap[i>>3]&(0x80>>(i&7)) != 0 {
+		return NullValue(), nil
+	}
+	if r.body != nil {
+		w := r.width
+		return fixedBody(&p.colTypes[c], r.body[i*w:(i+1)*w])
+	}
+	return p.fixedValue(c, i)
+}
+
+// fixedBody decodes a fixed-width column's untagged value body: readInlineBody for the only types
+// that have one (a scalar, or a fixed-width numeric slot), without copying the column type.
+func fixedBody(ty *colType, slot []byte) (Value, error) {
+	if ty.DecSlot != 0 {
+		return decimalValueInt64(decodeFixedDecimalSlot(slot), uint32(ty.DecScale)), nil
+	}
+	pos := 0
+	return readInlineScalar(ty.Scalar, slot, &pos, decodeConstruct)
+}
+
+// fixedValue decodes present fixed-width value (record i, column c) from the page in place: a
+// base-plus-offsets value straight from its integer, a plain or elided one from its slot's bytes,
+// which the page holds (a slot that crosses a shared key prefix's end is joined into a small
+// buffer).
+func (p *packedLeaf) fixedValue(c, i int) (Value, error) {
+	r := &p.dirs.regions[c]
+	ty := &p.colTypes[c]
+	if r.isFOR {
+		return forValue(ty, r.width, r.forValue(i)), nil
+	}
+	var slot []byte
+	if r.elided {
+		l := p.dirs
+		at, w, kp := r.keyAt, r.width, len(l.keyPrefix)
+		if at < kp && at+w > kp {
+			// The value crosses the shared prefix's end: join its two parts without a buffer.
+			head, tail := l.keyPrefix[at:], l.suffix(i)[:w-(kp-at)]
+			if w <= 8 {
+				return forValue(ty, w, beUint(head)<<(8*len(tail))|beUint(tail)), nil
+			}
+			var u [16]byte
+			copy(u[copy(u[:], head):], tail)
+			return UuidValue(u[:]), nil // the one wider key-derivable type
+		}
+		slot = l.keySlot(i, at, w, nil)
+	} else {
+		slot = r.body[i*r.width : (i+1)*r.width]
+	}
+	return fixedBody(ty, slot)
+}
+
+// forValue is the value of an eligible column (forEligible) whose value body, read as a big-endian
+// integer of w bytes, is u: the value readInlineBody decodes from that body.
+func forValue(ty *colType, w int, u uint64) Value {
+	x := int64(u - uint64(1)<<(8*w-1))
+	if ty.DecSlot != 0 {
+		return decimalValueInt64(x, uint32(ty.DecScale))
+	}
+	switch ty.Scalar {
+	case scalarTimestamp:
+		return TimestampValue(x)
+	case scalarTimestamptz:
+		return TimestamptzValue(x)
+	case scalarDate:
+		return DateValue(int32(x))
+	}
+	return IntValue(x)
 }
 
 // valueResolved is value for a reader that uses the value at once (packed-leaf.md §11 Track A5): a
@@ -6562,18 +6814,21 @@ func (p *packedLeaf) value(c, i int) (Value, error) {
 // span walk that builds it; an out-of-line or compressed value keeps the deferred route and is
 // resolved here. The result is the value resolving value's handle would give.
 func (p *packedLeaf) valueResolved(c, i int) (Value, error) {
+	if r := &p.dirs.regions[c]; r.width > 0 {
+		return p.fixedAt(r, c, i)
+	}
 	if p.dirs.isNull(c, i) {
 		return NullValue(), nil
 	}
-	vb, err := p.dirs.value(c, i)
+	if lz := p.dirs.regions[c].lazy; lz != nil && lz.kind == regionArr {
+		return lz.arrValue(i), nil // decoded alone from the page
+	}
+	ty := p.colTypes[c]
+	vb, err := p.dirs.value(c, i, nil)
 	if err != nil {
 		return Value{}, err
 	}
-	ty := p.colTypes[c]
 	pos := 0
-	if _, fixed := fixedValueWidth(ty); fixed {
-		return readInlineBody(ty, vb, &pos, decodeConstruct)
-	}
 	if len(vb) > 0 && vb[0] == 0x00 {
 		pos = 1
 		return readInlineBody(ty, vb, &pos, decodeConstruct)
@@ -6593,12 +6848,13 @@ func (p *packedLeaf) valueResolved(c, i int) (Value, error) {
 // variable column's tagged codec bytes (presence tag + inline body or out-of-line pointer), a
 // fixed-width column's untagged slot — and false for NULL (packed-leaf.md §11 Track A4). A span the
 // directories place outside the payload yields an empty slice, which no span reader accepts (the
-// caller falls back to the decoder, which reports the corruption).
-func (p *packedLeaf) valueSpan(c, i int) ([]byte, bool) {
+// caller falls back to the decoder, which reports the corruption). buf holds a fixed-width value the
+// page does not store whole; it may be nil for a variable column.
+func (p *packedLeaf) valueSpan(c, i int, buf *[16]byte) ([]byte, bool) {
 	if p.dirs.isNull(c, i) {
 		return nil, false
 	}
-	vb, err := p.dirs.value(c, i)
+	vb, err := p.dirs.value(c, i, buf)
 	if err != nil {
 		return []byte{}, true
 	}
@@ -6634,7 +6890,10 @@ func (p *packedLeaf) rowInto(i int, row storedRow) (storedRow, error) {
 // an external/compressed value becomes an Unfetched reference — no chain read, no decompression —
 // resolved later only for the columns a query touches (or on demand at the evaluator's column
 // access — the B4 backstop; paging is stamped into every deferred value for that).
-func decodeLeafNode(block []byte, pageID pageRef, colTypes []colType, paging *sharedPaging) (*pnode, error) {
+//
+// own says the caller owns block (a fresh read, not a store's retained buffer): the leaf then keeps a
+// copy of only its used payload, the checksum having been verified over the whole page (pager.md §3).
+func decodeLeafNode(block []byte, pageID pageRef, colTypes []colType, paging *sharedPaging, own bool) (*pnode, error) {
 	pg, err := parsePage(block)
 	if err != nil {
 		return nil, err
@@ -6646,6 +6905,13 @@ func decodeLeafNode(block []byte, pageID pageRef, colTypes []colType, paging *sh
 	leaf, err := parsePaxLeaf(pg.payload, n, colTypes)
 	if err != nil {
 		return nil, err
+	}
+	held := heapAllocSize(cap(block)) // a retained buffer is the store's, and charged whole
+	if own && leaf.end < len(pg.payload) && trimLeaves() {
+		used := make([]byte, leaf.end)
+		copy(used, pg.payload)
+		leaf.trimTo(used)
+		held = heapAllocSize(leaf.end)
 	}
 	// Packed form (packed-leaf.md §5): retain the block (via the paxLeaf's block-view slices) + the
 	// PAX directories, decode NO values. parsePaxLeaf validated + parsed the directories in one pass
@@ -6659,6 +6925,7 @@ func decodeLeafNode(block []byte, pageID pageRef, colTypes []colType, paging *sh
 		pcap = paging.cap()
 	}
 	packed := &packedLeaf{dirs: leaf, colTypes: colTypes, paging: paging, cap: pcap, n: n}
+	packed.held = held + packed.structBytes()
 	return &pnode{packed: packed, page: pageID.page, tag: pageID.tag}, nil
 }
 
@@ -7400,6 +7667,9 @@ func resolveUnfetched(ty colType, u *Unfetched, fetch func(pageRef) ([]byte, err
 	case 0x00:
 		// Inline-deferred (lazy-record.md §5b, L2): the bytes are already owned — no chain read, no
 		// decompression. Re-run the decoder over the captured span in construct mode.
+		if u.lazy != nil && u.lazy.kind == regionArr {
+			return u.lazy.arrValue(u.lazyIdx), nil // decoded alone from the page
+		}
 		body, err := u.bodyErr()
 		if err != nil {
 			return Value{}, err

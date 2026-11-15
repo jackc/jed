@@ -168,16 +168,19 @@ func (n *pnode) smallDecimalAt(i, c int, buf *[2]uint32) (d Decimal, null, ok bo
 	if p.dirs.isNull(c, i) {
 		return d, true, true
 	}
-	vb, err := p.dirs.value(c, i)
-	if err != nil {
-		return d, false, false
-	}
-	if ty := p.colTypes[c]; ty.DecSlot != 0 {
-		// A fixed-width slot (format.md v51): the unscaled integer at the column's scale.
-		if len(vb) != int(ty.DecSlot) {
+	if ty := &p.colTypes[c]; ty.DecSlot != 0 {
+		// A fixed-width slot (format.md v51): the unscaled integer at the column's scale, read in
+		// place — a base-plus-offsets value straight from its integer, never through slot bytes.
+		r := &p.dirs.regions[c]
+		if r.width != int(ty.DecSlot) || r.elided {
 			return d, false, false
 		}
-		u := decodeFixedDecimalSlot(vb)
+		var u int64
+		if r.isFOR {
+			u = int64(r.forValue(i) - uint64(1)<<(8*r.width-1))
+		} else {
+			u = decodeFixedDecimalSlot(r.body[i*r.width : (i+1)*r.width])
+		}
 		m := uint64(u)
 		if u < 0 {
 			m = -m
@@ -196,6 +199,10 @@ func (n *pnode) smallDecimalAt(i, c int, buf *[2]uint32) (d Decimal, null, ok bo
 			d.Neg, d.Limbs = u < 0, buf[:2:2]
 		}
 		return d, false, true
+	}
+	vb, err := p.dirs.value(c, i, nil)
+	if err != nil {
+		return d, false, false
 	}
 	if len(vb) < 6 || vb[0] != 0x00 {
 		return d, false, false
@@ -237,13 +244,13 @@ func (n *pnode) colIsNull(i, c int) bool {
 
 // colSpan returns the stored bytes of column c of row i, borrowed from a Packed leaf's page (Track
 // A4): present=false for NULL. ok=false on a Decoded leaf, which holds values rather than stored
-// bytes.
-func (n *pnode) colSpan(i, c int) (span []byte, present, ok bool) {
+// bytes. buf holds a fixed-width value the page does not store whole (packedLeaf.valueSpan).
+func (n *pnode) colSpan(i, c int, buf *[16]byte) (span []byte, present, ok bool) {
 	pk, at := n.stored(i)
 	if pk == nil {
 		return nil, false, false
 	}
-	span, present = pk.valueSpan(c, at)
+	span, present = pk.valueSpan(c, at, buf)
 	return span, present, true
 }
 
@@ -263,7 +270,8 @@ func (n *pnode) recordScanUnits(i int, colTypes []colType, capacity pageCap, mas
 		if _, fixed := fixedValueWidth(ty); fixed {
 			continue
 		}
-		if span, present := pk.valueSpan(c, at); present {
+		// chainSpan reads no value of a packed region, whose values are all inline.
+		if span, skip, err := pk.dirs.chainSpan(c, at); !skip && err == nil {
 			spanScanUnits(span, capacity, &pages, &decompress)
 		}
 	}
@@ -292,7 +300,8 @@ func (n *pnode) recordScanUnitsCols(i int, cols []int, colTypes []colType, capac
 		return recordScanUnits(colTypes, n.keyAt(i), n.vals[n.pi(i)], capacity, mask)
 	}
 	for _, c := range cols {
-		if span, present := pk.valueSpan(c, at); present && len(span) > 0 && span[0] != 0x00 {
+		// chainSpan reads no value of a packed region, whose values are all inline.
+		if span, skip, err := pk.dirs.chainSpan(c, at); !skip && err == nil && len(span) > 0 && span[0] != 0x00 {
 			spanScanUnits(span, capacity, &pages, &decompress)
 		}
 	}
@@ -325,12 +334,65 @@ func (n *pnode) keyLen() int {
 	return len(n.keys) - n.gapSize()
 }
 
-// keyAt returns key i as a borrowed span; a Packed leaf's span points into its retained page block.
+// keyAt returns key i as a borrowed span; a Packed leaf's span points into its retained page block,
+// or is a fresh copy when the page stores a shared key prefix (paxLeaf.key). A reader that only
+// compares uses compareKeyAt; one that emits many keys uses keysRange or a keyChunk.
 func (n *pnode) keyAt(i int) []byte {
 	if n.packed != nil {
 		return n.packed.key(i)
 	}
 	return n.keys[n.pi(i)]
+}
+
+// compareKeyAt is bytes.Compare(keyAt(i), probe) without building a prefixed leaf's key.
+func (n *pnode) compareKeyAt(i int, probe []byte) int {
+	if n.packed != nil && n.packed.dirs.keyPrefix != nil {
+		return n.packed.dirs.compareKey(i, probe)
+	}
+	return bytes.Compare(n.keyAt(i), probe)
+}
+
+// keysRange appends keys [lo, hi) to out: borrowed spans, or for a prefixed Packed leaf, keys built
+// into one transient blob the caller holds (paxLeaf.keysRange).
+func (n *pnode) keysRange(lo, hi int, out [][]byte) [][]byte {
+	if n.packed != nil {
+		return n.packed.dirs.keysRange(lo, hi, out)
+	}
+	for i := lo; i < hi; i++ {
+		out = append(out, n.keys[n.pi(i)])
+	}
+	return out
+}
+
+// keyChunkRows is the most keys a keyChunk builds at once for a prefixed leaf; it starts at
+// keyChunkFirst in each window and grows fourfold, so a scan that stops after a few keys builds few.
+const (
+	keyChunkRows  = 64
+	keyChunkFirst = 4
+)
+
+// keyChunk serves the keys a scan emits from one leaf window [lo, hi). For a prefixed Packed leaf it
+// builds them a chunk at a time, in the scan's direction, into a transient the scan holds, so the
+// leaf keeps no rebuilt keys and a scan that stops early builds few. Other leaves lend their spans.
+type keyChunk struct {
+	from, size int
+	keys       [][]byte
+}
+
+func (k *keyChunk) at(n *pnode, i, lo, hi int, reverse bool) []byte {
+	if n.packed == nil || n.packed.dirs.keyPrefix == nil {
+		return n.keyAt(i)
+	}
+	if i < k.from || i >= k.from+len(k.keys) {
+		k.size = min(max(k.size*4, keyChunkFirst), keyChunkRows)
+		a, b := i, min(i+k.size, hi)
+		if reverse {
+			a, b = max(lo, i+1-k.size), i+1
+		}
+		k.from = a
+		k.keys = n.packed.dirs.keysRange(a, b, k.keys[:0:0])
+	}
+	return k.keys[i-k.from]
 }
 
 // keyViews returns the leaf keys as a transient slice of borrowed spans for serialization. Packed
@@ -340,11 +402,7 @@ func (n *pnode) keyViews() [][]byte {
 	if n.packed == nil {
 		return n.keys
 	}
-	keys := make([][]byte, n.keyLen())
-	for i := range keys {
-		keys[i] = n.keyAt(i)
-	}
-	return keys
+	return n.keysRange(0, n.keyLen(), make([][]byte, 0, n.keyLen()))
 }
 
 func (n *pnode) weightAt(i int) uint32 {
@@ -992,9 +1050,9 @@ func (m *pMap) inorder(src leafSource) ([][]byte, []storedRow, error) {
 				if err != nil {
 					return err
 				}
-				keys = append(keys, n.keyAt(i))
 				vals = append(vals, row)
 			}
+			keys = n.keysRange(0, n.keyLen(), keys)
 			return nil
 		}
 		for i := range n.children {
@@ -1141,7 +1199,7 @@ func (b keyBound) entryWindow(n *pnode) (int, int) {
 	first := 0
 	if b.lo != nil {
 		first = sort.Search(n.keyLen(), func(i int) bool {
-			c := bytes.Compare(n.keyAt(i), b.lo)
+			c := n.compareKeyAt(i, b.lo)
 			if b.loInc {
 				return c >= 0
 			}
@@ -1151,7 +1209,7 @@ func (b keyBound) entryWindow(n *pnode) (int, int) {
 	last := n.keyLen()
 	if b.hi != nil {
 		last = sort.Search(n.keyLen(), func(i int) bool {
-			c := bytes.Compare(n.keyAt(i), b.hi)
+			c := n.compareKeyAt(i, b.hi)
 			if b.hiInc {
 				return c > 0
 			}
@@ -1195,9 +1253,9 @@ func (m *pMap) rangeEntriesCounted(b keyBound, src leafSource) ([][]byte, []stor
 				if err != nil {
 					return err
 				}
-				keys = append(keys, n.keyAt(i))
 				vals = append(vals, row)
 			}
+			keys = n.keysRange(ef, el, keys)
 			return nil
 		}
 		cf, cl := b.childWindow(n)
@@ -1309,12 +1367,13 @@ func (m *pMap) scanRange(b keyBound, src leafSource, visit func(key []byte, row 
 	walk = func(n *pnode) (bool, error) {
 		if n.isLeaf() {
 			ef, el := b.entryWindow(n)
+			var kc keyChunk
 			for i := ef; i < el; i++ {
 				row, err := n.rowAt(i)
 				if err != nil {
 					return false, err
 				}
-				cont, err := visit(n.keyAt(i), row)
+				cont, err := visit(kc.at(n, i, ef, el, false), row)
 				if err != nil || !cont {
 					return cont, err
 				}
@@ -1358,12 +1417,13 @@ func (m *pMap) scanRangeRev(b keyBound, src leafSource, visit func(key []byte, r
 	walk = func(n *pnode) (bool, error) {
 		if n.isLeaf() {
 			ef, el := b.entryWindow(n)
+			var kc keyChunk
 			for i := el - 1; i >= ef; i-- {
 				row, err := n.rowAt(i)
 				if err != nil {
 					return false, err
 				}
-				cont, err := visit(n.keyAt(i), row)
+				cont, err := visit(kc.at(n, i, ef, el, true), row)
 				if err != nil || !cont {
 					return cont, err
 				}
@@ -1404,6 +1464,9 @@ type scanFrame struct {
 	node   *pnode
 	isLeaf bool
 	lo, hi int
+	// win is the leaf's entry window [win0, win1) and keys the keys the cursor emits from it.
+	win0, win1 int
+	keys       keyChunk
 	// hinted counts the descents into this interior's children still covered by its last read-ahead
 	// hint.
 	hinted int
@@ -1412,7 +1475,7 @@ type scanFrame struct {
 func newScanFrame(n *pnode, b keyBound) scanFrame {
 	if n.isLeaf() {
 		ef, el := b.entryWindow(n)
-		return scanFrame{node: n, isLeaf: true, lo: ef, hi: el}
+		return scanFrame{node: n, isLeaf: true, lo: ef, hi: el, win0: ef, win1: el}
 	}
 	cf, cl := b.childWindow(n)
 	return scanFrame{node: n, isLeaf: false, lo: cf, hi: cl + 1}
@@ -1498,7 +1561,7 @@ func (c *rangeCursor) nextInto(dst *storedRow) (key []byte, row storedRow, ok bo
 			if dst != nil {
 				*dst = row
 			}
-			return fr.node.keyAt(p), row, true, nil
+			return fr.keys.at(fr.node, p, fr.win0, fr.win1, c.reverse), row, true, nil
 		}
 		if fr.hinted == 0 {
 			if c.reverse {
@@ -1968,7 +2031,7 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 	}
 	// PROTOTYPE (leaf_runs.go): each column's runs saving over every prefix and suffix.
 	var preRuns, sufRuns [][]int
-	if leafPositional() {
+	if leafPositional() || leafPFOR != 0 {
 		preRuns, sufRuns = make([][]int, len(shape.forCols)), make([][]int, len(shape.forCols))
 		for j, fc := range shape.forCols {
 			push := func(a *runsAcc, i int) {
@@ -1979,16 +2042,33 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 				}
 			}
 			preRuns[j], sufRuns[j] = make([]int, n+1), make([]int, n+1)
+			if leafPFOR != 0 {
+				// PROTOTYPE (leaf_pfor.go): the patched region's saving over every prefix and suffix,
+				// from one running accumulator each way (the spans above carry no PFOR facts).
+				a, b := newPforAcc(), newPforAcc()
+				for i := 0; i < n; i++ {
+					if v := vals[i][fc.col]; !v.IsNull() {
+						a.add(forSlot(fc, v))
+					}
+					preRuns[j][i+1] = a.saving(i+1, fc.w)
+				}
+				for i := n - 1; i >= 0; i-- {
+					if v := vals[i][fc.col]; !v.IsNull() {
+						b.add(forSlot(fc, v))
+					}
+					sufRuns[j][i] = b.saving(n-i, fc.w)
+				}
+			}
 			if leafRuns != leafRunsOff {
 				a := newRunsAcc(fc.w)
 				for i := 0; i < n; i++ {
 					push(a, i)
-					preRuns[j][i+1] = a.saving()
+					preRuns[j][i+1] = max(preRuns[j][i+1], a.saving())
 				}
 				b := newRunsAcc(fc.w)
 				for i := n - 1; i >= 0; i-- {
 					push(b, i)
-					sufRuns[j][i] = b.saving()
+					sufRuns[j][i] = max(sufRuns[j][i], b.saving())
 				}
 			}
 			if leafBlocks > 0 {

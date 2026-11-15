@@ -446,8 +446,13 @@ impl std::io::Write for SimStream {
             Some(e) if !e.closed && !e.eof => e.peer,
             _ => return Err(closed_error()),
         };
-        st.frames += 1;
-        if st.disconnect_at > 0 && st.frames == st.disconnect_at {
+        // A page read and its reply are not counted: which pages a client fetches depends on what
+        // its buffer pool holds, which is each core's own (simulation-testing.md, S8 Faults).
+        let read = page_read_frame(buf);
+        if !read {
+            st.frames += 1;
+        }
+        if !read && st.disconnect_at > 0 && st.frames == st.disconnect_at {
             st.disconnected = true;
             st.sever(self.id);
             net.cond.notify_all();
@@ -535,4 +540,10 @@ mod tests {
         drop(queued);
         net.settle();
     }
+}
+
+/// Whether `frame` is a `read_pages` request (code `0x03`) or its `pages` reply (`0x43`):
+/// `length u32 | code u8 | request_id u32 | body` (spec/pageservice/README.md §2).
+fn page_read_frame(frame: &[u8]) -> bool {
+    frame.len() > 4 && matches!(frame[4], 0x03 | 0x43)
 }
