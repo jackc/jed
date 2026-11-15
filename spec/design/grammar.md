@@ -1000,8 +1000,8 @@ without time zone` (the `timestamptz` and `timestamp` aliases) are four bare wor
 literal (`timestamp with time zone '…'`) is recognized by a four-token lookahead to the string. As
 in PostgreSQL (`TIMESTAMP '(' Iconst ')' opt_timezone`), a precision goes between `timestamp` and the
 zone words: `timestamp(3) with time zone` is `timestamptz(3)`. Fewer than all four words, or a quoted
-one, leaves the rest as stray input (`42601`). (A typed literal with a precision,
-`timestamp(3) with time zone '…'`, is not recognized, as for every other `type(p) '…'` literal.)
+one, leaves the rest as stray input (`42601`). (A typed literal with a precision and the zone words,
+`timestamp(3) with time zone '…'`, is not recognized; `timestamp(3) '…'` is, §36.)
 
 ## 15. Multi-table `FROM` and `JOIN`
 
@@ -2998,6 +2998,18 @@ function names — a §8 cross-core determinism surface, byte-identical across t
 parsers. (`true` / `false` / `null` are excluded from the type-name position — they are their own
 value literals, so `true 'x'` is not `CAST('x' AS true)`.)
 
+**With a type modifier — `type(p[, s]) '…'`.** A parenthesized integer modifier may sit between the
+name and the string: `INTERVAL(2) '1.2345'` (`00:00:01.23`), `NUMERIC(5,2) '1.239'` (`1.24`),
+`TIMESTAMP(1) '…'`, `VARCHAR(2) 'abc'` (`ab`). This is PostgreSQL's `ConstInterval '(' Iconst ')'
+Sconst` and `func_name '(' func_arg_list ')' Sconst`, and it **is** `CAST('…' AS type(p[, s]))` —
+the parsers desugar it to that `Cast` node, so the modifier is validated exactly as a cast target's
+(`22023` out of range, `42601` for a second interval modifier, `0A000` on a type that takes none)
+and an interval precision above 6 is reduced to 6. It is recognized by the lookahead name `(`
+integer [`,` integer] `)` string; anything else after `name(` is a function call, so `abs(-3)` is
+unaffected and `abs(1) 'x'` is `42704` (no type `abs`), as in PostgreSQL. No interval qualifier
+follows the precision form: `INTERVAL(2) '1' DAY` is `42601`, as in PostgreSQL. Pinned by
+suites/types/typmod_typed_literal.test (oracle-checked).
+
 **Documented divergences from PostgreSQL** (we own our surface, CLAUDE.md §1):
 
 - For `integer`/`decimal`, jed coerces with **PostgreSQL's input functions** (`pg_strtoint16/32/64`,
@@ -3012,11 +3024,8 @@ value literals, so `true 'x'` is not `CAST('x' AS true)`.)
   range check loses to the junk (`'0x80000000x'::int` is `22P02`). The one divergence is
   **`NaN` / `±Infinity`** (`numeric 'NaN'` — jed's decimal is always finite,
   [decimal.md](decimal.md) §2), which traps `22P02` where PG accepts it.
-- jed uses the **canonical single-word** type names: PG's multi-word `TIMESTAMP WITH TIME ZONE
-  '…'` and the **precision typmod** form `TIMESTAMP(p) '…'` / `INTERVAL(p) '…'` / `NUMERIC(p,s) '…'`
-  are not typed literals here (a `(` after the name breaks the lookahead; typmod rides only on
-  `CAST` / `::`). The **trailing interval qualifier** form `INTERVAL '1' DAY TO SECOND` *is*
-  accepted — it is `CAST('1' AS interval DAY TO SECOND)` ([interval.md](interval.md) §6.1).
+- PG's multi-word `TIMESTAMP WITH TIME ZONE '…'` is a typed literal here too (§14), but not with
+  a precision before the zone words (`TIMESTAMP(3) WITH TIME ZONE '…'`).
 - **ISO-8601 / SQL-standard combined interval forms** inside `INTERVAL '…'` remain deferred
   ([interval.md](interval.md) §3) — a parse-subset gap, not a literal-syntax one.
 

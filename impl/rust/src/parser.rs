@@ -1864,6 +1864,29 @@ impl Parser {
         Ok(is_array)
     }
 
+    /// Whether a `type(p[, s]) '…'` typed literal starts at the cursor: a type-naming word, `(`,
+    /// one or two integers, `)`, then a string (grammar.md §36). `true`/`false`/`null` are
+    /// excluded, as for `type '…'`.
+    fn at_typmod_literal(&self) -> bool {
+        let tok = |i: usize| self.tokens.get(self.pos + i);
+        if !is_ident(self.peek())
+            || matches!(self.peek(), Token::Word(w) if matches!(w.as_str(), "null" | "true" | "false"))
+        {
+            return false;
+        }
+        if !matches!(tok(1), Some(Token::LParen)) || !matches!(tok(2), Some(Token::Int(_))) {
+            return false;
+        }
+        let mut i = 3;
+        if matches!(tok(i), Some(Token::Comma)) {
+            if !matches!(tok(i + 1), Some(Token::Int(_))) {
+                return false;
+            }
+            i += 2;
+        }
+        matches!(tok(i), Some(Token::RParen)) && matches!(tok(i + 1), Some(Token::Str(_)))
+    }
+
     fn parse_type_mod(&mut self) -> Result<Option<TypeMod>> {
         if !matches!(self.peek(), Token::LParen) {
             return Ok(None);
@@ -6948,6 +6971,31 @@ impl Parser {
                     });
                 }
                 unreachable!("peeked a string literal after the type name");
+            });
+        }
+        // A typed string literal with a type modifier, `type(p[, s]) '…'` (grammar.md §36) —
+        // PostgreSQL's `ConstInterval '(' Iconst ')' Sconst` and `func_name '(' func_arg_list ')'
+        // Sconst`: `INTERVAL(2) '1.2345'`, `NUMERIC(5,2) '1.239'`, `TIMESTAMP(1) '…'`,
+        // `VARCHAR(2) 'abc'`. It is `CAST('…' AS type(p[, s]))` over a string-literal operand.
+        // Recognized by the lookahead word `(` integer [`,` integer] `)` string, so `f(1)` followed
+        // by anything else stays a function call.
+        if self.at_typmod_literal() {
+            return outline(|| {
+                let type_pos = self.here();
+                let type_name = self.expect_identifier()?;
+                let type_mod = self.parse_type_mod()?;
+                let pos = self.here();
+                if let Token::Str(text) = self.advance() {
+                    return Ok(Expr::Cast {
+                        inner: Box::new(Expr::Literal(Literal::Text(text), pos)),
+                        type_name,
+                        type_mod,
+                        pos,
+                        cast_pos: type_pos,
+                        type_pos,
+                    });
+                }
+                unreachable!("peeked a string literal after the type modifier");
             });
         }
         // Multi-word typed literals (types.md §2/§15, grammar.md §14).

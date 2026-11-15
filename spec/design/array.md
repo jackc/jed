@@ -123,11 +123,12 @@ The on-disk shape (full byte layout in [../fileformat/format.md](../fileformat/f
   15` followed by an **element type descriptor**, recursively:
   - `element_type_code u8` — `1`–`13` for a scalar element, `14` for a composite element, `15` for
     a nested-array element (**deferred `0A000` this slice** — never emitted in v1).
-  - then, only when the element code needs it: the decimal typmod (`precision u16`, `scale u16`)
-    when the element is `decimal` (code `6`); or `name_len u16` + name when the element is a
+  - then, only when the element code needs it: `name_len u16` + name when the element is a
     composite (code `14`).
-  This reuses the existing per-type catalog framing exactly — the same slots a `decimal` column's
-  typmod or a `composite` column's name occupy, one level down.
+  This reuses the existing per-type catalog framing exactly — the same slot a `composite` column's
+  name occupies, one level down. An element **typmod** (`numeric(p,s)[]`, `varchar(n)[]`,
+  `timestamp(p)[]`, `interval(p)[]`) is not stored: declaring one is `0A000`. When it lands, the
+  element's typmod bytes follow its code here, as a scalar column's follow its `type_code`.
 - **No persisted array-type entry, no array-type id.** Because the type is structural and the
   element descriptor is inline, an array file is self-describing with no extra catalog object —
   *more* portable than composite (which persists a field list) and far simpler than PG (no

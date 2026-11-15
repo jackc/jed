@@ -79,6 +79,8 @@ test('the types page autoruns the timestamp precision / interval fields demo', a
   await expect(rows).toContainText('00:02:03');
   await expect(rows).toContainText('5 days');
   await expect(rows).toContainText('00:00:01.23');
+  // interval(1) '1.25' — the precision typed literal rounds half away from zero.
+  await expect(rows).toContainText('00:00:01.3');
 });
 
 test('the types page reports timestamp calendar-step overflow', async ({ page }) => {

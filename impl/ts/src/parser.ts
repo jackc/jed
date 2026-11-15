@@ -5716,6 +5716,12 @@ class Parser {
       this.tokens[this.pos + 1]?.kind === "str"
     )
       return this.parseTypedLiteral();
+    // A typed string literal with a type modifier, `type(p[, s]) '…'` (grammar.md §36) —
+    // PostgreSQL's `ConstInterval '(' Iconst ')' Sconst` and `func_name '(' func_arg_list ')' Sconst`:
+    // `INTERVAL(2) '1.2345'`, `NUMERIC(5,2) '1.239'`, `TIMESTAMP(1) '…'`, `VARCHAR(2) 'abc'`. It is
+    // CAST('…' AS type(p[, s])) over a string-literal operand. Recognized by the lookahead word `(`
+    // integer [`,` integer] `)` string, so `f(1)` followed by anything else stays a function call.
+    if (this.atTypmodLiteral()) return this.parseTypmodLiteral();
     // Multi-word typed literals (types.md §2/§15, grammar.md §14).
     if (
       (((tlKw === "character" && this.peekKeywordAt(1) === "varying") ||
@@ -5906,6 +5912,42 @@ class Parser {
       }
     }
     return { kind: "typedLiteral", typeName, text: t.str!, loc, typeLoc };
+  }
+
+  // atTypmodLiteral reports whether a `type(p[, s]) '…'` typed literal starts at the cursor: a
+  // type-naming word, `(`, one or two integers, `)`, then a string (grammar.md §36). true/false/null
+  // are excluded, as for `type '…'`.
+  private atTypmodLiteral(): boolean {
+    const kw = this.peekKeyword();
+    if (!isIdentKind(this.peek().kind) || kw === "null" || kw === "true" || kw === "false")
+      return false;
+    const kind = (i: number) => this.tokens[this.pos + i]?.kind;
+    if (kind(1) !== "lparen" || kind(2) !== "int") return false;
+    let i = 3;
+    if (kind(i) === "comma") {
+      if (kind(i + 1) !== "int") return false;
+      i += 2;
+    }
+    return kind(i) === "rparen" && kind(i + 1) === "str";
+  }
+
+  // parseTypmodLiteral parses a `type(p[, s]) '…'` typed literal (a parsePrimary arm) into
+  // CAST('…' AS type(p[, s])).
+  private parseTypmodLiteral(): Expr {
+    const typeLoc = this.here();
+    const typeName = this.expectIdentifier();
+    const typeMod = this.parseTypeMod();
+    const loc = this.here();
+    const t = this.advance();
+    return {
+      kind: "cast",
+      inner: { kind: "literal", literal: { kind: "text", text: t.str! }, loc },
+      typeName,
+      typeMod,
+      loc,
+      castLoc: typeLoc,
+      typeLoc,
+    };
   }
 
   // parseMultiwordTypedLiteral parses a two-word typed literal (a parsePrimary arm).

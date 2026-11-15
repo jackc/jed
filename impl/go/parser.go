@@ -7541,6 +7541,23 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		}
 		return exprNode{Kind: exprTypedLiteral, TypeLitName: name, TypeLitText: t.Word, TypeLitPos: typePos, Pos: pos}, nil
 	}
+	// A typed string literal with a type modifier, `type(p[, s]) '…'` (grammar.md §36) —
+	// PostgreSQL's `ConstInterval '(' Iconst ')' Sconst` and `func_name '(' func_arg_list ')' Sconst`:
+	// `INTERVAL(2) '1.2345'`, `NUMERIC(5,2) '1.239'`, `TIMESTAMP(1) '…'`, `VARCHAR(2) 'abc'`. It is
+	// CAST('…' AS type(p[, s])) over a string-literal operand. Recognized by the lookahead word `(`
+	// integer [`,` integer] `)` string, so `f(1)` followed by anything else stays a function call.
+	if n := p.typmodLiteralLookahead(); n > 0 {
+		typePos := p.here()
+		name := p.advance().Word
+		tm, err := p.parseTypeMod()
+		if err != nil {
+			return exprNode{}, err
+		}
+		pos := p.here()
+		t := p.advance()
+		lit := exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalText, Str: t.Word}, Pos: pos}
+		return exprNode{Kind: exprCast, Cast: &castExpr{Inner: lit, TypeName: name, TypeMod: tm, CastPos: typePos, TypePos: typePos}, Pos: pos}, nil
+	}
 	// Multi-word typed literals (types.md §2/§15, grammar.md §14).
 	if (((p.peekKeyword() == "character" && p.peekKeywordAt(1) == "varying") ||
 		(p.peekKeyword() == "double" && p.peekKeywordAt(1) == "precision")) && p.peekKindAt(2) == tokStr) ||
@@ -8458,6 +8475,30 @@ func (p *parser) peekKeywordAt(offset int) string {
 
 // peekKindAt returns the token kind offset tokens ahead of the cursor, or TokEof past the end.
 // Used by the EXISTS / scalar-subquery lookahead (grammar.md §26).
+// typmodLiteralLookahead reports the token count of a `type(p[, s]) '…'` typed literal starting at
+// the cursor (a type-naming word, `(`, one or two integers, `)`, a string), or 0 if there is none
+// (grammar.md §36). true/false/null are excluded, as for `type '…'`.
+func (p *parser) typmodLiteralLookahead() int {
+	t0 := p.peek()
+	if !isIdentKind(t0.Kind) || (t0.Kind == tokWord && (t0.Word == "null" || t0.Word == "true" || t0.Word == "false")) {
+		return 0
+	}
+	if p.peekKindAt(1) != tokLParen || p.peekKindAt(2) != tokInt {
+		return 0
+	}
+	i := 3
+	if p.peekKindAt(i) == tokComma {
+		if p.peekKindAt(i+1) != tokInt {
+			return 0
+		}
+		i += 2
+	}
+	if p.peekKindAt(i) != tokRParen || p.peekKindAt(i+1) != tokStr {
+		return 0
+	}
+	return i + 2
+}
+
 func (p *parser) peekKindAt(offset int) tokenKind {
 	if p.pos+offset < len(p.tokens) {
 		return p.tokens[p.pos+offset].Kind

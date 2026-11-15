@@ -58,7 +58,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > named types (enums, domains).
 
 - [x] **`text` + collation, `varchar(n)`.** → [types.md §11/§15](spec/design/types.md), [collation.md](spec/design/collation.md)
-  - [ ] _follow-on:_ `char(n)`/`character(n)` (blank-padded); `varchar(n)[]` element typmod (the `numeric(p,s)[]` narrowing).
+  - [ ] _follow-on:_ `char(n)`/`character(n)` (blank-padded).
+- [ ] **Array element typmods** — `numeric(p,s)[]`, `varchar(n)[]`, `timestamp(p)[]`, `interval(p)[]`
+  / `interval DAY TO SECOND[]` (all `0A000` today; PostgreSQL applies the typmod to every element on
+  assignment and cast, and `format_type` shows `interval(1)[]`). Needs a `format_version` bump (the
+  array element descriptor carries the element's typmod bytes after its code, [array.md §3](spec/design/array.md)),
+  per-element rounding/cutting/truncation at every typmod site, the qualified element read of array
+  literal text, `jed_columns` rendering, and composite-field and `CREATE TABLE … AS` arrays. One
+  format bump for all four is cheaper than four. _(size: L)_
 - [x] **Exact `decimal`.** → [decimal.md](spec/design/decimal.md)
   - [ ] _follow-on:_ negative / `s>p` scale typmods.
   - [x] **Fixed-width stored `numeric(p,s)`**, `p ≤ 18` (format v51). → [decimal.md §6a](spec/design/decimal.md)
@@ -78,9 +85,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     would be the next step.
   - [ ] _follow-on:_ `generate_series(numeric, numeric[, numeric])` — PostgreSQL has a numeric series (`generate_series(1, 3.5)`); jed's SRF is integer-only (`42883`).
 - [x] **`timestamp` / `timestamptz`.** → [timestamp.md](spec/design/timestamp.md), [timezones.md](spec/design/timezones.md), [formatting.md](spec/design/formatting.md)
-  - [ ] _follow-on:_ a separate `time` type; `current_timestamp(p)` / `localtimestamp(p)`; the multi-word `timestamp [(p)] with[out] time zone` spelling; `timestamp(p)[]` element typmods (the `varchar(n)[]` narrowing); zone abbreviations in `to_timestamp` input (`'… EST'` under `TZ` is `0A000` until the abbreviation-table decision, [timezones.md §15](spec/design/timezones.md), [formatting.md §5](spec/design/formatting.md)).
-- [x] **`interval`.** → [interval.md](spec/design/interval.md)
-  - [ ] _follow-on:_ the `INTERVAL(p) '…'` typed-literal spelling (write `'…'::interval(p)`); `interval[]` element typmods.
+  - [ ] _follow-on:_ a separate `time` type; `current_timestamp(p)` / `localtimestamp(p)`; the `timestamp(p) with[out] time zone '…'` typed literal; zone abbreviations in `to_timestamp` input (`'… EST'` under `TZ` is `0A000` until the abbreviation-table decision, [timezones.md §15](spec/design/timezones.md), [formatting.md §5](spec/design/formatting.md)).
+- [x] **`interval`.** → [interval.md](spec/design/interval.md) (element typmods: *Array element typmods* above)
 - [x] **`json` / `jsonb` + SQL/JSON.** → [json.md](spec/design/json.md), [jsonpath.md](spec/design/jsonpath.md), [json-sql-functions.md](spec/design/json-sql-functions.md), [json-table.md](spec/design/json-table.md)
   - [ ] _follow-ons (deferred `0A000`):_ the string-**dictionary builder** (opens the [json.md §3](spec/design/json.md) door); `jsonb`-as-PK/index ([encoding.md §2.13](spec/design/encoding.md)); `JSON_TABLE` explicit `PLAN` (T2 — needs a maintainer decision: PostgreSQL 17/18 do not implement `PLAN` (a syntax error, `42601`), so there is no PostgreSQL behavior to follow); a composite/array column in a json record function's column-definition list, and `json[b]_populate_record(set)` over an anonymous-record base (`NULL::record`) ([json-table.md §1](spec/design/json-table.md)); a NaN or ±Infinity float `PASSING` value (a `numeric` NaN/Infinity item in PG, which jed's finite `decimal` cannot hold, [json-sql-functions.md §5.4](spec/design/json-sql-functions.md)); PostgreSQL 16+'s `_` digit separators and `0x`/`0o`/`0b` radix integers in jsonpath *path text* number literals and `.**{level}` bounds (`$ ? (@ == 0x10)`, `{1_000}` — still `42601`; the SQL literals and every text → number input already take them, [jsonpath.md §2](spec/design/jsonpath.md)).
   - [ ] _follow-on:_ when a storable `jsonpath` column lands, its decoder must re-run the compiler's

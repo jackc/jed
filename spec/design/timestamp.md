@@ -240,9 +240,9 @@ comparable value (always definite).
   literals, `TIMESTAMP '2024-01-31' + INTERVAL '1 month'`). It is a small **parser** addition (a
   one-token lookahead on a following string, like the `INTERVAL` literal — [interval.md](interval.md)
   §3); the string is parsed by the **same** `parse_timestamp` / `parse_timestamptz` as §3, so the
-  `22007` / `22008` codes and every field rule are identical. jed uses the canonical one-word
-  keywords only: PG's multi-word `TIMESTAMP WITH TIME ZONE '…'` and the `TIMESTAMP(p) '…'`
-  precision typmod are **not** accepted (documented §36 divergences).
+  `22007` / `22008` codes and every field rule are identical. The canonical one-word keywords, PG's
+  multi-word `TIMESTAMP WITH TIME ZONE '…'` (grammar.md §14), and the `TIMESTAMP(p) '…'` precision
+  form (`CAST('…' AS timestamp(p))`, grammar.md §36) all introduce one.
 - **Casts** ([casts.toml](../types/casts.toml)): **deferred**. `CAST(x AS timestamp)`,
   text↔timestamp, and the zone-requiring timestamp↔timestamptz conversion are all later work;
   the latter needs a zone and so never reconciles the two families here.
@@ -318,8 +318,7 @@ carried beside the column like `numeric(p,s)` and `varchar(n)`
   keeps it. `jed_columns.type` shows PostgreSQL's `format_type` modifier on jed's canonical name
   (`timestamp(3)`, `timestamptz(0)` — [introspection.md](introspection.md) §5).
 - **Not supported** — the multi-word `timestamp(p) with time zone` spelling (jed has no multi-word
-  `timestamp … time zone` name at all, grammar.md §36), the `TIMESTAMP(p) '…'` typed literal (the
-  `(` breaks the typed-literal lookahead; write `'…'::timestamp(p)`), `current_timestamp(p)` /
+  `timestamp … time zone` name at all, grammar.md §36), `current_timestamp(p)` /
   `localtimestamp(p)` (deferred, [grammar.ebnf](../grammar/grammar.ebnf)), and `timestamp(p)[]` (a
   typmod on an array type stays `0A000`, the `varchar(n)[]` narrowing — [array.md](array.md) §12).
 - **On disk** (`format_version` 43, [format.md](../fileformat/format.md)): a `timestamp` /

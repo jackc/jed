@@ -1401,10 +1401,15 @@ primary        ::= number
  * INTERVAL literal may take a trailing field qualifier — `INTERVAL '1' DAY`, `INTERVAL '1 2:03' DAY
  * TO MINUTE`, `INTERVAL '1.5' SECOND(0)` — PostgreSQL's `ConstInterval Sconst opt_interval`, which
  * is `CAST('…' AS interval <qualifier>)`: the text is read under the qualifier and cut to it
- * (../design/interval.md §6.1). (`INTERVAL(p) '…'` is not accepted — the same "(" lookahead rule;
- * write `'…'::interval(p)`.) */
+ * (../design/interval.md §6.1). A parenthesized integer type modifier may sit between the name and the
+ * string — `INTERVAL(2) '1.2345'`, `NUMERIC(5,2) '1.239'`, `TIMESTAMP(1) '…'`, `VARCHAR(2) 'abc'` —
+ * PostgreSQL's `ConstInterval '(' Iconst ')' Sconst` / `func_name '(' func_arg_list ')' Sconst`,
+ * which is `CAST('…' AS type(p[, s]))`. It is recognized by the lookahead name "(" integer
+ * ["," integer] ")" string, so a call `f(1)` followed by anything else stays a call; no interval
+ * qualifier follows the precision form (`INTERVAL(2) '1' DAY` is 42601, as in PostgreSQL). */
 typed_literal  ::= type_word string
                  | "interval" string interval_field_q
+                 | type_word "(" integer ( "," integer )? ")" string
 
 /* A bind parameter — "$" followed by a 1-based decimal index ($1, $2, …). A parameter
  * is bound by the host API (../design/api.md; the corpus binds through the `# params:`

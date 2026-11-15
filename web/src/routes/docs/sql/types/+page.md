@@ -78,7 +78,8 @@
   interval '1 day 02:03:04.5' hour          AS cut_to_hours,
   interval '2:03' minute to second          AS min_sec,
   interval '5' day                          AS unitless_days,
-  '1.23456'::interval(2)                    AS interval_precision;`;
+  '1.23456'::interval(2)                    AS interval_precision,
+  interval(1) '1.25'                        AS precision_literal;`;
 
 	const uuidCastDemo = `SELECT
   ('550E8400-E29B-41D4-A716-446655440000'::text)::uuid  AS text_to_uuid,
@@ -471,7 +472,8 @@ such as `YEAR TO MONTH`, `DAY TO SECOND`, `MINUTE TO SECOND` — and a precision
 `interval DAY TO SECOND(3)`. The fields steer how text is read (a bare `'5'` under `DAY` is five
 days; `'2:03'` under `MINUTE TO SECOND` is two minutes three seconds) and cut everything below the
 last field (`HOUR` drops minutes and seconds but keeps days and months). They also work on a literal:
-`INTERVAL '1' DAY`.
+`INTERVAL '1' DAY`. A precision goes before a literal's string, as for any type with a modifier:
+`INTERVAL(2) '1.2345'`, `TIMESTAMP(1) '…'`, `NUMERIC(5,2) '1.239'`.
 
 <LiveSql demo="precisionDemo" query={precisionDemo} rows={1} />
 

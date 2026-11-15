@@ -465,7 +465,8 @@ value codec are unchanged.
 **Grammar** (PostgreSQL's `opt_interval` / `INTERVAL '(' Iconst ')'`, [grammar.md](grammar.md) §6):
 after the type name `interval` — in a column or field definition, `ALTER … TYPE`, `CAST(… AS …)`,
 `::` — and after an `INTERVAL '…'` typed literal (which then means `CAST('…' AS interval
-<qualifier>)`), one of
+<qualifier>)`; a precision goes before the string, `INTERVAL(2) '…'`, which is `CAST('…' AS
+interval(2))` — [grammar.md](grammar.md) §36), one of
 
 - a qualifier: `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`, `YEAR TO MONTH`, `DAY TO HOUR`,
   `DAY TO MINUTE`, `DAY TO SECOND`, `HOUR TO MINUTE`, `HOUR TO SECOND`, `MINUTE TO SECOND` — the

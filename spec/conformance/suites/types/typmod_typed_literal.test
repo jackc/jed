@@ -1,0 +1,66 @@
+# Typed string literals with a type modifier (spec/design/grammar.md §36): `INTERVAL(p) '…'`,
+# `NUMERIC(p,s) '…'`, `TIMESTAMP(p) '…'`, `VARCHAR(n) '…'` — PostgreSQL's `ConstInterval '(' Iconst
+# ')' Sconst` and `func_name '(' func_arg_list ')' Sconst`, each exactly CAST('…' AS type(mod)) over
+# the string literal. The name stays usable as a function name: `f(1)` followed by anything but a
+# string is a call. All rows oracle-checked against PostgreSQL.
+# requires: query.select_no_from, cast.explicit, cast.string_literal, types.i32, types.text, types.decimal, types.timestamp, types.interval, types.interval_qualifier, types.timestamp_precision, types.varchar_length
+
+# --- interval(p): the precision rounds the seconds ------------------------------------------------
+query TTT nosort
+SELECT interval(2) '1.2345 sec', INTERVAL(0) '-0.5', interval(1) '1 day 02:03:04.56'
+----
+00:00:01.23
+-00:00:01
+1 day 02:03:04.6
+
+# it is the same value as the cast, and composes like any operand
+query BT nosort
+SELECT interval(2) '1.2345' = '1.2345'::interval(2), interval(2) '1.2345' + interval '1 day'
+----
+true
+1 day 00:00:01.23
+
+query T nosort
+SELECT CAST(interval(2) '1.2345' AS text)
+----
+00:00:01.23
+
+# --- the other parameterized types ----------------------------------------------------------------
+query DDD nosort
+SELECT numeric(5,2) '1.239', numeric(3) '12.5', decimal(4,1) '-1.25'
+----
+1.24
+13
+-1.3
+
+query T nosort
+SELECT timestamp(1) '2024-01-01 00:00:00.26'
+----
+2024-01-01 00:00:00.3
+
+query T nosort
+SELECT varchar(2) 'abc'
+----
+ab
+
+# --- errors ----------------------------------------------------------------------------------------
+# interval takes one precision, and no qualifier after the precision form
+statement error 42601
+SELECT interval(1, 2) '1'
+
+statement error 42601
+SELECT interval(2) '1.2345' day
+
+# a type name that is not a type
+statement error 42704
+SELECT abs(1) 'x'
+
+# a modifier out of range
+statement error 22023
+SELECT numeric(0) '1'
+
+# the name is still a function name when no string follows
+query I nosort
+SELECT abs(-3)
+----
+3
