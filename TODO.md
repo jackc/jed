@@ -39,12 +39,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 - [x] **Predicate forms** (`IN`/`BETWEEN`/`LIKE`/`ILIKE`/`CASE`, regex operators, `SIMILAR TO`). → grammar.md §20–§23, [regex.md](spec/design/regex.md)
   - [ ] _follow-on:_ a flat N-ary `IN (list)` node in place of the resolve-time OR-chain desugar (cost.md §7f) — the chain is as deep as the list is long, so the list is capped at 1000 elements (`54001`) and the deepest walks iterate its spine; a flat node would lift the cap and must reproduce the chain's costs (`n−1` `or` nodes, `=` nodes up to the first TRUE), EXPLAIN rendering, and the planner's point-lookup extraction exactly, in all three cores.
-- [x] **Left-to-right short-circuit `AND` / `OR`** (PostgreSQL's qual-list NULL rule in filters, whose conjuncts are cost-ordered like PostgreSQL's). → [cost.md §3](spec/design/cost.md), [planner.md §3.0](spec/design/planner.md), `expr/short_circuit.test`, `expr/filter_conjunct_order.test`
 - [x] **Scalar string / text functions** (code-point semantics). → [string-functions.md](spec/design/string-functions.md)
   - [ ] _follow-on:_ full-Unicode `initcap` word classification + non-ASCII titlecasing.
 - [x] **Named + optional (DEFAULT) function arguments.** → [functions.md §11](spec/design/functions.md)
   - [ ] _follow-on:_ general non-integer DEFAULT values (no consumer yet — built-ins use overloads or `make_interval`-style 0-defaults); user-defined-function defaults (jed has no UDFs).
-- [x] **Named windows.** → [window.md](spec/design/window.md)
 - [x] **`DISTINCT ON`** — the kept row is the first under the fully determined `ORDER BY`. → [grammar.md §11.1](spec/design/grammar.md)
   - [ ] _follow-on:_ streaming dedup over a scan that already satisfies the order, so `LIMIT` stops the scan early (planner.md §4).
   - [ ] _follow-on:_ push WHERE conjuncts that read only `ON` keys into a `DISTINCT ON` body (planner.md §3).
@@ -63,20 +61,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ `char(n)`/`character(n)` (blank-padded); `varchar(n)[]` element typmod (the `numeric(p,s)[]` narrowing).
 - [x] **Exact `decimal`.** → [decimal.md](spec/design/decimal.md)
   - [ ] _follow-on:_ negative / `s>p` scale typmods.
-  - [x] **Fixed-width stored `numeric(p,s)`**, `p ≤ 18` (format v51) — the unscaled integer in a
-    2/4/8-byte leaf slot: about 13 → 8 bytes per `numeric(12,2)` value and faster decimal
-    scans. → [decimal.md §6a](spec/design/decimal.md)
+  - [x] **Fixed-width stored `numeric(p,s)`**, `p ≤ 18` (format v51). → [decimal.md §6a](spec/design/decimal.md)
     - [ ] _follow-on:_ a 16-byte slot for `19 ≤ p ≤ 38` (needs 128-bit slot arithmetic in every
       core; about today's size for typical values). The negative / `s>p` typmod follow-on above must
       keep the slot rule `|value × 10^s| < 10^p`.
   - [ ] _follow-on (TS, per-core):_ the TS core's decimal lanes are still several times slower than
     Rust's and Go's; what remains is per-value directory reads, bigint cost arithmetic, and the fold
     dispatch ([benchmarks.md §11](spec/design/benchmarks.md)).
-  - [x] The columnar aggregate lane takes an integer grouping **expression** (`GROUP BY amount / 1000`,
-    on the safe-to-discard allowlist, always run as an attempt) and a **`HAVING`** (evaluated over the
-    finalized groups in creation order, as the row path's stage) — `group_by_agg` 0.48–1.7 s → 50–210 ms
-    and `group_by_agg_high_card` 0.78–6.1 s → 0.2–0.9 s across the cores
-    ([memory.md §5.4](spec/design/memory.md), [cost.md §6.1](spec/design/cost.md)).
   - [ ] _follow-on:_ the columnar aggregate lane takes one base table, one integer grouping key (a
     column or an expression) and `count`/`sum`/`avg`/`min`/`max`; a non-integer or multi-column key,
     `GROUP BY` on the primary key, and a top-N by an expression still run on the row path
@@ -169,11 +160,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ### Cost-based planner follow-ons
 
-- [x] **Runtime query-compilation investigation (Rust/Go/TS)** — research only, no production
-  rollout ([investigation](spec/design/query-compilation-investigation.md)). Independent proposals
-  share an [experiment contract](spec/design/execution-specialization-experiments.md); each requires
-  forced-path conformance coverage, whole-query controls and a separate outcome report. (Go's
-  G1/G2/G3 investigation is done — [results](bench/go-specialization/README.md).)
+- [x] **Runtime query-compilation investigation (Rust/Go/TS)** — research only. → [investigation](spec/design/query-compilation-investigation.md), [experiment contract](spec/design/execution-specialization-experiments.md), [Go results](bench/go-specialization/README.md)
   - [ ] **Rust cached typed programs** — selective scan execution, plan-owned reuse and
     per-execution scratch; static-kernel controls, no native JIT dependency.
     [Proposal](spec/design/rust-expression-specialization.md).
@@ -270,35 +257,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ keep chains on the remaining rewrite paths — `INSERT … ON CONFLICT DO UPDATE`, table rewrites (`ALTER TABLE`), and in-session rows of a table whose single root leaf stays resident after commit. Physical only (no byte or cost change). _(size: S–M)_
 - [x] **The compact leaf (format v52)** — 16-bit leaf directories, elided key columns, fixed-length keys without a directory, inline strings without a length, a shared key prefix, base-plus-offsets integer columns, string dictionaries, and bit-packed integer arrays. → [leaf-structural.md](spec/design/leaf-structural.md)
   - [ ] _decide (maintainer):_ **per-column symbol tables** for text and `jsonb` (step 8 of leaf-structural.md §10, prototyped and held): needs the trainer pinned bit-exactly across cores and the training points restated as a rule over rows and pages. Decide the table's **scope** in the same decision — one leaf, a group of neighbouring leaves (the "super block", as a small table the leaves reference, most naturally held by the lowest interior node; never a group of pages a read must fetch whole), or the column. Measured 2026-11-14 on a generated, stationary 145 MB database (`TestSuperBlockExperiment`, `impl/go/zz_superblock_test.go`), saving as a share of all leaf bytes with a symbol table plus dictionary of each scope: one leaf 17.0%, 8 leaves 28.7%, 64 leaves 31.8%, the column 35.5%; with a symbol table alone, 8 leaves reach about 90% of the column's gain and 64 leaves about 99%. A wider scope helps only text and `jsonb`: with v52's encodings a 64 KiB page file is 1.6% larger than the 8 KiB one. Still to settle: column scope against group scope on data that drifts (a column table saved nothing there until the per-leaf fallback, leaf-structural.md §10.2; a group table adapts locally but has no rule yet for splits and merges, and no engine found does it), and table generations for a column table. Decode symbol-coded values one at a time; a rebuilt plain region gives the RAM back.
-  - [x] _follow-on:_ keep a resident leaf the size of its page — every region read in place in all three cores (base-plus-offsets and elided key columns, keys under a shared prefix compared prefix-aware and built only as transients, packed arrays a value at a time), a fresh page trimmed to its used payload, and the buffer pool charging each leaf its bytes (leaf-structural.md §12 item 3, pager.md §3). A read leaf holds 1.16× its page in Go, 1.04× in Rust and 1.30× in TS, against 2.06×, 1.91× and 2.11×; live heap under a `cache_bytes` budget stays at the budget. Physical only, no format change.
   - [ ] _follow-on:_ an integrity fixture with a stored primary-key column (a `text` key), so `row_key_not_primary_key` is produced again; the v52 fixtures' integer keys are elided and cannot disagree with their rows. _(size: S)_
   - [ ] _follow-on:_ have the integrity check verify the content-dependent choices (the stored prefix is the longest one; each region has its smallest kind). _(size: S)_
   - [ ] _follow-on:_ fixed-length keys for index trees whose key columns are all `NOT NULL` (needs `ALTER TABLE … DROP NOT NULL` to rebuild the index), and a shared prefix in interior pages (leaf-structural.md §5, §7).
-  - [ ] _decide (maintainer):_ **write costs on dense leaves** — measured in Go with prototypes behind
-    default-off switches; the recommendation awaits a decision. #4 (inserts and removes shifting a
-    dirty leaf's arrays): port the shorter-side shift (cascade −29%, range delete −8%, contained in
-    the edit helpers), not the movable gap (cascade −47% but insert +12%, and it touches every site
-    that indexes a dirty leaf). #5 (one widened value splitting a full leaf) **landed as format v54**
-    (2026-11-14): up to 16 exceptions per base-plus-offsets column per leaf (patched base plus
-    offsets), region kind 6, in all three cores and the Ruby reference (leaf-write-cost.md §8–§9; the
-    cap chosen over one exception and over 8 on realistic distributions). Not adopted:
-    slack (+3% to +7% live pages, helps only wide-row leaves) or runs with their own base
-    (−21% on a drifting column, but writes 2–6.5× slower as built and random reads in place 3–5×
-    slower). Fixed blocks with the exception on top are the better drift option (−19%, constant-time
-    reads in place, no load cost) but re-measure the column on every insert or delete (writes 25–62%
-    slower as built) and make a right half's size non-monotone in the split point; develop them only
-    if drift compression is wanted. Implementation-only follow-ons either way: split a lazy
-    leaf from its page instead of decoding every row, and size a failed evening candidate from its
-    page. → [leaf-write-cost.md](spec/design/leaf-write-cost.md) _(size: S for the Go shorter side;
-    M for the split path)_
-- [x] **Format v53: deferred interior pages + the narrow commit manifest** — landed 2026-11-13 as one
-  change in all three cores and the Ruby reference, with no switches left: a `(parent, slot) → page`
-  remap list lets a commit keep an interior whose only change is a child's page (and its catalog
-  chain), halving a single-row commit's bytes; manifest entries are `page_index u32, crc32 u32`,
-  copied from the page header instead of a second CRC-64 pass; and page header offset 2 is the
-  writing commit's low-16 txid stamp, checked against the commit window during manifest validation.
-  Inline capacity (the `synchronous = off` batch cap) is unchanged or one better than v52 at every
-  page size. → [deferred-interior.md §9](spec/design/deferred-interior.md), [manifest-crc32.md](spec/design/manifest-crc32.md), format.md *Remap list* / *Deferral* / *Commit manifest*
+  - [ ] _decide (maintainer):_ **shifting a dirty leaf's arrays on insert/remove** (#4, measured in
+    Go behind default-off switches): the recommendation is to port the shorter-side shift (cascade
+    −29%, range delete −8%, contained in the edit helpers), not the movable gap (cascade −47% but
+    insert +12%, touching every site that indexes a dirty leaf). (#5 landed as format v54.)
+    → [leaf-write-cost.md](spec/design/leaf-write-cost.md) _(size: S)_
+  - [ ] _follow-on:_ drift compression for base-plus-offsets columns, only if wanted — fixed blocks
+    with exceptions on top are the better option measured (−19%, constant-time reads in place) but
+    re-measure the column on every insert/delete and make a right half's size non-monotone in the
+    split point ([leaf-write-cost.md](spec/design/leaf-write-cost.md)).
+  - [ ] _follow-on:_ split a lazy leaf from its page instead of decoding every row, and size a failed
+    evening candidate from its page. _(size: M)_
+- [x] **Format v53: deferred interior pages + the narrow commit manifest.** → [deferred-interior.md §9](spec/design/deferred-interior.md), [manifest-crc32.md](spec/design/manifest-crc32.md), format.md *Remap list* / *Deferral* / *Commit manifest*
   - [ ] _follow-on:_ give the stamp its remaining surface — a window for the integrity check (it holds
     one meta slot, not the floor) and for the page service's check of a client delta's pages
     (manifest-crc32.md §4). _(size: S–M)_
@@ -330,8 +303,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > The north star is an **embeddable library** (§1). The formal API + bind parameters + sessions
 > + the CLI have landed. Parallelizable with most feature work.
 
-- [x] **Go public API documentation and tooling boundary.** Executable embedding examples, named metadata records, test-only catalog accessors, tagged tooling hooks, `MapRows`, and consumer-interface guidance. → [api.md §11.7](spec/design/api.md)
-- [x] **Go configuration validation and duration options.** Use `time.Duration` for timeouts/intervals, preserve omitted versus explicit-zero defaults, and reject invalid session time zones at construction. → [api.md §11.6](spec/design/api.md)
 - [x] **Unify the create constructor.** → [api.md §2.1.1](spec/design/api.md)
   - [ ] _follow-on:_ the anticipated create-time knobs as new `CreateOptions` fields
     (a spill `temp_dir`, then a thread count);
@@ -342,14 +313,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     `42883` there today); the dedicated resolvers (array, range-constructor, json-set functions)
     still type their own arguments; a parameter already typed by an earlier occurrence still counts
     as unknown in a later function argument.
-- [x] **Integrity-check host API** — SQLite's `PRAGMA integrity_check` / `quick_check`: verify page
-  checksums, tree invariants, free-list and live-count accounting, and index ↔ table agreement on a
-  live database, returning structured findings. The checkers already exist in the simulation runners
-  and `spec/fileformat/verify.rb`; expose them through the host API and the CLI. Designed in
-  [integrity-check.md](spec/design/integrity-check.md); I1 (registry, Ruby reference, damaged fixtures),
-  I2 (the check + host API in all three cores), I3 (expression, partial, GIN and GiST agreement, GiST
-  bounds), I4 (the `constraints` option) and I5 (`jed check`) landed (§9). Exclusion constraints and
-  typmods inside arrays/composites are follow-ons (§8). _(size: M)_
+- [x] **Integrity-check host API + `jed check`.** → [integrity-check.md](spec/design/integrity-check.md)
+  - [ ] _follow-on:_ check exclusion constraints and typmods inside arrays/composites ([integrity-check.md §8](spec/design/integrity-check.md)).
   - [ ] _follow-on:_ an in-memory attachment's commits share one version, so the check cannot tell a
     commit racing it apart (spurious findings possible); give them distinct versions in every core
     ([integrity-check.md §8](spec/design/integrity-check.md)).
@@ -406,11 +371,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > Each language is **native or wrapped** per the best-experience rule (performance vs. clean
 > integration). Any native core still passes the full conformance contract; a wrap inherits it.
 
-- [x] **Ruby v53 experimental refresh** — explicitly requested 2026-11-13, tracking `32feb48fd`. Format v53, deferred commits, current reclamation and leaf redistribution; full memory/plaintext/encrypted corpus, 77 host files and 279 cross-core process cases pass. See [refresh report](impl/ruby-native/PARITY_UPDATE_2026-11-13.md). Ruby remains opt-in and experimental. _(size: L)_
-- [x] **Ruby experimental parity refresh** — explicitly requested 2026-11-12, tracking supported-core source `b1a6affc`. Format v52, current SQL/cost behavior and host APIs; memory, plaintext/encrypted disk, host/storage and cross-core process audits pass. See [refresh report](impl/ruby-native/PARITY_UPDATE_2026-11-12.md). Ruby remains opt-in and experimental. _(size: L)_
-- [x] **Swift experimental v53 refresh** — explicitly requested 2026-11-13; target `32feb48fd961598c2d7e60f0de284ba619a74ab0` (764 SQL files, 121 byte fixtures, 19 saved simulations). Complete: storage deferral, narrow manifests/stamps, incremental reclamation and leaf redistribution; 560 native tests, all 764 SQL files and full Linux cross-core acceptance pass. See [verification](impl/swift-native/VERIFICATION.md). Keep Swift opt-in and preserve historical benchmark evidence. _(size: L)_
-- [x] **Swift experimental baseline refresh** — explicitly requested 2026-11-12; target `b1a6affca7725e0b07a4f734eddb1c569ef76bcf` (v52, 763 SQL files, 116 byte fixtures, 19 saved simulations). Complete: 557 native tests, all 763 SQL files, exact resource/encrypted/service matrices, full interchange, process/stress checks and saved/generated recovery sweeps pass; see [VERIFICATION.md](impl/swift-native/VERIFICATION.md). Keep the experiment opt-in and preserve historical benchmarks. _(size: L)_
-- [x] **Swift structural performance investigation** — explicitly authorized 2026-11-06. Structural implementation is local-only `fb34b0e8cb3d82287fbd3401e3426f04b3b86c7a`; correctness revalidation passes 543 native tests, all 749 frozen SQL files and the affected resource/storage/process gates. Diagnostic comparisons and reporting are complete for 22 peer, eight paired Swift and three Ruby workloads, with three rounds per actor. Original 143-workload experiment evidence and opt-in status are preserved. See [investigation](spec/design/swift-native-performance.md) and [results](impl/swift-native/BENCHMARKS.md). _(size: L)_
+> The opt-in native experiments (Ruby, Swift, C#, Java under `impl/*-native`) are frozen and record
+> their own state in their charters, `VERIFICATION.md` and `BENCHMARKS.md` (CLAUDE.md §2); they are
+> refreshed only on explicit request and are not tracked here.
 
 - [x] **Ruby gem** (wraps the safe Rust core). → [ruby.md](spec/design/ruby.md), [cores.md §6](spec/design/cores.md)
   - [ ] _follow-on (each its own slice):_ a **gem prepared-statement API** (isolates the pure FFI tax from per-call parse); **`interval`/`uuid`/`bytea`** typed coercion (left as String); **distributable packaging** — a `gem install`-able native gem via `rb-sys` + precompiled platform gems (or `magnus`), replacing the in-repo `mise run ruby:build` (a wrapper-module dep — needs §14 confirmation); an optional **Ruby conformance runner**; **host functions over `bytea`/`uuid`/`interval`/`json`/`jsonb`/`jsonpath`** (needs a native text→value parse at the boundary, ruby.md §5b); **`component_id`/`semantic_version` on gem host functions**, without which a gem host function can back neither an index nor a `CHECK` (extensibility.md §7.1/§8.1). _(size: L wrap)_
@@ -422,10 +385,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [ ] **Public, stable C API + header** — the Ruby gem already loads a Rust `cdylib`; promoting that
   boundary to a documented, versioned C ABI lets PHP, Dart/Flutter, Elixir, and others bind cheaply
   (SQLite's C API is the reason it is everywhere). _(size: L)_
-- [x] **C# parity/performance refresh** — explicitly authorized 2026-11-13; updated to `6b2355d98a7fd3738c60474779d1d63548f350dc` and format v53. Storage parity and measured query/write refactoring complete; all 766 SQL files across 12 inventories, four host variants, 496 process cases, 16,000 threaded checks and 85 full recovery traces pass. Repeated JIT/NativeAOT comparisons and final allocation cleanup evidence are in [BENCHMARKS.md](impl/csharp-native/BENCHMARKS.md); substantial improvement does not establish universal Go parity. Historical evidence and experimental opt-in status remain preserved. _(size: XL; §2)_
-- [x] **Native C# experiment** — completed/frozen 2026-11-13 against `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. Opt-in Linux x86-64/.NET 11, async-first native core. All 12 SQL inventories/four host variants, 496 mixed-core process cases, 16,000 threaded checks and 85 stable fault traces pass; all 763 SQL files are covered across storage modes. Four variants ×three diagnostic measurement repeats are recorded, with substantial historical overhead against Go and explicit tmpfs limits. See [charter](spec/design/csharp-native-experiment.md), [verification](impl/csharp-native/VERIFICATION.md) and [measurements](impl/csharp-native/BENCHMARKS.md). Production delivery and promotion remain separate decisions; this does not validate earlier near-Rust performance expectations. _(size: XL; §2)_
 - [ ] **Production Swift delivery decision** — native or wrapped remains separate from the frozen experiment. Its [measured results](impl/swift-native/BENCHMARKS.md) inform that decision but do not change the existing wrap leaning (safe Rust + Apple packaging) or imply promotion. Apple support still needs builds and tests on Apple platforms. _(size: L wrap / XL native; §2/§13)_
-- [x] **Java native experiment** — completed frozen parity at `3e5962f9affc06c768df1688765162a65a893848`, format v53, Linux x86-64. Java 25 plus ordinary JDK 28/value-class variants pass all 42 correctness gates. Matched 24-workload, five-actor, three-repeat measurements and separate memory probes are recorded with shared-host/warmup limitations; performance parity is not established. Blocking streaming API, narrow FFM OS host seam, scoped Bouncy Castle Argon2id. Opt-in; production delivery and promotion remain separate. → [charter](spec/design/java-native-experiment.md), [verification](impl/java-native/VERIFICATION.md), [measurements](impl/java-native/BENCHMARKS.md). _(size: XL; §2)_
 
 ### Host extensions
 
