@@ -309,7 +309,7 @@ NOREC_FILTER = { "JED_CONFORMANCE_FILTER" => "metamorphic/_norec_" }.freeze
 CORES = {
   "rust" => { dir: %w[impl rust], env: NOREC_FILTER,
               cmd: %w[cargo run --profile checked --quiet --bin conformance] },
-  "go" => { dir: %w[impl go], env: NOREC_FILTER, cmd: %w[go run ./cmd/conformance] },
+  "go" => { dir: %w[impl go], env: NOREC_FILTER, cmd: %w[go run -tags jedtooling ./cmd/conformance] },
   "ts" => { dir: %w[impl ts], env: NOREC_FILTER, cmd: %w[npm run --silent conformance] },
 }.freeze
 

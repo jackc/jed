@@ -129,7 +129,7 @@ func TestAutocommitPersistsEachWriteAcrossClose(t *testing.T) {
 func TestCommitAndRollbackAreNoopsUnderAutocommit(t *testing.T) {
 	t.Parallel()
 	// With no explicit transaction open, both are lenient no-op successes (transactions.md §4.2).
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1)")
 	if err := db.Commit(); err != nil {
@@ -146,7 +146,7 @@ func TestCommitAndRollbackAreNoopsUnderAutocommit(t *testing.T) {
 
 func TestPrepareExecuteAndQueryWithParams(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	insert, err := db.Prepare("INSERT INTO t VALUES ($1, $2)")
 	if err != nil {
@@ -214,7 +214,7 @@ func TestPreparedHandleMethods(t *testing.T) {
 	}
 
 	// Session: the durable-connection form.
-	s := base.Session(SessionOptions{})
+	s := mustSession(base, SessionOptions{})
 	defer s.Close()
 	if _, err := s.ExecPrepared(ctx, insert, 2, 200); err != nil {
 		t.Fatal(err)
@@ -224,7 +224,7 @@ func TestPreparedHandleMethods(t *testing.T) {
 	}
 
 	// Transaction: the same statement inside an explicit block, read-your-writes, rolled back.
-	err = s.Update(func(tx *Transaction) error {
+	err = s.Update(context.Background(), func(tx *Transaction) error {
 		if _, err := tx.ExecPrepared(ctx, insert, 3, 300); err != nil {
 			return err
 		}
@@ -270,7 +270,7 @@ func TestPreparedHandleMethods(t *testing.T) {
 // write run through Query used to commit and THEN return 42601; now it just succeeds.
 func TestQueryOnNonQueryStatementIsTotal(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 
 	// DDL through Query: no columns, no rows, no error, and the table is really created.
 	rows, err := db.queryValues("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", nil)
@@ -321,7 +321,7 @@ func TestQueryOnNonQueryStatementIsTotal(t *testing.T) {
 
 func TestErrorsSurfaceWithSQLState(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if _, err := db.Prepare("SELCT 1"); err == nil {
 		t.Fatal("expected error")
 	} else if ee, ok := err.(*EngineError); !ok || ee.Code() != "42601" {
@@ -331,7 +331,7 @@ func TestErrorsSurfaceWithSQLState(t *testing.T) {
 
 func TestCommitOnInMemoryIsNoopSuccess(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	before := db.Txid()
 	if err := db.Commit(); err != nil { // no open block -> no-op success, not an error
@@ -348,7 +348,7 @@ func TestRowsAffectedReportsDMLCounts(t *testing.T) {
 	// how many rows they touched (PostgreSQL's command-tag count); a DML statement that
 	// matched nothing reports (0, true); DDL and transaction control report (0, false);
 	// DML with RETURNING is a query outcome (its row count is the result's length).
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	affected := func(sql string) (int64, bool) {
 		t.Helper()
 		out, err := queryOutcome(db, sql, nil)
@@ -425,7 +425,7 @@ func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
 		t.Fatal("handle must report read-only")
 	}
 	// A single stateful session so an open block spans calls (a read-only block, then poisoning).
-	s := rodb.Session(SessionOptions{})
+	s := mustSession(rodb, SessionOptions{})
 	wantCode := func(sql, code string) {
 		t.Helper()
 		_, err := queryOutcome(s, sql, nil)
@@ -454,13 +454,13 @@ func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
 	// ...and an explicit READ WRITE request, via SQL or the host API.
 	wantCode("BEGIN READ WRITE", "25006")
 	var ee *EngineError
-	if err := s.Begin(true); !errors.As(err, &ee) || ee.Code() != "25006" {
+	if err := s.Begin(context.Background(), true); !errors.As(err, &ee) || ee.Code() != "25006" {
 		t.Fatalf("Begin(true) on a read-only handle: %v", err)
 	}
-	if err := rodb.View(func(tx *Transaction) error { _, err := tx.queryValues("SELECT id FROM t", nil); return err }); err != nil {
+	if err := rodb.View(context.Background(), func(tx *Transaction) error { _, err := tx.queryValues("SELECT id FROM t", nil); return err }); err != nil {
 		t.Fatalf("View on a read-only handle: %v", err)
 	}
-	err = rodb.Update(func(tx *Transaction) error { _, err := queryOutcome(tx, "DELETE FROM t", nil); return err })
+	err = rodb.Update(context.Background(), func(tx *Transaction) error { _, err := queryOutcome(tx, "DELETE FROM t", nil); return err })
 	if !errors.As(err, &ee) || ee.Code() != "25006" {
 		t.Fatalf("Update on a read-only handle: %v", err)
 	}

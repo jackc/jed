@@ -31,7 +31,7 @@ func errArray(t *testing.T, db dbHandle, sql string) string {
 
 func TestArrayImageRoundtrip(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	runArray(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], tags text[])")
 	runArray(t, db, "INSERT INTO t VALUES (1, ARRAY[10, 20, 30], ARRAY['a', 'b'])")
 	runArray(t, db, "INSERT INTO t VALUES (2, ARRAY[1, NULL, 3], '{}')")
@@ -64,7 +64,7 @@ func TestArrayImageRoundtrip(t *testing.T) {
 // layers; subscript yields the composite, field access reads into it, a slice yields addr[].
 func TestArrayOfCompositeRoundtripAndAccess(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	runArray(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	runArray(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])")
 	runArray(t, db, `INSERT INTO t VALUES (1, '{"(Main,90210)","(Side,5)"}')`)
@@ -95,7 +95,7 @@ func TestArrayOfCompositeRoundtripAndAccess(t *testing.T) {
 // cross-core golden).
 func TestArrayOfCompositeImageRoundtrip(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	runArray(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	runArray(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])")
 	runArray(t, db, `INSERT INTO t VALUES (1, '{"(Main,90210)","(Side,5)"}')`)
@@ -126,7 +126,7 @@ func TestArrayOfCompositeImageRoundtrip(t *testing.T) {
 // elements have NULL fields (spec/design/array.md §5, oracle-pinned).
 func TestArrayOfCompositeNullFieldOrderingOperators(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	runArray(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	got := queryRendered(t, db, `SELECT '{"(1,)"}'::addr[] <= '{"(1,)"}'::addr[], `+
 		`'{"(1,)"}'::addr[] >= '{"(1,)"}'::addr[], `+
@@ -145,7 +145,7 @@ func TestArrayOfCompositeNullFieldOrderingOperators(t *testing.T) {
 // the new element type does not relax the key gate.
 func TestArrayOfCompositePrimaryKeyIs0A000(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	runArray(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	if code := errArray(t, db, "CREATE TABLE t (items addr[] PRIMARY KEY)"); code != "0A000" {
 		t.Fatalf("composite-array PK: got %s, want 0A000", code)

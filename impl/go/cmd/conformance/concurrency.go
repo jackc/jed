@@ -1,3 +1,5 @@
+//go:build jedtooling
+
 package main
 
 // The concurrency schedule runner (spec/design/concurrency-testing.md §4). A `.test` file carrying

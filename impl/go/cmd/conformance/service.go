@@ -1,3 +1,5 @@
+//go:build jedtooling
+
 package main
 
 // The corpus through a page client (spec/pageservice/README.md §7): in `service` mode another core's

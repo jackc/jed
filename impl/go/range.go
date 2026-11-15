@@ -716,7 +716,7 @@ func rangeOut(r *RangeVal) string {
 
 // rangeOutZoned is rangeOut with a tstzrange bound rendered in zone when one is given (the session
 // render, timezones.md §9.5).
-func rangeOutZoned(r *RangeVal, zone *ZoneRef) (string, error) {
+func rangeOutZoned(r *RangeVal, zone *zoneRef) (string, error) {
 	if r.Empty {
 		return "empty", nil
 	}

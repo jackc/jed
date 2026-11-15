@@ -32,7 +32,7 @@ func TestQueryMemorySettingDefaultsToUnlimited(t *testing.T) {
 	if len(out.Rows) != 2000 {
 		t.Fatalf("got %d rows, want 2000", len(out.Rows))
 	}
-	opts := memDB().Session(SessionOptions{MaxQueryMemoryBytes: 1 << 20})
+	opts := mustSession(memDB(), SessionOptions{MaxQueryMemoryBytes: 1 << 20})
 	if got := opts.MaxQueryMemoryBytes(); got != 1<<20 {
 		t.Fatalf("SessionOptions budget %d, want %d", got, 1<<20)
 	}
@@ -74,7 +74,7 @@ func TestQueryMemoryBufferedRowsReleasedOnYield(t *testing.T) {
 
 func TestQueryMemoryBudgetStaysWithCursor(t *testing.T) {
 	db := memDB()
-	s := db.Session(SessionOptions{MaxQueryMemoryBytes: 1 << 20})
+	s := mustSession(db, SessionOptions{MaxQueryMemoryBytes: 1 << 20})
 	for _, sql := range []string{"CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1), (2)"} {
 		if _, err := queryOutcome(s, sql, nil); err != nil {
 			t.Fatal(err)
@@ -117,7 +117,7 @@ func TestQueryMemorySpillingOperatorStateReleasesItsCharge(t *testing.T) {
 	}
 	defer db.Close()
 	db.setSpillDirForTest(dir)
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, s text)")
 	mustExec(t, s, "INSERT INTO t SELECT g, repeat('x', g) FROM generate_series(1, 300) g")
@@ -125,11 +125,11 @@ func TestQueryMemorySpillingOperatorStateReleasesItsCharge(t *testing.T) {
 	peak := func(workMem int) int64 {
 		s.SetWorkMem(workMem)
 		s.SetMaxQueryMemoryBytes(1 << 40)
-		ResetQueryMemoryPeak()
+		resetQueryMemoryPeak()
 		if _, err := queryOutcome(s, sql, nil); err != nil {
 			t.Fatal(err)
 		}
-		return QueryMemoryPeak()
+		return queryMemoryPeakForTooling()
 	}
 	resident := peak(1 << 30)
 	spilling := peak(4096)

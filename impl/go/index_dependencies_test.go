@@ -11,7 +11,7 @@ import (
 const zoneIndexSQL = "CREATE UNIQUE INDEX zone_idx ON t (account) WHERE (ts AT TIME ZONE 'America/New_York')::date >= DATE '2024-01-01'"
 
 func buildZoneIndex(t *testing.T) *Session {
-	db := memDBIn(testEnv("tz")).Session(SessionOptions{})
+	db := mustSession(memDBIn(testEnv("tz")), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t(id int PRIMARY KEY, account int, ts timestamptz)")
 	mustExec(t, db, "INSERT INTO t VALUES (1,7,'2024-06-01 00:00:00+00'),(2,7,'2020-01-01 00:00:00+00')")
 	mustExec(t, db, zoneIndexSQL)
@@ -184,7 +184,7 @@ func TestIndexTimezoneSessionIndependence(t *testing.T) {
 }
 
 func TestIndexDynamicZoneCache(t *testing.T) {
-	db := memDBIn(testEnv("tz")).Session(SessionOptions{})
+	db := mustSession(memDBIn(testEnv("tz")), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE d (id int PRIMARY KEY, account int, ts timestamptz, zone text)")
 	mustExec(t, db, "INSERT INTO d VALUES (1,7,'2024-06-01 00:00:00+00','UTC')")
 	ddl := "CREATE INDEX dynamic_idx ON d (account) WHERE (ts AT TIME ZONE zone)::date >= DATE '2024-01-01'"

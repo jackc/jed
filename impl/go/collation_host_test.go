@@ -13,6 +13,7 @@ package jed
 // impl/ts/tests/collation_host.test.ts.
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -49,7 +50,7 @@ func TestLoadedCollationsIsTheRealSet(t *testing.T) {
 	// bundle, the real version-pinned set (es, unicode), ascending by name, no IsDefault (an environment
 	// property, not a per-db one). C is built in and never listed. The pin is UCA/UCD 17.0.0.
 	env := loadFixtureBundle(t)
-	db := memDBIn(env).Session(SessionOptions{})
+	db := mustSession(memDBIn(env), SessionOptions{})
 	v := db.LoadedCollations()
 	names := make([]string, len(v))
 	for i, c := range v {
@@ -80,7 +81,7 @@ func TestLoadedCollationUsedInAnExpression(t *testing.T) {
 	// the root (ä near a), the opposite of the C byte order where it is false. A transient query COLLATE
 	// does not make the database REFERENCE the collation, so db.Collations() stays empty.
 	env := loadFixtureBundle(t)
-	db := memDBIn(env).Session(SessionOptions{})
+	db := mustSession(memDBIn(env), SessionOptions{})
 	if n := len(db.Collations()); n != 0 {
 		t.Fatalf("fresh db references %d collations, want 0", n)
 	}
@@ -95,7 +96,7 @@ func TestEsOrdersEnyeAsADistinctLetter(t *testing.T) {
 	// The es tailoring (&N<ñ<<<Ñ) makes ñ a distinct PRIMARY letter after n: 'nz' < 'ña' (n < ñ),
 	// whereas under the untailored root ñ is n+accent so 'ña' < 'nz'. The Spanish-collation headline.
 	env := loadFixtureBundle(t)
-	db := memDBIn(env).Session(SessionOptions{})
+	db := mustSession(memDBIn(env), SessionOptions{})
 	if rows := query(t, db, `SELECT 'nz' < 'ña' COLLATE "es"`); len(rows) != 1 || rows[0][0] != BoolValue(true) {
 		t.Fatalf("es 'nz' < 'ña': got %v, want [[true]]", rows)
 	}
@@ -108,7 +109,7 @@ func TestUnknownCollationIs42704(t *testing.T) {
 	t.Parallel()
 	// A collation neither loaded nor referenced is 42704 (the loaded-set fallback must not mask it).
 	env := loadFixtureBundle(t)
-	db := memDBIn(env).Session(SessionOptions{})
+	db := mustSession(memDBIn(env), SessionOptions{})
 	if _, err := queryOutcome(db, `SELECT 'x' COLLATE "no-such-collation"`, nil); err == nil || err.(*EngineError).Code() != "42704" {
 		t.Fatalf("want 42704, got %v", err)
 	}
@@ -120,7 +121,7 @@ func TestPerColumnCollationOrdersImplicitlyAndIsReferenced(t *testing.T) {
 	// COLLATE on the query — unicode puts ä next to a. Because the SCHEMA now references unicode,
 	// db.Collations() (the per-file view) lists exactly it.
 	env := loadFixtureBundle(t)
-	db := memDBIn(env).Session(SessionOptions{})
+	db := mustSession(memDBIn(env), SessionOptions{})
 	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "unicode")`)
 	run(t, db, `INSERT INTO t VALUES (1,'z'),(2,'ä'),(3,'a')`)
 	if got := texts(t, query(t, db, `SELECT name FROM t ORDER BY name`)); !eqStrings(got, []string{"a", "ä", "z"}) {
@@ -141,7 +142,7 @@ func TestImplicitConflictIs42P22(t *testing.T) {
 	// Two columns with DIFFERENT implicit (loaded) collations compared with no explicit COLLATE →
 	// 42P22 (PG-matching). C counts as a distinct implicit collation, so unicode vs C also conflicts.
 	env := loadFixtureBundle(t)
-	db := memDBIn(env).Session(SessionOptions{})
+	db := mustSession(memDBIn(env), SessionOptions{})
 	run(t, db, `CREATE TABLE t (a text COLLATE "unicode", b text COLLATE "es", c text COLLATE "C")`)
 	run(t, db, `INSERT INTO t VALUES ('a','z','b')`)
 	for _, sql := range []string{`SELECT a < b FROM t`, `SELECT a < c FROM t`} {
@@ -167,7 +168,7 @@ func TestImplicitConflictIs42P22(t *testing.T) {
 func TestNonTextCollateIs42804UnknownName42704(t *testing.T) {
 	t.Parallel()
 	env := loadFixtureBundle(t)
-	db := memDBIn(env).Session(SessionOptions{})
+	db := mustSession(memDBIn(env), SessionOptions{})
 	if _, err := queryOutcome(db, `CREATE TABLE t (a i32 COLLATE "unicode")`, nil); err == nil || err.(*EngineError).Code() != "42804" {
 		t.Fatalf("non-text COLLATE: want 42804, got %v", err)
 	}
@@ -183,7 +184,7 @@ func TestDefaultCollationInheritedByUnannotatedColumn(t *testing.T) {
 	// SetDefaultCollation moves the per-database default to a LOADED collation (no import); an
 	// un-annotated text column created AFTER inherits it (frozen), one created BEFORE keeps C.
 	env := loadFixtureBundle(t)
-	db := memDBIn(env).Session(SessionOptions{})
+	db := mustSession(memDBIn(env), SessionOptions{})
 	if db.DefaultCollation() != "C" {
 		t.Fatalf("fresh default: got %q", db.DefaultCollation())
 	}
@@ -215,7 +216,7 @@ func TestDefaultCollationInheritedByUnannotatedColumn(t *testing.T) {
 func TestSetDefaultUnknownIs42704(t *testing.T) {
 	t.Parallel()
 	env := loadFixtureBundle(t)
-	db := memDBIn(env).Session(SessionOptions{})
+	db := mustSession(memDBIn(env), SessionOptions{})
 	if err := db.SetDefaultCollation("nope"); err == nil || err.(*EngineError).Code() != "42704" {
 		t.Fatalf("set default unknown: want 42704, got %v", err)
 	}
@@ -232,7 +233,7 @@ func TestCollatedPrimaryKeyStoredInCollationOrder(t *testing.T) {
 	// physically iterates in COLLATION order. unicode (loaded, no import): a < A < b < Z; C bytes:
 	// A < Z < a < b. A no-ORDER-BY single-table scan returns jed's stored (key) order.
 	env := loadFixtureBundle(t)
-	db := memDBIn(env).Session(SessionOptions{})
+	db := mustSession(memDBIn(env), SessionOptions{})
 	run(t, db, `CREATE TABLE t (name text COLLATE "unicode" PRIMARY KEY)`)
 	run(t, db, `INSERT INTO t VALUES ('Z'),('a'),('b'),('A')`)
 	if got := texts(t, query(t, db, `SELECT name FROM t`)); !eqStrings(got, []string{"a", "A", "b", "Z"}) {
@@ -250,7 +251,7 @@ func TestCollatedUniqueDedupsByByteIdentity(t *testing.T) {
 	// A collated UNIQUE key dedups by byte-identity (a deterministic collation: 'a' and 'A' are
 	// DISTINCT, both admitted — collation.md §7), like a C unique key; only a byte-duplicate violates.
 	env := loadFixtureBundle(t)
-	db := memDBIn(env).Session(SessionOptions{})
+	db := mustSession(memDBIn(env), SessionOptions{})
 	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "unicode" UNIQUE)`)
 	run(t, db, `INSERT INTO t VALUES (1,'a'),(2,'A'),(3,'b')`)
 	if _, err := queryOutcome(db, `INSERT INTO t VALUES (4,'a')`, nil); err == nil || err.(*EngineError).Code() != "23505" {
@@ -345,7 +346,7 @@ func TestSkewedCollationBlocksWrites(t *testing.T) {
 	// bundle), the table degrades to read-only: reads still return the rows (the heap-scan fallback),
 	// every write raises XX002, and the skew is legible via db.Collations.
 	env := loadFixtureBundle(t)
-	db := memDBIn(env).Session(SessionOptions{})
+	db := mustSession(memDBIn(env), SessionOptions{})
 	for _, sql := range []string{
 		`CREATE TABLE t (x text COLLATE "unicode" PRIMARY KEY)`,
 		`INSERT INTO t VALUES ('b'), ('a')`,
@@ -357,7 +358,7 @@ func TestSkewedCollationBlocksWrites(t *testing.T) {
 		}
 	}
 	for _, c := range db.Collations() {
-		if c.Verdict != verdictFull {
+		if c.Verdict != CollationFull {
 			t.Fatalf("%q must be Full before skew injection, got %v", c.Name, c.Verdict)
 		}
 	}
@@ -374,7 +375,7 @@ func TestSkewedCollationBlocksWrites(t *testing.T) {
 	for _, c := range db.Collations() {
 		if c.Name == "unicode" {
 			found = true
-			if c.Verdict != verdictSkewed {
+			if c.Verdict != CollationSkewed {
 				t.Fatalf("unicode verdict: got %v, want Skewed", c.Verdict)
 			}
 			if c.UnicodeVersion != "0.0.0" {
@@ -416,7 +417,7 @@ func TestUpgradeCollationsClearsSkew(t *testing.T) {
 	// (suites/collation/collation_upgrade.test) cannot read — the verdict-flip + the re-pin count —
 	// plus idempotence. The skew injection mirrors TestSkewedCollationBlocksWrites.
 	env := loadFixtureBundle(t)
-	db := memDBIn(env).Session(SessionOptions{})
+	db := mustSession(memDBIn(env), SessionOptions{})
 	for _, sql := range []string{
 		`CREATE TABLE t (x text COLLATE "unicode" PRIMARY KEY)`,
 		`INSERT INTO t VALUES ('b'), ('a')`,
@@ -454,7 +455,7 @@ func TestUpgradeCollationsClearsSkew(t *testing.T) {
 	}
 	for _, c := range db.Collations() {
 		if c.Name == "unicode" {
-			if c.Verdict != verdictFull {
+			if c.Verdict != CollationFull {
 				t.Fatalf("unicode verdict after upgrade: got %v, want Full", c.Verdict)
 			}
 			if c.UnicodeVersion != loaded.UnicodeVersion {
@@ -479,7 +480,7 @@ func TestCollationOpenRefusesAbsent(t *testing.T) {
 	// refusal (collation.md §12, slice 2d): decoding the reference entry fails with XX002 naming it +
 	// its version, rather than the old bare 42704. "zz-absent-collation" is never in any bundle, so
 	// this is independent of the loaded set (no bundle load needed).
-	coll := &Collation{Name: "zz-absent-collation", UnicodeVersion: "17.0.0", CldrVersion: "48"}
+	coll := &compiledCollation{Name: "zz-absent-collation", UnicodeVersion: "17.0.0", CldrVersion: "48"}
 	buf := collationEntryBytes(coll, false)
 	pos := 0
 	_, _, err := decodeCollationEntry(buf, &pos, NewEnvironment())
@@ -496,8 +497,8 @@ func TestCollationHostOpsRejectedInReadOnlyOrFailedBlock(t *testing.T) {
 	// A host collation op inside an open block follows the block's statement rules: a READ ONLY
 	// block is 25006 and an aborted block is 25P02, never a success that COMMIT then discards.
 	env := loadFixtureBundle(t)
-	db := memDBIn(env).Session(SessionOptions{})
-	if err := db.Begin(false); err != nil {
+	db := mustSession(memDBIn(env), SessionOptions{})
+	if err := db.Begin(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.SetDefaultCollation("unicode"); err == nil || err.(*EngineError).Code() != "25006" {
@@ -509,7 +510,7 @@ func TestCollationHostOpsRejectedInReadOnlyOrFailedBlock(t *testing.T) {
 	if err := db.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Begin(true); err != nil {
+	if err := db.Begin(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := queryOutcome(db, "SELECT * FROM absent", nil); err == nil {
@@ -586,7 +587,7 @@ func TestTextArrayCollationConflictIsRaisedAtPlanTime(t *testing.T) {
 	// differently-collated text[] values only once its element texteq runs, so an empty table (or
 	// arrays of different lengths) succeeds there; jed derives the conflict when the query is planned.
 	env := loadFixtureBundle(t)
-	db := memDBIn(env).Session(SessionOptions{})
+	db := mustSession(memDBIn(env), SessionOptions{})
 	run(t, db, `CREATE TABLE t (a text[] COLLATE "unicode", c text[] COLLATE "C")`)
 	if _, err := queryOutcome(db, `SELECT a = c FROM t`, nil); err == nil || err.(*EngineError).Code() != "42P22" {
 		t.Fatalf("empty-table text[] conflict: want 42P22, got %v", err)

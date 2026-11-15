@@ -45,7 +45,7 @@ func BenchmarkSpecialization(b *testing.B) {
 				}
 			}
 			defer db.Close()
-			s := db.Session(SessionOptions{})
+			s := mustSession(db, SessionOptions{})
 			defer s.Close()
 			for _, q := range []struct {
 				name, sql    string

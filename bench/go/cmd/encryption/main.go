@@ -53,7 +53,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	s := db.Session(jed.SessionOptions{})
+	s, err := db.Session(jed.SessionOptions{})
+	if err != nil {
+		return err
+	}
 	if _, err := s.Exec(ctx, "CREATE TABLE t (id i64 PRIMARY KEY, v text)"); err != nil {
 		return err
 	}
@@ -80,7 +83,10 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		s := db.Session(jed.SessionOptions{})
+		s, err := db.Session(jed.SessionOptions{})
+		if err != nil {
+			return err
+		}
 		if phase.name == "cold" {
 			start := time.Now()
 			var count, sum int64

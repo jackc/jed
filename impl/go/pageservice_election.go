@@ -163,7 +163,7 @@ func openServiceDatabase(path string, opts OpenOptions) (*Database, error) {
 // wins. claim is false when the caller already holds the process-local path claim.
 func openServiceWith(h *serviceHandoff, claim bool) (*Database, error) {
 	opts := h.opts
-	election, err := electService(h.host, h.path, opts.FileLockTimeoutMs, opts.ReadOnly, electOptions{never: opts.Ownership == OwnershipNever, reelect: !claim, opts: opts, env: opts.Environment})
+	election, err := electService(h.host, h.path, durationMillisPtr(opts.FileLockTimeout), opts.ReadOnly, electOptions{never: opts.Ownership == OwnershipNever, reelect: !claim, opts: opts, env: opts.Environment})
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +173,7 @@ func openServiceWith(h *serviceHandoff, claim bool) (*Database, error) {
 		c.handoff = h
 		h.attachHost(c)
 		c.storage.budget.limit = opts.MaxStorageBytes
-		c.storage.setSynchronous(opts.Synchronous == SynchronousOff, flushIntervalMs(opts.FlushIntervalMs), c.env)
+		c.storage.setSynchronous(opts.Synchronous == SynchronousOff, flushIntervalMs(opts.FlushInterval), c.env)
 		r := &serviceRole{gen: 1, client: election.client}
 		c.installRole(r, e)
 		c.watchClient(r)
@@ -199,7 +199,7 @@ func startServiceOwner(e *engine, coord *fileCoordinator, h *serviceHandoff) (*D
 	c.handoff = h
 	h.attachHost(c)
 	c.storage.budget.limit = h.opts.MaxStorageBytes
-	c.storage.setSynchronous(h.opts.Synchronous == SynchronousOff, flushIntervalMs(h.opts.FlushIntervalMs), c.env)
+	c.storage.setSynchronous(h.opts.Synchronous == SynchronousOff, flushIntervalMs(h.opts.FlushInterval), c.env)
 	o, err := newPageServiceOwner(c, e.paging, e.committed.txid, h, coord)
 	if err != nil {
 		_ = e.paging.close()

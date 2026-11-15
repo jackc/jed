@@ -346,7 +346,7 @@ func (k *integrityChecker) checkForeignKey(table *catTable, store *tableStore, r
 	}
 	// The probe encodes under the referenced columns' collations, so it needs them as the stored keys
 	// were built (§3.5 missing_loaded_data).
-	parentColls := make([]*Collation, len(parent.Columns))
+	parentColls := make([]*compiledCollation, len(parent.Columns))
 	for i, col := range parent.Columns {
 		if col.Collation != "" {
 			parentColls[i] = k.snap.resolveCollation(col.Collation)

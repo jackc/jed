@@ -392,7 +392,7 @@ func (o *pageServiceOwner) acquireGate(timeoutMs uint64, done <-chan struct{}) e
 	}
 	var expired <-chan time.Time
 	if timeoutMs > 0 {
-		timer := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
+		timer := time.NewTimer(millisDuration(timeoutMs))
 		defer timer.Stop()
 		expired = timer.C
 	}
@@ -479,9 +479,18 @@ func (o *pageServiceOwner) broadcast(n psNotice) {
 
 // waitAdmission blocks an owner session's transaction begin while a yield drains (README.md §6.5).
 func (o *pageServiceOwner) waitAdmission() {
+	_ = o.waitAdmissionCancel(nil)
+}
+
+func (o *pageServiceOwner) waitAdmissionCancel(cancel <-chan struct{}) error {
 	if done := o.drainDone.Load(); done != nil {
-		<-*done
+		select {
+		case <-*done:
+		case <-cancel:
+			return doneErr(cancel)
+		}
 	}
+	return doneErr(cancel)
 }
 
 // admitting reports whether client begins are answered rather than parked.
@@ -1470,19 +1479,19 @@ func (c *sharedCore) maintenanceCommit(o *pageServiceOwner) {
 	c.planEpoch.Add(1)
 }
 
-// HangUpNextPageServiceAckForTesting makes a serving owner drop the connection instead of
+// hangUpNextPageServiceAckForTesting makes a serving owner drop the connection instead of
 // acknowledging its next client commit, after the commit is durable — the case commit_status resolves
 // (page-service.md §8.4). Test-only; no effect on a handle that is not a page-service owner.
-func HangUpNextPageServiceAckForTesting(db *Database) {
+func hangUpNextPageServiceAckForTesting(db *Database) {
 	if o := db.core.pageOwner(); o != nil {
 		o.nextAck.Store(psAckHangUp)
 	}
 }
 
-// CrashBeforeNextPageServiceAckForTesting makes a serving owner exit its process instead of
+// crashBeforeNextPageServiceAckForTesting makes a serving owner exit its process instead of
 // acknowledging its next client commit, after the commit is durable, so the client resolves the commit
 // under the next owner — itself, when it is the only other process (README.md §6.5). Test-only.
-func CrashBeforeNextPageServiceAckForTesting(db *Database) {
+func crashBeforeNextPageServiceAckForTesting(db *Database) {
 	if o := db.core.pageOwner(); o != nil {
 		o.nextAck.Store(psAckCrash)
 	}

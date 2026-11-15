@@ -320,6 +320,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > The north star is an **embeddable library** (§1). The formal API + bind parameters + sessions
 > + the CLI have landed. Parallelizable with most feature work.
 
+- [x] **Go public API documentation and tooling boundary.** Executable embedding examples, named metadata records, test-only catalog accessors, tagged tooling hooks, `MapRows`, and consumer-interface guidance. → [api.md §11.7](spec/design/api.md)
+- [x] **Go configuration validation and duration options.** Use `time.Duration` for timeouts/intervals, preserve omitted versus explicit-zero defaults, and reject invalid session time zones at construction. → [api.md §11.6](spec/design/api.md)
 - [x] **Unify the create constructor.** → [api.md §2.1.1](spec/design/api.md)
   - [ ] _follow-on:_ the anticipated create-time knobs as new `CreateOptions` fields
     (a spill `temp_dir`, then a thread count);

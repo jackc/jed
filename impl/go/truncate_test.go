@@ -11,12 +11,13 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // churn runs n single-row updates of t, each its own durable commit.
 func churn(t *testing.T, db *Database, n int, tag string) {
 	t.Helper()
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	for k := 0; k < n; k++ {
 		sql := fmt.Sprintf("UPDATE t SET pad = '%s%d' || repeat('y', 200), n = n + 7 WHERE id = %d", tag, k, 1+k%100)
@@ -91,7 +92,7 @@ func TestTrailingTruncationWaitsForAnOlderReader(t *testing.T) {
 	// may not be reused and nothing is truncated while it is open: the high-water never goes down.
 	reader := db.ReadSession()
 	high := db.PageCount()
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	for k := 0; k < 400; k++ {
 		if _, err := queryOutcome(s, fmt.Sprintf("UPDATE t SET n = %d WHERE id = %d", k, 1+k%100), nil); err != nil {
 			t.Fatal(err)
@@ -134,7 +135,7 @@ func TestTrailingTruncationWaitsForTheFlushUnderSynchronousOff(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "truncate-relaxed.jed")
 	db := createCompactFile(t, path)
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	for _, sql := range []string{
 		"CREATE TABLE t (id i64 PRIMARY KEY, pad text, n i64)",
 		"INSERT INTO t SELECT g, lpad(g::text, 300, 'x'), g % 7 FROM generate_series(1, 100) g",
@@ -147,13 +148,13 @@ func TestTrailingTruncationWaitsForTheFlushUnderSynchronousOff(t *testing.T) {
 	}
 	s.Close()
 	db.Close()
-	zero := uint64(0) // no time-based flush: wall time never moves a flush
-	db, err := OpenDatabaseWithOptions(path, OpenOptions{Synchronous: SynchronousOff, FlushIntervalMs: &zero})
+	zero := time.Duration(0) // no time-based flush: wall time never moves a flush
+	db, err := OpenDatabaseWithOptions(path, OpenOptions{Synchronous: SynchronousOff, FlushInterval: &zero})
 	if err != nil {
 		t.Fatal(err)
 	}
 	peak := db.PageCount()
-	s = db.Session(SessionOptions{})
+	s = mustSession(db, SessionOptions{})
 	if _, err := queryOutcome(s, "DROP TABLE big", nil); err != nil {
 		t.Fatal(err)
 	}

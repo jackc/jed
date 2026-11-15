@@ -5,6 +5,7 @@ package jed
 // directory, so /tmp tmpfs cannot silently turn the durability experiment into RAM.
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -68,7 +69,7 @@ func BenchmarkProductionRelaxedCommit(b *testing.B) {
 					b.Fatal(err)
 				}
 				exec := func(sql string) {
-					if _, err := db.ExecuteScript(sql); err != nil {
+					if _, err := db.ExecuteScript(context.Background(), sql); err != nil {
 						b.Fatal(err)
 					}
 				}

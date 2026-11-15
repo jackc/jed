@@ -21,7 +21,7 @@ func main() {
 	// run each in order, and commit all-or-nothing (any error rolls the lot back). It DISCARDS
 	// result rows — you get back only an O(1) summary (statements run, rows affected, cost), so a
 	// huge import never buffers results.
-	summary, err := db.ExecuteScript(
+	summary, err := db.ExecuteScript(ctx,
 		`CREATE TABLE account (id i32 PRIMARY KEY, balance i64);
 		 INSERT INTO account VALUES (1, 100), (2, 50);
 		 CREATE INDEX account_balance ON account (balance);`)

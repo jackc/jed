@@ -473,7 +473,7 @@ func (db *engine) statisticsValueKey(value Value, rel scopeRel, column int) ([]b
 	if !ok {
 		return nil, false
 	}
-	var coll *Collation
+	var coll *compiledCollation
 	if declared.Collation != "" {
 		coll = db.relationSnap(rel.db, rel.table.Name).resolveCollation(declared.Collation)
 	}

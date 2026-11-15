@@ -1,3 +1,5 @@
+//go:build jedtooling
+
 // Command process_actor is the test-only line actor for the shared real-process corpus.
 package main
 
@@ -32,8 +34,8 @@ func run() error {
 	// handoff options (spec/pageservice/README.md §6.5): ownership=prefer|yield|never, yield_grace,
 	// shutdown_grace, idle_session (milliseconds), max_connections; synchronous=off batches the handle's
 	// barriers (spec/design/validated-cow.md §4).
-	timeout := uint64(5000)
-	var idle *uint64
+	timeout := 5 * time.Second
+	var idle *time.Duration
 	var positional []string
 	options := map[string]string{}
 	for _, arg := range os.Args[3:] {
@@ -44,18 +46,18 @@ func run() error {
 		}
 	}
 	if len(positional) > 0 {
-		timeout, _ = strconv.ParseUint(positional[0], 10, 64)
+		timeout, _ = time.ParseDuration(positional[0] + "ms")
 	}
 	if len(positional) > 1 {
-		ms, _ := strconv.ParseUint(positional[1], 10, 64)
+		ms, _ := time.ParseDuration(positional[1] + "ms")
 		idle = &ms
 	}
-	millis := func(key string) *uint64 {
+	millis := func(key string) *time.Duration {
 		value, ok := options[key]
 		if !ok {
 			return nil
 		}
-		ms, _ := strconv.ParseUint(value, 10, 64)
+		ms, _ := time.ParseDuration(value + "ms")
 		return &ms
 	}
 	ownership := jed.OwnershipPrefer
@@ -107,17 +109,17 @@ func run() error {
 		if latency, ok := options["latency_us"]; ok {
 			transport = append(transport, latency)
 		}
-		db, err = jed.OpenRemote(transport, "remote:"+os.Args[2], jed.OpenOptions{FileLockTimeoutMs: &timeout, Credential: credential})
+		db, err = jed.OpenRemote(transport, "remote:"+os.Args[2], jed.OpenOptions{FileLockTimeout: &timeout, Credential: credential})
 	} else if os.Args[1] == "create" {
 		db, err = jed.CreateDatabase(jed.CreateOptions{
-			Path: os.Args[2], Locking: locking, FileLockTimeoutMs: &timeout, IdleInTransactionTimeoutMs: idle,
-			IdleSessionTimeoutMs: millis("idle_session"), YieldGraceMs: millis("yield_grace"), ShutdownGraceMs: millis("shutdown_grace"), MaxConnections: maxConnections, Ownership: ownership,
+			Path: os.Args[2], Locking: locking, FileLockTimeout: &timeout, IdleInTransactionTimeout: idle,
+			IdleSessionTimeout: millis("idle_session"), YieldGrace: millis("yield_grace"), ShutdownGrace: millis("shutdown_grace"), MaxConnections: maxConnections, Ownership: ownership,
 			Credential: credential, Synchronous: synchronous,
 		})
 	} else {
 		db, err = jed.OpenDatabaseWithOptions(os.Args[2], jed.OpenOptions{
-			Locking: locking, FileLockTimeoutMs: &timeout, IdleInTransactionTimeoutMs: idle, ReadOnly: readOnly,
-			IdleSessionTimeoutMs: millis("idle_session"), YieldGraceMs: millis("yield_grace"), ShutdownGraceMs: millis("shutdown_grace"), MaxConnections: maxConnections, Ownership: ownership,
+			Locking: locking, FileLockTimeout: &timeout, IdleInTransactionTimeout: idle, ReadOnly: readOnly,
+			IdleSessionTimeout: millis("idle_session"), YieldGrace: millis("yield_grace"), ShutdownGrace: millis("shutdown_grace"), MaxConnections: maxConnections, Ownership: ownership,
 			Credential: credential, Synchronous: synchronous,
 		})
 	}
@@ -155,10 +157,16 @@ func run() error {
 				reader = nil
 			}
 		case "WRITE_OPEN":
-			writer = db.Session(jed.SessionOptions{})
-			ms, _ := strconv.ParseUint(argument, 10, 64)
-			writer.SetLockTimeoutMs(ms)
-			err = writer.Begin(true)
+			var timeout time.Duration
+			if argument != "" {
+				timeout, err = time.ParseDuration(argument + "ms")
+			}
+			if err == nil {
+				writer, err = db.Session(jed.SessionOptions{LockTimeout: timeout})
+			}
+			if err == nil {
+				err = writer.Begin(context.Background(), true)
+			}
 		case "WRITE_EXEC":
 			_, err = writer.Exec(context.Background(), sql(argument))
 		case "WRITE_COMMIT":
@@ -302,8 +310,8 @@ func ownerIdle(root string) error {
 		var err error
 		switch command {
 		case "OWNER_OPEN":
-			timeout := uint64(5000)
-			db, err = jed.OpenDatabaseWithOptions(sql(argument), jed.OpenOptions{Locking: jed.LockingAuto, SkipFsync: true, FileLockTimeoutMs: &timeout, Environment: env})
+			timeout := 5 * time.Second
+			db, err = jed.OpenDatabaseWithOptions(sql(argument), jed.OpenOptions{Locking: jed.LockingAuto, SkipFsync: true, FileLockTimeout: &timeout, Environment: env})
 		case "OWNER_CLOSE":
 			if db != nil {
 				err = db.Close()

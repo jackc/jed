@@ -70,7 +70,7 @@ func TestReclaimTriggerInMemoryCommitsDoNotWalkEveryTime(t *testing.T) {
 	defer db.Close()
 	st := db.core.storage
 	st.reclaimWithinSession = true
-	sess := db.Session(SessionOptions{})
+	sess := mustSession(db, SessionOptions{})
 	sessExec(t, sess, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)")
 	sessExec(t, sess, triggerSetupSQL)
 	for k := 0; k < triggerRounds; k++ {

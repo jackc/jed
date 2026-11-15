@@ -19,7 +19,7 @@ func TestPreparedJoinReuse(t *testing.T) {
 	if err = json.Unmarshal(data, &plan); err != nil {
 		t.Fatal(err)
 	}
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	mustExec(t, s, "CREATE TABLE items (id i32 PRIMARY KEY, bucket i32, score i32, label text)")
 	mustExec(t, s, "INSERT INTO items SELECT CAST(g AS i32), CAST(g%10 AS i32), CAST((g*37)%10000 AS i32), 'row'||CAST(g AS text) FROM generate_series(0,999) AS g")
 	for _, w := range plan.Workloads {
@@ -93,7 +93,7 @@ func TestPreparedJoinCounters(t *testing.T) {
 	if err = json.Unmarshal(data, &plan); err != nil {
 		t.Fatal(err)
 	}
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	mustExec(t, s, "CREATE TABLE items (id i32 PRIMARY KEY, bucket i32, score i32, label text)")
 	mustExec(t, s, "INSERT INTO items SELECT CAST(g AS i32), CAST(g%10 AS i32), CAST((g*37)%10000 AS i32), 'row'||CAST(g AS text) FROM generate_series(0,999) AS g")
 	for _, w := range plan.Workloads {

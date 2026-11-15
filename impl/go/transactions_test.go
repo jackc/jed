@@ -7,7 +7,10 @@ package jed
 // exercise: s.Begin(writable), the s.View/s.Update closure wrappers, the Close rollback safety net,
 // and s.Commit/s.Rollback as the same mechanism. Mirrors impl/rust/tests/transactions.rs.
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 // txCount returns the number of rows of `SELECT * FROM t` against the committed/visible state.
 func txCount(t *testing.T, db dbHandle, table string) int {
@@ -21,9 +24,9 @@ func txCount(t *testing.T, db dbHandle, table string) int {
 
 func TestBeginExecuteCommitIsVisible(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
-	if err := db.Begin(true); err != nil {
+	if err := db.Begin(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := queryOutcome(db, "INSERT INTO t VALUES (1)", nil); err != nil {
@@ -57,10 +60,10 @@ func TestBeginExecuteCommitIsVisible(t *testing.T) {
 
 func TestBeginExecuteRollbackDiscards(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1)")
-	if err := db.Begin(true); err != nil {
+	if err := db.Begin(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := queryOutcome(db, "INSERT INTO t VALUES (2)", nil); err != nil {
@@ -84,7 +87,7 @@ func TestDroppingASessionWithAnOpenBlockRollsBack(t *testing.T) {
 	// the pre-block committed state.
 	db := memDB()
 	func() {
-		s := db.Session(SessionOptions{})
+		s := mustSession(db, SessionOptions{})
 		defer s.Close()
 		if _, err := queryOutcome(s, "CREATE TABLE t (id i32 PRIMARY KEY)", nil); err != nil {
 			t.Fatal(err)
@@ -94,9 +97,9 @@ func TestDroppingASessionWithAnOpenBlockRollsBack(t *testing.T) {
 		}
 	}()
 	func() {
-		s := db.Session(SessionOptions{})
+		s := mustSession(db, SessionOptions{})
 		defer s.Close()
-		if err := s.Begin(true); err != nil {
+		if err := s.Begin(context.Background(), true); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := queryOutcome(s, "INSERT INTO t VALUES (2)", nil); err != nil {
@@ -104,7 +107,7 @@ func TestDroppingASessionWithAnOpenBlockRollsBack(t *testing.T) {
 		}
 		// s closed here without commit/rollback — the safety net rolls the block back
 	}()
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	if s.InTransaction() {
 		t.Fatal("no block is open on a fresh session")
@@ -116,9 +119,9 @@ func TestDroppingASessionWithAnOpenBlockRollsBack(t *testing.T) {
 
 func TestUpdateClosureCommitsOnNil(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
-	err := db.Update(func(tx *Transaction) error {
+	err := db.Update(context.Background(), func(tx *Transaction) error {
 		if _, e := queryOutcome(tx, "INSERT INTO t VALUES (1)", nil); e != nil {
 			return e
 		}
@@ -138,10 +141,10 @@ func TestUpdateClosureCommitsOnNil(t *testing.T) {
 
 func TestUpdateClosureRollsBackOnErr(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1)")
-	err := db.Update(func(tx *Transaction) error {
+	err := db.Update(context.Background(), func(tx *Transaction) error {
 		if _, e := queryOutcome(tx, "INSERT INTO t VALUES (2)", nil); e != nil {
 			return e
 		}
@@ -163,12 +166,12 @@ func TestUpdateClosureRollsBackOnErr(t *testing.T) {
 
 func TestViewIsReadOnly(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1), (2)")
 	// a read inside a View works
 	got := 0
-	if err := db.View(func(tx *Transaction) error {
+	if err := db.View(context.Background(), func(tx *Transaction) error {
 		rows, e := tx.queryValues("SELECT id FROM t", nil)
 		if e != nil {
 			return e
@@ -184,7 +187,7 @@ func TestViewIsReadOnly(t *testing.T) {
 		t.Fatalf("rows read in View = %d want 2", got)
 	}
 	// a write inside a View is 25006, and the View auto-rolls-back
-	err := db.View(func(tx *Transaction) error {
+	err := db.View(context.Background(), func(tx *Transaction) error {
 		_, e := queryOutcome(tx, "INSERT INTO t VALUES (3)", nil)
 		return e
 	})
@@ -198,9 +201,9 @@ func TestViewIsReadOnly(t *testing.T) {
 
 func TestNestedBeginIs25001(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
-	if err := db.Begin(true); err != nil {
+	if err := db.Begin(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := queryOutcome(db, "INSERT INTO t VALUES (1)", nil); err != nil {
@@ -220,7 +223,7 @@ func TestNestedBeginIs25001(t *testing.T) {
 
 func TestCommitRollbackAreNoopsInAutocommit(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	// no open transaction: both are lenient no-op successes (transactions.md §4.2)
 	if err := db.Commit(); err != nil {

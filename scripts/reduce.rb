@@ -60,7 +60,7 @@ def prepare_core(name)
     { cmd: [File.join(REPO, "impl/rust/target/checked/conformance")], dir: REPO }
   when "go"
     bin = File.join(REPO, "impl/go", ".reduce_conformance")
-    ok = system(*%W[go build -o #{bin} ./cmd/conformance], chdir: File.join(REPO, "impl/go"))
+    ok = system(*%W[go build -tags jedtooling -o #{bin} ./cmd/conformance], chdir: File.join(REPO, "impl/go"))
     abort "reduce: go harness build failed" unless ok
     at_exit { FileUtils.rm_f(bin) }
     { cmd: [bin], dir: File.join(REPO, "impl/go") }

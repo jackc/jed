@@ -9,7 +9,7 @@ import "testing"
 
 func TestCreateTableAsBindsParameters(t *testing.T) {
 	t.Parallel()
-	sess := memDB().Session(SessionOptions{})
+	sess := mustSession(memDB(), SessionOptions{})
 	defer sess.Close()
 	sessExec(t, sess, "CREATE TABLE src (id i32 PRIMARY KEY, name text)")
 	sessExec(t, sess, "INSERT INTO src VALUES (1, 'a'), (2, 'b'), (3, 'c')")

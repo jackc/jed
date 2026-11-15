@@ -259,7 +259,7 @@ func resolveAggSortKey(s *scope, key *orderKey, params *paramTypes) (*rExpr, res
 	if err != nil {
 		return nil, resolvedType{}, keySort{}, err
 	}
-	var collation *Collation
+	var collation *compiledCollation
 	if key.Collation != "" {
 		if !ktype.collatable() && ktype.kind != rtNull {
 			return nil, resolvedType{}, keySort{}, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(ktype)))
@@ -326,7 +326,7 @@ func resolveAggOrder(s *scope, keys []orderKey, distinct bool, args []*exprNode,
 // minmaxCollation is the comparison collation of a text MIN/MAX (spec/design/collation.md §1
 // "Aggregates and window functions"): the operand's own derivation, so a conflicted or indeterminate
 // operand is 42P22 (PostgreSQL raises it once two values compare). nil for any other aggregate.
-func minmaxCollation(s *scope, plan aggPlan, args []*exprNode, result resolvedType) (*Collation, error) {
+func minmaxCollation(s *scope, plan aggPlan, args []*exprNode, result resolvedType) (*compiledCollation, error) {
 	if (plan != planMin && plan != planMax) || !result.collatable() || len(args) == 0 {
 		return nil, nil
 	}
@@ -380,7 +380,7 @@ func resolveOrderedSetAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *
 	// expression key's derivation; an indeterminate key is 42P21, a sort target); otherwise the
 	// default C (byte) order. Resolved to the loaded Collation (42704 if not loaded). The finalize
 	// sort applies it (an unmapped code point → 0A000 there).
-	var collation *Collation
+	var collation *compiledCollation
 	if key.Collation != "" {
 		if !optype.collatable() && optype.kind != rtNull {
 			return nil, resolvedType{}, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(optype)))
@@ -691,7 +691,7 @@ func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx,
 		result resolvedType
 		wagg   aggPlan // the aggregate plan, valid only when plan == planAgg
 		// aggColl is a text MIN/MAX window aggregate's comparison collation (minmaxCollation).
-		aggColl *Collation
+		aggColl *compiledCollation
 		// aggJSONTypes is a JSON window aggregate's operand type (aggSpec.jsonTypes).
 		aggJSONTypes []resolvedType
 	)
@@ -1039,7 +1039,7 @@ func resolveWindowDef(s *scope, wd *windowDef, keyCtx *aggCtx, windowKeys *[]*rE
 		// (an indeterminate key is 42P21, a sort target). A collated window ORDER BY honors the
 		// collation in both the per-partition sort and peer determination (window.md §3/§5); COLLATE
 		// "C" resolves to nil (the raw-byte fast path).
-		var coll *Collation
+		var coll *compiledCollation
 		if key.Collation != "" {
 			if !ty.collatable() && ty.kind != rtNull {
 				return nil, nil, nil, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(ty)))

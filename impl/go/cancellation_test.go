@@ -7,6 +7,7 @@ package jed
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -80,7 +81,7 @@ func TestCancelDuringExecution(t *testing.T) {
 		}
 	}
 
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	// Always-cancel: the first checkpoint during the scan aborts. The ctx path is untouched here, so a
 	// 57014 can only come from the meter consulting session.cancel. Since S4 (streaming.md §6) Query
@@ -205,6 +206,9 @@ func TestCursorCancellationInFlight(t *testing.T) {
 						if code := cancelCode(t, runErr); code != "57014" {
 							t.Fatalf("want 57014, got %s", code)
 						}
+						if !errors.Is(runErr, context.Canceled) {
+							t.Fatalf("lost context cancellation identity: %v", runErr)
+						}
 						if rows != nil {
 							if !rows.closed || rows.onClose != nil {
 								t.Fatal("terminal error retained cursor pin")
@@ -228,11 +232,11 @@ func TestCursorCancellationInFlight(t *testing.T) {
 					case "database":
 						exercise(db)
 					case "session":
-						s := db.Session(SessionOptions{})
+						s := mustSession(db, SessionOptions{})
 						defer s.Close()
 						exercise(s)
 					case "transaction":
-						if code := cancelCode(t, db.Update(func(tx *Transaction) error { return exercise(tx) })); code != "57014" {
+						if code := cancelCode(t, db.Update(context.Background(), func(tx *Transaction) error { return exercise(tx) })); code != "57014" {
 							t.Fatal(code)
 						}
 					}
@@ -249,7 +253,7 @@ func TestCursorCancellationInFlight(t *testing.T) {
 func TestCursorCancellationLifetime(t *testing.T) {
 	db := memDB()
 	defer db.Close()
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	bg := context.Background()
 	ctx, cancel := context.WithCancel(bg)
@@ -321,7 +325,7 @@ func TestCancellationBatchCheckpoints(t *testing.T) {
 	}
 	for _, sql := range []string{"SELECT sum(v), count(*) FROM t", "SELECT v FROM t", "SELECT v, count(*) FROM t GROUP BY v"} {
 		t.Run(sql, func(t *testing.T) {
-			s := db.Session(SessionOptions{})
+			s := mustSession(db, SessionOptions{})
 			defer s.Close()
 			done := make(chan struct{})
 			s.engine.session.cancel = done
@@ -367,7 +371,7 @@ func TestCancellationPreservesCostLimits(t *testing.T) {
 			var wantRows int
 			var wantErr string
 			for i, c := range []context.Context{bg, ctx} {
-				s := db.Session(SessionOptions{})
+				s := mustSession(db, SessionOptions{})
 				if setting != "" {
 					if setting == "SET max_cost = 50" {
 						s.SetMaxCost(50)
@@ -453,7 +457,7 @@ func TestCancellationWithoutRowEmission(t *testing.T) {
 		"SELECT a.id FROM t a JOIN t b ON a.id + b.id < 0 ORDER BY a.id LIMIT 1",
 	} {
 		t.Run(sql, func(t *testing.T) {
-			s := db.Session(SessionOptions{})
+			s := mustSession(db, SessionOptions{})
 			defer s.Close()
 			done := make(chan struct{})
 			s.engine.session.cancel = done
@@ -536,7 +540,7 @@ func TestCancellationCachesDone(t *testing.T) {
 func TestCancellationRestoresSession(t *testing.T) {
 	db := memDB()
 	defer db.Close()
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	previous := make(chan struct{})
 	close(previous)

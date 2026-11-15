@@ -38,7 +38,7 @@ func errRange(t *testing.T, db dbHandle, sql string) string {
 // this is the behavioral round-trip.
 func TestRangeImageRoundtrip(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range, br i64range)")
 	run(t, db, "INSERT INTO t VALUES (1, '[1,5)', '[10,20)')")
 	run(t, db, "INSERT INTO t VALUES (2, '[1,5]', NULL)") // canonical [1,6)
@@ -74,7 +74,7 @@ func TestRangeImageRoundtrip(t *testing.T) {
 func TestRangeCanonicalNameAndAliases(t *testing.T) {
 	t.Parallel()
 	// The PG alias is accepted on the column; the value renders the same as the canonical spelling.
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r int4range)")
 	run(t, db, "INSERT INTO t VALUES (1, '[1,5)')")
 	got := queryRendered(t, db, "SELECT r FROM t")
@@ -84,7 +84,7 @@ func TestRangeCanonicalNameAndAliases(t *testing.T) {
 
 	// A range PRIMARY KEY now WORKS even when declared with the PG alias, and the value behaves as a
 	// key (the stored row renders the canonical spelling). Range is keyable since R4 (encoding.md §2.11).
-	db2 := memDB().Session(SessionOptions{})
+	db2 := mustSession(memDB(), SessionOptions{})
 	run(t, db2, "CREATE TABLE k (r int4range PRIMARY KEY, n i32)")
 	run(t, db2, "INSERT INTO k VALUES ('[1,5)', 1)")
 	if got := errRange(t, db2, "INSERT INTO k VALUES ('[1,4]', 2)"); got != "23505" {
@@ -96,7 +96,7 @@ func TestRangeCanonicalNameAndAliases(t *testing.T) {
 	// an array/jsonb opclass, so GIN over a plain range column is 42704 and names the canonical element
 	// type (PG agrees a range has no gin opclass but reports int4range — the naming divergence, so this
 	// stays a per-core test).
-	db3 := memDB().Session(SessionOptions{})
+	db3 := mustSession(memDB(), SessionOptions{})
 	run(t, db3, "CREATE TABLE u (id i32 PRIMARY KEY, r int4range)")
 	_, err := queryOutcome(db3, "CREATE INDEX ON u USING gin (r)", nil)
 	if err == nil {
@@ -118,7 +118,7 @@ func TestRangeCanonicalNameAndAliases(t *testing.T) {
 // oracle-clean corpus.
 func TestRangeNarrowingsAre0A000(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if got := errRange(t, db, "CREATE TABLE b (id i32 PRIMARY KEY, r i32range DEFAULT '[1,5)')"); got != "0A000" {
 		t.Errorf("range DEFAULT: got %s, want 0A000", got)
 	}
@@ -138,7 +138,7 @@ func TestRangeNarrowingsAre0A000(t *testing.T) {
 // types/range.test.
 func TestRangeCrossElementComparisonIs42804(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	// A range over i32 vs a range over i64 — different element types, no implicit cross-range cast.
 	if got := errRange(t, db, "SELECT '[1,5)'::i32range = '[1,5)'::i64range"); got != "42804" {
 		t.Errorf("i32range = i64range: got %s, want 42804", got)
@@ -157,7 +157,7 @@ func TestRangeCrossElementComparisonIs42804(t *testing.T) {
 // in the oracle corpus. The agreeing range-field behavior is types/composite_range_field.test.
 func TestRangeCompositeFieldTypmodIs0A000(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if got := errRange(t, db, "CREATE TYPE rec AS (lo i32, span numrange(10,2))"); got != "0A000" {
 		t.Errorf("range composite field typmod: got %s, want 0A000", got)
 	}
@@ -174,7 +174,7 @@ func TestRangeCompositeFieldTypmodIs0A000(t *testing.T) {
 // impl/rust/tests/range_storage.rs.
 func TestRangeConstructorDivergences(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	// (1) jed ACCEPTS the i/f-prefix spellings i32range/i64range as constructor names (PG ships only
 	// int4range/int8range). The result is identical to the PG-spelled alias.
 	if got := queryRendered(t, db, "SELECT i32range(1, 5)"); !reflect.DeepEqual(got, [][]string{{"[1,5)"}}) {
@@ -216,7 +216,7 @@ func TestRangeConstructorDivergences(t *testing.T) {
 // expr/range_operators.test. Mirrors range_operator_divergences in impl/rust/tests/range_storage.rs.
 func TestRangeOperatorDivergences(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	// THE divergence: jed has no integer bit-shift, so the `<<` / `>>` tokens are RANGE-only. An
 	// integer `<<` / `>>` is "operator does not exist" (42883) — PostgreSQL would compute a bit shift
 	// (5 << 2 = 20). A documented divergence (jed owns its surface), so it cannot live in the corpus.

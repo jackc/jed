@@ -46,7 +46,7 @@ func bareString(ty colType) bool { return leafBareString && stringPayload(ty) }
 
 // inlinePayload is the content payload of an inline-deferred string value, whichever form it was
 // read from.
-func (u *Unfetched) inlinePayload() []byte {
+func (u *unfetchedValue) inlinePayload() []byte {
 	if u.bare {
 		return u.body()
 	}

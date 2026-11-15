@@ -1,7 +1,3 @@
-// Package jed is the Go core of the engine (CLAUDE.md §2): a downstream consumer
-// of /spec, the canonical source of truth. Pure Go — no cgo, no FFI. It implements
-// the step-1 surface (integer DDL/DML/SELECT) and ships a conformance harness
-// (cmd/conformance) that runs the shared corpus.
 package jed
 
 import (
@@ -22,6 +18,8 @@ import (
 type EngineError struct {
 	State   SqlState
 	Message string
+	// cause preserves a host cancellation's Go error identity without changing SQLSTATE.
+	cause error
 	// ConstraintName is the violated constraint — set for 23505/23514/23503/23P01.
 	ConstraintName string
 	// TableName is the relation the failing write targeted.
@@ -68,6 +66,9 @@ func newError(state SqlState, message string) *EngineError {
 
 // Code returns the error's SQLSTATE string.
 func (e *EngineError) Code() string { return e.State.Code() }
+
+// Unwrap returns the underlying host cancellation error, if any.
+func (e *EngineError) Unwrap() error { return e.cause }
 
 // Error renders the error. The SQLSTATE is included in the text so that
 // `statement error <code>` also matches as a plain regex under the stock

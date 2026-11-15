@@ -1184,7 +1184,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				if ty.kind == rtJson {
 					return nil, orderJSONError(key, appendedOn)
 				}
-				var coll *Collation
+				var coll *compiledCollation
 				if key.Collation != "" {
 					if !ty.collatable() && ty.kind != rtNull {
 						return nil, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(ty)))
@@ -1209,7 +1209,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			// The sort key's collation (spec/design/collation.md §1/§7). An explicit COLLATE must be on a
 			// text column (42804) and name a loaded collation ("C" → byte order, else 42704); absent a
 			// clause, the key inherits the column's frozen (implicit) collation.
-			var coll *Collation
+			var coll *compiledCollation
 			if key.Collation != "" {
 				if !s.columnOf(r).Type.IsCollatable() {
 					return nil, typeError(fmt.Sprintf(
@@ -1274,7 +1274,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		// The collation of an expression key (collation.md §1): an explicit trailing COLLATE (rare —
 		// parseExpr usually absorbs one into the key) must be on a text key (42804); otherwise it is
 		// DERIVED from the key expression.
-		var coll *Collation
+		var coll *compiledCollation
 		if key.Collation != "" {
 			if !ty.collatable() && ty.kind != rtNull {
 				return nil, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(ty)))

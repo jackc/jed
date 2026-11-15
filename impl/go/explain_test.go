@@ -11,7 +11,7 @@ import "testing"
 // even though plain EXPLAIN never executes.
 func TestExplainDelegatesInnerPrivileges(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	sessExec(t, db, "INSERT INTO t VALUES (1, 10)")
 	db.SetDefaultPrivileges(PrivSetEmpty.With(PrivSelect))
@@ -31,7 +31,7 @@ func TestExplainDelegatesInnerPrivileges(t *testing.T) {
 // EXPLAIN ANALYZE of a write IS a write and is rejected 25006.
 func TestExplainWriteClassification(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	sessExec(t, db, "INSERT INTO t VALUES (1, 10)")
 	sessExec(t, db, "BEGIN READ ONLY")
@@ -45,7 +45,7 @@ func TestExplainWriteClassification(t *testing.T) {
 // Plain EXPLAIN of a DELETE does not mutate; EXPLAIN ANALYZE of an INSERT does (and persists).
 func TestExplainAnalyzeExecutesWrites(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	sessExec(t, db, "INSERT INTO t VALUES (1, 10)")
 	sessExec(t, db, "INSERT INTO t VALUES (2, 20)")
@@ -63,7 +63,7 @@ func TestExplainAnalyzeExecutesWrites(t *testing.T) {
 // (larger) inner cost reported inside the Analyze root.
 func TestExplainOwnsRenderCost(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	sessExec(t, db, "INSERT INTO t VALUES (1, 10)")
 	sessExec(t, db, "INSERT INTO t VALUES (2, 20)")

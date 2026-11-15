@@ -181,8 +181,9 @@ read-write. The idiomatic spellings are Rust `AttachSource::file(path).locking(.
 .file_lock_timeout_ms(...)`, Go `AttachFileWithOptions(path, AttachFileOptions{...})`, and TypeScript
 `attachFile(path, { locking, fileLockTimeoutMs })`. An in-memory create ignores file-lock options.
 
-Go represents `file_lock_timeout_ms` as `*uint64`: `nil` is the 5000 ms default and a non-nil pointer
-to `0` is the explicit single attempt.
+Go exposes `FileLockTimeout *time.Duration`: `nil` is the five-second default and a pointer
+to zero is an explicit single attempt. Negative durations are rejected; positive fractional
+milliseconds round up (api.md §11.6).
 
 ### 7.2 Errors
 

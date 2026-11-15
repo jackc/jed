@@ -648,9 +648,9 @@ Extends the [api.md §6](api.md) table; same shape across cores, idiomatic spell
 | split statements *(top-level — not a `Session`/`Database` method)* | `jed::split_statements(sql) -> impl Iterator<Item = StatementSpan>` | `jed.SplitStatements(sql) iter.Seq[StatementSpan]` | `splitStatements(sql): Iterable<StatementSpan>` |
 | open session | `db.session(opts) -> Session` | `db.Session(opts) (*Session, error)` | `session(db, opts): Session` |
 | close session | `session.close()` + `Drop` | `session.Close() error` | `session.close(): void` |
-| run a script | `session.execute_script(sql) -> Result<ScriptSummary>` | `session.ExecuteScript(sql) (ScriptSummary, error)` | `session.executeScript(sql): ScriptSummary` |
+| run a script | `session.execute_script(sql) -> Result<ScriptSummary>` | `session.ExecuteScript(ctx, sql) (ScriptSummary, error)` | `session.executeScript(sql): ScriptSummary` |
 | set lifetime budget | `session.set_lifetime_max_cost(n)` | `session.SetLifetimeMaxCost(n)` | `session.setLifetimeMaxCost(n)` |
-| set writer-lock timeout | `session.set_lock_timeout_ms(n)` | `session.SetLockTimeoutMs(n)` | `session.setLockTimeoutMs(n)` |
+| set writer-lock timeout | `session.set_lock_timeout_ms(n)` | `session.SetLockTimeout(n)` | `session.setLockTimeoutMs(n)` |
 | cumulative cost gauge | `session.lifetime_cost() -> i64` | `session.LifetimeCost() int64` | `session.lifetimeCost: number` |
 | default privileges | `SessionOptions { default_privileges }` | `SessionOptions{ DefaultPrivileges }` | `{ defaultPrivileges }` |
 | grant / revoke | `session.grant(privs, on)` / `session.revoke(privs, on)` | `session.Grant` / `session.Revoke` | `session.grant` / `session.revoke` |

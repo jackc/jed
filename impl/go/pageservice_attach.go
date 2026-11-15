@@ -84,12 +84,12 @@ func (c *sharedCore) openServiceAttachment(name, path string, source AttachSourc
 		return nil, "", err
 	}
 	opts := OpenOptions{
-		ReadOnly:          readOnly,
-		Locking:           LockingAuto,
-		FileLockTimeoutMs: source.fileLockTimeoutMs,
-		Environment:       c.env,
-		MaxStorageBytes:   source.maxStorageBytes,
-		Credential:        source.credential,
+		ReadOnly:        readOnly,
+		Locking:         LockingAuto,
+		FileLockTimeout: source.fileLockTimeout,
+		Environment:     c.env,
+		MaxStorageBytes: source.maxStorageBytes,
+		Credential:      source.credential,
 	}
 	if spill != nil && spillEncrypts(spill) {
 		// The attachment seals its scratch files when the handle does (encryption.md §6).
@@ -100,16 +100,16 @@ func (c *sharedCore) openServiceAttachment(name, path string, source AttachSourc
 		// (validated-cow.md §4, §4.1).
 		opts.Synchronous = SynchronousOff
 	}
-	interval := c.storage.deadline.intervalMs()
-	opts.FlushIntervalMs = &interval
+	interval := millisDuration(c.storage.deadline.intervalMs())
+	opts.FlushInterval = &interval
 	if h := c.handoff; h != nil {
 		// A handle under the page service lends its ownership preference and owner limits to its
 		// attachments (README.md §6.6).
 		opts.Ownership = h.ownership
-		opts.IdleInTransactionTimeoutMs = h.opts.IdleInTransactionTimeoutMs
-		opts.IdleSessionTimeoutMs = h.opts.IdleSessionTimeoutMs
-		opts.YieldGraceMs = h.opts.YieldGraceMs
-		opts.ShutdownGraceMs = h.opts.ShutdownGraceMs
+		opts.IdleInTransactionTimeout = h.opts.IdleInTransactionTimeout
+		opts.IdleSessionTimeout = h.opts.IdleSessionTimeout
+		opts.YieldGrace = h.opts.YieldGrace
+		opts.ShutdownGrace = h.opts.ShutdownGrace
 		opts.MaxConnections = h.opts.MaxConnections
 	}
 	h := newServiceHandoff(host, real, opts)
@@ -254,7 +254,7 @@ func attachPinsStale(pins []attachPin) error {
 // main is under the page service) and of every read-write service attachment, in real-path byte order
 // (page-service.md §5.5). Each wait is bounded by timeoutMs; a failure releases the gates already held
 // in reverse order. Read-only service attachments are then pinned for the writer.
-func (c *sharedCore) acquireGates(timeoutMs uint64) error {
+func (c *sharedCore) acquireGates(timeoutMs uint64, done <-chan struct{}) error {
 	var gates []gateRef
 	if c.handoff != nil {
 		gates = append(gates, gateRef{path: c.handoff.path})
@@ -272,9 +272,9 @@ func (c *sharedCore) acquireGates(timeoutMs uint64) error {
 	for _, g := range gates {
 		var err error
 		if g.att == nil {
-			err = c.beginServiceWrite(timeoutMs)
+			err = c.beginServiceWrite(timeoutMs, done)
 		} else {
-			err = g.att.svc.core.acquireWriter(timeoutMs)
+			err = g.att.svc.core.acquireWriterCancel(timeoutMs, done)
 		}
 		if err != nil {
 			releaseGates(c, held)
@@ -398,13 +398,13 @@ func (c *sharedCore) domainName() string {
 	return "main"
 }
 
-// PageServiceAttachmentRoleForTesting reports the page-service role of attachment name: "owner",
+// pageServiceAttachmentRoleForTesting reports the page-service role of attachment name: "owner",
 // "client", or "none" (not under the page service, between roles, or not attached). Test-only
 // (README.md §6.5).
-func PageServiceAttachmentRoleForTesting(db *Database, name string) string {
+func pageServiceAttachmentRoleForTesting(db *Database, name string) string {
 	att := db.core.attachment(name)
 	if att == nil || att.svc == nil {
 		return "none"
 	}
-	return PageServiceRoleForTesting(att.svc)
+	return pageServiceRoleForTesting(att.svc)
 }

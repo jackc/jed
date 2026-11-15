@@ -122,7 +122,7 @@ func TestRowReuseRetainedResults(t *testing.T) {
 	for _, file := range []bool{false, true} {
 		t.Run(fmt.Sprint(file), func(t *testing.T) {
 			db := rowReuseDB(t, file)
-			s := db.Session(SessionOptions{MaxQueryMemoryBytes: 1024})
+			s := mustSession(db, SessionOptions{MaxQueryMemoryBytes: 1024})
 			defer s.Close()
 			for _, dirty := range []bool{false, true} {
 				if dirty {
@@ -201,7 +201,7 @@ func TestRowReusePreparedIsolation(t *testing.T) {
 	}
 	// Same-session interleaving and cross-session concurrent shared-plan execution.
 	run := func(start int) error {
-		s := db.Session(SessionOptions{})
+		s := mustSession(db, SessionOptions{})
 		defer s.Close()
 		a, err := s.QueryPrepared(context.Background(), stmt, start)
 		if err != nil {

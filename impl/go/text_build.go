@@ -80,7 +80,7 @@ func evalTextVariadic(e *rExpr, row storedRow, env *evalEnv, m *costMeter) (Valu
 // rather than the true/false of the ::text cast. A finite timestamptz at any depth renders in the
 // session zone and charges one timezone unit, charged and guarded before rendering. The caller
 // handles NULL.
-func outputText(v Value, zone ZoneRef, m *costMeter) (string, error) {
+func outputText(v Value, zone zoneRef, m *costMeter) (string, error) {
 	switch v.Kind {
 	case ValText:
 		return v.str(), nil
@@ -104,7 +104,7 @@ func outputText(v Value, zone ZoneRef, m *costMeter) (string, error) {
 // is an amplifier (cost.md §8.1): it sizes the result exactly, caps it at maxResultChars (54000),
 // charges scalar_byte per output byte, guards, and reserves the bytes before building. concat is a
 // growth kernel and its caller charges the built result.
-func concatValues(vals []Value, sep string, amplify bool, zone ZoneRef, m *costMeter) (string, error) {
+func concatValues(vals []Value, sep string, amplify bool, zone zoneRef, m *costMeter) (string, error) {
 	parts := make([]string, 0, len(vals))
 	for _, v := range vals {
 		if v.IsNull() {
@@ -266,7 +266,7 @@ func formatParseSpec(b string, start int) (formatSpec, error) {
 // converts any other type through its output text). NULL is width 0; an integer outside int32 is
 // 22003; any other value goes through the text → i32 cast, so a non-integer is that cast's 22P02 /
 // 22003.
-func formatWidthValue(v Value, zone ZoneRef, m *costMeter) (int32, error) {
+func formatWidthValue(v Value, zone zoneRef, m *costMeter) (int32, error) {
 	switch v.Kind {
 	case ValNull:
 		return 0, nil
@@ -292,7 +292,7 @@ func formatWidthValue(v Value, zone ZoneRef, m *costMeter) (int32, error) {
 // UTF-8 bytes are charged as the input scan and guarded; one pass parses it and renders each
 // converted argument (the specifier errors surface in scan order); the exact output size is then
 // capped at maxResultChars (54000), charged, guarded, and reserved before the result is built.
-func formatText(fmtStr string, args []Value, zone ZoneRef, m *costMeter) (string, error) {
+func formatText(fmtStr string, args []Value, zone zoneRef, m *costMeter) (string, error) {
 	m.Charge(costs.ScalarByte * int64(len(fmtStr)))
 	if err := m.Guard(); err != nil {
 		return "", err

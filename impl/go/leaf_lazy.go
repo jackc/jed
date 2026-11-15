@@ -278,7 +278,7 @@ func storedSame(ty colType, v Value, p *packedLeaf, c, i int) bool {
 		return bytes.Equal(encodeValue(ty, v)[1:], l.fixedSlot(r, i, &buf))
 	}
 	str := stringPayload(ty)
-	var u *Unfetched
+	var u *unfetchedValue
 	if v.Kind == ValUnfetched {
 		u = v.unfetched()
 		if u.Form != 0x00 {

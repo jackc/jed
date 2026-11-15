@@ -557,7 +557,7 @@ func parseTimestamp(s string) (int64, error) { return parseDatetime(s, "timestam
 // sentinel, and an offset-less wall clock is read in zone — the session zone at every caller (DST
 // gap/overlap as the timestamp → timestamptz cast; a shift past the range is 22008). It meters
 // nothing: a caller that evaluates per row charges the zone consult.
-func parseTimestamptz(s string, zone ZoneRef) (int64, error) {
+func parseTimestamptz(s string, zone zoneRef) (int64, error) {
 	iz := inputZone{zone: zone}
 	return iz.parseTimestamptz(s)
 }
@@ -571,7 +571,7 @@ func parseTimestamptz(s string, zone ZoneRef) (int64, error) {
 // re-resolved in whatever zone the next statement runs under — 42P17). Explicit offsets and
 // ±infinity never consult it.
 type inputZone struct {
-	zone      ZoneRef
+	zone      zoneRef
 	consulted bool
 	// prop is the handle Environment's casing table (nil ⇒ ASCII) — the one text-input parse that
 	// needs it is a jsonpath literal, whose like_regex `i` flag folds its pattern at compile.
@@ -725,7 +725,7 @@ func renderTimestamptz(micros int64) string {
 // which follows the session zone (timezones.md §9.5): the local wall clock plus the offset in effect
 // at the instant. ±infinity render bare; a finite instant whose local reading leaves the timestamp
 // range traps 22008 (timezones.md §6).
-func renderTimestamptzIn(micros int64, zone ZoneRef) (string, error) {
+func renderTimestamptzIn(micros int64, zone zoneRef) (string, error) {
 	if micros == negInfinity || micros == posInfinity {
 		return renderDatetime(micros, nil), nil
 	}
@@ -745,7 +745,7 @@ func renderTimestampXSD(micros int64) string { return renderDatetimeStyled(micro
 // style): the local wall clock with a T separator and an offset that always shows its minutes
 // (+05:30, +00:00). ±infinity render bare; a local reading out of range traps 22008, as the text
 // render does.
-func renderTimestamptzXSDIn(micros int64, zone ZoneRef) (string, error) {
+func renderTimestamptzXSDIn(micros int64, zone zoneRef) (string, error) {
 	if micros == negInfinity || micros == posInfinity {
 		return renderDatetime(micros, nil), nil
 	}

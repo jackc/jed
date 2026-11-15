@@ -45,10 +45,12 @@ type Valuer interface{ JedValue() (Value, error) }
 type Scanner interface{ ScanJed(v Value) error }
 
 // Queryer is satisfied by *Database, *Session, and *Transaction so a data-access helper can take a
-// bare handle, a durable connection, or an open transaction interchangeably (api.md §11). The
+// database, a session, or an open transaction interchangeably (api.md §11). The
 // *Prepared methods run a PreparedStatement — a standalone parsed value bound to no session — on
 // the handle, which supplies the session that execute observes; a *PreparedStatement itself carries
 // no query methods (the handle chosen at each call is what determines the session, api.md §2.4).
+// Applications should usually define an interface in their own package with only
+// the methods they need. Queryer is a convenience for helpers using the full set.
 type Queryer interface {
 	Query(ctx context.Context, sql string, args ...any) (*Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) *Row
@@ -84,14 +86,19 @@ func ergoQuery(ctx context.Context, eng *engine, args []any, raw func([]Value) (
 	done := contextDone(ctx)
 	if err := doneErr(done); err != nil {
 		eng.failOpenBlock() // so is a pre-execution 57014 (api.md §11.4)
-		return nil, err
+		return nil, contextError(ctx, err)
 	}
 	defer eng.restoreCancel(eng.armCancel(done))
 	rows, err := raw(params)
 	if err != nil {
-		return nil, err
+		return nil, contextError(ctx, err)
 	}
-	rows.done = done
+	if !rows.executionComplete {
+		rows.done = done
+	}
+	if rows.done != nil {
+		rows.cancelErr = ctx.Err
+	}
 	return rows, nil
 }
 
@@ -123,7 +130,7 @@ func ergoExec(ctx context.Context, eng *engine, args []any, raw func([]Value) (*
 // session explicitly (rather than via queryValues) so cancellation arms on the engine that runs
 // the statement.
 func (db *Database) Query(ctx context.Context, sql string, args ...any) (*Rows, error) {
-	s := db.Session(SessionOptions{})
+	s := db.sessionWithState(newSession(db.core.env))
 	defer s.Close()
 	return ergoQuery(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryValues(sql, p) })
 }
@@ -132,7 +139,7 @@ func (db *Database) Query(ctx context.Context, sql string, args ...any) (*Rows, 
 // through the same total query seam as Query and discards any result set (§11) — so Exec and Query
 // are one path, and a SELECT run through Exec is valid (its rows are dropped).
 func (db *Database) Exec(ctx context.Context, sql string, args ...any) (Result, error) {
-	s := db.Session(SessionOptions{})
+	s := db.sessionWithState(newSession(db.core.env))
 	defer s.Close()
 	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryValues(sql, p) })
 }
@@ -168,14 +175,14 @@ func (tx *Transaction) QueryRow(ctx context.Context, sql string, args ...any) *R
 
 // QueryPrepared runs a prepared query on a fresh autocommit session, binding native args.
 func (db *Database) QueryPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (*Rows, error) {
-	s := db.Session(SessionOptions{})
+	s := db.sessionWithState(newSession(db.core.env))
 	defer s.Close()
 	return ergoQuery(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryStmt(stmt.ast, p, &stmt.sc, &stmt.ic) })
 }
 
 // ExecPrepared runs a prepared statement on a fresh autocommit session and returns its command tag.
 func (db *Database) ExecPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (Result, error) {
-	s := db.Session(SessionOptions{})
+	s := db.sessionWithState(newSession(db.core.env))
 	defer s.Close()
 	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryStmt(stmt.ast, p, &stmt.sc, &stmt.ic) })
 }
@@ -321,7 +328,7 @@ func (r *Rows) Err() error { return r.err }
 // Close releases the cursor's pinned read snapshot (spec/design/streaming.md §5): it closes the
 // underlying cursor and deregisters the reader-liveness watermark pin (if any), advancing
 // oldestLiveTxid. A no-op for a buffered cursor (it pins nothing). Idempotent. The ergonomic
-// iterators (All/Collect/Scan) close automatically on loop exit, as does Next on exhaustion or
+// iterators (All/MapRows/Scan) close automatically on loop exit, as does Next on exhaustion or
 // error. A caller that stops early must Close (Go has no destructor).
 func (r *Rows) Close() error {
 	if r.closed {
@@ -330,6 +337,7 @@ func (r *Rows) Close() error {
 	r.closed = true
 	r.valid = false
 	r.done = nil
+	r.cancelErr = nil
 	r.onErr = nil
 	r.cursor.close()
 	if r.onClose != nil {
@@ -451,12 +459,16 @@ func (r *Rows) All() iter.Seq[*Rows] {
 	}
 }
 
-// Collect returns an iterator that maps each row through fn and yields (value, error). A terminal
+// MapRows returns an iterator that maps each row through fn and yields (value, error). A terminal
 // stream error (a canceled ctx, a future mid-stream fault) is delivered as a final (zero, err)
-// pair. The cursor is Closed on loop exit. Pair with RowToStructByName for struct mapping:
+// pair. The iterator is single-use. Once iteration begins, it closes rows on
+// completion, error, or early loop exit. If it is never iterated, the caller must
+// close rows. It returns iter.Seq2[T, error], so it cannot be passed directly to
+// slices.Collect, which accepts iter.Seq[T]. Handle each error in the loop.
+// Pair with RowToStructByName for struct mapping:
 //
-//	for u, err := range jed.Collect(rows, jed.RowToStructByName[User]) { ... }
-func Collect[T any](rows *Rows, fn func(*Rows) (T, error)) iter.Seq2[T, error] {
+//	for u, err := range jed.MapRows(rows, jed.RowToStructByName[User]) { ... }
+func MapRows[T any](rows *Rows, fn func(*Rows) (T, error)) iter.Seq2[T, error] {
 	return func(yield func(T, error) bool) {
 		defer rows.Close()
 		for rows.Next() {
@@ -975,6 +987,28 @@ func doneErr(done <-chan struct{}) error {
 	default:
 		return nil
 	}
+}
+
+// contextError enriches only observed cancellation errors. Never infer failure
+// from a context that was canceled after a successful operation or commit.
+func contextError(ctx context.Context, err error) error {
+	if ctx == nil || err == nil {
+		return err
+	}
+	return cancellationCause(err, ctx.Err)
+}
+
+func cancellationCause(err error, cause func() error) error {
+	if cause == nil {
+		return err
+	}
+	if ee, ok := err.(*EngineError); ok && ee.State == QueryCanceled && ee.cause == nil {
+		// Errors can be retained by other consumers; attach host metadata to a copy.
+		copy := *ee
+		copy.cause = cause()
+		return &copy
+	}
+	return err
 }
 
 // armCancel temporarily installs an operation-owned channel. Meters and snapshot

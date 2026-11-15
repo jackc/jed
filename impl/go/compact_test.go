@@ -10,6 +10,7 @@ package jed
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -35,7 +36,7 @@ func createCompactFile(t *testing.T, path string) *Database {
 // growAndShrink grows table t to 2000 wide rows, then deletes all but 100: most pages end up dead.
 func growAndShrink(t *testing.T, db *Database) {
 	t.Helper()
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	for _, sql := range []string{
 		"CREATE TABLE t (id i64 PRIMARY KEY, pad text, n i64)",
@@ -52,7 +53,7 @@ func growAndShrink(t *testing.T, db *Database) {
 // rowsAndCost returns the rows and the cost of sql on a fresh session.
 func rowsAndCost(t *testing.T, db *Database, sql string) ([][]Value, int64) {
 	t.Helper()
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	out, err := queryOutcome(s, sql, nil)
 	if err != nil {
@@ -230,7 +231,7 @@ func TestPreparedStatementsSurviveCompaction(t *testing.T) {
 	t.Parallel()
 	db := memDB()
 	growAndShrink(t, db)
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	stmt, err := s.Prepare("SELECT count(*) FROM t WHERE n = $1")
 	if err != nil {
@@ -272,7 +273,7 @@ func TestCompactionPreconditionsFailWithoutWriting(t *testing.T) {
 		t.Fatalf("pinned reader: %s, want 55006", code)
 	}
 	reader.Close()
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	rows, err := s.queryValues("SELECT id FROM t", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -286,8 +287,8 @@ func TestCompactionPreconditionsFailWithoutWriting(t *testing.T) {
 	rows.Close()
 
 	// An open write transaction blocks it; compaction never waits for the writer gate.
-	writer := db.Session(SessionOptions{})
-	if err := writer.Begin(true); err != nil {
+	writer := mustSession(db, SessionOptions{})
+	if err := writer.Begin(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if code := compactCode(t, db.Compact("main")); code != "55006" {

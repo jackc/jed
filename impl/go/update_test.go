@@ -23,7 +23,7 @@ func setupUpdate(t *testing.T) *Session {
 
 func TestUpdateMissingTable(t *testing.T) {
 	t.Parallel()
-	wantErr(t, memDB().Session(SessionOptions{}), "UPDATE nope SET a = 1", "42P01")
+	wantErr(t, mustSession(memDB(), SessionOptions{}), "UPDATE nope SET a = 1", "42P01")
 }
 
 func TestUpdateUnknownColumn(t *testing.T) {
@@ -34,7 +34,7 @@ func TestUpdateUnknownColumn(t *testing.T) {
 // idsABC is the (id, a, b) rows of t in storage-key order, "id/a/b" strings, for end-state
 // assertions.
 func idsABC(db dbHandle) []string {
-	rows := db.RowsInKeyOrder("t")
+	rows := db.rowsInKeyOrder("t")
 	out := make([]string, len(rows))
 	for i, r := range rows {
 		out[i] = fmt.Sprintf("%d/%d/%d", r[0].Int, r[1].Int, r[2].Int)

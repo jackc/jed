@@ -65,7 +65,7 @@ func retGrid(rows [][]Value) string {
 
 func retSetup(t *testing.T) *Session {
 	t.Helper()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	for _, s := range []string{
 		"CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7, w i32)",
 		"INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
@@ -297,7 +297,7 @@ func TestReturningGrowsTheTouchedSet(t *testing.T) {
 	// ceil(100000/8180) = 13 slabs.
 	big := "INSERT INTO big VALUES (1, 0, '" + strings.Repeat("x", 100_000) + "')"
 	fresh := func() *Session {
-		db := memDB().Session(SessionOptions{})
+		db := mustSession(memDB(), SessionOptions{})
 		retRun(t, db, "CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)")
 		retRun(t, db, big)
 		return db
@@ -394,7 +394,7 @@ func TestOldNewShadowedByTableName(t *testing.T) {
 	t.Parallel()
 	// A target table literally named old (or new) keeps the ordinary table-qualified
 	// meaning — the row-version pseudo-relation is suppressed (PG-probed).
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	retRun(t, db, "CREATE TABLE old (x i32)")
 	if g := retGrid(retRows(t, db, "INSERT INTO old VALUES (1) RETURNING old.x")); g != "1" {
 		t.Fatalf("got %s", g) // the inserted value, NOT the NULL old side
@@ -442,7 +442,7 @@ func TestOldNewTouchedSet(t *testing.T) {
 	// Compressed 100k text at page_size 8192 = 13 slabs.
 	big := "INSERT INTO big VALUES (1, 0, '" + strings.Repeat("x", 100_000) + "')"
 	fresh := func() *Session {
-		db := memDB().Session(SessionOptions{})
+		db := mustSession(memDB(), SessionOptions{})
 		retRun(t, db, "CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)")
 		retRun(t, db, big)
 		return db

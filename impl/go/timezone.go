@@ -46,15 +46,16 @@ type offset struct {
 	IsDst  bool
 }
 
-// ZoneRef is a resolved zone reference: a built-in fixed offset (UTC / ±HH:MM, §3.2) or a loaded zone.
-type ZoneRef struct {
+// zoneRef is a resolved zone reference: a built-in fixed offset (UTC / ±HH:MM, §3.2) or a loaded zone.
+type zoneRef struct {
 	Fixed bool
 	Off   int32 // valid when Fixed
 	zone  *zone // valid when !Fixed
 }
 
-// TimeZoneInfo is an introspection row for db.LoadedTimeZones (timezones.md §3.3).
-type timeZoneInfo struct {
+// TimeZoneInfo describes a named time zone or alias loaded into an Environment.
+// TzdataVersion identifies the time-zone database release supplying its rules.
+type TimeZoneInfo struct {
 	Name          string
 	TzdataVersion string
 }
@@ -699,18 +700,18 @@ func openTzBundle(data []byte) (*tzBundle, error) {
 
 // builtinZone resolves a built-in zone name — UTC or a fixed ±HH[:MM[:SS]] offset (§3.2) — with no
 // loaded data. Named zones come from the handle's Environment (Environment.resolveZone).
-func builtinZone(name string) (ZoneRef, bool) {
+func builtinZone(name string) (zoneRef, bool) {
 	if foldZoneName(name) == "utc" {
-		return ZoneRef{Fixed: true, Off: 0}, true
+		return zoneRef{Fixed: true, Off: 0}, true
 	}
 	if off, ok := parseFixedOffset(name); ok {
-		return ZoneRef{Fixed: true, Off: off}, true
+		return zoneRef{Fixed: true, Off: off}, true
 	}
-	return ZoneRef{}, false
+	return zoneRef{}, false
 }
 
 // OffsetAtRef is the offset in effect at instantSecs for a resolved zone reference.
-func offsetAtRef(zr ZoneRef, instantSecs int64) offset {
+func offsetAtRef(zr zoneRef, instantSecs int64) offset {
 	if zr.Fixed {
 		return offset{Utoff: zr.Off, Abbrev: fixedAbbrev(zr.Off), IsDst: false}
 	}
@@ -721,7 +722,7 @@ func offsetAtRef(zr ZoneRef, instantSecs int64) offset {
 // when the shift leaves the finite int64-µs range — it overflows int64 or lands on a ±infinity
 // sentinel — which every caller raises as 22008 "timestamp out of range" (timezones.md §6). The
 // caller passes a FINITE instant.
-func instantToLocalMicros(zr ZoneRef, instantMicros int64) (int64, bool) {
+func instantToLocalMicros(zr zoneRef, instantMicros int64) (int64, bool) {
 	off := offsetAtRef(zr, floorDiv(instantMicros, 1_000_000))
 	return finiteShift(add64(instantMicros, int64(off.Utoff)*1_000_000))
 }
@@ -730,7 +731,7 @@ func instantToLocalMicros(zr ZoneRef, instantMicros int64) (int64, bool) {
 // chosen by determineLocalOffset, matching PostgreSQL's DetermineTimeZoneOffset at a DST gap/overlap
 // (oracle-pinned, timezones.md §6). ok exactly as instantToLocalMicros; the caller passes a FINITE
 // wall clock.
-func localToInstantMicros(zr ZoneRef, wallMicros int64) (int64, bool) {
+func localToInstantMicros(zr zoneRef, wallMicros int64) (int64, bool) {
 	wallSecs := floorDiv(wallMicros, 1_000_000)
 	chosen := determineLocalOffset(zr, wallSecs)
 	return finiteShift(sub64(wallMicros, chosen*1_000_000))
@@ -750,7 +751,7 @@ func finiteShift(micros int64, ok bool) (int64, bool) {
 // normal time both candidate offsets agree; for a spring-forward GAP (a nonexistent wall clock) PG
 // uses the *before* (earlier) offset; for a fall-back OVERLAP (a doubled wall clock) PG uses the
 // *after* (later) offset. A fixed-offset zone has no boundary, so the single offset is returned.
-func determineLocalOffset(zr ZoneRef, wallSecs int64) int64 {
+func determineLocalOffset(zr zoneRef, wallSecs int64) int64 {
 	const day int64 = 86_400
 	// The offsets a day before / after wallSecs (taken as if UTC). A DST transition is never less
 	// than a day apart, so at most one boundary lies in this 2-day window; if both ends agree there
@@ -887,21 +888,21 @@ func decodeNumericZone(name string) (int32, numericZoneStatus) {
 // (decodeNumericZone — `+05:30` is UTC+5:30, the timestamp-literal sign, NOT AT TIME ZONE's POSIX
 // sign), out of range being 22023 "numeric time zone … out of range"; anything else resolves as a
 // zone name through env (22023 "not recognized" when unknown).
-func resolveMakeTimestamptzZone(env *Environment, name string) (ZoneRef, error) {
+func resolveMakeTimestamptzZone(env *Environment, name string) (zoneRef, error) {
 	if len(name) > 0 && name[0] >= '0' && name[0] <= '9' {
-		return ZoneRef{}, newError(InvalidParameterValue,
+		return zoneRef{}, newError(InvalidParameterValue,
 			fmt.Sprintf("invalid input syntax for type numeric time zone: %q", name))
 	}
 	switch off, status := decodeNumericZone(name); status {
 	case numericZoneOK:
-		return ZoneRef{Fixed: true, Off: off}, nil
+		return zoneRef{Fixed: true, Off: off}, nil
 	case numericZoneOverflow:
-		return ZoneRef{}, newError(InvalidParameterValue,
+		return zoneRef{}, newError(InvalidParameterValue,
 			fmt.Sprintf("numeric time zone %q out of range", name))
 	}
 	zr, ok := env.resolveZone(name)
 	if !ok {
-		return ZoneRef{}, newError(InvalidParameterValue, fmt.Sprintf("time zone %q not recognized", name))
+		return zoneRef{}, newError(InvalidParameterValue, fmt.Sprintf("time zone %q not recognized", name))
 	}
 	return zr, nil
 }

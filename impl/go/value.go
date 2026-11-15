@@ -91,7 +91,7 @@ const (
 	ValJsonPath
 )
 
-// Unfetched is the on-disk form of a lazily-loaded value (spec/design/large-values.md §14,
+// unfetchedValue is the on-disk form of a lazily-loaded value (spec/design/large-values.md §14,
 // generalized to every variable-length value by lazy-record.md §5a/L3) — exactly the record's
 // pointer fields (or, for the inline form, a view onto its body bytes), so the scan layer can
 // resolve it through the pager (and the cost walk can count its chain pages / decompress slabs)
@@ -111,12 +111,12 @@ const (
 // database's shared paging context, so a value the static touched set missed is resolved ON DEMAND
 // at the evaluator's column access (resolveUnfetchedSelf, the demand-fault backstop) instead of
 // being read as NULL or poisoning. The handles are resolution plumbing, NOT stored identity: an
-// Unfetched only ever rides a Value behind a *Unfetched pointer (never compared or hashed by
+// unfetchedValue only ever rides a Value behind a *unfetchedValue pointer (never compared or hashed by
 // contents — the comparison/render/encode paths stay poisoned), so equality remains pointer
 // identity and the handles never leak into results. A value reloaded from a spill run file carries
 // the nil sentinel (types == nil): it rides the sort output unread by contract (spill.md §4), and
 // touching one stays the loud pre-B4 poison panic.
-type Unfetched struct {
+type unfetchedValue struct {
 	Form      byte
 	FirstPage uint32
 	// firstTag is the tag FirstPage's pointer binds in an encrypted file (spec/fileformat/encrypted.md
@@ -151,7 +151,7 @@ type Unfetched struct {
 }
 
 // bufferedPayloadLen is a buffered value's resolved payload length — the length of its string.
-func (u *Unfetched) bufferedPayloadLen() int64 {
+func (u *unfetchedValue) bufferedPayloadLen() int64 {
 	if u.Form == tagExternal {
 		return int64(u.StoredLen)
 	}
@@ -186,7 +186,7 @@ type Value struct {
 	//   ValArray                                      → *ArrayVal (accessor arrayVal())
 	//   ValRange                                      → *RangeVal (accessor rangeVal())
 	//   ValJsonb                                      → *JsonNode (accessor jsonb())
-	//   ValUnfetched                                  → *Unfetched (accessor unfetched())
+	//   ValUnfetched                                  → *unfetchedValue (accessor unfetched())
 	// Value stays ==-comparable: an interface holding a pointer (or a comparable value like
 	// Interval/string) compares by that, exactly as the old pointer/inline fields did — but VALUE
 	// equality for decimal/interval/composite/array/range/jsonb is scale-/span-/structure-sensitive
@@ -214,8 +214,8 @@ func (v Value) boolVal() bool { return v.Int != 0 }
 // decimal returns the *Decimal of a ValDecimal value.
 func (v Value) decimal() *Decimal { return v.ref.(*Decimal) }
 
-// unfetched returns the *Unfetched of a ValUnfetched value (internal to the storage/scan layers).
-func (v Value) unfetched() *Unfetched { return v.ref.(*Unfetched) }
+// unfetched returns the *unfetchedValue of a ValUnfetched value (internal to the storage/scan layers).
+func (v Value) unfetched() *unfetchedValue { return v.ref.(*unfetchedValue) }
 
 // interval returns the Interval of a ValInterval value (a copy — Interval is a small value struct).
 func (v Value) interval() Interval { return v.ref.(Interval) }
@@ -681,13 +681,13 @@ func (v Value) Render() string {
 // exactly Render, except every timestamptz — at any depth inside an array, composite, or range —
 // renders in zone (+HH / +HH:MM / +HH:MM:SS; ±infinity bare). Fails 22008 only for a finite instant
 // whose local reading leaves the i64 range (timezones.md §6).
-func (v Value) renderIn(zone ZoneRef) (string, error) {
+func (v Value) renderIn(zone zoneRef) (string, error) {
 	return v.renderZoned(&zone)
 }
 
 // renderZoned is the shared body of Render (zone == nil, the canonical UTC render, infallible) and
 // renderIn (zone != nil).
-func (v Value) renderZoned(zone *ZoneRef) (string, error) {
+func (v Value) renderZoned(zone *zoneRef) (string, error) {
 	switch v.Kind {
 	case ValTimestamptz:
 		if zone != nil {
@@ -1114,7 +1114,7 @@ func recordOut(fields []Value) string {
 
 // recordOutZoned is recordOut with each field rendered by renderZoned — a timestamptz field in zone
 // when one is given (timezones.md §9.5).
-func recordOutZoned(fields []Value, zone *ZoneRef) (string, error) {
+func recordOutZoned(fields []Value, zone *zoneRef) (string, error) {
 	var b strings.Builder
 	b.WriteByte('(')
 	for i, f := range fields {
@@ -1391,7 +1391,7 @@ func compositeTotalCmp(a, b []Value) int {
 // array_out / record_out embed ({t,f}, (t,1)). The top-level result cell keeps the canonical
 // true/false (conformance.md §1), and a bool -> text cast stays true/false as PostgreSQL's booltext
 // (spec/design/array.md §7).
-func (v Value) renderElementZoned(zone *ZoneRef) (string, error) {
+func (v Value) renderElementZoned(zone *zoneRef) (string, error) {
 	if v.Kind == ValBool {
 		if v.boolVal() {
 			return "t", nil
@@ -1417,7 +1417,7 @@ func arrayOut(a *ArrayVal) string {
 
 // arrayOutZoned is arrayOut with each element rendered by renderZoned — a timestamptz at any depth
 // in zone when one is given (the session render and the array → text cast, timezones.md §9.5).
-func arrayOutZoned(a *ArrayVal, zone *ZoneRef) (string, error) {
+func arrayOutZoned(a *ArrayVal, zone *zoneRef) (string, error) {
 	if len(a.Elements) == 0 {
 		return "{}", nil // the empty array (ndim 0)
 	}
@@ -1448,7 +1448,7 @@ func arrayOutZoned(a *ArrayVal, zone *ZoneRef) (string, error) {
 
 // renderArrayDim renders the brace structure for dimension d of a, consuming flattened elements via
 // cursor (the helper for arrayOut). The innermost dimension renders elements; outer dimensions recurse.
-func renderArrayDim(a *ArrayVal, d int, cursor *int, b *strings.Builder, zone *ZoneRef) error {
+func renderArrayDim(a *ArrayVal, d int, cursor *int, b *strings.Builder, zone *zoneRef) error {
 	b.WriteByte('{')
 	for k := 0; k < a.Dims[d]; k++ {
 		if k > 0 {
@@ -1468,7 +1468,7 @@ func renderArrayDim(a *ArrayVal, d int, cursor *int, b *strings.Builder, zone *Z
 }
 
 // renderArrayElem renders one array element (PG array_out quoting; a NULL element is unquoted NULL).
-func renderArrayElem(e Value, b *strings.Builder, zone *ZoneRef) error {
+func renderArrayElem(e Value, b *strings.Builder, zone *zoneRef) error {
 	if e.Kind == ValNull {
 		b.WriteString("NULL")
 		return nil
@@ -1903,4 +1903,4 @@ func boolNot(a Value) Value {
 }
 
 // first is the bound pointer to an external form's first chain page.
-func (u *Unfetched) first() pageRef { return pageRef{page: u.FirstPage, tag: u.firstTag} }
+func (u *unfetchedValue) first() pageRef { return pageRef{page: u.FirstPage, tag: u.firstTag} }

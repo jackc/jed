@@ -7,7 +7,10 @@ package jed
 // Idle/Open/Failed transaction state machine. Per-core API behaviors the shared corpus cannot
 // express (it is single-handle SQL-in/rows-out — CLAUDE.md §10). Mirrors impl/rust/tests/session.rs.
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func sessExec(t *testing.T, db dbHandle, sql string) {
 	t.Helper()
@@ -28,7 +31,7 @@ func TestDefaultSessionIsStatefulAcrossCalls(t *testing.T) {
 	t.Parallel()
 	// The Engine-owned default session holds an open BEGIN block across *separate* calls (the
 	// PG/SQLite connection model, §2.1); db.Status() exposes the explicit state machine.
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if db.Status() != TxIdle {
 		t.Fatalf("fresh db: want Idle, got %v", db.Status())
 	}
@@ -51,7 +54,7 @@ func TestFailedBlockIsTheFailedState(t *testing.T) {
 	t.Parallel()
 	// A statement error inside a block poisons it: status is Failed, every later statement but
 	// ROLLBACK/COMMIT is 25P02 (§2.2 / transactions.md §6), and ROLLBACK returns to Idle.
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	sessExec(t, db, "BEGIN")
 	_, err := queryOutcome(db, "SELECT * FROM missing", nil)
 	if got := sessCode(t, err); got != "42P01" {
@@ -75,7 +78,7 @@ func TestAdditionalSessionSharesStorageWithIndependentSettings(t *testing.T) {
 	// Two sessions over one shared Database core: each owns its private Engine, but committed storage
 	// is shared through the core (§2.4) — no swap. Settings (the cost ceiling) are independent.
 	db := memDB()
-	a := db.Session(SessionOptions{})
+	a := mustSession(db, SessionOptions{})
 	if _, err := queryOutcome(a, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +87,7 @@ func TestAdditionalSessionSharesStorageWithIndependentSettings(t *testing.T) {
 	}
 
 	// A second session with its own cost ceiling — a's is untouched.
-	s := db.Session(SessionOptions{MaxCost: 5})
+	s := mustSession(db, SessionOptions{MaxCost: 5})
 	if s.MaxCost() != 5 {
 		t.Fatalf("session MaxCost: want 5, got %d", s.MaxCost())
 	}
@@ -124,7 +127,7 @@ func TestAdditionalSessionCostCeilingEnforced(t *testing.T) {
 	// The session's settings drive the execution path: a tiny ceiling aborts the scan with 54P01,
 	// while an unlimited session runs it fine — both over the same shared core.
 	db := memDB()
-	a := db.Session(SessionOptions{})
+	a := mustSession(db, SessionOptions{})
 	if _, err := queryOutcome(a, "CREATE TABLE t (id i32 PRIMARY KEY)", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +138,7 @@ func TestAdditionalSessionCostCeilingEnforced(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := db.Session(SessionOptions{MaxCost: 1})
+	s := mustSession(db, SessionOptions{MaxCost: 1})
 	_, err := queryOutcome(s, "SELECT * FROM t", nil)
 	if got := sessCode(t, err); got != "54P01" {
 		t.Fatalf("want 54P01, got %s", got)
@@ -152,13 +155,13 @@ func TestAdditionalSessionCostCeilingEnforced(t *testing.T) {
 func TestAdditionalSessionUpdateClosureCommitsToSharedStorage(t *testing.T) {
 	t.Parallel()
 	db := memDB()
-	a := db.Session(SessionOptions{})
+	a := mustSession(db, SessionOptions{})
 	if _, err := queryOutcome(a, "CREATE TABLE t (id i32 PRIMARY KEY)", nil); err != nil {
 		t.Fatal(err)
 	}
 
-	s := db.Session(SessionOptions{})
-	err := s.Update(func(tx *Transaction) error {
+	s := mustSession(db, SessionOptions{})
+	err := s.Update(context.Background(), func(tx *Transaction) error {
 		if _, err := queryOutcome(tx, "INSERT INTO t VALUES (1)", nil); err != nil {
 			return err
 		}

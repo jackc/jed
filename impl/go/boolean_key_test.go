@@ -47,7 +47,7 @@ func TestBooleanPrimaryKeyCRUD(t *testing.T) {
 	}
 
 	// A full scan iterates in key (byte) order: false (0x00) before true (0x01).
-	rows := db.RowsInKeyOrder("t")
+	rows := db.rowsInKeyOrder("t")
 	if len(rows) != 2 || rows[0][0].boolVal() != false || rows[1][0].boolVal() != true {
 		t.Fatalf("key order got %v, want [false, true]", rows)
 	}
@@ -66,7 +66,7 @@ func TestBooleanCompositePrimaryKey(t *testing.T) {
 		t.Fatalf("duplicate composite tuple: got %s, want 23505", code)
 	}
 	// Key order: a ascending, then b false<true within an a-group.
-	rows := db.RowsInKeyOrder("t")
+	rows := db.rowsInKeyOrder("t")
 	type ab struct {
 		a int64
 		b bool

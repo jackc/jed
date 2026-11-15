@@ -27,7 +27,7 @@ func sqlStateOf(t *testing.T, err error) string {
 
 func TestInvalidUTF8TextIsRejectedEverywhere(t *testing.T) {
 	t.Parallel()
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v text)")
 	ctx := context.Background()
 	// The exact PostgreSQL message: the first invalid sequence's bytes, up to its expected length.
@@ -75,7 +75,7 @@ func TestInvalidUTF8TextIsRejectedEverywhere(t *testing.T) {
 
 func TestTimeBindsByInferredTemporalType(t *testing.T) {
 	t.Parallel()
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	mustExec(t, s, "CREATE TABLE ev (id i32 PRIMARY KEY, at timestamptz, local timestamp, day date)")
 	ctx := context.Background()
 	// The calendar date differs between the time's zone and UTC only near midnight, so use such a
@@ -134,7 +134,7 @@ func TestTimeBindsByInferredTemporalType(t *testing.T) {
 
 func TestInfiniteTemporalHasNoTimeForm(t *testing.T) {
 	t.Parallel()
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	ctx := context.Background()
 	for _, sql := range []string{
 		"SELECT 'infinity'::timestamp", "SELECT '-infinity'::timestamp",

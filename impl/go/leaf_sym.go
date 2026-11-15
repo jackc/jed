@@ -1332,7 +1332,7 @@ func (l *paxLeaf) chainSpan(c, i int) (span []byte, skip bool, err error) {
 
 // bodyErr is an inline-deferred value's body: Comp, or for a value of a lazy region its content
 // payload (a string's) or its body after the tag (any other type), from the rebuilt region.
-func (u *Unfetched) bodyErr() ([]byte, error) {
+func (u *unfetchedValue) bodyErr() ([]byte, error) {
 	if u.lazy == nil {
 		return u.Comp, nil
 	}
@@ -1365,7 +1365,7 @@ func (u *Unfetched) bodyErr() ([]byte, error) {
 
 // body is bodyErr for the callers that only measure or copy the bytes: a malformed region yields no
 // bytes here and its error when the value is resolved.
-func (u *Unfetched) body() []byte {
+func (u *unfetchedValue) body() []byte {
 	b, _ := u.bodyErr()
 	return b
 }

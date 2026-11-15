@@ -43,7 +43,7 @@ func TestUnchangedCommits(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	for _, sql := range []string{"CREATE TABLE t (id i32 PRIMARY KEY, v i32)", "INSERT INTO t VALUES (1, 1)", "CREATE SEQUENCE s"} {
 		if _, err = queryOutcome(s, sql, nil); err != nil {
@@ -76,12 +76,12 @@ func TestUnchangedCommits(t *testing.T) {
 			version := db.Txid()
 			count.writes, count.syncs, count.grows = 0, 0, 0
 			if mode != "auto" && mode != "script" {
-				if err := s.Begin(true); err != nil {
+				if err := s.Begin(context.Background(), true); err != nil {
 					t.Fatal(err)
 				}
 			}
 			if mode == "script" {
-				_, err = s.ExecuteScript(sql)
+				_, err = s.ExecuteScript(context.Background(), sql)
 			} else {
 				for _, stmt := range strings.Split(sql, ";") {
 					if strings.TrimSpace(stmt) == "" {
@@ -129,7 +129,7 @@ func TestUnchangedCommits(t *testing.T) {
 	version := db.Txid()
 	count.writes, count.syncs = 0, 0
 	for _, body := range []func(*Transaction) error{func(*Transaction) error { return nil }, func(tx *Transaction) error { var n int; return tx.QueryRow(context.Background(), "SELECT 1").Scan(&n) }} {
-		if err := db.Update(body); err != nil {
+		if err := db.Update(context.Background(), body); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -153,7 +153,7 @@ func BenchmarkWritableNoopCommit(b *testing.B) {
 			}
 			b.ResetTimer()
 			for b.Loop() {
-				if err := db.Update(func(tx *Transaction) error {
+				if err := db.Update(context.Background(), func(tx *Transaction) error {
 					if sql == "" {
 						return nil
 					}
@@ -184,7 +184,7 @@ func TestAttachmentCommitLeavesMainUntouched(t *testing.T) {
 	if err := db.Attach("a", AttachFile(attached), false); err != nil {
 		t.Fatal(err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	if _, err := queryOutcome(s, "CREATE TABLE t (id i32 PRIMARY KEY)", nil); err != nil {
 		t.Fatal(err)
@@ -197,7 +197,7 @@ func TestAttachmentCommitLeavesMainUntouched(t *testing.T) {
 	}
 	version := db.Txid()
 	// Main is a candidate write domain but no rows match. Only the attachment may persist.
-	if err := s.Begin(true); err != nil {
+	if err := s.Begin(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	for _, sql := range []string{"DELETE FROM t WHERE id = 999", "CREATE TABLE a.t (id i32 PRIMARY KEY)", "INSERT INTO a.t VALUES (1)"} {

@@ -14,7 +14,7 @@ import (
 // not share amt, but an inactive row may duplicate an active one. Survives reload (v27).
 func TestPartialUniqueConstrainsOnlyQualifyingAndPersists(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE pt (id i32 PRIMARY KEY, status text, amt i32)")
 	mustExec(t, db, "INSERT INTO pt VALUES (1, 'active', 10)")
 	mustExec(t, db, "CREATE UNIQUE INDEX pt_uact ON pt (amt) WHERE status = 'active'")
@@ -44,7 +44,7 @@ func TestPartialUniqueConstrainsOnlyQualifyingAndPersists(t *testing.T) {
 // §9) — the syntactic implication gate. EXPLAIN names it when gated, not otherwise.
 func TestPartialPlannerGatesOnPredicateConjunct(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE pt (id i32 PRIMARY KEY, status text, amt i32)")
 	mustExec(t, db, "INSERT INTO pt VALUES (1,'active',10),(2,'inactive',10),(3,'active',30)")
 	mustExec(t, db, "CREATE INDEX pt_amt_active ON pt (amt) WHERE status = 'active'")
@@ -75,7 +75,7 @@ func TestPartialPlannerGatesOnPredicateConjunct(t *testing.T) {
 // non-boolean predicate is 42804; a partial GIN index is 0A000.
 func TestPartialPredicateRejections(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamptz, a i32, arr i32[])")
 	if code := errCode(t, db, "CREATE INDEX ON t (a) WHERE ts::date IS NULL"); code != "42P17" {
 		t.Fatalf("timestamptz predicate: want 42P17, got %s", code)
@@ -91,7 +91,7 @@ func TestPartialPredicateRejections(t *testing.T) {
 // jed_indexes surfaces a partial index's predicate canonical text; NULL for a non-partial index.
 func TestPartialIntrospectionShowsPredicate(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, s text, a i32)")
 	mustExec(t, db, "CREATE INDEX ipart ON t (a) WHERE s = 'x'")
 	mustExec(t, db, "CREATE INDEX ifull ON t (a)")

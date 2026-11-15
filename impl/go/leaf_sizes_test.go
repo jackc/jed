@@ -82,7 +82,7 @@ func TestLeafMergeAndSplitFacts(t *testing.T) {
 	}
 	// One transaction: later statements edit the decoded leaves the earlier merges and splits built,
 	// whose facts with a distinct column are dropped on the first insert or replacement.
-	sess := db.Session(SessionOptions{})
+	sess := mustSession(db, SessionOptions{})
 	defer sess.Close()
 	for _, sql := range []string{
 		"BEGIN",

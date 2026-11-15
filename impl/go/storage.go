@@ -496,7 +496,7 @@ func (s *tableStore) OverlapScanUnits(b keyBound, mask []bool) (pages, slabs int
 // are computed inline from the entries it collects). Byte-identical cost and rows by construction.
 // One variant for whole-row and touched-column feeds alike — the old masked/unmasked
 // reconstruction split is collapsed (bplus-reshape.md B4): reconstruction is uniformly lazy
-// (fixed-width columns decode eagerly, variable columns defer as self-resolving Unfetched), so
+// (fixed-width columns decode eagerly, variable columns defer as self-resolving unfetchedValue), so
 // there is nothing left to mask. mask is the cost touched set (which columns' spill/compress to
 // charge — a §8 byte contract).
 func (s *tableStore) RangeScanWithUnits(b keyBound, mask []bool) ([]entry, int, int, error) {
@@ -638,7 +638,7 @@ func (s *tableStore) resolveColumnsInPlace(out storedRow, mask []bool) (storedRo
 }
 
 // resolveValue materializes one deferred value of column col through this store's pager.
-func (s *tableStore) resolveValue(col int, u *Unfetched) (Value, error) {
+func (s *tableStore) resolveValue(col int, u *unfetchedValue) (Value, error) {
 	if s.paging == nil {
 		panic("an unfetched value implies a paged store")
 	}
@@ -675,7 +675,7 @@ func (s *tableStore) settleCarried(key []byte, row storedRow) (storedRow, error)
 	return row, nil
 }
 
-// resolveInlineColumns returns row with only its inline-deferred values — the Form 0x00 Unfetched
+// resolveInlineColumns returns row with only its inline-deferred values — the Form 0x00 unfetchedValue
 // form L2 introduces (lazy-record.md §5b) — materialized, leaving the large-value forms
 // (tagExternal/tagInlineComp/tagExternalComp) deferred for the §14 touched-set path. The internal
 // index/FK-maintenance write paths read a faulted row's key columns directly (not via a touched-set

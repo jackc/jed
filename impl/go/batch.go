@@ -1073,7 +1073,7 @@ func aggWindowBounds(plan *selectPlan, n int64) (int64, int64) {
 
 // newAccsForSpecs builds one accumulator per aggregate spec (whole-table or one group), via the same
 // newAccFromSpec the scalar group machinery uses — so acc state + finalize are identical.
-func newAccsForSpecs(specs []aggSpec, zone ZoneRef) []*acc {
+func newAccsForSpecs(specs []aggSpec, zone zoneRef) []*acc {
 	accs := make([]*acc, len(specs))
 	for i := range specs {
 		accs[i] = newAccFromSpec(specs[i], zone)
@@ -1508,7 +1508,7 @@ func (db *engine) aggregateLaneEligible(plan *selectPlan) bool {
 
 // freshGroupState is a new group's state-map value, as blockingAggregate builds it: its creation
 // ordinal, then each aggregate's packed fresh accumulator.
-func freshGroupState(specs []aggSpec, ordinal int64, zone ZoneRef) storedRow {
+func freshGroupState(specs []aggSpec, ordinal int64, zone zoneRef) storedRow {
 	state := make(storedRow, 0, 1+len(specs))
 	state = append(state, IntValue(ordinal))
 	for _, spec := range specs {
@@ -1519,7 +1519,7 @@ func freshGroupState(specs []aggSpec, ordinal int64, zone ZoneRef) storedRow {
 
 // laneGroupBaseBytes is what one group with an integer (or NULL) key holds in a resident state map
 // before any fold (memory.md §6.6): ENTRY + key + state.
-func laneGroupBaseBytes(specs []aggSpec, zone ZoneRef) int64 {
+func laneGroupBaseBytes(specs []aggSpec, zone zoneRef) int64 {
 	return memMapEntryBytes([]Value{NullValue()}, freshGroupState(specs, 0, zone))
 }
 
@@ -1555,7 +1555,7 @@ type laneGroupSpill struct {
 }
 
 // state returns key's state, creating the group (and recording its key for emission) when it is new.
-func (s *laneGroupSpill) state(key Value, specs []aggSpec, zone ZoneRef) (storedRow, error) {
+func (s *laneGroupSpill) state(key Value, specs []aggSpec, zone zoneRef) (storedRow, error) {
 	state, ok, err := s.groups.get([]Value{key})
 	if err != nil {
 		return nil, err
@@ -1571,7 +1571,7 @@ func (s *laneGroupSpill) state(key Value, specs []aggSpec, zone ZoneRef) (stored
 }
 
 // laneGroupSpillFold folds v into aggregate si of a loaded state.
-func laneGroupSpillFold(state storedRow, si int, spec aggSpec, v Value, zone ZoneRef, m *costMeter) error {
+func laneGroupSpillFold(state storedRow, si int, spec aggSpec, v Value, zone zoneRef, m *costMeter) error {
 	if scratchAccPlan(spec) {
 		var a acc
 		blockingAccInto(&a, spec, *state[si+1].composite(), zone)

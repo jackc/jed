@@ -38,10 +38,10 @@ started = Parallel.now
 sh "cargo", "build", "--release", "--quiet", "--bin", "conformance", "--manifest-path", RUST_MANIFEST
 sh "cargo", "build", "--profile", "checked", "--quiet", "--bin", "conformance", "--manifest-path", RUST_MANIFEST if CHECKED
 go_bin = File.join(GO_DIR, "bin", "conformance#{EXE}")
-sh "go", "build", "-o", go_bin, "./cmd/conformance", chdir: GO_DIR
+sh "go", "build", "-tags", "jedtooling", "-o", go_bin, "./cmd/conformance", chdir: GO_DIR
 # The page-service walks start another core's process actor as the owner (spec/pageservice/README.md §7).
 sh "cargo", "build", "--release", "--quiet", "--bin", "process_actor", "--manifest-path", RUST_MANIFEST
-sh "go", "build", "-o", "process_actor", "./cmd/process_actor", chdir: GO_DIR
+sh "go", "build", "-tags", "jedtooling", "-o", "process_actor", "./cmd/process_actor", chdir: GO_DIR
 rust_target = File.expand_path(ENV.fetch("CARGO_TARGET_DIR", "impl/rust/target"), ROOT)
 
 # core => [argv, working directory], matching the per-core tasks in mise.toml.

@@ -71,7 +71,7 @@ type snapshot struct {
 	// model (§4.2) the file holds only a metadata entry per collation the schema references; the table
 	// comes from the binary's vendored set (entry_kind = 3, format_version 18 —
 	// spec/fileformat/format.md).
-	collations map[string]*Collation
+	collations map[string]*compiledCollation
 	// defaultCollation is the per-database default collation name, or "" for C (collation.md §1/§5).
 	// An un-annotated text column inherits this at CREATE TABLE. Persisted as the is_default flag bit
 	// on that collation's entry_kind = 3 reference entry, restored on load.
@@ -121,7 +121,7 @@ func newSnapshot(env *Environment) *snapshot {
 		indexStores:           make(map[string]*tableStore),
 		sequences:             make(map[string]*sequenceDef),
 		views:                 make(map[string]*viewDef),
-		collations:            make(map[string]*Collation),
+		collations:            make(map[string]*compiledCollation),
 		gistTrees:             make(map[string]*gistTree),
 	}
 }
@@ -159,7 +159,7 @@ func (s *snapshot) clone() *snapshot {
 	}
 	// Collations, like Table, are never mutated in place — only added — so the map copy is shallow
 	// (spec/design/collation.md §4).
-	collations := make(map[string]*Collation, len(s.collations))
+	collations := make(map[string]*compiledCollation, len(s.collations))
 	for k, v := range s.collations {
 		collations[k] = v
 	}
@@ -368,7 +368,7 @@ func (s *snapshot) demoteCleanLeaves() {
 // the handle's Environment (§4). nil ⇒ neither has it (the resolver raises 42704). C is handled
 // by the caller (built-in). This is the reference-only read path: a collation is never baked into the
 // file — the file references it by name and the table comes from a loaded bundle.
-func (s *snapshot) resolveCollation(name string) *Collation {
+func (s *snapshot) resolveCollation(name string) *compiledCollation {
 	if c := s.collations[name]; c != nil {
 		return c
 	}
@@ -401,7 +401,7 @@ func (s *snapshot) collationSkew(name string) (fileU, fileC, loadedU, loadedC st
 // the schema uses it, regardless of whether it was ever passed to a (now-removed) import call. C
 // columns (empty Collation) reference nothing. A referenced name this build does not vendor is a bug
 // surfaced here (the precursor to the slice-2d open-time verdict).
-func (s *snapshot) referencedCollations() ([]*Collation, error) {
+func (s *snapshot) referencedCollations() ([]*compiledCollation, error) {
 	names := map[string]struct{}{}
 	for _, t := range s.tables {
 		for _, col := range t.Columns {
@@ -418,7 +418,7 @@ func (s *snapshot) referencedCollations() ([]*Collation, error) {
 		sorted = append(sorted, n)
 	}
 	sort.Strings(sorted)
-	out := make([]*Collation, len(sorted))
+	out := make([]*compiledCollation, len(sorted))
 	for i, name := range sorted {
 		c := s.resolveCollation(name)
 		if c == nil {
@@ -500,7 +500,7 @@ func (s *snapshot) upgradeCollations(pageSize uint32) (int, error) {
 		if !pkSkewed && len(indexes) == 0 {
 			continue
 		}
-		colls := make([]*Collation, len(table.Columns))
+		colls := make([]*compiledCollation, len(table.Columns))
 		for i, c := range table.Columns {
 			if c.Collation != "" {
 				colls[i] = s.resolveCollation(c.Collation)

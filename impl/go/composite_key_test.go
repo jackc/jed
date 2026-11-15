@@ -15,7 +15,7 @@ import (
 
 func idsInKeyOrder(db *Session, table string) []int64 {
 	var ids []int64
-	for _, r := range db.RowsInKeyOrder(table) {
+	for _, r := range db.rowsInKeyOrder(table) {
 		ids = append(ids, r[0].Int)
 	}
 	return ids
@@ -39,7 +39,7 @@ func TestCompositePKOrdersByFieldLexicographic(t *testing.T) {
 	if got := idsInKeyOrder(db, "t"); !slices.Equal(got, []int64{4, 2, 3, 1}) {
 		t.Fatalf("composite key order = %v, want [4 2 3 1]", got)
 	}
-	tab, _ := db.Table("t")
+	tab, _ := db.table("t")
 	if got := tab.PKIndices(); !slices.Equal(got, []int{1}) {
 		t.Fatalf("PKIndices = %v, want [1]", got)
 	}
@@ -67,7 +67,7 @@ func TestCompositePKUniquenessIsWholeValue(t *testing.T) {
 	if code := compositeErrCode(t, db, "INSERT INTO t VALUES (7, ROW('X', 1)), (8, ROW('X', 1))"); code != "23505" {
 		t.Fatalf("in-batch duplicate: got %s, want 23505", code)
 	}
-	if n := len(db.RowsInKeyOrder("t")); n != 2 {
+	if n := len(db.rowsInKeyOrder("t")); n != 2 {
 		t.Fatalf("got %d rows, want 2 (batch all-or-nothing)", n)
 	}
 }
@@ -88,7 +88,7 @@ func TestCompositeUniqueAndNested(t *testing.T) {
 	if _, err := queryOutcome(db, "INSERT INTO t VALUES (5, ROW(ROW('Main',1), ROW('Elm',3)))", nil); err != nil {
 		t.Fatalf("distinct deeply-nested field: %v", err)
 	}
-	if n := len(db.RowsInKeyOrder("t")); n != 2 {
+	if n := len(db.rowsInKeyOrder("t")); n != 2 {
 		t.Fatalf("got %d rows, want 2", n)
 	}
 }
@@ -120,10 +120,10 @@ func TestCompositeSecondaryIndexAndImageRoundtrip(t *testing.T) {
 	if _, err := queryOutcome(loaded, "INSERT INTO t VALUES (4, ROW('Elm', 100))", nil); err != nil {
 		t.Fatalf("reinsert (index maintenance): %v", err)
 	}
-	if n := len(loaded.RowsInKeyOrder("t")); n != 3 {
+	if n := len(loaded.rowsInKeyOrder("t")); n != 3 {
 		t.Fatalf("got %d rows, want 3", n)
 	}
-	tab, _ := loaded.Table("t")
+	tab, _ := loaded.table("t")
 	found := false
 	for _, ix := range tab.Indexes {
 		if ix.Name == "t_home" {

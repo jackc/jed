@@ -148,7 +148,7 @@ func TestVarwidthLanesMatchRowPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	seed := db.Session(SessionOptions{})
+	seed := mustSession(db, SessionOptions{})
 	for _, sql := range varwidthSeed {
 		mustExec(t, seed, sql)
 	}
@@ -179,7 +179,7 @@ func TestVarwidthLanesMatchRowPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer paged.Close()
-	s := paged.Session(SessionOptions{})
+	s := mustSession(paged, SessionOptions{})
 	// Clean (Packed) leaves faulted from the file.
 	varwidthCheckAll(t, s)
 	// A writer's uncommitted changes live in Decoded leaves: the atoms fall back to the evaluator.
@@ -287,7 +287,7 @@ func laneSession(t *testing.T, file string, seed []string) *Session {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { db.Close() })
-		s := db.Session(SessionOptions{})
+		s := mustSession(db, SessionOptions{})
 		for _, sql := range seed {
 			mustExec(t, s, sql)
 		}
@@ -298,7 +298,7 @@ func laneSession(t *testing.T, file string, seed []string) *Session {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	for _, sql := range seed {
 		mustExec(t, s, sql)
 	}
@@ -310,7 +310,7 @@ func laneSession(t *testing.T, file string, seed []string) *Session {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { paged.Close() })
-	return paged.Session(SessionOptions{})
+	return mustSession(paged, SessionOptions{})
 }
 
 // laneRows renders an outcome's rows — in order for an ORDER BY query, sorted otherwise.
@@ -614,7 +614,7 @@ func TestLaneGroupSizeTracksThePackedState(t *testing.T) {
 	}
 	// One fresh group's base is ENTRY + key + its packed fresh state.
 	specs := []aggSpec{{plan: planCountStar}, {plan: planSumDecimal}, {plan: planMin}}
-	zone := ZoneRef{}
+	zone := zoneRef{}
 	if got, want := laneGroupBaseBytes(specs, zone), memMapEntryBytes([]Value{IntValue(5)}, freshGroupState(specs, 3, zone)); got != want {
 		t.Fatalf("group base %d, state-map measure %d", got, want)
 	}

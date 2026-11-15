@@ -2389,7 +2389,7 @@ func requireTextOrNull(t resolvedType) error {
 // the input array is charged, each element rendered (a finite timestamptz in the session zone, one
 // timezone unit each), the exact UTF-8 size computed and capped at maxResultChars (54000), then
 // charged and reserved before the result is joined.
-func arrayToStringValue(vals []Value, zone ZoneRef, m *costMeter) (Value, error) {
+func arrayToStringValue(vals []Value, zone zoneRef, m *costMeter) (Value, error) {
 	if vals[0].Kind == ValNull || vals[1].Kind == ValNull {
 		return NullValue(), nil
 	}

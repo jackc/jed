@@ -50,7 +50,7 @@ func dbExt(t *testing.T, env *Environment, stmts ...string) *Session {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	for _, stmt := range stmts {
 		if _, err := queryOutcome(s, stmt, nil); err != nil {
 			t.Fatalf("setup %q: %v", stmt, err)
@@ -217,7 +217,7 @@ func TestDeclaredCostGatesMaxCostCeiling(t *testing.T) {
 	heavy := NewHostFunction("host_heavy", nil, "i64",
 		func(args []Value) (Value, error) { return IntValue(0), nil }).WithCost(1_000_000)
 	db, _ := CreateDatabase(CreateOptions{Environment: envWith(t, heavy)})
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	s.SetMaxCost(1000)
 	_, err := queryOutcome(s, "SELECT host_heavy()", nil)
 	if ee, ok := err.(*EngineError); !ok || ee.Code() != "54P01" {
@@ -268,7 +268,7 @@ func TestNoExtensionsIsUnaffected(t *testing.T) {
 	}
 	wantErr(t, s, "SELECT host_add(1, 2)", "42883")
 	// No Environment option (a fresh empty environment) behaves the same.
-	s2 := memDB().Session(SessionOptions{})
+	s2 := mustSession(memDB(), SessionOptions{})
 	wantErr(t, s2, "SELECT host_add(1, 2)", "42883")
 }
 
@@ -482,7 +482,7 @@ func TestHostFuncIndexReindexRepairsVersionBump(t *testing.T) {
 		wantHostCode(t, db, "INSERT INTO t VALUES (3, 3)", "XX002")
 		// A rolled-back REINDEX leaves the stale pin in place.
 		func() {
-			s := db.Session(SessionOptions{})
+			s := mustSession(db, SessionOptions{})
 			defer s.Close()
 			wantHostOK(t, s, "BEGIN")
 			wantHostOK(t, s, "REINDEX INDEX ix")

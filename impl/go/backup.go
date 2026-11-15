@@ -19,10 +19,10 @@ import (
 	"sort"
 )
 
-// BackupForTesting backs up database main to dest, which must not exist: page-identical when
+// backupForTesting backs up database main to dest, which must not exist: page-identical when
 // pageIdentical is set, compacted otherwise. The host API's name and shape are not yet decided
 // (spec/design/page-service.md §9); this test-only entry point drives the shared implementation.
-func BackupForTesting(db *Database, dest string, pageIdentical bool) error {
+func backupForTesting(db *Database, dest string, pageIdentical bool) error {
 	return db.core.backup(dest, pageIdentical)
 }
 

@@ -96,7 +96,7 @@ func TestFloatElementArrayMultidimKeyOrder(t *testing.T) {
 // yet keyable), while float-element arrays are accepted everywhere a key is taken.
 func TestCompositeElementArrayKeysRejected(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if _, err := queryOutcome(db, "CREATE TYPE addr AS (street text, zip i32)", nil); err != nil {
 		t.Fatal(err)
 	}

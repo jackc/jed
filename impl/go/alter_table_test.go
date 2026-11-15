@@ -8,12 +8,12 @@ import (
 
 func TestAlterAddColumnRewriteMatchesFreshTableBytes(t *testing.T) {
 	t.Parallel()
-	altered := memDB().Session(SessionOptions{})
+	altered := mustSession(memDB(), SessionOptions{})
 	uqRun(t, altered, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	uqRun(t, altered, "INSERT INTO t VALUES (1), (2)")
 	uqRun(t, altered, "ALTER TABLE t ADD v i32 DEFAULT 7")
 
-	fresh := memDB().Session(SessionOptions{})
+	fresh := mustSession(memDB(), SessionOptions{})
 	uqRun(t, fresh, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7)")
 	uqRun(t, fresh, "INSERT INTO t (id) VALUES (1), (2)")
 
@@ -32,12 +32,12 @@ func TestAlterAddColumnRewriteMatchesFreshTableBytes(t *testing.T) {
 
 func TestAlterDropColumnRewriteMatchesFreshTableBytes(t *testing.T) {
 	t.Parallel()
-	altered := memDB().Session(SessionOptions{})
+	altered := mustSession(memDB(), SessionOptions{})
 	uqRun(t, altered, "CREATE TABLE t (obsolete text, id i32 PRIMARY KEY, v i32 DEFAULT 7)")
 	uqRun(t, altered, "INSERT INTO t VALUES ('a', 1, 7), ('b', 2, 8)")
 	uqRun(t, altered, "ALTER TABLE t DROP obsolete")
 
-	fresh := memDB().Session(SessionOptions{})
+	fresh := mustSession(memDB(), SessionOptions{})
 	uqRun(t, fresh, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7)")
 	uqRun(t, fresh, "INSERT INTO t VALUES (1, 7), (2, 8)")
 
@@ -57,7 +57,7 @@ func TestAlterDropColumnRewriteMatchesFreshTableBytes(t *testing.T) {
 func TestAlterTypeAndPrimaryKeyRewritesMatchFreshTableBytes(t *testing.T) {
 	t.Parallel()
 	image := func(sqls ...string) []byte {
-		db := memDB().Session(SessionOptions{})
+		db := mustSession(memDB(), SessionOptions{})
 		for _, sql := range sqls {
 			uqRun(t, db, sql)
 		}
@@ -87,7 +87,7 @@ func TestAlterTypeAndPrimaryKeyRewritesMatchFreshTableBytes(t *testing.T) {
 // (ddl/alter_table.test) pins the behavior; this pins the persisted bytes of the text.
 func TestRenameRewriteQuotesTheSubstitutedName(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	uqRun(t, db, "CREATE TABLE r (a i32 CHECK (a > 0), b i32 CHECK (B IS NULL OR b > a))")
 	uqRun(t, db, `ALTER TABLE r RENAME COLUMN a TO "null"`)
 	uqRun(t, db, "ALTER TABLE r RENAME COLUMN b TO plain")
@@ -99,7 +99,7 @@ func TestRenameRewriteQuotesTheSubstitutedName(t *testing.T) {
 		}
 		return out
 	}
-	tbl, _ := db.Table("r")
+	tbl, _ := db.table("r")
 	if got := texts(tbl); !slices.Equal(got, want) {
 		t.Fatalf("check texts = %q, want %q", got, want)
 	}
@@ -111,7 +111,7 @@ func TestRenameRewriteQuotesTheSubstitutedName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ltbl, _ := loaded.Table("r")
+	ltbl, _ := loaded.table("r")
 	if got := texts(ltbl); !slices.Equal(got, want) {
 		t.Fatalf("reloaded check texts = %q, want %q", got, want)
 	}

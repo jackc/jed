@@ -31,12 +31,12 @@ func wantErr(t *testing.T, db dbHandle, sql, code string) {
 
 func TestCreatesTableWithResolvedTypesAndPK(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	out := mustCreate(t, db, "CREATE TABLE nums (id i32 PRIMARY KEY, small i16, big i64)")
 	if out.Kind != outcomeStatement {
 		t.Fatalf("expected statement outcome, got %v", out.Kind)
 	}
-	tbl, ok := db.Table("nums")
+	tbl, ok := db.table("nums")
 	if !ok {
 		t.Fatal("table not registered")
 	}
@@ -60,9 +60,9 @@ func TestCreatesTableWithResolvedTypesAndPK(t *testing.T) {
 
 func TestSQLStandardTypeAliasesResolve(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustCreate(t, db, "CREATE TABLE t (a smallint, b integer, c int, d bigint)")
-	tbl, _ := db.Table("t")
+	tbl, _ := db.table("t")
 	want := []scalarType{scalarInt16, scalarInt32, scalarInt32, scalarInt64}
 	for i, w := range want {
 		if tbl.Columns[i].Type.ScalarTy() != w {
@@ -74,20 +74,20 @@ func TestSQLStandardTypeAliasesResolve(t *testing.T) {
 // A bare name folds to lowercase; the host API looks a name up exactly (grammar.md §3).
 func TestBareNamesFoldAndHostLookupIsExact(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustCreate(t, db, "create table T (Id I32 primary key)")
-	tbl, ok := db.Table("t")
+	tbl, ok := db.table("t")
 	if !ok {
 		t.Fatal("lowercase lookup failed")
 	}
 	if tbl.Columns[0].Name != "id" {
 		t.Errorf("column name = %q, want id", tbl.Columns[0].Name)
 	}
-	if _, ok := db.Table("T"); ok {
+	if _, ok := db.table("T"); ok {
 		t.Error("uppercase lookup must not reach the folded table t")
 	}
 	mustCreate(t, db, `create table "T" ("Id" i32 primary key)`)
-	up, ok := db.Table("T")
+	up, ok := db.table("T")
 	if !ok || up.Columns[0].Name != "Id" {
 		t.Fatalf("quoted table T missing or wrong column: %v", up)
 	}
@@ -98,7 +98,7 @@ func TestBareNamesFoldAndHostLookupIsExact(t *testing.T) {
 // every name exact (a bare lookup never reaches a mixed-case name).
 func TestCatalogOrderIsExactNameBytesAcrossReload(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	for _, sql := range []string{
 		"CREATE TABLE a (id i32 PRIMARY KEY)",
 		`CREATE TABLE "C" (id i32 PRIMARY KEY)`,
@@ -126,7 +126,7 @@ func TestCatalogOrderIsExactNameBytesAcrossReload(t *testing.T) {
 	if !slices.Equal(got, []string{"B", "C", "a"}) {
 		t.Fatalf("table names = %v", got)
 	}
-	b, ok := loaded.Table("B")
+	b, ok := loaded.table("B")
 	if !ok {
 		t.Fatal("table B missing")
 	}
@@ -140,7 +140,7 @@ func TestCatalogOrderIsExactNameBytesAcrossReload(t *testing.T) {
 	if b.Columns[1].Name != "V" || b.Columns[2].Name != "v" {
 		t.Fatalf("columns = %q, %q", b.Columns[1].Name, b.Columns[2].Name)
 	}
-	if _, ok := loaded.Table("b"); ok {
+	if _, ok := loaded.table("b"); ok {
 		t.Fatal("bare b must not reach B")
 	}
 	if _, err := queryOutcome(loaded, `SELECT nextval('"Seq"')`, nil); err != nil {
@@ -164,20 +164,20 @@ func TestCatalogOrderIsExactNameBytesAcrossReload(t *testing.T) {
 
 func TestDuplicateTableIsRejected(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustCreate(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	wantErr(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)", "42P07")
 }
 
 func TestDuplicateColumnIsRejected(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	wantErr(t, db, "CREATE TABLE t (a i32, a i16)", "42701")
 }
 
 func TestUnknownTypeIsRejected(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	wantErr(t, db, "CREATE TABLE t (a int128)", "42704")
 	// The old jed bit-names are a CLEAN BREAK — replaced by the i/f prefix, no longer
 	// accepted (CLAUDE.md §4; types.md §11).
@@ -191,9 +191,9 @@ func TestPGByteShorthandTypeNamesAreAccepted(t *testing.T) {
 	// byte-namespace, so PG's byte-shorthand is accepted as aliases (CLAUDE.md §1/§4;
 	// types.md §11): int2→i16, int4→i32, int8→i64, float4→f32, float8→f64. There is no
 	// int8-means-8-bit collision, and a future 8-bit i8 stays free.
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustCreate(t, db, "CREATE TABLE t (a int2, b int4, c int8, d float4, e float8)")
-	tbl, _ := db.Table("t")
+	tbl, _ := db.table("t")
 	want := []scalarType{scalarInt16, scalarInt32, scalarInt64, scalarFloat32, scalarFloat64}
 	for i, w := range want {
 		if got := tbl.Columns[i].Type.ScalarTy(); got != w {
@@ -204,13 +204,13 @@ func TestPGByteShorthandTypeNamesAreAccepted(t *testing.T) {
 
 func TestMultiplePrimaryKeysAreRejected(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	wantErr(t, db, "CREATE TABLE t (a i32 PRIMARY KEY, b i32 PRIMARY KEY)", "42P16")
 }
 
 func TestSyntaxErrorsAreReported(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	wantErr(t, db, "CREATE TABLE t", "42601")
 	wantErr(t, db, "CREATE TABLE t (a i32,)", "42601")
 }

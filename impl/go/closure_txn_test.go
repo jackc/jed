@@ -35,12 +35,12 @@ func ctxCode(t *testing.T, err error) string {
 func TestUpdateClosureSQLCommitIs2D000AndNeverDiscardsWrites(t *testing.T) {
 	t.Parallel()
 	db := memDB()
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY)")
 
 	// The closure propagates the 2D000: Update rolls back and reports it.
-	err := s.Update(func(tx *Transaction) error {
+	err := s.Update(context.Background(), func(tx *Transaction) error {
 		if _, e := queryOutcome(tx, "INSERT INTO t VALUES (1)", nil); e != nil {
 			return e
 		}
@@ -65,7 +65,7 @@ func TestUpdateClosureSQLCommitIs2D000AndNeverDiscardsWrites(t *testing.T) {
 	}
 
 	// The closure swallows the error and returns nil: Update still reports that nothing committed.
-	err = s.Update(func(tx *Transaction) error {
+	err = s.Update(context.Background(), func(tx *Transaction) error {
 		_, _ = queryOutcome(tx, "INSERT INTO t VALUES (1)", nil)
 		_, _ = queryOutcome(tx, "ROLLBACK", nil)
 		_, _ = queryOutcome(tx, "INSERT INTO t VALUES (5)", nil)
@@ -80,7 +80,7 @@ func TestUpdateClosureSQLCommitIs2D000AndNeverDiscardsWrites(t *testing.T) {
 
 	// The gate was released: this session and another both write again.
 	mustExec(t, s, "INSERT INTO t VALUES (2)")
-	other := db.Session(SessionOptions{})
+	other := mustSession(db, SessionOptions{})
 	defer other.Close()
 	mustExec(t, other, "INSERT INTO t VALUES (3)")
 	if n := txCount(t, other, "t"); n != 2 {
@@ -90,10 +90,10 @@ func TestUpdateClosureSQLCommitIs2D000AndNeverDiscardsWrites(t *testing.T) {
 
 func TestClosureTransactionHandleCommitRollbackIs2D000WithoutAborting(t *testing.T) {
 	t.Parallel()
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	defer s.Close()
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY)")
-	err := s.Update(func(tx *Transaction) error {
+	err := s.Update(context.Background(), func(tx *Transaction) error {
 		if _, e := queryOutcome(tx, "INSERT INTO t VALUES (1)", nil); e != nil {
 			return e
 		}
@@ -114,7 +114,7 @@ func TestClosureTransactionHandleCommitRollbackIs2D000WithoutAborting(t *testing
 		t.Fatalf("rows = %d want 2", n)
 	}
 	// View: the same gate.
-	err = s.View(func(tx *Transaction) error {
+	err = s.View(context.Background(), func(tx *Transaction) error {
 		if _, e := queryOutcome(tx, "COMMIT", nil); ctxCode(t, e) != "2D000" {
 			t.Fatalf("COMMIT inside View: want 2D000, got %v", e)
 		}
@@ -127,10 +127,10 @@ func TestClosureTransactionHandleCommitRollbackIs2D000WithoutAborting(t *testing
 
 func TestSavepointsWorkInsideUpdateClosure(t *testing.T) {
 	t.Parallel()
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	defer s.Close()
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY)")
-	err := s.Update(func(tx *Transaction) error {
+	err := s.Update(context.Background(), func(tx *Transaction) error {
 		for _, sql := range []string{"INSERT INTO t VALUES (1)", "SAVEPOINT a", "INSERT INTO t VALUES (2)", "ROLLBACK TO a", "INSERT INTO t VALUES (3)", "RELEASE a"} {
 			if _, e := queryOutcome(tx, sql, nil); e != nil {
 				return e
@@ -156,7 +156,7 @@ func TestSavepointsWorkInsideUpdateClosure(t *testing.T) {
 
 func TestParseStageErrorsPoisonAnOpenBlock(t *testing.T) {
 	t.Parallel()
-	s := memDB().Session(SessionOptions{MaxSQLLength: 64})
+	s := mustSession(memDB(), SessionOptions{MaxSQLLength: 64})
 	defer s.Close()
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	expectPoisoned := func(what string) {
@@ -202,7 +202,7 @@ func TestParseStageErrorsPoisonAnOpenBlock(t *testing.T) {
 	expectPoisoned("a Prepare 42601")
 
 	// the closure's Transaction too
-	err := s.Update(func(tx *Transaction) error {
+	err := s.Update(context.Background(), func(tx *Transaction) error {
 		if _, e := queryOutcome(tx, "SELECT 1 FROM", nil); ctxCode(t, e) != "42601" {
 			t.Fatalf("want 42601, got %v", e)
 		}
@@ -225,10 +225,10 @@ func TestCloseAttachDetachNeverWaitForAnOpenWriteBlock(t *testing.T) {
 	if err := db.Attach("aux", AttachMemory(), false); err != nil {
 		t.Fatal(err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY)")
-	if err := s.Begin(true); err != nil {
+	if err := s.Begin(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	mustExec(t, s, "INSERT INTO t VALUES (1)")

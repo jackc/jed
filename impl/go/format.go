@@ -2492,12 +2492,12 @@ func orphanedLeafPages(pageIdx pageRef, shared map[uint32]bool, paging *sharedPa
 
 // verifyLivePages, when set, makes every file commit recount its live pages by a reachability walk and
 // panic if the incremental count differs (test tooling: the conformance harness's disk pass and the
-// storage-limit tests). SetVerifyLivePages sets it.
+// storage-limit tests). setVerifyLivePages sets it.
 var verifyLivePages atomic.Bool
 
-// SetVerifyLivePages turns the live-page self-check of every file commit on or off (spec/design/memory.md
+// setVerifyLivePages turns the live-page self-check of every file commit on or off (spec/design/memory.md
 // §8.7) — conformance and test tooling, never a production setting.
-func SetVerifyLivePages(on bool) { verifyLivePages.Store(on) }
+func setVerifyLivePages(on bool) { verifyLivePages.Store(on) }
 
 // verifyLiveCount recounts live by reachability and compares it with the incremental count
 // (verifyLivePages). Runs after the commit's body pages are written, so the walk reads the new catalog;
@@ -3798,7 +3798,7 @@ func (s *chainSource) keepChain(first pageRef, stored int, seal sealer, take fun
 // an inline body or block verbatim, an external pointer to its kept chain (§15) — so a rewritten
 // record never re-reads, decompresses, or recompresses an unchanged value.
 func encodeDisposedValue(ty colType, v Value, plan *recordPlan, c int, seal sealer, take func() uint32, ovf *[]dirtyPage, src *chainSource) ([]byte, error) {
-	var u *Unfetched
+	var u *unfetchedValue
 	if v.Kind == ValUnfetched {
 		u = v.unfetched()
 	}
@@ -3901,7 +3901,7 @@ func encodeDisposedValue(ty colType, v Value, plan *recordPlan, c int, seal seal
 
 // planBlock is the LZ4 block a compressed disposition stores: the plan's own block, or the one
 // already on the deferred value's chain.
-func planBlock(plan *recordPlan, c int, u *Unfetched, src *chainSource) ([]byte, error) {
+func planBlock(plan *recordPlan, c int, u *unfetchedValue, src *chainSource) ([]byte, error) {
 	if plan.comp[c] != nil {
 		return plan.comp[c], nil
 	}
@@ -4492,7 +4492,7 @@ func decodeSequenceEntry(buf []byte, pos *int) (*sequenceDef, error) {
 // v18): a flags byte (bit0 is_default), then metadata ONLY — name + unicode_version + cldr_version +
 // description, each u16-len + UTF-8. NO table: it is vendored into the binary and resolved by name on
 // open (spec/design/collation.md §2/§5/§9).
-func collationEntryBytes(c *Collation, isDefault bool) []byte {
+func collationEntryBytes(c *compiledCollation, isDefault bool) []byte {
 	var out []byte
 	var flags byte
 	if isDefault {
@@ -4510,7 +4510,7 @@ func collationEntryBytes(c *Collation, isDefault bool) []byte {
 // the caller has consumed the entry_kind byte. Reads the metadata, then resolves the compiled table
 // from env's loaded set by name (§2/§9) — the table is no longer in the file. Returns the
 // resolved collation + whether it is the per-database default (the is_default flag bit).
-func decodeCollationEntry(buf []byte, pos *int, env *Environment) (*Collation, bool, error) {
+func decodeCollationEntry(buf []byte, pos *int, env *Environment) (*compiledCollation, bool, error) {
 	flags, err := readU8(buf, pos)
 	if err != nil {
 		return nil, false, err
@@ -4546,7 +4546,7 @@ func decodeCollationEntry(buf []byte, pos *int, env *Environment) (*Collation, b
 		return nil, false, newError(CollationVersionMismatch,
 			fmt.Sprintf("collation %q (@ %s/%s) is not provided by any loaded bundle", name, unicode, cldr))
 	}
-	coll := &Collation{
+	coll := &compiledCollation{
 		Name:           name,
 		UnicodeVersion: unicode,
 		CldrVersion:    cldr,
@@ -4941,7 +4941,7 @@ func decodeStatisticsValue(buf []byte, pos *int, s *snapshot, tableKey string, c
 		return statisticsValue{}, newError(DataCorrupted, "statistics values may not be NULL")
 	}
 	_, _, _, _, collationSkewed := s.collationSkew(table.Columns[column].Collation)
-	var coll *Collation
+	var coll *compiledCollation
 	if table.Columns[column].Collation != "" {
 		coll = s.resolveCollation(table.Columns[column].Collation)
 	}
@@ -6710,7 +6710,7 @@ func (p *packedLeaf) recordWeight(i int) uint32 {
 // NULL is answered from the region bitmap / zero-length span with no decode. A fixed-width slot is
 // the untagged inline body, decoded eagerly (deferring a fixed-width scalar buys nothing,
 // lazy-record.md §6); a variable value's span takes the lazy tag path — a spillable body becomes an
-// inline-deferred Unfetched (a block view). Byte-identical to the eager value, moved from
+// inline-deferred unfetchedValue (a block view). Byte-identical to the eager value, moved from
 // fault-time to touch-time (§8); a corrupt touched inline body surfaces XX001 here.
 func (p *packedLeaf) value(c, i int) (Value, error) {
 	if r := &p.dirs.regions[c]; r.width > 0 {
@@ -6726,7 +6726,7 @@ func (p *packedLeaf) value(c, i int) (Value, error) {
 			pos := 0
 			return readValueLazy(p.colTypes, c, raw, &pos, p.cap, p.paging)
 		}
-		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: 0x00, lazy: lz, lazyIdx: i, bare: stringPayload(p.colTypes[c]), types: p.colTypes, typeIdx: c}}, nil
+		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: 0x00, lazy: lz, lazyIdx: i, bare: stringPayload(p.colTypes[c]), types: p.colTypes, typeIdx: c}}, nil
 	}
 	vb, err := p.dirs.value(c, i, nil)
 	if err != nil {
@@ -6887,7 +6887,7 @@ func (p *packedLeaf) rowInto(i int, row storedRow) (storedRow, error) {
 // decodeLeafNode decodes a single leaf page block into a resident node, for the demand-paging fault
 // path (spec/design/pager.md §4; paging.go faultLeaf). block is one page; page is its page id, stamped
 // on the node so a later incremental commit keeps it clean. Decoding is LAZY (large-values.md §14):
-// an external/compressed value becomes an Unfetched reference — no chain read, no decompression —
+// an external/compressed value becomes an unfetchedValue reference — no chain read, no decompression —
 // resolved later only for the columns a query touches (or on demand at the evaluator's column
 // access — the B4 backstop; paging is stamped into every deferred value for that).
 //
@@ -7555,7 +7555,7 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64, pcap pageCap) (*
 
 // readValueLazy reads one value (column c of a table with the shared resolved types) lazily
 // (spec/design/large-values.md §14): inline-plain and NULL decode as today, but an
-// external/compressed form becomes an Unfetched reference holding exactly the record's pointer
+// external/compressed form becomes an unfetchedValue reference holding exactly the record's pointer
 // fields — no chain read, no decompression. Every deferred reference is stamped with its
 // resolution handles (types+c always, paging on the external forms — bplus-reshape.md §5, B4) so
 // it can self-resolve at the evaluator's column access. The scan layer resolves the references
@@ -7571,7 +7571,7 @@ func readValueLazy(types []colType, c int, buf []byte, pos *int, pcap pageCap, p
 	switch tag {
 	case 0x00:
 		// A present inline value (lazy-record.md §12, L3): a variable-length / structured body (the
-		// isSpillable set — §6) is DEFERRED as an Unfetched (Form 0x00) referencing the shared page
+		// isSpillable set — §6) is DEFERRED as an unfetchedValue (Form 0x00) referencing the shared page
 		// block — FORM (a), zero-copy (§5a): keep the span as a SLICE of the faulted page block
 		// instead of copying it. A Go slice keeps its backing array alive under GC, so the leaf's one
 		// page block stays resident and is shared by every deferred value in it (the scan-emit clone
@@ -7590,7 +7590,7 @@ func readValueLazy(types []colType, c int, buf []byte, pos *int, pcap pageCap, p
 			if err != nil {
 				return Value{}, err
 			}
-			return Value{Kind: ValUnfetched, ref: &Unfetched{Form: 0x00, Comp: span, types: types, typeIdx: c}}, nil
+			return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: 0x00, Comp: span, types: types, typeIdx: c}}, nil
 		}
 		return readInlineBody(ty, buf, pos, decodeConstruct)
 	case tagInlineBare:
@@ -7601,7 +7601,7 @@ func readValueLazy(types []colType, c int, buf []byte, pos *int, pcap pageCap, p
 		}
 		span := buf[*pos:]
 		*pos = len(buf)
-		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: 0x00, Comp: span, bare: true, types: types, typeIdx: c}}, nil
+		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: 0x00, Comp: span, bare: true, types: types, typeIdx: c}}, nil
 	case 0x01:
 		return NullValue(), nil
 	case tagExternal:
@@ -7617,7 +7617,7 @@ func readValueLazy(types []colType, c int, buf []byte, pos *int, pcap pageCap, p
 		if err != nil {
 			return Value{}, err
 		}
-		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternal, FirstPage: first, firstTag: ref.tag, StoredLen: length, types: types, typeIdx: c, paging: paging}}, nil
+		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: tagExternal, FirstPage: first, firstTag: ref.tag, StoredLen: length, types: types, typeIdx: c, paging: paging}}, nil
 	case tagInlineComp:
 		rawLen, err := readU32(buf, pos)
 		if err != nil {
@@ -7633,7 +7633,7 @@ func readValueLazy(types []colType, c int, buf []byte, pos *int, pcap pageCap, p
 		}
 		comp := make([]byte, len(compSlice))
 		copy(comp, compSlice)
-		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagInlineComp, RawLen: rawLen, Comp: comp, types: types, typeIdx: c}}, nil
+		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: tagInlineComp, RawLen: rawLen, Comp: comp, types: types, typeIdx: c}}, nil
 	case tagExternalComp:
 		first, err := readU32(buf, pos)
 		if err != nil {
@@ -7651,7 +7651,7 @@ func readValueLazy(types []colType, c int, buf []byte, pos *int, pcap pageCap, p
 		if err != nil {
 			return Value{}, err
 		}
-		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternalComp, FirstPage: first, firstTag: ref.tag, StoredLen: stored, RawLen: rawLen, types: types, typeIdx: c, paging: paging}}, nil
+		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: tagExternalComp, FirstPage: first, firstTag: ref.tag, StoredLen: stored, RawLen: rawLen, types: types, typeIdx: c, paging: paging}}, nil
 	default:
 		return Value{}, newError(DataCorrupted, "invalid value presence tag")
 	}
@@ -7661,7 +7661,7 @@ func readValueLazy(types []colType, c int, buf []byte, pos *int, pcap pageCap, p
 // (spec/design/large-values.md §14): gather the overflow chain through fetch for an external
 // form, decompress a compressed one, and reconstruct by column type. Decompression errors are
 // data_corrupted, surfaced only when the value is actually touched.
-func resolveUnfetched(ty colType, u *Unfetched, fetch func(pageRef) ([]byte, error), pcap pageCap) (Value, error) {
+func resolveUnfetched(ty colType, u *unfetchedValue, fetch func(pageRef) ([]byte, error), pcap pageCap) (Value, error) {
 	var sink []uint32
 	switch u.Form {
 	case 0x00:
@@ -7723,7 +7723,7 @@ func resolveUnfetched(ty colType, u *Unfetched, fetch func(pageRef) ([]byte, err
 // the cost basis + prefetch hint. A spill-run-file reload carries the nil sentinel handles
 // (spill.go — it rides the sort output unread by contract), so touching one stays the loud pre-B4
 // poison.
-func resolveUnfetchedSelf(u *Unfetched) (Value, error) {
+func resolveUnfetchedSelf(u *unfetchedValue) (Value, error) {
 	if u.types == nil {
 		panic("BUG: unfetched large value escaped the storage layer (spill pass-through)")
 	}

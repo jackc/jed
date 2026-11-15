@@ -9,7 +9,7 @@ import "unicode/utf8"
 
 // chargeSortKey charges one sort-key value of a row the sort receives: collate per code point for
 // a collated text or text[] key, else sort_key per payload byte.
-func chargeSortKey(m *costMeter, v Value, coll *Collation) error {
+func chargeSortKey(m *costMeter, v Value, coll *compiledCollation) error {
 	var units int64
 	if coll != nil && (v.Kind == ValText || v.Kind == ValArray) {
 		units = costs.Collate * collatedCodePoints(v)

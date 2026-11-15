@@ -1844,21 +1844,21 @@ func (db *engine) indexMaintEnv() *evalEnv {
 // the store's colTypes were resolved against the OWNING database's type catalog, so an attached-DB
 // table whose composite type lives in the attached file keys correctly (a main-catalog re-resolution
 // would miss it).
-func (db *engine) indexEntries(columns []catColumn, colTypes []colType, colls []*Collation, rindex *resolvedIndex, storageKey []byte, row storedRow) ([][]byte, error) {
+func (db *engine) indexEntries(columns []catColumn, colTypes []colType, colls []*compiledCollation, rindex *resolvedIndex, storageKey []byte, row storedRow) ([][]byte, error) {
 	return indexEntryKeys(columns, colTypes, colls, rindex, storageKey, row, db.indexMaintEnv())
 }
 
 // indexPrefix computes a row's uniqueness-probe prefix for one index (spec/design/indexes.md §8),
 // building the unmetered eval env internally (as indexEntries). colTypes is the store's cached
 // per-column types (see indexEntries).
-func (db *engine) indexPrefix(colTypes []colType, colls []*Collation, rindex *resolvedIndex, row storedRow) ([]byte, bool, error) {
+func (db *engine) indexPrefix(colTypes []colType, colls []*compiledCollation, rindex *resolvedIndex, row storedRow) ([]byte, bool, error) {
 	return indexPrefixKey(colTypes, colls, rindex, row, db.indexMaintEnv())
 }
 
 // arbiterProbeKey computes a candidate row's arbiter key for ON CONFLICT (spec/design/upsert.md §3),
 // building the unmetered eval env internally (an expression-index arbiter evaluates its keys — as
 // indexPrefix). colTypes is the store's cached per-column types (see indexEntries).
-func (db *engine) arbiterProbeKey(arb *arbiter, colTypes []colType, pk []int, colls []*Collation, rindexes []resolvedIndex, row storedRow) ([]byte, bool, error) {
+func (db *engine) arbiterProbeKey(arb *arbiter, colTypes []colType, pk []int, colls []*compiledCollation, rindexes []resolvedIndex, row storedRow) ([]byte, bool, error) {
 	return arbiterKey(arb, colTypes, pk, colls, rindexes, row, db.indexMaintEnv())
 }
 
@@ -3858,7 +3858,7 @@ func (db *engine) relationExists(name string) bool {
 	// Session-local temp tables + their (UNIQUE) index names join the namespace too, so a name colliding
 	// with any temp relation is also 42P07 (preclude-overlaps — spec/design/temp-tables.md §3). db.Table
 	// is persistent-only, so the temp snapshot is checked explicitly.
-	if _, ok := db.Table(name); ok {
+	if _, ok := db.table(name); ok {
 		return true
 	}
 	if _, ok := db.tempSnap().table(name); ok {
@@ -4465,7 +4465,7 @@ func (db *engine) buildIndexEntries(scope *string, table *catTable, def *indexDe
 		}
 		meter.Charge(costs.StorageRowRead)
 		// The build reads the referenced columns; resolve a faulted row's touched columns before
-		// encoding (an expression key may read a spilled value; the evaluator's Unfetched backstop
+		// encoding (an expression key may read a spilled value; the evaluator's unfetchedValue backstop
 		// also handles it).
 		row, err := store.resolveInlineColumns(e.Row)
 		if err != nil {

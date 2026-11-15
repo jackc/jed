@@ -214,7 +214,7 @@ func decExec(t *testing.T, db dbHandle, sql string) {
 
 func decDB(t *testing.T, stmts ...string) *Session {
 	t.Helper()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	for _, s := range stmts {
 		decExec(t, db, s)
 	}

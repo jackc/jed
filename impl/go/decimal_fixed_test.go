@@ -158,7 +158,7 @@ func TestFixedDecimalStatisticsStaySingleValue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	run(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, a numeric(4,2), b numeric(9,0), c numeric(18,6))")
 	run(t, s, "INSERT INTO t SELECT g, (g % 7)::numeric / 4, g % 5, (g % 11)::numeric / 8 FROM generate_series(1, 400) AS g")
 	run(t, s, "ANALYZE t")
@@ -173,7 +173,7 @@ func TestFixedDecimalStatisticsStaySingleValue(t *testing.T) {
 		t.Fatalf("reopen after ANALYZE: %v", err)
 	}
 	defer db.Close()
-	s = db.Session(SessionOptions{})
+	s = mustSession(db, SessionOptions{})
 	if got := queryRows(t, s, q); got[0][0].str() != want[0][0].str() || got[0][2].str() != want[0][2].str() {
 		t.Fatalf("after reopen: %v, want %v", got, want)
 	}

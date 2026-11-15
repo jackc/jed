@@ -1,3 +1,5 @@
+//go:build jedtooling
+
 // Command conformance is the Go core's conformance harness (CLAUDE.md §7).
 //
 // Walks spec/conformance/suites, and for each .test file whose `# requires:`
@@ -1092,7 +1094,10 @@ func runFile(text string, disk bool) error {
 	// sequential corpus relies on (sticky lifetime_max_cost, session-local temp tables, the per-record
 	// # set:/privilege resets). Re-minted whenever a `# fixture:` swaps the underlying database, or (disk
 	// mode) whenever the file is reopened before a record.
-	sess := db.Session(jed.SessionOptions{})
+	sess, err := db.Session(jed.SessionOptions{})
+	if err != nil {
+		return err
+	}
 	// The handle's default work_mem, restored on every record without `# work_mem:` or the override.
 	defaultWorkMem := sess.WorkMem()
 	// onTemp tracks whether db/sess still point at the reopenable temp-file handle (a `# fixture:` swap
@@ -1137,7 +1142,10 @@ func runFile(text string, disk bool) error {
 		if err := db.SetMaxStorageBytes("main", mainStorageLimit); err != nil {
 			return fmt.Errorf("disk reopen: max_storage_bytes: %w", err)
 		}
-		sess = db.Session(jed.SessionOptions{})
+		sess, err = db.Session(jed.SessionOptions{})
+		if err != nil {
+			return err
+		}
 		return nil
 	}
 	// cleanup releases the current handle; a `# fixture:` directive swaps in a file-backed handle whose
@@ -1262,7 +1270,10 @@ func runFile(text string, disk bool) error {
 				cleanup() // release the prior (in-memory no-op) handle before swapping in the fixture
 				db = fixtureDB
 				cleanup = fixtureCleanup
-				sess = db.Session(jed.SessionOptions{})
+				sess, err = db.Session(jed.SessionOptions{})
+				if err != nil {
+					return err
+				}
 				onTemp = false // the handle is now the fixture image, not the reopenable temp file
 				i++
 				continue

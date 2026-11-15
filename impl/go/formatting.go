@@ -783,7 +783,7 @@ func toCharTimestamp(micros int64, tmpl string) (Value, error) {
 // toCharTimestamptz is to_char(timestamptz, text): the instant decomposed in zone, with its offset
 // (OF, TZH, TZM) and abbreviation (TZ). A fixed-offset zone other than UTC has no abbreviation, as
 // PostgreSQL's ±HH:MM zone spelling has none. ±infinity is NULL.
-func toCharTimestamptz(instant int64, zone ZoneRef, tmpl string, m *costMeter) (Value, error) {
+func toCharTimestamptz(instant int64, zone zoneRef, tmpl string, m *costMeter) (Value, error) {
 	if tmpl == "" || instant == posInfinity || instant == negInfinity {
 		return NullValue(), nil
 	}
@@ -1646,7 +1646,7 @@ func roundToPrecision(t int64, prec int32) (int64, bool) {
 
 // toTimestampText is to_timestamp(text, text) → timestamptz: an explicit TZH / TZM / OF offset fixes
 // the instant; otherwise the wall clock is read in zone (one timezone unit).
-func toTimestampText(input, tmpl string, zone ZoneRef, m *costMeter) (int64, error) {
+func toTimestampText(input, tmpl string, zone zoneRef, m *costMeter) (int64, error) {
 	tm, fsec, fprec, hasTz, tzEast, err := toTimestampParts(input, tmpl)
 	if err != nil {
 		return 0, err

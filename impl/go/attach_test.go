@@ -11,6 +11,7 @@ package jed
 // and impl/ts/tests/attach.test.ts.
 
 import (
+	"context"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -43,7 +44,7 @@ func TestAttachLifecycle(t *testing.T) {
 	if err := db.Attach("mydb", AttachMemory(), false); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	attachExec(t, s, "CREATE TABLE mydb.t (id i32 PRIMARY KEY, v i32)")
 	attachExec(t, s, "INSERT INTO mydb.t VALUES (1, 10), (2, 20)")
 
@@ -64,7 +65,7 @@ func TestAttachLifecycle(t *testing.T) {
 	// (the roots.attached publish, §5) — proves the commit published a new attached root. Drain the
 	// cursor fully so it releases its reader pin (an undrained streaming cursor would hold the roots
 	// and make the detach below 55006).
-	s2 := db.Session(SessionOptions{})
+	s2 := mustSession(db, SessionOptions{})
 	r2, err := s2.queryValues("SELECT v FROM mydb.t WHERE id = 1", nil)
 	if err != nil {
 		t.Fatalf("second session cannot see attachment: %v", err)
@@ -82,7 +83,7 @@ func TestAttachLifecycle(t *testing.T) {
 		t.Fatalf("detach: %v", err)
 	}
 	// After detach the qualifier is unknown again (42P01).
-	if code := attachErrCode(t, db.Session(SessionOptions{}), "SELECT v FROM mydb.t"); code != "42P01" {
+	if code := attachErrCode(t, mustSession(db, SessionOptions{}), "SELECT v FROM mydb.t"); code != "42P01" {
 		t.Fatalf("post-detach select: want 42P01, got %s", code)
 	}
 }
@@ -96,13 +97,13 @@ func TestAttachmentWorkingRootsAndCursorsDoNotAlias(t *testing.T) {
 	if err := db.Attach("work", AttachMemory(), false); err != nil {
 		t.Fatal(err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	attachExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	attachExec(t, s, "CREATE TABLE work.t (id i32 PRIMARY KEY, v i32)")
 	attachExec(t, s, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
 	attachExec(t, s, "INSERT INTO work.t VALUES (1, 100), (2, 200), (3, 300)")
-	if err := s.Begin(true); err != nil {
+	if err := s.Begin(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	mainPin, err := s.queryValues("SELECT id, v FROM t ORDER BY id", nil)
@@ -147,7 +148,7 @@ func TestAttachmentWorkingRootsAndCursorsDoNotAlias(t *testing.T) {
 	if err := s.Rollback(); err != nil {
 		t.Fatal(err)
 	}
-	fresh := db.Session(SessionOptions{})
+	fresh := mustSession(db, SessionOptions{})
 	defer fresh.Close()
 	for _, sql := range []string{"SELECT count(*) FROM t", "SELECT count(*) FROM work.t"} {
 		out, err := queryOutcome(fresh, sql, nil)
@@ -165,7 +166,7 @@ func TestAttachReadOnlyRejectsWrites(t *testing.T) {
 	if err := db.Attach("ro", AttachMemory(), true); err != nil {
 		t.Fatalf("attach read-only: %v", err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	for _, sql := range []string{
 		"CREATE TABLE ro.t (id i32 PRIMARY KEY)",
 		"CREATE INDEX ix ON ro.t (id)",
@@ -243,7 +244,7 @@ func makeFileDB(t *testing.T, dir, name string, pageSize uint32, stmts ...string
 	if err != nil {
 		t.Fatalf("create %s: %v", name, err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	for _, sql := range stmts {
 		attachExec(t, s, sql)
 	}
@@ -268,7 +269,7 @@ func TestAttachFileReadOnlyCrossRead(t *testing.T) {
 		t.Fatalf("attach file read-only: %v", err)
 	}
 	defer db.Detach("ref")
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	attachExec(t, s, "CREATE TABLE visit (city_id i32 PRIMARY KEY, n i32)")
 	attachExec(t, s, "INSERT INTO visit VALUES (1, 7), (2, 9)")
@@ -315,7 +316,7 @@ func TestAttachFileReadWritePersistsAcrossReopen(t *testing.T) {
 	if err := db.Attach("work", AttachFile(work), false); err != nil {
 		t.Fatalf("attach file read-write: %v", err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	attachExec(t, s, "CREATE TABLE work.acct (id i32 PRIMARY KEY, bal i32)")
 	attachExec(t, s, "INSERT INTO work.acct VALUES (1, 100), (2, 200)")
 	attachExec(t, s, "CREATE INDEX acct_bal ON work.acct (bal)")
@@ -336,7 +337,7 @@ func TestAttachFileReadWritePersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("reopened rows = %v, want [[1 100] [2 200]]", rows)
 	}
 	// The index persisted too (introspection — the catalog carries it).
-	if tbl, ok := reopened.Table("acct"); !ok || len(tbl.Indexes) != 1 || tbl.Indexes[0].Name != "acct_bal" {
+	if tbl, ok := reopened.table("acct"); !ok || len(tbl.Indexes) != 1 || tbl.Indexes[0].Name != "acct_bal" {
 		t.Fatalf("reopened index missing: %+v", tbl)
 	}
 }
@@ -364,7 +365,7 @@ func TestAttachFileCompositeColumnDML(t *testing.T) {
 		t.Fatalf("attach file read-write: %v", err)
 	}
 	defer db.Detach("work")
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 
 	// Each of these maintains the composite `loc_home` index, encoding the composite `home` column
@@ -406,9 +407,9 @@ func TestAttachFileOneDurableWriter(t *testing.T) {
 	}
 	defer db.Detach("extra")
 
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
-	if err := s.Begin(true); err != nil {
+	if err := s.Begin(context.Background(), true); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	attachExec(t, s, "INSERT INTO m VALUES (1)")       // main (file) dirtied
@@ -447,10 +448,10 @@ func TestAttachFileWithMemoryMainMultiWrite(t *testing.T) {
 		t.Fatalf("attach: %v", err)
 	}
 	defer func() { db.Detach("work"); db.Close() }()
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	attachExec(t, s, "CREATE TABLE local (id i32 PRIMARY KEY)")
-	if err := s.Begin(true); err != nil {
+	if err := s.Begin(context.Background(), true); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	attachExec(t, s, "INSERT INTO local VALUES (1)")  // in-memory main (free)
@@ -474,7 +475,7 @@ func TestAttachFilePageSizeIndependent(t *testing.T) {
 	if err := db.Attach("small", AttachFile(small), false); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	attachExec(t, s, "CREATE TABLE small.grid (id i32 PRIMARY KEY, v i32)")
 	// Enough rows to force at least one leaf split at the small page size (its own page space).
 	for i := 1; i <= 40; i++ {
@@ -512,7 +513,7 @@ func TestAttachFileReattach(t *testing.T) {
 		if err := db.Attach("ref", AttachFile(ref), true); err != nil {
 			t.Fatalf("attach #%d: %v", i, err)
 		}
-		s := db.Session(SessionOptions{})
+		s := mustSession(db, SessionOptions{})
 		rows := queryRows(t, s, "SELECT id FROM ref.t")
 		s.Close()
 		if len(rows) != 1 || rows[0][0].Int != 1 {
@@ -552,7 +553,7 @@ func TestAttachNamesAreExact(t *testing.T) {
 	if err := db.Attach("Reports", AttachMemory(), false); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	attachExec(t, s, `CREATE TABLE "Reports".sales (id i32 PRIMARY KEY)`)
 	attachExec(t, s, `INSERT INTO "Reports".sales VALUES (1)`)
 	ids := func(sql string) []int64 { return mustIds(t, s, sql) }

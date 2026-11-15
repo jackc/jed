@@ -77,7 +77,7 @@ func streamResult(t *testing.T, s *Session, sql string) ([][]Value, int64) {
 func TestStreamingMatchesEager(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 100)
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	for _, sql := range []string{
 		"SELECT id, v FROM t LIMIT 5",
@@ -106,7 +106,7 @@ func TestStreamingMatchesEager(t *testing.T) {
 func TestNonStreamableFallsBack(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 20)
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	for _, sql := range []string{
 		"SELECT count(*) FROM t",
@@ -129,7 +129,7 @@ func TestNonStreamableFallsBack(t *testing.T) {
 func TestStreamingEarlyExitChargesLess(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 1000)
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 
 	_, fullCost := streamResult(t, s, "SELECT id FROM t ORDER BY id")
@@ -161,7 +161,7 @@ func TestStreamingCursorPinsSnapshot(t *testing.T) {
 	if db.Version() != 1 || db.OldestLiveTxid() != 1 {
 		t.Fatalf("seed: version=%d oldest=%d", db.Version(), db.OldestLiveTxid())
 	}
-	reader := db.Session(SessionOptions{})
+	reader := mustSession(db, SessionOptions{})
 	defer reader.Close()
 
 	rows, err := reader.queryValues("SELECT id FROM t ORDER BY id", nil)
@@ -221,9 +221,9 @@ func TestStreamingCursorPinsSnapshot(t *testing.T) {
 func TestWriteTransactionCursorStableAcrossLaterInserts(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 3)
-	writer := db.Session(SessionOptions{})
+	writer := mustSession(db, SessionOptions{})
 	defer writer.Close()
-	if err := writer.Begin(true); err != nil {
+	if err := writer.Begin(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := queryOutcome(writer, "INSERT INTO t VALUES (4, 40)", nil); err != nil {
@@ -260,7 +260,7 @@ func TestWriteTransactionCursorStableAcrossLaterInserts(t *testing.T) {
 	if err := writer.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	fresh := db.Session(SessionOptions{})
+	fresh := mustSession(db, SessionOptions{})
 	defer fresh.Close()
 	got, _ := eagerResult(t, fresh, "SELECT count(*) FROM t")
 	if len(got) != 1 || got[0][0].Int != 67 {
@@ -272,7 +272,7 @@ func TestWriteTransactionCursorStableAcrossLaterInserts(t *testing.T) {
 func TestStreamingMidDrainCostAbort(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 1000)
-	s := db.Session(SessionOptions{MaxCost: 50})
+	s := mustSession(db, SessionOptions{MaxCost: 50})
 	defer s.Close()
 	rows, err := s.queryValues("SELECT id FROM t ORDER BY id", nil)
 	if err != nil {
@@ -412,7 +412,7 @@ func TestBareHandleQueryPinsWatermarkUnderReclamation(t *testing.T) {
 func TestBufferedMatchesEager(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 40)
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	for _, sql := range []string{
 		"SELECT count(*) FROM t",                                        // whole-table aggregate (Final, 1 row)
@@ -442,7 +442,7 @@ func TestBufferedMatchesEager(t *testing.T) {
 func TestBufferedEarlyExitChargesLess(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 1000)
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 
 	sql := "SELECT id, v + 1 FROM t GROUP BY id, v ORDER BY id"
@@ -481,7 +481,7 @@ func TestBufferedCursorPinsSnapshot(t *testing.T) {
 	if db.OldestLiveTxid() != 1 {
 		t.Fatalf("seed: oldest=%d", db.OldestLiveTxid())
 	}
-	reader := db.Session(SessionOptions{})
+	reader := mustSession(db, SessionOptions{})
 	defer reader.Close()
 
 	// A blocking query (ORDER BY v — not PK order) → the buffered cursor. Pull one row (runs the
@@ -531,7 +531,7 @@ func TestBufferedCursorPinsSnapshot(t *testing.T) {
 func TestBufferedMidDrainCostAbort(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 1000)
-	s := db.Session(SessionOptions{MaxCost: 50})
+	s := mustSession(db, SessionOptions{MaxCost: 50})
 	defer s.Close()
 	rows, err := s.queryValues("SELECT v FROM t ORDER BY v", nil)
 	if err != nil {
@@ -562,7 +562,7 @@ func TestBufferedMidDrainCostAbort(t *testing.T) {
 func TestSortedMatchesEager(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 40)
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	for _, sql := range []string{
 		"SELECT v FROM t ORDER BY v",                  // non-PK sort, full output
@@ -594,7 +594,7 @@ func TestSortedMatchesEager(t *testing.T) {
 func TestSortedEarlyExitChargesLess(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 1000)
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 
 	sql := "SELECT v FROM t ORDER BY v" // non-PK ORDER BY, no LIMIT → a 1000-row lazy Sorted output
@@ -667,14 +667,14 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 
 	// Eager oracle: a default-workMem session never spills 200 small rows (in-memory sort).
 	sql := "SELECT id, k FROM t ORDER BY k, id"
-	oracle := db.Session(SessionOptions{})
+	oracle := mustSession(db, SessionOptions{})
 	er, ec := eagerResult(t, oracle, sql)
 	oracle.Close()
 
 	// A finite top-k whose shared fixed-row estimate fits workMem bypasses the external sorter:
 	// after the blocking first pull there is no live spill run. Lowering the budget below K's
 	// estimate falls back to the existing sorter, whose undrained merge keeps runs live.
-	fit := db.Session(SessionOptions{})
+	fit := mustSession(db, SessionOptions{})
 	fit.SetWorkMem(512) // K=5 × (8 + 2×40) = 440 bytes
 	fitRows, err := fit.queryValues(sql+" LIMIT 5", nil)
 	if err != nil || !fitRows.Next() {
@@ -686,7 +686,7 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 	_ = fitRows.Close()
 	fit.Close()
 
-	fallback := db.Session(SessionOptions{})
+	fallback := mustSession(db, SessionOptions{})
 	fallback.SetWorkMem(128)
 	fallbackRows, err := fallback.queryValues(sql+" LIMIT 5", nil)
 	if err != nil || !fallbackRows.Next() {
@@ -702,7 +702,7 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 	}
 
 	// Full lazy drain under a tiny workMem (forces spill + merge): rows + cost match the oracle.
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	s.SetWorkMem(128) // ~2-3 rows per run → dozens of runs + a deep merge
 	sr, sc := streamResult(t, s, sql)
 	if !rowsEqual(sr, er) {
@@ -718,7 +718,7 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 
 	// Early exit over the merge: pull a prefix, then close the cursor. close releases the undrained
 	// merge's run files, so none leak.
-	s2 := db.Session(SessionOptions{})
+	s2 := mustSession(db, SessionOptions{})
 	s2.SetWorkMem(128)
 	rows, err := s2.queryValues(sql, nil)
 	if err != nil {
@@ -747,7 +747,7 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 func TestDeferredMatchesEager(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 20)
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	for _, sql := range []string{
 		// Set operations (every kind), with and without a trailing ORDER BY.
@@ -783,7 +783,7 @@ func TestDeferredMatchesEager(t *testing.T) {
 func TestDeferredRunsFullyOnFirstPull(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 100)
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	sql := "SELECT id FROM t UNION ALL SELECT id FROM t ORDER BY id"
 
@@ -818,7 +818,7 @@ func TestDeferredCursorPinsSnapshot(t *testing.T) {
 	if db.OldestLiveTxid() != 1 {
 		t.Fatalf("seed: oldest=%d", db.OldestLiveTxid())
 	}
-	reader := db.Session(SessionOptions{})
+	reader := mustSession(db, SessionOptions{})
 	defer reader.Close()
 
 	// A top-level UNION → the deferred cursor. Pull one row (runs the set op over the v1 snapshot),
@@ -868,7 +868,7 @@ func TestDeferredCursorPinsSnapshot(t *testing.T) {
 func TestDeferredMidDrainCostAbort(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 1000)
-	s := db.Session(SessionOptions{MaxCost: 50})
+	s := mustSession(db, SessionOptions{MaxCost: 50})
 	defer s.Close()
 	rows, err := s.queryValues("SELECT id FROM t UNION ALL SELECT id FROM t ORDER BY id", nil)
 	if err != nil {
@@ -897,7 +897,7 @@ func TestDeferredMidDrainCostAbort(t *testing.T) {
 func TestDeferredSkipsDataModifyingWith(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 5)
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	// A writable CTE: INSERT … RETURNING fed to the primary. This is stmtIsWrite, so it bypasses
 	// tryDeferredQuery and runs through the write path — but Query still surfaces its rows.
@@ -958,7 +958,7 @@ func preparedStreamResult(t *testing.T, s *Session, sql string, params []Value) 
 func TestPreparedQueryMatchesStreamed(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 100)
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	for _, sql := range []string{
 		"SELECT id, v FROM t LIMIT 5",             // streaming (LIMIT short-circuit)
@@ -985,7 +985,7 @@ func TestPreparedQueryMatchesStreamed(t *testing.T) {
 func TestPreparedQueryBindsParamsAndStreams(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 100)
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	sql := "SELECT id, v FROM t WHERE id >= $1 ORDER BY id LIMIT 4"
 
@@ -1010,7 +1010,7 @@ func TestPreparedQueryBindsParamsAndStreams(t *testing.T) {
 func TestPreparedQueryEarlyExitChargesLess(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 1000)
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	stmt, err := s.Prepare("SELECT id FROM t ORDER BY id")
 	if err != nil {
@@ -1054,7 +1054,7 @@ func TestPreparedQueryPinsSnapshot(t *testing.T) {
 	if db.OldestLiveTxid() != 1 {
 		t.Fatalf("seed oldest=%d", db.OldestLiveTxid())
 	}
-	reader := db.Session(SessionOptions{})
+	reader := mustSession(db, SessionOptions{})
 	defer reader.Close()
 	stmt, err := reader.Prepare("SELECT id FROM t ORDER BY id")
 	if err != nil {
@@ -1103,7 +1103,7 @@ func TestPreparedQueryPinsSnapshot(t *testing.T) {
 func TestPreparedQueryMidDrainCostAbort(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 1000)
-	s := db.Session(SessionOptions{MaxCost: 50})
+	s := mustSession(db, SessionOptions{MaxCost: 50})
 	defer s.Close()
 	stmt, err := s.Prepare("SELECT id FROM t ORDER BY id")
 	if err != nil {

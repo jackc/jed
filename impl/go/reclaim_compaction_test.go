@@ -22,7 +22,7 @@ func churnInMemory(t *testing.T, reclaim bool, rounds int) (uint32, *Database) {
 	t.Helper()
 	db := newInMemoryWithPageSize(256, NewEnvironment())
 	db.core.storage.reclaimWithinSession = reclaim
-	sess := db.Session(SessionOptions{})
+	sess := mustSession(db, SessionOptions{})
 	sessExec(t, sess, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)")
 	base := strings.Repeat("x", 40)
 	for i := 1; i <= 30; i++ {
@@ -59,7 +59,7 @@ func TestWithinSessionCompactionBoundsInMemoryChurn(t *testing.T) {
 	}
 
 	// The churned value and every row survive the reuse (a reclaimed page was dead, never a live one).
-	sess := dbOn.Session(SessionOptions{})
+	sess := mustSession(dbOn, SessionOptions{})
 	want := fmt.Sprintf("a%d-%s", rounds-1, strings.Repeat("y", 40))
 	got := queryRows(t, sess, "SELECT pad FROM t WHERE id = 15")
 	if len(got) != 1 || got[0][0].str() != want {
@@ -74,7 +74,7 @@ func TestCompactionDefersWhileOlderReaderPinned(t *testing.T) {
 	t.Parallel()
 	db := newInMemoryWithPageSize(256, NewEnvironment())
 	db.core.storage.reclaimWithinSession = true
-	sess := db.Session(SessionOptions{})
+	sess := mustSession(db, SessionOptions{})
 	sessExec(t, sess, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)")
 	base := strings.Repeat("x", 40)
 	for i := 1; i <= 30; i++ {

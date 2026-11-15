@@ -22,10 +22,10 @@ func singleValuesInsertEligible(candidateCount int, hasConflict bool) bool {
 // and its collation, evaluated against each row — unmetered — to yield the key value). Built once
 // per statement by (*engine).resolveIndex from an indexDef.
 type resolvedKey struct {
-	Col  int        // column ordinal (column key)
-	Expr *rExpr     // resolved expression (expression key)
-	Ty   dataType   // result key type (expression key)
-	Coll *Collation // derived collation (expression key)
+	Col  int                // column ordinal (column key)
+	Expr *rExpr             // resolved expression (expression key)
+	Ty   dataType           // result key type (expression key)
+	Coll *compiledCollation // derived collation (expression key)
 }
 
 // resolvedIndex is an index resolved for one statement's maintenance: the def's identity (name /
@@ -68,7 +68,7 @@ type insertValuesPlan struct {
 	viewChecks   []viewCheck
 	defaultExprs []*rExpr
 	rindexes     []resolvedIndex
-	colls        []*Collation
+	colls        []*compiledCollation
 	provided     []int
 	arity        int
 	valueExprs   valueExprs
@@ -231,7 +231,7 @@ func resolvedToKeyType(rt resolvedType) (dataType, bool) {
 // the §2.2 tag). A column key uses the store's resolved colType (colTypes[col]), so a composite column
 // recurses into its field codec (encoding.md §2.15); an expression key is never composite, so it stays
 // on the by-name encodeTypedKey. Maintenance eval is unmetered (cost.md §3).
-func indexSlotKey(key resolvedKey, colTypes []colType, colls []*Collation, row storedRow, env *evalEnv) (present bool, b []byte, err error) {
+func indexSlotKey(key resolvedKey, colTypes []colType, colls []*compiledCollation, row storedRow, env *evalEnv) (present bool, b []byte, err error) {
 	if key.Expr == nil {
 		v := row[key.Col]
 		if v.Kind == ValNull {
@@ -266,8 +266,8 @@ func indexSlotKey(key resolvedKey, colTypes []colType, colls []*Collation, row s
 // unassigned columns over from the old row still deferred. The key encoders resolve it
 // (residentValue), so maintenance computes the same entry bytes the INSERT wrote. An expression key
 // evaluates against the row (§4), faulting a referenced spilled value in through the evaluator's
-// Unfetched backstop.
-func indexEntryKey(colTypes []colType, colls []*Collation, rindex *resolvedIndex, storageKey []byte, row storedRow, env *evalEnv) ([]byte, error) {
+// unfetchedValue backstop.
+func indexEntryKey(colTypes []colType, colls []*compiledCollation, rindex *resolvedIndex, storageKey []byte, row storedRow, env *evalEnv) ([]byte, error) {
 	var out []byte
 	for i, key := range rindex.Keys {
 		present, b, err := indexSlotKey(key, colTypes, colls, row, env)
@@ -311,7 +311,7 @@ func indexRowQualifies(rindex *resolvedIndex, row storedRow, env *evalEnv) (bool
 // maintenance uniform (the UPDATE old-set/new-set diff handles a row entering/leaving/moving for
 // free). colls (column-ordinal-indexed) selects each text key column's collated form (§2.12); a GIN
 // term is always the C key (gin.md §4.2), so a GIN index never collates.
-func indexEntryKeys(columns []catColumn, colTypes []colType, colls []*Collation, rindex *resolvedIndex, storageKey []byte, row storedRow, env *evalEnv) ([][]byte, error) {
+func indexEntryKeys(columns []catColumn, colTypes []colType, colls []*compiledCollation, rindex *resolvedIndex, storageKey []byte, row storedRow, env *evalEnv) ([][]byte, error) {
 	if ok, err := indexRowQualifies(rindex, row, env); err != nil {
 		return nil, err
 	} else if !ok {
@@ -335,7 +335,7 @@ func indexEntryKeys(columns []catColumn, colTypes []colType, colls []*Collation,
 // no engine to evaluate an expression key. An expression index is C-collated (its keys never
 // change on a collation upgrade), so it is fail-closed 0A000 there; this asserts the index is
 // plain-column and reuses the ordinary builder with a nil env (a column key never touches env).
-func indexEntryKeysColumns(columns []catColumn, colTypes []colType, colls []*Collation, def indexDef, storageKey []byte, row storedRow) ([][]byte, error) {
+func indexEntryKeysColumns(columns []catColumn, colTypes []colType, colls []*compiledCollation, def indexDef, storageKey []byte, row storedRow) ([][]byte, error) {
 	cols := def.columnOrdinals()
 	if cols == nil {
 		panic("indexEntryKeysColumns called on an expression index")
@@ -670,7 +670,7 @@ func bytesDiff(a, b [][]byte) [][]byte {
 // (spec/design/indexes.md §8): the §3 entry key's slot prefix — without the storage-key
 // suffix — or ok=false when any component is NULL (NULLS DISTINCT: such a tuple never
 // conflicts). Two rows conflict iff they yield the same prefix.
-func indexPrefixKey(colTypes []colType, colls []*Collation, rindex *resolvedIndex, row storedRow, env *evalEnv) ([]byte, bool, error) {
+func indexPrefixKey(colTypes []colType, colls []*compiledCollation, rindex *resolvedIndex, row storedRow, env *evalEnv) ([]byte, bool, error) {
 	// A partial index constrains only its qualifying rows (indexes.md §9): a non-qualifying row is
 	// exempt from uniqueness, exactly like a NULL-bearing prefix (ok=false).
 	if ok, err := indexRowQualifies(rindex, row, env); err != nil {
@@ -720,7 +720,7 @@ func uniqueProbeBound(prefix []byte) keyBound {
 // the store) is the vehicle that carries a composite member's field list — the by-name dataType
 // cannot (composite.md §2). Shared by the INSERT duplicate check and the ON CONFLICT arbiter probe
 // (upsert.md §3); a PK column is NOT NULL, so there is no presence tag at the top level.
-func encodePkKey(colTypes []colType, pk []int, colls []*Collation, row storedRow) ([]byte, error) {
+func encodePkKey(colTypes []colType, pk []int, colls []*compiledCollation, row storedRow) ([]byte, error) {
 	var key []byte
 	for _, i := range pk {
 		b, err := encodeColTypeKey(colTypes[i], row[i], colls[i])
@@ -951,7 +951,7 @@ func sameIntSet(s []int, set map[int]struct{}) bool {
 // a PK arbiter (never NULL), or the unique-index prefix for an index arbiter (the bool is false
 // when a nullable arbiter column is NULL — NULLS DISTINCT, so the row never conflicts). colTypes is
 // the table's resolved column types (composite PK/index columns key through their field codec, §2.15).
-func arbiterKey(arb *arbiter, colTypes []colType, pk []int, colls []*Collation, rindexes []resolvedIndex, row storedRow, env *evalEnv) ([]byte, bool, error) {
+func arbiterKey(arb *arbiter, colTypes []colType, pk []int, colls []*compiledCollation, rindexes []resolvedIndex, row storedRow, env *evalEnv) ([]byte, bool, error) {
 	if arb.isPK {
 		k, err := encodePkKey(colTypes, pk, colls, row)
 		if err != nil {
@@ -1153,7 +1153,7 @@ func (db *engine) arbiterExisting(arb *arbiter, store *tableStore, table *catTab
 // rowConflictsCommitted reports whether a candidate row conflicts with a COMMITTED row on the
 // primary key or any unique index (the no-target DO NOTHING skip test — spec/design/upsert.md §2).
 // NULLS DISTINCT: a unique tuple with any NULL component never conflicts.
-func (db *engine) rowConflictsCommitted(store *tableStore, table *catTable, pk []int, colls []*Collation, rindexes []resolvedIndex, row storedRow) (bool, error) {
+func (db *engine) rowConflictsCommitted(store *tableStore, table *catTable, pk []int, colls []*compiledCollation, rindexes []resolvedIndex, row storedRow) (bool, error) {
 	if len(pk) > 0 {
 		k, err := encodePkKey(store.colTypes, pk, colls, row)
 		if err != nil {
@@ -2067,7 +2067,7 @@ func (db *engine) executeInsertValuesPlan(ins *insert, params []Value, ctx cteCt
 // validated rows after every check passes and BEFORE phase 2 writes — so its subqueries
 // observe the pre-statement snapshot and a ceiling abort stays all-or-nothing; params feeds
 // its $Ns. Returns the projected output rows, nil without a clause.
-func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, viewChecks []viewCheck, defaultExprs []*rExpr, rindexes []resolvedIndex, colls []*Collation, rng *stmtRng, provided []int, rows [][]Value, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) ([][]Value, error) {
+func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, viewChecks []viewCheck, defaultExprs []*rExpr, rindexes []resolvedIndex, colls []*compiledCollation, rng *stmtRng, provided []int, rows [][]Value, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) ([][]Value, error) {
 	// The eval env for phase-1 index-expression evaluation (index eval is unmetered; params/CTEs
 	// are empty — an index expression cannot reference them). The per-statement rng is shared with
 	// the CHECK / default evaluation.
@@ -2348,7 +2348,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 // insertOne is the plain one-candidate INSERT ... VALUES specialization. It retains the general
 // path's validation and write order (constraints.md §7) but needs no within-batch maps, stringified
 // byte keys, prepared-row slice, or per-index write buffers.
-func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, viewChecks []viewCheck, defaultExprs []*rExpr, rindexes []resolvedIndex, colls []*Collation, rng *stmtRng, provided []int, values []Value, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) ([][]Value, error) {
+func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, viewChecks []viewCheck, defaultExprs []*rExpr, rindexes []resolvedIndex, colls []*compiledCollation, rng *stmtRng, provided []int, values []Value, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) ([][]Value, error) {
 	var err error
 	env := &evalEnv{exec: db, rng: rng}
 
@@ -2655,7 +2655,7 @@ func (db *engine) exclusionParticipates(chk *exclusionCheck, row storedRow) (boo
 // column holds the empty range. A btree exclusion's key (§7.2) is the backing ordered index's slot
 // prefix — two participating rows conflict iff their prefixes are equal, exactly UNIQUE's rule —
 // and a GiST exclusion's the conjunction query.
-func (db *engine) exclusionKeyFor(chk *exclusionCheck, columns []catColumn, colTypes []colType, colls []*Collation, row storedRow) (exclusionKey, bool, error) {
+func (db *engine) exclusionKeyFor(chk *exclusionCheck, columns []catColumn, colTypes []colType, colls []*compiledCollation, row storedRow) (exclusionKey, bool, error) {
 	if chk.rindex.Kind == indexBtree {
 		// indexPrefix applies the predicate and the NULL rule.
 		prefix, ok, err := db.indexPrefix(colTypes, colls, &chk.rindex, row)
@@ -2717,7 +2717,7 @@ func (db *engine) exclusionStoredConflict(dbScope *string, table string, chk *ex
 // exclusionConflictsPlanned reports whether a proposed ON CONFLICT DO NOTHING row conflicts under
 // one exclusion constraint with a stored row or with an insert this statement already planned
 // (planned) — the row-at-a-time visibility upsert.md §3 reproduces (gist.md §7).
-func (db *engine) exclusionConflictsPlanned(dbScope *string, table string, chk *exclusionCheck, columns []catColumn, colTypes []colType, colls []*Collation, row storedRow, planned []storedRow) (bool, error) {
+func (db *engine) exclusionConflictsPlanned(dbScope *string, table string, chk *exclusionCheck, columns []catColumn, colTypes []colType, colls []*compiledCollation, row storedRow, planned []storedRow) (bool, error) {
 	key, ok, err := db.exclusionKeyFor(chk, columns, colTypes, colls, row)
 	if err != nil || !ok {
 		return false, err
@@ -5055,7 +5055,7 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 // or nil if the table does not exist. A test/debug convenience — the SELECT path scans through
 // IterInKeyOrder directly (propagating fault errors); these callers are in-memory, where a scan never
 // faults, so the error is inert and panicking on it surfaces a genuine bug rather than hiding it.
-func (db *engine) RowsInKeyOrder(name string) []storedRow {
+func (db *engine) rowsInKeyOrder(name string) []storedRow {
 	snap := db.readSnap()
 	if db.isTempTable(name) { // temp tables live in the session temp snapshot (temp-tables.md §2)
 		snap = db.tempSnap()

@@ -59,7 +59,7 @@ func siErr(t *testing.T, db dbHandle, sql string) string {
 // rows per value, so an equality admits 4 of 20.
 func siDB20(t *testing.T) *Session {
 	t.Helper()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	siRun(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)")
 	for i := 1; i <= 20; i++ {
 		siRun(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d, %d)", i, i%5, i))
@@ -73,7 +73,7 @@ func siDB20(t *testing.T) *Session {
 // catalog holds indexes in ascending name byte order.
 func TestIndexAutoNamingMatchesPostgres(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	siRun(t, db, "CREATE TABLE T (A i32 PRIMARY KEY, B i32)")
 	siRun(t, db, "CREATE INDEX ON T (B)")        // t_b_idx
 	siRun(t, db, "CREATE INDEX ON T (B)")        // t_b_idx1
@@ -81,7 +81,7 @@ func TestIndexAutoNamingMatchesPostgres(t *testing.T) {
 	siRun(t, db, "CREATE INDEX ON T (A, B)")     // t_a_b_idx
 	siRun(t, db, "CREATE INDEX ON T (B, B)")     // t_b_b1_idx (duplicate column allowed; the repeat is b1 — PG)
 	siRun(t, db, `CREATE INDEX "Mine" ON T (B)`) // explicit quoted name, exact case kept
-	tab, _ := db.Table("t")
+	tab, _ := db.table("t")
 	names := make([]string, 0, len(tab.Indexes))
 	for _, ix := range tab.Indexes {
 		names = append(names, ix.Name)
@@ -100,7 +100,7 @@ func TestIndexAutoNamingMatchesPostgres(t *testing.T) {
 	siRun(t, db, `CREATE TABLE "Up" ("K" i32, k i32)`)
 	siRun(t, db, `CREATE INDEX ON "Up" ("K")`)
 	siRun(t, db, `CREATE INDEX ON "Up" (k)`)
-	up, _ := db.Table("Up")
+	up, _ := db.table("Up")
 	names = names[:0]
 	for _, ix := range up.Indexes {
 		names = append(names, ix.Name)
@@ -115,7 +115,7 @@ func TestIndexAutoNamingMatchesPostgres(t *testing.T) {
 // tables; DROP mismatches are 42704/42809.
 func TestIndexDDLErrorsMatchPostgres(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	siRun(t, db, "CREATE TABLE t (a i32 PRIMARY KEY, s f64)")
 	if got := siErr(t, db, "CREATE INDEX i ON nosuch (nope)"); got != "42P01" {
 		t.Fatalf("missing table: %s", got)
@@ -156,14 +156,14 @@ func TestIndexDDLErrorsMatchPostgres(t *testing.T) {
 	// over a table named `on`, and an index explicitly named `on`.
 	siRun(t, db, "CREATE TABLE on (x i32)")
 	siRun(t, db, "CREATE INDEX ON on (x)")
-	onTab, _ := db.Table("on")
+	onTab, _ := db.table("on")
 	if onTab.Indexes[0].Name != "on_x_idx" {
 		t.Fatalf("auto-name over table on: %s", onTab.Indexes[0].Name)
 	}
 	siRun(t, db, "DROP TABLE on") // free the name `on` in the relation namespace
 	siRun(t, db, "CREATE TABLE q (x i32)")
 	siRun(t, db, "CREATE INDEX on ON q (x)")
-	qTab, _ := db.Table("q")
+	qTab, _ := db.table("q")
 	if qTab.Indexes[0].Name != "on" {
 		t.Fatalf("index named on: %s", qTab.Indexes[0].Name)
 	}
@@ -228,7 +228,7 @@ func TestIndexRoundTripsThroughTheImage(t *testing.T) {
 	if !bytes.Equal(img, img2) {
 		t.Fatal("reload is not byte-stable")
 	}
-	tab, _ := loaded.Table("t")
+	tab, _ := loaded.table("t")
 	if len(tab.Indexes) != 1 || tab.Indexes[0].Name != "t_v_idx" || !slices.Equal(tab.Indexes[0].columnOrdinals(), []int{1}) {
 		t.Fatalf("reloaded indexes = %+v", tab.Indexes)
 	}
@@ -252,7 +252,7 @@ func TestIndexDDLIsTransactional(t *testing.T) {
 		t.Fatalf("in-tx index scan cost = %d, want 17", got)
 	}
 	siRun(t, db, "ROLLBACK")
-	tab, _ := db.Table("t")
+	tab, _ := db.table("t")
 	if len(tab.Indexes) != 0 {
 		t.Fatalf("rolled-back index survived: %+v", tab.Indexes)
 	}
@@ -326,7 +326,7 @@ func TestCreateIndexHonorsTheCostCeiling(t *testing.T) {
 		t.Fatalf("ceiling abort: %s", got)
 	}
 	db.SetMaxCost(0)
-	tab, _ := db.Table("t")
+	tab, _ := db.table("t")
 	if len(tab.Indexes) != 0 {
 		t.Fatalf("aborted CREATE INDEX registered: %+v", tab.Indexes)
 	}

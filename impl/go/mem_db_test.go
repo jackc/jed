@@ -17,3 +17,13 @@ func memDBIn(env *Environment) *Database {
 	}
 	return db
 }
+
+// mustSession keeps tests with known-valid options concise. Configuration error
+// tests call Database.Session directly.
+func mustSession(db *Database, opts SessionOptions) *Session {
+	s, err := db.Session(opts)
+	if err != nil {
+		panic(err)
+	}
+	return s
+}

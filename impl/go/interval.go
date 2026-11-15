@@ -270,7 +270,7 @@ func tsShift(ts int64, iv Interval, subtract bool) (int64, error) {
 // `+ 24 hours`); the micros are then added on the instant. Each step performs a zone consult only
 // when its field is nonzero (tsShiftZoneConsults counts them for the cost meter). ±infinity is
 // unchanged; a wall clock or instant leaving the finite range traps 22008.
-func tsShiftZoned(ts int64, iv Interval, subtract bool, zr ZoneRef) (int64, error) {
+func tsShiftZoned(ts int64, iv Interval, subtract bool, zr zoneRef) (int64, error) {
 	if ts == negInfinity || ts == posInfinity {
 		return ts, nil
 	}

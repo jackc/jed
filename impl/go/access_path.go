@@ -87,7 +87,7 @@ type boundTerm struct {
 type pkEqCol struct {
 	name    string
 	colType scalarType
-	coll    *Collation
+	coll    *compiledCollation
 	srcs    []*rExpr
 	ranges  []boundTerm
 }
@@ -98,7 +98,7 @@ type pkBoundPlan struct {
 	eqCols      []pkEqCol
 	rangeName   string
 	rangeType   scalarType
-	rangeColl   *Collation
+	rangeColl   *compiledCollation
 	rangeTerms  []boundTerm
 	memberCount int
 }
@@ -263,7 +263,7 @@ type intervalSpec struct {
 // unused.
 type pkKeySetPlan struct {
 	pkType scalarType
-	coll   *Collation
+	coll   *compiledCollation
 	specs  []intervalSpec
 	clip   []boundTerm
 
@@ -280,7 +280,7 @@ type tupleMember struct {
 	name    string
 	column  int
 	colType scalarType
-	coll    *Collation
+	coll    *compiledCollation
 	specs   []intervalSpec
 	clip    []boundTerm
 	point   bool
@@ -455,7 +455,7 @@ type ginBoundPlan struct {
 // (encoding.md §2.12) to match the index's stored key form (collation.md §8).
 type indexEqCol struct {
 	colType scalarType
-	coll    *Collation
+	coll    *compiledCollation
 	srcs    []*rExpr
 	// order is the key element's sort order (indexes.md §11): the probe slot is its §2.16 present
 	// slot.
@@ -477,7 +477,7 @@ type indexBoundPlan struct {
 	rangeType scalarType // the range column's type (meaningful iff rangeTerms != nil)
 	// rangeColl is the range column's key collation: a collated text column encodes its endpoints
 	// as the column collation's UCA sort key, the stored key form (encoding.md §2.12).
-	rangeColl  *Collation
+	rangeColl  *compiledCollation
 	rangeTerms []boundTerm // range conjuncts on the column after the equality prefix (nil ⇒ none)
 	// rangeOrder is the range element's sort order (indexes.md §11): a DESC element swaps the byte
 	// endpoints.
@@ -517,7 +517,7 @@ func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx ind
 	// (A partial index's predicate needs no NULL-rejection here: every bound term below is a strict
 	// comparison on this relation's key, so its WHERE conjunct rejects a NULL-extended row.)
 	var rangeType scalarType
-	var rangeColl *Collation
+	var rangeColl *compiledCollation
 	var rangeTerms []boundTerm
 	var rangeOrder keyOrder
 	for i := range rindex.Keys {
@@ -525,7 +525,7 @@ func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx ind
 		// Each key element yields (its scalar key type, its key collation, the matcher against a
 		// WHERE conjunct operand). A non-scalar / skewed element stops the prefix.
 		var ty scalarType
-		var coll *Collation
+		var coll *compiledCollation
 		var matcher keyMatch
 		if key.Expr == nil {
 			ci := key.Col
@@ -942,7 +942,7 @@ func (db *engine) planMutationScan(scope *string, table *catTable, filter *rExpr
 // detectIntervalSet finds the first top-level AND conjunct that is a pure OR of intervals on one
 // key. A leaf is one comparison or an AND of comparisons (BETWEEN's resolved shape). Other direct
 // top-level comparisons on the same key become a global clip, implementing IN/OR ∩ range.
-func detectIntervalSet(filter *rExpr, keyIdx int, keyType scalarType, coll *Collation) (specs []intervalSpec, clip []boundTerm) {
+func detectIntervalSet(filter *rExpr, keyIdx int, keyType scalarType, coll *compiledCollation) (specs []intervalSpec, clip []boundTerm) {
 	if filter == nil {
 		return nil, nil
 	}
@@ -951,7 +951,7 @@ func detectIntervalSet(filter *rExpr, keyIdx int, keyType scalarType, coll *Coll
 
 // detectIntervalSetConjuncts is detectIntervalSet over an AND-chain's conjuncts; siblings admits a
 // sibling column as a source (an index-nested-loop inner, cost.md §3 "JOIN").
-func detectIntervalSetConjuncts(conjuncts []*rExpr, keyIdx int, keyType scalarType, coll *Collation, siblings columnRanges) (specs []intervalSpec, clip []boundTerm) {
+func detectIntervalSetConjuncts(conjuncts []*rExpr, keyIdx int, keyType scalarType, coll *compiledCollation, siblings columnRanges) (specs []intervalSpec, clip []boundTerm) {
 	colColl := ""
 	if coll != nil {
 		colColl = coll.Name
@@ -1271,7 +1271,7 @@ func pointValue(keyType scalarType, v Value) (Value, bool) {
 // a NULL element, and an element no key can equal (an out-of-range integer, a non-integral decimal
 // against an integer key, an unmapped collated text) contribute no point, exactly as the equivalent
 // IN-list's disjuncts would.
-func arrayPointKeys(keyType scalarType, src *rExpr, params []Value, outer []storedRow, coll *Collation, left storedRow) ([][]byte, bool) {
+func arrayPointKeys(keyType scalarType, src *rExpr, params []Value, outer []storedRow, coll *compiledCollation, left storedRow) ([][]byte, bool) {
 	var keys [][]byte
 	switch src.kind {
 	case reSubquery:
@@ -1313,7 +1313,7 @@ func arrayPointKeys(keyType scalarType, src *rExpr, params []Value, outer []stor
 
 // valuePointKeys encodes element values as key points, in order: a NULL element and one no key can
 // equal contribute none.
-func valuePointKeys(keyType scalarType, elems []Value, coll *Collation) [][]byte {
+func valuePointKeys(keyType scalarType, elems []Value, coll *compiledCollation) [][]byte {
 	var keys [][]byte
 	for _, elem := range elems {
 		point, ok := pointValue(keyType, elem)
@@ -1392,7 +1392,7 @@ func inventoryINLCandidates(on *rExpr, whereFilter *rExpr, rel scopeRel, sibling
 	if rel.isAttachment() {
 		return nil
 	}
-	collect := func(keyIdx int, ty scalarType, coll *Collation) []boundTerm {
+	collect := func(keyIdx int, ty scalarType, coll *compiledCollation) []boundTerm {
 		colColl := ""
 		if coll != nil {
 			colColl = coll.Name
@@ -1652,7 +1652,7 @@ func keySetUsesSibling(specs []intervalSpec, clip []boundTerm, tuple []tupleMemb
 //     read-safety rule §12; seeking a loaded-version probe in a file-version B-tree would mis-match —
 //     the tripwire suites/collation/skew.test stays green only because this refuses). An
 //     unresolvable collation likewise refuses rather than mis-encoding.
-func (db *engine) keyCollationCtx(col catColumn) (*Collation, bool) {
+func (db *engine) keyCollationCtx(col catColumn) (*compiledCollation, bool) {
 	if col.Collation == "" {
 		return nil, true
 	}
@@ -2199,7 +2199,7 @@ func indexStoreBoundEntries(istore, store *tableStore, suffix []keySlot, b keyBo
 	return out, pages, slabs, nil
 }
 
-func buildLogicalInterval(keyType scalarType, terms []boundTerm, params []Value, outer []storedRow, coll *Collation, left storedRow) (keyBound, bool) {
+func buildLogicalInterval(keyType scalarType, terms []boundTerm, params []Value, outer []storedRow, coll *compiledCollation, left storedRow) (keyBound, bool) {
 	b := unboundedBound()
 	for _, t := range terms {
 		key, isNull, ok := encodeBoundKey(keyType, t.src, params, outer, coll, left)
@@ -2240,7 +2240,7 @@ func intersectBounds(a, b keyBound) keyBound {
 	return out
 }
 
-func canonicalIntervalSet(keyType scalarType, specs []intervalSpec, clipTerms []boundTerm, params []Value, outer []storedRow, coll *Collation, left storedRow) []keyBound {
+func canonicalIntervalSet(keyType scalarType, specs []intervalSpec, clipTerms []boundTerm, params []Value, outer []storedRow, coll *compiledCollation, left storedRow) []keyBound {
 	clip := unboundedBound()
 	if len(clipTerms) > 0 {
 		var empty bool
@@ -3399,7 +3399,7 @@ func rexprEqShifted(a, b *rExpr, offset int) bool {
 
 // collationsEqual reports whether two derived collations are the same (both nil / C, or both a
 // loaded collation of the same name) — used to compare comparison nodes in rexprEqShifted.
-func collationsEqual(a, b *Collation) bool {
+func collationsEqual(a, b *compiledCollation) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
@@ -3656,7 +3656,7 @@ func (db *engine) buildCompletePKPoint(bp *pkBoundPlan, params []Value, outer []
 // type's range (no key can equal it), so the caller drops this bound. reParam/reOuterColumn resolve
 // to a runtime Value first (the param table / the enclosing outer row) and then encode through the
 // shared path.
-func encodeBoundKey(pkType scalarType, src *rExpr, params []Value, outer []storedRow, coll *Collation, left storedRow) (key []byte, isNull bool, ok bool) {
+func encodeBoundKey(pkType scalarType, src *rExpr, params []Value, outer []storedRow, coll *compiledCollation, left storedRow) (key []byte, isNull bool, ok bool) {
 	switch src.kind {
 	case reConstNull:
 		return nil, true, false
@@ -3710,7 +3710,7 @@ func encodeBoundKey(pkType scalarType, src *rExpr, params []Value, outer []store
 // to a full scan + residual filter — which reproduces the exact non-pushdown answer (empty for =,
 // since equality is byte-identity §7; the 0A000 for an ordering compare iff any row is scanned).
 // Identical across cores (mirrors Rust encode_text_bound / TS encodeTextBound).
-func encodeTextBound(s string, coll *Collation) (key []byte, isNull bool, ok bool) {
+func encodeTextBound(s string, coll *compiledCollation) (key []byte, isNull bool, ok bool) {
 	if coll == nil {
 		return encodeTerminated([]byte(s)), false, true
 	}
@@ -3725,7 +3725,7 @@ func encodeTextBound(s string, coll *Collation) (key []byte, isNull bool, ok boo
 // storage key. isNull ⇒ the value is NULL (a 3VL-empty range); ok=false (not null) ⇒ an integer
 // outside the PK width, so the caller drops this half-bound (a wider, still sound, scan). coll
 // selects a text value's key form (collated sort key vs raw bytes — encodeTextBound).
-func encodeValueKey(pkType scalarType, v Value, coll *Collation) (key []byte, isNull bool, ok bool) {
+func encodeValueKey(pkType scalarType, v Value, coll *compiledCollation) (key []byte, isNull bool, ok bool) {
 	if v.IsNull() {
 		return nil, true, false
 	}

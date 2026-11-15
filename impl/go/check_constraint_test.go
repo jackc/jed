@@ -26,7 +26,7 @@ func checkErr(t *testing.T, db dbHandle, sql string) (string, string) {
 
 func checkNames(t *testing.T, db dbHandle, table string) []string {
 	t.Helper()
-	tab, ok := db.Table(table)
+	tab, ok := db.table(table)
 	if !ok {
 		t.Fatalf("table %s not found", table)
 	}
@@ -66,7 +66,7 @@ func TestCheckAutoNamingMatchesPostgres(t *testing.T) {
 		t.Fatalf("t9 names = %v", got)
 	}
 	// The persisted expression text is the re-rendered token sequence.
-	tab, _ := db.Table("t")
+	tab, _ := db.table("t")
 	texts := make([]string, len(tab.Checks))
 	for i, c := range tab.Checks {
 		texts[i] = c.ExprText
@@ -214,7 +214,7 @@ func TestCheckTwoPhaseAndDefaults(t *testing.T) {
 	if code, _ := checkErr(t, db, "INSERT INTO t VALUES (1), (-1)"); code != "23514" {
 		t.Fatalf("multi-row = %s, want 23514", code)
 	}
-	if rows := db.RowsInKeyOrder("t"); len(rows) != 0 {
+	if rows := db.rowsInKeyOrder("t"); len(rows) != 0 {
 		t.Fatalf("two-phase INSERT stored %d rows, want 0", len(rows))
 	}
 	// INSERT ... SELECT flows through the same per-row checks.
@@ -226,7 +226,7 @@ func TestCheckTwoPhaseAndDefaults(t *testing.T) {
 	if code, _ := checkErr(t, db, "UPDATE t SET a = a - 1"); code != "23514" {
 		t.Fatalf("update = %s, want 23514", code)
 	}
-	rows := db.RowsInKeyOrder("t")
+	rows := db.rowsInKeyOrder("t")
 	if len(rows) != 2 || rows[0][0].Int != 1 || rows[1][0].Int != 2 {
 		t.Fatalf("two-phase UPDATE changed rows: %v", rows)
 	}
@@ -299,7 +299,7 @@ func TestCheckEvaluationIsMetered(t *testing.T) {
 		t.Fatalf("ceiling = %v, want 54P01", err)
 	}
 	db.SetMaxCost(0)
-	if rows := db.RowsInKeyOrder("c"); len(rows) != 3 {
+	if rows := db.rowsInKeyOrder("c"); len(rows) != 3 {
 		t.Fatalf("aborted insert stored rows: %d, want 3", len(rows))
 	}
 }
@@ -324,7 +324,7 @@ func TestCheckRoundTripsThroughOnDiskImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadEngine: %v", err)
 	}
-	tab, _ := loaded.Table("t")
+	tab, _ := loaded.table("t")
 	wantNames := []string{"price_range", "t_b_check", "t_note_check"}
 	wantTexts := []string{"price >= 0.50 and price <= 9999.99", "b > 0", "note = 'ok' or note = 'a''b'"}
 	for i, c := range tab.Checks {

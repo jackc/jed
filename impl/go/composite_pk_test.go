@@ -27,7 +27,7 @@ func compositeErrCode(t *testing.T, db dbHandle, sql string) string {
 func TestCompositeKeyOrdersByTuple(t *testing.T) {
 	t.Parallel()
 	db := dbWith(t, "CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))")
-	tab, _ := db.Table("t")
+	tab, _ := db.table("t")
 	if got := tab.PKIndices(); !slices.Equal(got, []int{0, 1}) {
 		t.Fatalf("PKIndices = %v, want [0 1]", got)
 	}
@@ -57,7 +57,7 @@ func TestCompositeKeyOrdersByTuple(t *testing.T) {
 		}
 	}
 	want := [][2]int64{{-1, 9}, {1, 1}, {1, 2}, {2, 0}, {2, 1}}
-	rows := db.RowsInKeyOrder("t")
+	rows := db.rowsInKeyOrder("t")
 	if len(rows) != len(want) {
 		t.Fatalf("got %d rows, want %d", len(rows), len(want))
 	}
@@ -87,7 +87,7 @@ func TestCompositeUniquenessIsTheWholeTuple(t *testing.T) {
 		t.Fatalf("in-batch duplicate: got %s, want 23505", code)
 	}
 	// The failed batch stored nothing (all-or-nothing).
-	if n := len(db.RowsInKeyOrder("t")); n != 2 {
+	if n := len(db.rowsInKeyOrder("t")); n != 2 {
 		t.Fatalf("got %d rows, want 2", n)
 	}
 }
@@ -97,7 +97,7 @@ func TestCompositeUniquenessIsTheWholeTuple(t *testing.T) {
 // (0A000): out-of-declaration-order list, non-keyable member type.
 func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if _, err := queryOutcome(db, "CREATE TYPE addr AS (street text, zip i32)", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -127,8 +127,8 @@ func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
 	if _, err := queryOutcome(db, "CREATE TABLE cpk (a i32, s addr, PRIMARY KEY (a, s))", nil); err != nil {
 		t.Fatalf("composite PK member: %v", err)
 	}
-	if cpk, _ := db.Table("cpk"); !slices.Equal(cpk.PKIndices(), []int{0, 1}) {
-		t.Fatalf("composite-PK-member PKIndices = %v, want [0 1]", func() []int { c, _ := db.Table("cpk"); return c.PKIndices() }())
+	if cpk, _ := db.table("cpk"); !slices.Equal(cpk.PKIndices(), []int{0, 1}) {
+		t.Fatalf("composite-PK-member PKIndices = %v, want [0 1]", func() []int { c, _ := db.table("cpk"); return c.PKIndices() }())
 	}
 	if _, err := queryOutcome(db, "CREATE TYPE poly AS (name text, pts addr[])", nil); err != nil {
 		t.Fatal(err)
@@ -142,14 +142,14 @@ func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
 	if _, err := queryOutcome(db, "CREATE TABLE rev (a i32, b i32, PRIMARY KEY (b, a))", nil); err != nil {
 		t.Fatalf("out-of-declaration-order PK: %v", err)
 	}
-	if revTab, _ := db.Table("rev"); !slices.Equal(revTab.PKIndices(), []int{1, 0}) {
-		t.Fatalf("PKIndices = %v, want [1 0]", func() []int { rt, _ := db.Table("rev"); return rt.PKIndices() }())
+	if revTab, _ := db.table("rev"); !slices.Equal(revTab.PKIndices(), []int{1, 0}) {
+		t.Fatalf("PKIndices = %v, want [1 0]", func() []int { rt, _ := db.table("rev"); return rt.PKIndices() }())
 	}
 	if _, err := queryOutcome(db, "INSERT INTO rev VALUES (1, 20), (2, 10), (3, 15)", nil); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 	var bs []int64
-	for _, row := range db.RowsInKeyOrder("rev") {
+	for _, row := range db.rowsInKeyOrder("rev") {
 		bs = append(bs, row[1].Int)
 	}
 	if !slices.Equal(bs, []int64{10, 15, 20}) {
@@ -160,7 +160,7 @@ func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
 	if _, err := queryOutcome(db, "CREATE TABLE ok (a i32, PRIMARY KEY (a))", nil); err != nil {
 		t.Fatalf("single-column table constraint: %v", err)
 	}
-	tab, _ := db.Table("ok")
+	tab, _ := db.table("ok")
 	if tab.PrimaryKeyIndex() != 0 || !tab.Columns[0].NotNull {
 		t.Fatal("single-member constraint must behave as the column-level form")
 	}
@@ -188,7 +188,7 @@ func TestCompositeMembersNotNullAndRekey(t *testing.T) {
 			t.Fatalf("%q: %v", stmt, err)
 		}
 	}
-	rows := db.RowsInKeyOrder("t")
+	rows := db.rowsInKeyOrder("t")
 	if len(rows) != 1 || rows[0][0].Int != 9 || rows[0][1].Int != 9 || rows[0][2].Int != 11 {
 		t.Fatalf("after re-key: got %v, want one row (9,9,11)", rows)
 	}
@@ -208,7 +208,7 @@ func TestCompositeMixedUuidIntComponentsOrder(t *testing.T) {
 			t.Fatalf("%q: %v", stmt, err)
 		}
 	}
-	rows := db.RowsInKeyOrder("t")
+	rows := db.rowsInKeyOrder("t")
 	want := []int64{-2, 7, -5}
 	for i, r := range rows {
 		if r[1].Int != want[i] {
@@ -237,7 +237,7 @@ func TestCompositeRoundTripsThroughTheOnDiskImage(t *testing.T) {
 		t.Fatalf("LoadEngine: %v", err)
 	}
 
-	tab, _ := loaded.Table("t")
+	tab, _ := loaded.table("t")
 	if got := tab.PKIndices(); !slices.Equal(got, []int{0, 1}) {
 		t.Fatalf("PKIndices after reload = %v, want [0 1]", got)
 	}
@@ -246,7 +246,7 @@ func TestCompositeRoundTripsThroughTheOnDiskImage(t *testing.T) {
 	}
 
 	want := [][2]int64{{1, 1}, {1, 2}, {2, 1}}
-	rows := loaded.RowsInKeyOrder("t")
+	rows := loaded.rowsInKeyOrder("t")
 	if len(rows) != len(want) {
 		t.Fatalf("got %d rows, want %d", len(rows), len(want))
 	}
@@ -262,7 +262,7 @@ func TestCompositeRoundTripsThroughTheOnDiskImage(t *testing.T) {
 	if _, err := queryOutcome(loaded, "INSERT INTO t VALUES (2, 2, 50)", nil); err != nil {
 		t.Fatalf("fresh insert after reload: %v", err)
 	}
-	if n := len(loaded.RowsInKeyOrder("t")); n != 4 {
+	if n := len(loaded.rowsInKeyOrder("t")); n != 4 {
 		t.Fatalf("got %d rows, want 4", n)
 	}
 }

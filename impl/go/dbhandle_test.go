@@ -12,9 +12,9 @@ package jed
 // Execute/Outcome public API — a statement is observably a *Rows with no output columns).
 type dbHandle interface {
 	queryValues(sql string, params []Value) (*Rows, error)
-	Table(name string) (*catTable, bool)
-	CompositeType(name string) *compositeType
-	RowsInKeyOrder(name string) []storedRow
+	table(name string) (*catTable, bool)
+	compositeType(name string) *compositeType
+	rowsInKeyOrder(name string) []storedRow
 	ToImage(pageSize uint32, txid uint64) ([]byte, error)
 	Txid() uint64
 	PageSize() uint32

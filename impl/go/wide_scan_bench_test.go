@@ -91,7 +91,7 @@ func BenchmarkTrackAWideScan(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		sess := db.Session(SessionOptions{})
+		sess := mustSession(db, SessionOptions{})
 
 		for _, q := range queries {
 			b.Run(fmt.Sprintf("w%02d/%s", w, q.name), func(b *testing.B) {

@@ -9,6 +9,7 @@ package jed
 // stay in the shared concurrency corpus (suites/concurrency/).
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -76,13 +77,13 @@ func TestFileBackedExplicitTransactionPersistsThenRollsBack(t *testing.T) {
 		defer db.Close()
 		// Explicit transactions live on a Session (the persistent default-session bridge was removed
 		// from Database): mint one over the file-backed core and drive BEGIN/COMMIT/ROLLBACK on it.
-		s := db.Session(SessionOptions{})
+		s := mustSession(db, SessionOptions{})
 		defer s.Close()
 		if _, err := queryOutcome(s, "CREATE TABLE t (id i64 PRIMARY KEY)", nil); err != nil {
 			t.Fatalf("create table: %v", err)
 		}
 		// A committed explicit block is durable.
-		if err := s.Begin(true); err != nil {
+		if err := s.Begin(context.Background(), true); err != nil {
 			t.Fatalf("begin: %v", err)
 		}
 		if _, err := queryOutcome(s, "INSERT INTO t VALUES (1)", nil); err != nil {
@@ -98,7 +99,7 @@ func TestFileBackedExplicitTransactionPersistsThenRollsBack(t *testing.T) {
 			t.Fatalf("after commit count = %d, want 2", got)
 		}
 		// A rolled-back block leaves nothing.
-		if err := s.Begin(true); err != nil {
+		if err := s.Begin(context.Background(), true); err != nil {
 			t.Fatalf("begin2: %v", err)
 		}
 		if _, err := queryOutcome(s, "INSERT INTO t VALUES (3)", nil); err != nil {
@@ -131,7 +132,7 @@ func TestFileBackedExecuteScriptIsAllOrNothing(t *testing.T) {
 			t.Fatalf("create: %v", err)
 		}
 		defer db.Close()
-		summary, err := db.ExecuteScript(
+		summary, err := db.ExecuteScript(context.Background(),
 			"CREATE TABLE t (id i64 PRIMARY KEY); INSERT INTO t VALUES (1); INSERT INTO t VALUES (2);",
 		)
 		if err != nil {

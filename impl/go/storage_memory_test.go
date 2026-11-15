@@ -49,7 +49,7 @@ func TestStorageLimitOptionsAndGauge(t *testing.T) {
 	if fresh <= 0 || fresh%storagePage != 0 {
 		t.Fatalf("a fresh image holds its meta and catalog pages: %d", fresh)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	storageExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v text)")
 	// Unlimited by default: a large insert commits.
 	storageExec(t, s, storageBatch(0, 200))
@@ -77,7 +77,7 @@ func TestStorageLimitOptionsAndGauge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s = db.Session(SessionOptions{})
+	s = mustSession(db, SessionOptions{})
 	storageExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v text)")
 	if code := storageExecCode(s, storageBatch(0, 200)); code != "54P06" {
 		t.Fatalf("create-option limit: want 54P06, got %q", code)
@@ -111,8 +111,8 @@ func TestStorageLimitOptionsAndGauge(t *testing.T) {
 // every commit in these tests also recounts its live pages by reachability and panics on a mismatch.
 func storageFileDB(t *testing.T, maxStorageBytes int64) (*Database, string) {
 	t.Helper()
-	SetVerifyLivePages(true)
-	t.Cleanup(func() { SetVerifyLivePages(false) })
+	setVerifyLivePages(true)
+	t.Cleanup(func() { setVerifyLivePages(false) })
 	path := filepath.Join(t.TempDir(), "storage.jed")
 	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true, MaxStorageBytes: maxStorageBytes})
 	if err != nil {
@@ -127,7 +127,7 @@ func TestFileStorageLimitMeasuresLivePages(t *testing.T) {
 	if got := mustStorageBytes(t, db, "main"); got != storagePage {
 		t.Fatalf("fresh file storage %d, want %d", got, storagePage)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	storageExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v text)")
 	storageExec(t, s, storageBatch(0, 200))
 	full := mustStorageBytes(t, db, "main")
@@ -180,7 +180,7 @@ func TestFileStorageLimitMeasuresLivePages(t *testing.T) {
 	if got := mustStorageBytes(t, db, "main"); got != measured {
 		t.Fatalf("reopened storage %d, want %d", got, measured)
 	}
-	s = db.Session(SessionOptions{})
+	s = mustSession(db, SessionOptions{})
 	defer s.Close()
 	if code := storageExecCode(s, storageBatch(100, 100)); code != "54P06" {
 		t.Fatalf("open-option limit: want 54P06, got %q", code)
@@ -196,7 +196,7 @@ func TestFileStorageLimitCountsEveryLiveStructure(t *testing.T) {
 	// reachability recount.
 	db, _ := storageFileDB(t, 0)
 	defer db.Close()
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	storageExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, k i32, v text, a i32[], r i32range)")
 	storageExec(t, s, "CREATE INDEX t_k ON t (k)")
@@ -256,7 +256,7 @@ func TestFileAttachmentStorageLimit(t *testing.T) {
 	if err := host.Attach("f", AttachFile(path).WithMaxStorageBytes(4*storagePage), false); err != nil {
 		t.Fatal(err)
 	}
-	s := host.Session(SessionOptions{})
+	s := mustSession(host, SessionOptions{})
 	storageExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v text)")
 	main := mustStorageBytes(t, host, "main")
 	aux := mustStorageBytes(t, host, "f")
@@ -296,7 +296,7 @@ func TestStorageLimitMultiRootRejectionPacksNoAttachment(t *testing.T) {
 	if err := db.Attach("aux", AttachMemory(), false); err != nil {
 		t.Fatal(err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	storageExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v text)")
 	storageExec(t, s, "CREATE TABLE aux.a (id i32 PRIMARY KEY, v text)")
 	main := mustStorageBytes(t, db, "main")
@@ -328,7 +328,7 @@ func TestStorageLimitMultiRootRejectionPacksNoAttachment(t *testing.T) {
 
 func TestStorageLimitPinnedReaderBlocksForcedCompaction(t *testing.T) {
 	db := memDB()
-	w := db.Session(SessionOptions{})
+	w := mustSession(db, SessionOptions{})
 	storageExec(t, w, "CREATE TABLE t (id i32 PRIMARY KEY, v text)")
 	storageExec(t, w, storageBatch(0, 100))
 	if err := db.SetMaxStorageBytes("main", mustStorageBytes(t, db, "main")); err != nil {

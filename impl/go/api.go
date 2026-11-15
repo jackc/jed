@@ -201,8 +201,11 @@ func (db *engine) queryStmt(stmt statement, params []Value, sc *stmtCache, ic *i
 // way, so callers are unchanged. It is the one result type of the total queryValues seam: a non-query
 // statement is a Rows with no output columns, carrying its command tag (rowsAffected).
 type Rows struct {
-	columnNames []string
-	columnTypes []string
+	// executionComplete marks materialized results, whose execution and any commit
+	// finished before Query returned. Later cancellation cannot undo that success.
+	executionComplete bool
+	columnNames       []string
+	columnTypes       []string
 	// rowsAffected / hasAffected carry the command tag (spec/design/api.md §4) for a statement run
 	// through the now-total query seam (rowsFromOutcome): how many rows a DML statement touched, and
 	// whether it carries a count at all (a SELECT / DDL / transaction control has none). This is how
@@ -224,6 +227,9 @@ type Rows struct {
 	// done is captured at Query time for the entry check. The cursor's snapshot and
 	// meters independently retain the same channel throughout execution inside Next.
 	done <-chan struct{}
+	// cancelErr is retained only for cancelable operations, to preserve the Go
+	// sentinel when a lazy cursor observes cancellation. Close releases it.
+	cancelErr func() error
 	// err holds a terminal error reached during iteration (cancellation or a mid-stream
 	// fault). Surfaced by Err() after the loop — the bufio.Scanner / database/sql idiom.
 	err error
@@ -243,11 +249,12 @@ type Rows struct {
 // bug this removes — a write reached here after dispatch already committed it; spec/design/api.md §11).
 func rowsFromOutcome(out outcome, acct queryAccount) *Rows {
 	return &Rows{
-		columnNames:  out.ColumnNames,
-		columnTypes:  out.ColumnTypes,
-		cursor:       bufferedCursor(out.Rows, out.Cost, acct),
-		rowsAffected: out.RowsAffected,
-		hasAffected:  out.HasRowsAffected,
+		executionComplete: true,
+		columnNames:       out.ColumnNames,
+		columnTypes:       out.ColumnTypes,
+		cursor:            bufferedCursor(out.Rows, out.Cost, acct),
+		rowsAffected:      out.RowsAffected,
+		hasAffected:       out.HasRowsAffected,
 	}
 }
 
@@ -262,6 +269,7 @@ func (r *Rows) attachErrHook(hook func(error)) { r.onErr = hook }
 // setErr records a terminal iteration error and fires the onErr hook exactly once (subsequent Next
 // short-circuits on r.err, so the hook cannot double-fire).
 func (r *Rows) setErr(err error) {
+	err = cancellationCause(err, r.cancelErr)
 	r.err = err
 	if r.onErr != nil {
 		r.onErr(err)

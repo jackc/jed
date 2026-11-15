@@ -3791,7 +3791,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 			}
 		}
 		// Text / text[] arguments derive one comparison collation (42P21/42P22 on conflict — §52).
-		var coll *Collation
+		var coll *compiledCollation
 		if unified.collatable() {
 			d := deriv{}
 			for _, a := range e.GreatestLeast {
@@ -3825,7 +3825,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 // built-in byte / code-point order → nil (the unchanged fast path); any other name resolves through
 // the reference-only read path (the database's resolved set, then the binary's vendored set), else
 // 42704.
-func resolveCollationName(catalog *engine, name string) (*Collation, error) {
+func resolveCollationName(catalog *engine, name string) (*compiledCollation, error) {
 	if name == "C" {
 		return nil, nil
 	}
@@ -4247,7 +4247,7 @@ func subqueryOutputDeriv(body deriv) deriv {
 // membershipCollation is the comparison collation of `lhs IN / op ANY|ALL (SELECT …)`
 // (spec/design/collation.md §1): the left operand's derivation combined with the body column's, which
 // is implicit outside the subquery. A conflict is 42P22. nil for a non-collatable or row-valued comparison.
-func membershipCollation(s *scope, lhs exprNode, lt, elem resolvedType, rowValued bool, plan *queryPlan) (*Collation, error) {
+func membershipCollation(s *scope, lhs exprNode, lt, elem resolvedType, rowValued bool, plan *queryPlan) (*compiledCollation, error) {
 	if rowValued || !lt.collatable() || !elem.collatable() {
 		return nil, nil
 	}
@@ -4266,7 +4266,7 @@ func membershipCollation(s *scope, lhs exprNode, lt, elem resolvedType, rowValue
 // or grouping target must not be indeterminate"): a key expression combining two different implicit
 // collations is 42P21 here, at plan time (PostgreSQL's parse-time check), while a key that only reads
 // a conflicted column stays 42P22 at resolveDeriv.
-func sortTargetCollation(catalog *engine, d deriv) (*Collation, error) {
+func sortTargetCollation(catalog *engine, d deriv) (*compiledCollation, error) {
 	if err := rejectIndeterminateTarget(d); err != nil {
 		return nil, err
 	}
@@ -4378,7 +4378,7 @@ func catColumnDeriv(col *catColumn) deriv {
 
 // columnCollation is the concrete collation a sort over a bare column reference uses absent an
 // explicit COLLATE: the column's derivation resolved (nil = byte order).
-func columnCollation(s *scope, r resolved) (*Collation, error) {
+func columnCollation(s *scope, r resolved) (*compiledCollation, error) {
 	return resolveDeriv(s.catalog, catColumnDeriv(s.columnOf(r)))
 }
 
@@ -4424,7 +4424,7 @@ func combineDeriv(a, b deriv) (deriv, error) {
 // resolveDeriv resolves a derivation to the concrete collation a comparison / ORDER BY uses. none
 // and C → nil (byte order, the fast path); a loaded name → its table (42704 if it vanished);
 // derivIndeterminate / derivConflicted → 42P22 (the collation is required but ambiguous).
-func resolveDeriv(catalog *engine, d deriv) (*Collation, error) {
+func resolveDeriv(catalog *engine, d deriv) (*compiledCollation, error) {
 	switch d.kind {
 	case derivIndeterminate, derivConflicted:
 		return nil, newError(IndeterminateCollation,
@@ -4439,7 +4439,7 @@ func resolveDeriv(catalog *engine, d deriv) (*Collation, error) {
 // collatedCmp compares two non-NULL text values under a loaded collation (spec/design/collation.md
 // §6/§7): order by the UCA sort keys, whose memcmp order IS the collation order. The caller charges
 // the collate cost and handles NULLs.
-func collatedCmp(coll *Collation, a, b string) (int, error) {
+func collatedCmp(coll *compiledCollation, a, b string) (int, error) {
 	ka, err := sortKey(coll, a)
 	if err != nil {
 		return 0, err
@@ -4456,7 +4456,7 @@ func collatedCmp(coll *Collation, a, b string) (int, error) {
 // collate per code point of both (collation.md §11) when m is non-nil — the comparison operators and
 // GREATEST/LEAST; the unmetered sort/min/max paths pass nil. A NULL element or the array shape
 // decides without a charge.
-func collatedArrayCmp(coll *Collation, a, b *ArrayVal, m *costMeter) (int, error) {
+func collatedArrayCmp(coll *compiledCollation, a, b *ArrayVal, m *costMeter) (int, error) {
 	n := len(a.Elements)
 	if len(b.Elements) < n {
 		n = len(b.Elements)
@@ -4492,7 +4492,7 @@ func collatedArrayCmp(coll *Collation, a, b *ArrayVal, m *costMeter) (int, error
 // collationSortKey is a collated sort's decoration for one value (spec/design/collation.md §8): a
 // text value's UCA sort key, a text[] value's collated array key (encoding.md §2.14 — memcmp-ordered
 // exactly like collatedArrayCmp), nil for NULL. An unmapped code point is 0A000.
-func collationSortKey(coll *Collation, v Value) ([]byte, error) {
+func collationSortKey(coll *compiledCollation, v Value) ([]byte, error) {
 	switch v.Kind {
 	case ValText:
 		return sortKey(coll, v.str())
@@ -4506,7 +4506,7 @@ func collationSortKey(coll *Collation, v Value) ([]byte, error) {
 // collatedOrValueCmp compares two non-NULL values under coll when it is set and they are text or
 // text[] (collatedValueCmp, unmetered), else by the value order — the min/max fold and the
 // hypothetical-set key comparison.
-func collatedOrValueCmp(coll *Collation, a, b Value) (int, error) {
+func collatedOrValueCmp(coll *compiledCollation, a, b Value) (int, error) {
 	if coll != nil && ((a.Kind == ValText && b.Kind == ValText) || (a.Kind == ValArray && b.Kind == ValArray)) {
 		return collatedValueCmp(coll, a, b, nil)
 	}
@@ -4516,7 +4516,7 @@ func collatedOrValueCmp(coll *Collation, a, b Value) (int, error) {
 // collatedValueCmp compares two non-NULL values of one collatable type under coll: text by its sort
 // key, text[] element-wise (collatedArrayCmp, metered when m is non-nil). The caller handles NULL and
 // charges a text pair's collate itself.
-func collatedValueCmp(coll *Collation, a, b Value, m *costMeter) (int, error) {
+func collatedValueCmp(coll *compiledCollation, a, b Value, m *costMeter) (int, error) {
 	if a.Kind == ValArray {
 		return collatedArrayCmp(coll, a.arrayVal(), b.arrayVal(), m)
 	}
@@ -4725,7 +4725,7 @@ func resolveBinary(s *scope, b *binaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		// IMPLICIT collations are indeterminate (42P22 when consumed here). Derived for ALL comparison
 		// ops incl =/<> (PG raises the conflict regardless), even though =/<> ignore the collation at
 		// eval (byte equality, §7).
-		var coll *Collation
+		var coll *compiledCollation
 		if lt.collatable() && rt.collatable() {
 			ld, err := deriveCollation(s, b.Lhs)
 			if err != nil {

@@ -9,6 +9,7 @@ package jed
 // shared::multi_root_failure_tests and the TS multi_root_failure test.
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"reflect"
@@ -20,7 +21,7 @@ const multiRootRows = 200
 // attachmentRows reads every (id, v) of a.t in key order through a fresh session.
 func attachmentRows(t *testing.T, db *Database) [][2]int64 {
 	t.Helper()
-	rows := queryRows(t, db.Session(SessionOptions{}), "SELECT id, v FROM a.t ORDER BY id")
+	rows := queryRows(t, mustSession(db, SessionOptions{}), "SELECT id, v FROM a.t ORDER BY id")
 	out := make([][2]int64, len(rows))
 	for i, row := range rows {
 		out[i] = [2]int64{row[0].Int, row[1].Int}
@@ -86,12 +87,12 @@ func TestFailedMainPersistLeavesInMemoryAttachmentIntact(t *testing.T) {
 	if err := db.Attach("a", AttachMemory(), false); err != nil {
 		t.Fatal(err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	mustExec(t, s, "CREATE TABLE t (id i64 PRIMARY KEY)")
 	seedAttachment(t, s)
 
 	// Main's durable commit fails at its barrier after the attachment was dirtied in the same tx.
-	if err := s.Begin(true); err != nil {
+	if err := s.Begin(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	dirtyAttachment(t, s)
@@ -105,7 +106,7 @@ func TestFailedMainPersistLeavesInMemoryAttachmentIntact(t *testing.T) {
 	// attachment pages before main's persist fails. They must never land on pages the published root
 	// uses. (An attachment-only commit would not persist main at all, transactions.md §2.1.)
 	for k := 0; k < 4; k++ {
-		if err := s.Begin(true); err != nil {
+		if err := s.Begin(context.Background(), true); err != nil {
 			t.Fatal(err)
 		}
 		mustExec(t, s, fmt.Sprintf("UPDATE a.t SET v = %d WHERE id %% 7 = %d", 10+k, k))
@@ -126,13 +127,13 @@ func TestFailedLaterAttachmentLeavesEarlierAttachmentIntact(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	mustExec(t, s, "CREATE TABLE t (id i64 PRIMARY KEY)")
 	mustExec(t, s, "CREATE TABLE b.t (id i64 PRIMARY KEY)")
 	seedAttachment(t, s)
 
 	// a stages before b (in-memory attachments commit in name order); b's pack fails.
-	if err := s.Begin(true); err != nil {
+	if err := s.Begin(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	dirtyAttachment(t, s)
@@ -154,7 +155,7 @@ func TestFailedLaterAttachmentLeavesEarlierAttachmentIntact(t *testing.T) {
 		}
 		return 0
 	}))
-	if n := queryRows(t, db.Session(SessionOptions{}), "SELECT count(*) FROM t")[0][0].Int; n != 6 {
+	if n := queryRows(t, mustSession(db, SessionOptions{}), "SELECT count(*) FROM t")[0][0].Int; n != 6 {
 		t.Fatalf("main rows = %d want 6", n)
 	}
 }

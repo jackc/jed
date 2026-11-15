@@ -39,7 +39,7 @@ func castOne(t *testing.T, db dbHandle, sql string) Value {
 // bool → i16 and bool → i64 are forbidden (PG has only bool → int4): jed 42804, PG 42846.
 func TestBoolToNonI32Forbidden(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	for _, sql := range []string{
 		"SELECT CAST(TRUE AS i16)",
 		"SELECT CAST(TRUE AS i64)",
@@ -75,7 +75,7 @@ func TestNonI32ToBoolForbidden(t *testing.T) {
 // traps 22003 (PG reports 42846 — it types the literal as int8 first). A documented divergence.
 func TestLiteralBeyondI32ToBoolOverflows(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	for _, sql := range []string{
 		"SELECT CAST(5000000000 AS boolean)",
 		"SELECT 5000000000::boolean",
@@ -90,7 +90,7 @@ func TestLiteralBeyondI32ToBoolOverflows(t *testing.T) {
 // the exhaustive behavior is in the corpus). true→1, false→0, 0→false, nonzero→true, NULL→NULL.
 func TestBoolI32RoundTripSmoke(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if v := castOne(t, db, "SELECT CAST(TRUE AS i32)"); v.Kind != ValInt || v.Int != 1 {
 		t.Fatalf("CAST(TRUE AS i32) = %v, want 1", v)
 	}

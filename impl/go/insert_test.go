@@ -7,7 +7,7 @@ import "testing"
 
 func dbWith(t *testing.T, stmts ...string) *Session {
 	t.Helper()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	for _, s := range stmts {
 		if _, err := queryOutcome(db, s, nil); err != nil {
 			t.Fatalf("setup %q: %v", s, err)
@@ -43,7 +43,7 @@ func TestNegativeKeysSortBeforePositive(t *testing.T) {
 	for _, s := range []string{"INSERT INTO t VALUES (1)", "INSERT INTO t VALUES (-1)", "INSERT INTO t VALUES (0)"} {
 		mustCreate(t, db, s)
 	}
-	if got := ids(db.RowsInKeyOrder("t")); !eqInts(got, -1, 0, 1) {
+	if got := ids(db.rowsInKeyOrder("t")); !eqInts(got, -1, 0, 1) {
 		t.Errorf("key order got %v want [-1 0 1]", got)
 	}
 }
@@ -53,7 +53,7 @@ func TestBoundaryValuesRoundTrip(t *testing.T) {
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, s i16, b i64)")
 	mustCreate(t, db, "INSERT INTO t VALUES (1, 32767, 9223372036854775807)")
 	mustCreate(t, db, "INSERT INTO t VALUES (2, -32768, -9223372036854775808)")
-	rows := db.RowsInKeyOrder("t")
+	rows := db.rowsInKeyOrder("t")
 	if rows[0][1].Int != 32767 || rows[0][2].Int != 9223372036854775807 {
 		t.Errorf("row 0 wrong: %+v", rows[0])
 	}
@@ -64,7 +64,7 @@ func TestBoundaryValuesRoundTrip(t *testing.T) {
 
 func TestInsertIntoMissingTableTraps(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	wantErr(t, db, "INSERT INTO nope VALUES (1)", "42P01")
 }
 
@@ -75,7 +75,7 @@ func TestNoPKMultiRowInsertKeepsInsertionOrder(t *testing.T) {
 	db := dbWith(t, "CREATE TABLE log (a i32)")
 	// No PK ⇒ monotonic synthetic rowids, allocated left-to-right; key order = insertion order.
 	mustCreate(t, db, "INSERT INTO log VALUES (30), (10), (20)")
-	if got := ids(db.RowsInKeyOrder("log")); !eqInts(got, 30, 10, 20) {
+	if got := ids(db.rowsInKeyOrder("log")); !eqInts(got, 30, 10, 20) {
 		t.Errorf("got %v want [30 10 20]", got)
 	}
 }
@@ -87,7 +87,7 @@ func TestNoPKMultiRowInsertIsAllOrNothing(t *testing.T) {
 	// The batch fails validation (second row overflows), so its first row (2) is not stored.
 	wantErr(t, db, "INSERT INTO log VALUES (2), (99999)", "22003")
 	mustCreate(t, db, "INSERT INTO log VALUES (3), (4)")
-	if got := ids(db.RowsInKeyOrder("log")); !eqInts(got, 1, 3, 4) {
+	if got := ids(db.rowsInKeyOrder("log")); !eqInts(got, 1, 3, 4) {
 		t.Errorf("got %v want [1 3 4]", got)
 	}
 }
@@ -108,7 +108,7 @@ func TestInsertSelectParamInSourceWhere(t *testing.T) {
 	if _, err := queryOutcome(db, "INSERT INTO dst SELECT id, a FROM src WHERE id >= $1", []Value{IntValue(2)}); err != nil {
 		t.Fatalf("INSERT ... SELECT with param: %v", err)
 	}
-	if got := ids(db.RowsInKeyOrder("dst")); !eqInts(got, 2, 3) {
+	if got := ids(db.rowsInKeyOrder("dst")); !eqInts(got, 2, 3) {
 		t.Errorf("got %v want [2 3]", got)
 	}
 }
@@ -141,7 +141,7 @@ func TestValuesExpressionParamsTypedByContext(t *testing.T) {
 	if _, err := queryOutcome(db, "INSERT INTO t VALUES ($1 + 1, upper($2))", []Value{IntValue(1), TextValue("ab")}); err != nil {
 		t.Fatalf("INSERT with expression params: %v", err)
 	}
-	rows := db.RowsInKeyOrder("t")
+	rows := db.rowsInKeyOrder("t")
 	if len(rows) != 1 || rows[0][0].Int != 2 || rows[0][1].Kind != ValText || rows[0][1].str() != "AB" {
 		t.Fatalf("got %v, want [[2 AB]]", rows)
 	}

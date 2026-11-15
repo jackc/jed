@@ -40,13 +40,13 @@ func main() {
 	}
 	fmt.Printf("balance = %d\n", balance)
 
-	// Query + the Collect iterator (Go 1.23+) maps each row to a struct by column name and ranges
+	// Query + the MapRows iterator (Go 1.23+) maps each row to a struct by column name and ranges
 	// them; the cursor closes on loop exit, and a stream error surfaces as the loop's err.
 	rows, err := db.Query(ctx, "SELECT id, name FROM account ORDER BY id")
 	if err != nil {
 		log.Fatal(err)
 	}
-	for acct, err := range jed.Collect(rows, jed.RowToStructByName[Account]) {
+	for acct, err := range jed.MapRows(rows, jed.RowToStructByName[Account]) {
 		if err != nil {
 			log.Fatal(err)
 		}

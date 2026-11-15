@@ -309,7 +309,7 @@ func integrityTestDB(t *testing.T) (*Database, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	for _, sql := range []string{
 		"CREATE TABLE t (id i32 PRIMARY KEY, v i32, note text)",
 		"CREATE INDEX t_v ON t (v)",
@@ -377,7 +377,7 @@ func TestIntegrityHostSurface(t *testing.T) {
 	if err := db.Attach("scratch", AttachMemory(), false); err != nil {
 		t.Fatal(err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	if _, err := s.Exec(ctx, "CREATE TABLE scratch.u (id i64 PRIMARY KEY, v text)"); err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +397,7 @@ func TestIntegrityInMemory(t *testing.T) {
 	if err != nil || !report.OK() {
 		t.Fatalf("empty: %v %+v", err, report.Findings)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	for _, sql := range []string{
 		"CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
 		"CREATE INDEX t_v ON t (v)",
@@ -509,7 +509,7 @@ func TestIntegrityLiveDamage(t *testing.T) {
 		// One more commit, which rewrites only the last leaf and the root, so the leaves damaged
 		// below are not in the generation's manifest. Two damaged leaves: two page_corrupt
 		// findings, then a table_unreadable skip of the index.
-		if _, err := db.Session(SessionOptions{}).Exec(ctx, "INSERT INTO t VALUES (100000, 1, 'last')"); err != nil {
+		if _, err := mustSession(db, SessionOptions{}).Exec(ctx, "INSERT INTO t VALUES (100000, 1, 'last')"); err != nil {
 			t.Fatal(err)
 		}
 		damagePage(t, path, 512, leaves[0], 511)
@@ -630,7 +630,7 @@ func TestIntegrityEveryIndexKindClean(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	for _, sql := range []string{
 		"CREATE TABLE t (id i32 PRIMARY KEY, v i32, tags i32[], doc jsonb, room i32, during i32range)",
 		"CREATE INDEX t_expr ON t ((v * 2 + 1) DESC, lower('X' || v::text))",
@@ -664,7 +664,7 @@ func TestIntegrityEveryIndexKindClean(t *testing.T) {
 func TestIntegrityUniqueEntrySplit(t *testing.T) {
 	db := memDBIn(goldenEnv())
 	defer db.Close()
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	for _, sql := range []string{
 		"CREATE TYPE pair AS (a text, b i32)",
 		`CREATE TABLE u (id i32 PRIMARY KEY, r i32range, a text[], c pair, d decimal, x text COLLATE "unicode", n numrange, ts timestamp)`,

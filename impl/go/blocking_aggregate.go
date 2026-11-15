@@ -73,7 +73,7 @@ func scratchAccPlan(spec aggSpec) bool {
 
 // blockingAccInto is blockingAccFromRow for a scratchAccPlan spec, into caller-owned a: the same
 // accumulator newAccFromSpec builds and blockingAccFromRow fills, without the allocation.
-func blockingAccInto(a *acc, spec aggSpec, r storedRow, zone ZoneRef) {
+func blockingAccInto(a *acc, spec aggSpec, r storedRow, zone zoneRef) {
 	*a = acc{plan: spec.plan, jsonTypes: spec.jsonTypes, jsonZone: zone}
 	switch spec.plan {
 	case planCountStar, planCount:
@@ -95,7 +95,7 @@ func blockingAccInto(a *acc, spec aggSpec, r storedRow, zone ZoneRef) {
 	}
 }
 
-func blockingAccFromRow(spec aggSpec, r storedRow, zone ZoneRef) *acc {
+func blockingAccFromRow(spec aggSpec, r storedRow, zone zoneRef) *acc {
 	a := newAccFromSpec(spec, zone)
 	if a.ordered {
 		return a

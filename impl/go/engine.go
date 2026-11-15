@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // The engine handle: session/transaction state, snapshot routing, host config, and reference-data
@@ -166,7 +167,7 @@ type estimatorTouchedRelation struct {
 
 // SessionOptions are the relocatable session settings (spec/design/session.md §3 — the bucket-A
 // envelope subset landed in S1): the cost ceiling, the input-size limit, and the work-memory
-// budget. Passed to (*Engine).NewSession. A zero MaxSQLLength or WorkMem takes its default at
+// budget. Passed to Database.Session. A zero MaxSQLLength or WorkMem takes its default at
 // construction (use the setter for the 0 ⇒ unlimited form); a zero MaxCost IS unlimited (the
 // genuine default). The entropy/clock sources come from the handle's Environment.
 type SessionOptions struct {
@@ -183,8 +184,10 @@ type SessionOptions struct {
 	// rejected at admission). Sibling to MaxCost, which bounds one statement.
 	LifetimeMaxCost int64
 	MaxSQLLength    int
-	LockTimeoutMs   uint64
-	WorkMem         int
+	// LockTimeout bounds writer-lock waits. Zero is unlimited. Negative values
+	// are invalid; positive fractions of a millisecond round up.
+	LockTimeout time.Duration
+	WorkMem     int
 	// DefaultPrivileges is the table-privilege set granted to every table — the GRANT … ON ALL TABLES
 	// default (spec/design/session.md §5.3). nil ⇒ all four (the default), so a fresh session is
 	// unrestricted; PrivSetEmpty.With(PrivSelect) is a read-only session. A pointer so the zero
@@ -213,7 +216,7 @@ type SessionOptions struct {
 	// TimeZone is the session time zone (spec/design/session.md §6.2, timezones.md §9.4): the zone a
 	// timestamptz is decomposed in by date_trunc / EXTRACT / the cross-family casts. "" ⇒ UTC. Accepts
 	// UTC, a fixed ±HH:MM offset, or a named IANA zone a loaded JTZ bundle provides; an invalid value
-	// here falls back to UTC at mint (the validated setter is Session.SetTimeZone — 22023).
+	// returns an error (22023) from Database.Session.
 	TimeZone string
 }
 
@@ -370,9 +373,9 @@ type sessionState struct {
 	vars map[string]string
 	// timeZone is the resolved session time zone (spec/design/session.md §6.2, timezones.md §9.4): the
 	// zone a timestamptz is decomposed in by date_trunc / EXTRACT / the cross-family casts. Resolved
-	// once (from SessionOptions.TimeZone at mint, or SetTimeZone) to a cheap ZoneRef (UTC = Fixed 0);
+	// once (from SessionOptions.TimeZone at mint, or SetTimeZone) to a cheap zoneRef (UTC = Fixed 0);
 	// the evaluator reads it via the active session. SESSION state (no storage effect).
-	timeZone ZoneRef
+	timeZone zoneRef
 	// readPin is the read pin for a data-modifying WITH statement (spec/design/writable-cte.md §2):
 	// the single pre-statement snapshot of every database domain (main, session-local temp, each host
 	// attachment) that every sub-statement reads, so the data-modifying CTEs and the primary cannot
@@ -398,13 +401,28 @@ func requireCustomVarName(name string) (string, error) {
 // newSession builds a fresh default session over env: no open transaction, default settings, empty
 // state.
 func newSession(env *Environment) sessionState {
-	return newSessionWithOptions(SessionOptions{}, env)
+	s, err := newSessionWithOptions(SessionOptions{}, env)
+	if err != nil {
+		panic(err) // The default settings are always valid.
+	}
+	return s
 }
 
 // newSessionWithOptions builds a session configured from opts (spec/design/session.md §2.1). A zero
 // MaxSQLLength or WorkMem takes its default; the rest of the per-connection state starts empty. env
 // is the handle's Environment (never nil).
-func newSessionWithOptions(opts SessionOptions, env *Environment) sessionState {
+func newSessionWithOptions(opts SessionOptions, env *Environment) (sessionState, error) {
+	if err := validateDuration("LockTimeout", opts.LockTimeout); err != nil {
+		return sessionState{}, err
+	}
+	tzName := opts.TimeZone
+	if tzName == "" {
+		tzName = "UTC"
+	}
+	zr, ok := env.resolveZone(tzName)
+	if !ok {
+		return sessionState{}, newError(InvalidParameterValue, fmt.Sprintf("time zone %q not recognized", tzName))
+	}
 	if opts.MaxSQLLength == 0 {
 		opts.MaxSQLLength = DefaultMaxSQLLength
 	}
@@ -419,7 +437,7 @@ func newSessionWithOptions(opts SessionOptions, env *Environment) sessionState {
 		lifetimeTotal:       new(int64),
 		lane:                new(laneTooling),
 		maxSQLLength:        opts.MaxSQLLength,
-		lockTimeoutMs:       opts.LockTimeoutMs,
+		lockTimeoutMs:       durationMillis(opts.LockTimeout),
 		workMem:             opts.WorkMem,
 		privileges:          newPrivileges(),
 		allowDDL:            true,
@@ -448,18 +466,8 @@ func newSessionWithOptions(opts SessionOptions, env *Environment) sessionState {
 	if opts.MaxTempStorageBytes != nil {
 		s.maxTempStorageBytes = *opts.MaxTempStorageBytes
 	}
-	// Resolve the configured zone once; an invalid value falls back to UTC at mint (the validated
-	// path is SetTimeZone, which surfaces 22023). timezones.md §9.4.
-	tzName := opts.TimeZone
-	if tzName == "" {
-		tzName = "UTC"
-	}
-	if zr, ok := env.resolveZone(tzName); ok {
-		s.timeZone = zr
-	} else {
-		s.timeZone = ZoneRef{Fixed: true, Off: 0}
-	}
-	return s
+	s.timeZone = zr
+	return s, nil
 }
 
 // SetTimeZone sets the session time zone (spec/design/session.md §6.2, timezones.md §9.4): the zone a
@@ -637,9 +645,9 @@ func (db *engine) ensureCollationsWritable(columns []catColumn) error {
 	return nil
 }
 
-func (db *engine) columnCollations(columns []catColumn) []*Collation {
+func (db *engine) columnCollations(columns []catColumn) []*compiledCollation {
 	snap := db.readSnap()
-	out := make([]*Collation, len(columns))
+	out := make([]*compiledCollation, len(columns))
 	for i := range columns {
 		if columns[i].Collation != "" {
 			out[i] = snap.resolveCollation(columns[i].Collation)
@@ -660,9 +668,9 @@ func (db *engine) relationSnap(scope *string, table string) *snapshot {
 	return db.readSnap()
 }
 
-func (db *engine) columnCollationsScoped(scope *string, table string, columns []catColumn) []*Collation {
+func (db *engine) columnCollationsScoped(scope *string, table string, columns []catColumn) []*compiledCollation {
 	snap := db.relationSnap(scope, table)
-	out := make([]*Collation, len(columns))
+	out := make([]*compiledCollation, len(columns))
 	for i := range columns {
 		if columns[i].Collation != "" {
 			out[i] = snap.resolveCollation(columns[i].Collation)
@@ -689,7 +697,7 @@ func (db *engine) columnStatisticsScoped(scope *string, table string, column int
 // collation's UCA sort key when coll is non-nil (a non-C collated column), else the C
 // text-terminated-escape body (§2.4). The sort key can fail (0A000) on a code point the collation
 // does not map — propagated, so a collated INSERT of an unmapped string aborts the write.
-func collatedTextKey(coll *Collation, s string) ([]byte, error) {
+func collatedTextKey(coll *compiledCollation, s string) ([]byte, error) {
 	if coll != nil {
 		return sortKey(coll, s)
 	}
@@ -1541,13 +1549,13 @@ func (s *sessionState) ResetVars() { s.vars = map[string]string{} }
 func (db *engine) ReadOnly() bool { return db.readOnly }
 
 // Table looks up a table definition by name (exact name) in the visible snapshot.
-func (db *engine) Table(name string) (*catTable, bool) {
+func (db *engine) table(name string) (*catTable, bool) {
 	return db.readSnap().table(name)
 }
 
 // CompositeType looks up a composite type definition by name (exact name) in the visible
 // snapshot (spec/design/composite.md); nil if absent.
-func (db *engine) CompositeType(name string) *compositeType {
+func (db *engine) compositeType(name string) *compositeType {
 	return db.readSnap().compositeType(name)
 }
 
@@ -1557,33 +1565,28 @@ func (db *engine) putTable(t *catTable) {
 	db.working().putTable(t, db.pageSize)
 }
 
-// CollationVerdict is the slice-2d version-skew verdict for one referenced collation
-// (spec/design/collation.md §12, compatibility.md §7). VerdictFull ⇒ a loaded bundle provides the
-// name at the file's pinned (unicode, cldr), so the collation's objects are read-write. VerdictSkewed
-// ⇒ a loaded bundle provides it at a DIFFERENT version, so its objects are read-only (reads recompute
-// against the loaded table — the heap-scan fallback; a write raises XX002). A pure comparison of the
-// file pin (§5) vs the loaded set — every core computes the identical verdict (the §10 contract).
-type collationVerdict int
+// CollationVerdict reports whether a referenced collation matches the loaded data.
+type CollationVerdict int
 
 const (
-	verdictFull collationVerdict = iota
-	verdictSkewed
+	// CollationFull means the loaded collation matches the database's pinned version.
+	CollationFull CollationVerdict = iota
+	// CollationSkewed means versions differ. Reads remain available, but writes
+	// to affected objects fail until the host upgrades the collations.
+	CollationSkewed
 )
 
-// CollationInfo is introspection metadata for one loaded collation (db.Collations,
-// spec/design/collation.md §1). ContentHash is the CRC-32 of the compiled table (the reference-mode
-// stamp, §3/§4); Description is provenance, excluded from the hash. Verdict is the slice-2d
-// version-skew verdict (§12) — VerdictFull for the Environment's loaded set (it IS the reference);
-// for a database's referenced collations it is VerdictSkewed when the file's pin differs from the
-// loaded bundle's.
-type collationInfo struct {
+// CollationInfo describes an available collation. ContentHash is the CRC-32 of
+// its compiled table; Description records provenance and is excluded from that
+// hash. Verdict reports whether the loaded data matches the database's version.
+type CollationInfo struct {
 	Name           string
 	UnicodeVersion string
 	CLDRVersion    string
 	ContentHash    uint32
 	Description    string
 	IsDefault      bool
-	Verdict        collationVerdict
+	Verdict        CollationVerdict
 }
 
 // ImportCollation / ExportCollation are GONE (the reference-only pivot, spec/design/collation.md
@@ -1594,7 +1597,7 @@ type collationInfo struct {
 // LoadedTimeZones introspects the handle Environment's loaded zone set (timezones.md §3.3) — every
 // named zone (and alias) a loaded bundle provides, ascending by name. UTC and fixed offsets are built
 // in and not listed.
-func (db *engine) LoadedTimeZones() []timeZoneInfo {
+func (db *engine) LoadedTimeZones() []TimeZoneInfo {
 	return db.session.env.LoadedTimeZones()
 }
 
@@ -1602,7 +1605,7 @@ func (db *engine) LoadedTimeZones() []timeZoneInfo {
 // every collation a loaded bundle provides, ascending by name. A property of the environment, not of
 // this database; for the collations this database references, use Engine.Collations. IsDefault is
 // always false here (that is a per-database property). C is built in and not listed.
-func (db *engine) LoadedCollations() []collationInfo {
+func (db *engine) LoadedCollations() []CollationInfo {
 	return db.session.env.LoadedCollations()
 }
 
@@ -1703,21 +1706,21 @@ func (db *engine) DefaultCollation() string {
 // spec/design/collation.md §4.2) — every collation its schema uses (a column's COLLATE, or the
 // per-database default), in ascending name order. This is the per-file view; for the Environment's
 // LOADED set, use Engine.LoadedCollations. C is built in and not listed.
-func (db *engine) Collations() []collationInfo {
+func (db *engine) Collations() []CollationInfo {
 	// referencedCollations resolves each referenced name (from a loaded bundle).
 	colls, err := db.committed.referencedCollations()
 	if err != nil {
 		return nil
 	}
-	out := make([]collationInfo, len(colls))
+	out := make([]CollationInfo, len(colls))
 	for i, c := range colls {
-		verdict := verdictFull
+		verdict := CollationFull
 		// The slice-2d verdict: Skewed when the file's pin differs from the loaded bundle's version
 		// (the object is read-only), else Full (collation.md §12).
 		if _, _, _, _, skewed := db.committed.collationSkew(c.Name); skewed {
-			verdict = verdictSkewed
+			verdict = CollationSkewed
 		}
-		out[i] = collationInfo{
+		out[i] = CollationInfo{
 			Name:           c.Name,
 			UnicodeVersion: c.UnicodeVersion,
 			CLDRVersion:    c.CldrVersion,

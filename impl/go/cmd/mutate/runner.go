@@ -144,7 +144,7 @@ func (w *Workspace) runUnit(regex string, timeout time.Duration) (out string, ki
 }
 
 func (w *Workspace) build() (string, error) {
-	cmd := exec.Command(goBinary(), "build", "-o", w.bin, "./cmd/conformance")
+	cmd := exec.Command(goBinary(), "build", "-tags", "jedtooling", "-o", w.bin, "./cmd/conformance")
 	cmd.Dir = w.goDir
 	var buf bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &buf, &buf

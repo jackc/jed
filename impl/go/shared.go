@@ -16,7 +16,7 @@ package jed
 //     and mints Sessions (ReadSession / WriteSession / Session).
 //   - sharedCore holds the published committed root — the file Snapshot — in an atomic.Pointer[roots]
 //     (so a reader pins it with a lock-free Load and a writer publishes with a single Store), the
-//     single-writer gate (a sync.Mutex held for the write transaction's life, so a second WriteSession blocks —
+//     single-writer gate (a cancelable mutex held for the write transaction's life, so a second WriteSession blocks —
 //     bbolt semantics), and the live-reader registry (pinned versions → the reclamation watermark, §8).
 //   - Session is the unified per-caller handle = the §3 envelope + a private *Engine + an access mode:
 //       - A READ ONLY session (ReadSession) pins the committed snapshot at mint (a lock-free Load) and
@@ -52,6 +52,7 @@ package jed
 // drives the single-handle path and mints additional concurrent sessions.
 
 import (
+	"context"
 	"errors"
 	"math"
 	"path/filepath"
@@ -59,6 +60,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // afterPersistHook is a test-only seam (nil in production, a single nil-check per commit): it fires in
@@ -104,7 +106,7 @@ type sharedCore struct {
 	roots atomic.Pointer[roots]
 	// writeMu is the single-writer gate: a goroutine holds it for its whole write transaction, so a
 	// second Write blocks until the holder commits or rolls back (CLAUDE.md §3 — at most one writer).
-	writeMu sync.Mutex
+	writeMu writerGate
 	// liveMu guards live, the live-reader registry (transactions.md §8): pinned version → refcount.
 	// Its minimum key is the reclamation watermark (several readers may pin the same version).
 	liveMu sync.Mutex
@@ -152,11 +154,21 @@ func (c *sharedCore) acquireWriter(timeoutMs uint64) error {
 	return c.acquireWriterScoped(timeoutMs, true)
 }
 
+func (c *sharedCore) acquireWriterCancel(timeoutMs uint64, done <-chan struct{}) error {
+	return c.acquireWriterScopedCancel(timeoutMs, true, done)
+}
+
 // acquireWriterScoped takes the in-process writer lock, then (when gates is set) the gates of main and
 // of the service attachments, in real-path order (page-service.md §5.5). Attach and Detach take only the
 // in-process lock: they change only this handle's registry, so they never wait for another process.
 func (c *sharedCore) acquireWriterScoped(timeoutMs uint64, gates bool) error {
-	c.writeMu.Lock()
+	return c.acquireWriterScopedCancel(timeoutMs, gates, nil)
+}
+
+func (c *sharedCore) acquireWriterScopedCancel(timeoutMs uint64, gates bool, done <-chan struct{}) error {
+	if err := c.writeMu.lock(done); err != nil {
+		return err
+	}
 	if c.handoff == nil {
 		if err := c.checkCoordinatorPIDs(); err != nil {
 			c.writeMu.Unlock()
@@ -167,10 +179,14 @@ func (c *sharedCore) acquireWriterScoped(timeoutMs uint64, gates bool) error {
 		// Under the page service a writer takes the owner's gate — its own, or through begin_write — and
 		// an owner then adopts any client commit published since its last transaction (page-service.md
 		// §5.5, §7).
-		if err := c.acquireGates(timeoutMs); err != nil {
+		if err := c.acquireGates(timeoutMs, done); err != nil {
 			c.writeMu.Unlock()
 			return err
 		}
+	}
+	if err := doneErr(done); err != nil {
+		c.releaseWriter()
+		return err
 	}
 	return nil
 }
@@ -364,7 +380,7 @@ type storage struct {
 	servicePending []manifestEntry
 	serviceReuse   map[uint32]bool
 	// deadline is the time-based flush of a relaxed batch (validated-cow.md §4.1): the handle's
-	// FlushIntervalMs, its clock, and the batch deadline its commits and idle flusher share.
+	// FlushInterval, its clock, and the batch deadline its commits and idle flusher share.
 	deadline deadlineFlush
 }
 
@@ -1441,13 +1457,13 @@ func (st *storage) maybeCompact(snap *snapshot, catRoot pageRef, written []uint3
 }
 
 // tempSpills counts the session-local temp domains spilled to a scratch file in this process
-// (temp-tables.md §6) — the conformance harness's forced temp-spill mode reports it (TempSpills), so a
+// (temp-tables.md §6) — the conformance harness's forced temp-spill mode reports it (tempSpills), so a
 // run that never actually spilled cannot pass silently.
 var tempSpills atomic.Uint64
 
-// TempSpills reports how many session-local temp domains have spilled to a scratch file in this
+// tempSpills reports how many session-local temp domains have spilled to a scratch file in this
 // process (spec/design/temp-tables.md §6) — conformance tooling, never a production signal.
-func TempSpills() uint64 { return tempSpills.Load() }
+func tempSpillsForTooling() uint64 { return tempSpills.Load() }
 
 // stageTemp stages a TEMP snapshot's dirty pages into the domain's store (temp-tables.md §6): the SAME
 // incremental copy-on-write serialize as a file/in-memory commit, but with NO meta slot and NO sync — a
@@ -1741,19 +1757,21 @@ type Database struct {
 // (Slice 1b); a FILE source opens an existing single-file jed database on disk (Slice 2). Build one
 // with AttachMemory() or AttachFile(path).
 type AttachSource struct {
-	file              bool   // false = in-memory (Slice 1b); true = file-backed (Slice 2)
-	path              string // the file path, when file is true
-	locking           Locking
-	fileLockTimeoutMs *uint64
-	maxStorageBytes   int64 // the attachment's committed-storage limit (memory.md §8.1); <= 0 is unlimited
+	file            bool   // false = in-memory (Slice 1b); true = file-backed (Slice 2)
+	path            string // the file path, when file is true
+	locking         Locking
+	fileLockTimeout *time.Duration
+	maxStorageBytes int64 // the attachment's committed-storage limit (memory.md §8.1); <= 0 is unlimited
 	// credential unlocks an encrypted file attachment (spec/design/encryption.md §5).
 	credential *Credential
 }
 
 // AttachFileOptions controls one file attachment's independent coordination domain.
 type AttachFileOptions struct {
-	Locking           Locking
-	FileLockTimeoutMs *uint64
+	Locking Locking
+	// FileLockTimeout is the open wait: nil uses five seconds; zero tries once.
+	// Attach rejects a negative value before opening the file.
+	FileLockTimeout *time.Duration
 }
 
 // AttachMemory returns a source for a fresh, empty in-memory attachment (attached-databases.md §6).
@@ -1768,7 +1786,7 @@ func AttachFile(path string) AttachSource { return AttachFileWithOptions(path, A
 
 // AttachFileWithOptions returns a coordinated file attachment source with explicit lock settings.
 func AttachFileWithOptions(path string, opts AttachFileOptions) AttachSource {
-	return AttachSource{file: true, path: path, locking: opts.Locking, fileLockTimeoutMs: opts.FileLockTimeoutMs}
+	return AttachSource{file: true, path: path, locking: opts.Locking, fileLockTimeout: opts.FileLockTimeout}
 }
 
 // WithMaxStorageBytes returns the source with the attachment's committed-storage limit set to bytes
@@ -1816,21 +1834,21 @@ type CreateOptions struct {
 	// Synchronous is the durability mode (SynchronousOn, the default, or SynchronousOff — transactions.md
 	// §9). Ignored for an in-memory database. A handle setting, not stored in the file.
 	Synchronous Synchronous
-	// FlushIntervalMs is the OpenOptions field of the same name (validated-cow.md §4.1): nil is
-	// DefaultFlushIntervalMs, &0 turns the time-based flush off.
-	FlushIntervalMs *uint64
-	Locking         Locking
+	// FlushInterval is the OpenOptions field of the same name (validated-cow.md §4.1): nil is
+	// DefaultFlushInterval, &0 turns the time-based flush off.
+	FlushInterval *time.Duration
+	Locking       Locking
 	// nil is the 5s default; &0 requests one immediate acquisition attempt.
-	FileLockTimeoutMs *uint64
-	// IdleInTransactionTimeoutMs, IdleSessionTimeoutMs, YieldGraceMs, ShutdownGraceMs, MaxConnections,
+	FileLockTimeout *time.Duration
+	// IdleInTransactionTimeout, IdleSessionTimeout, YieldGrace, ShutdownGrace, MaxConnections,
 	// and Ownership are the OpenOptions fields of the same names, for a creator under the page service:
 	// it is the owner, and keeps them for later roles.
-	IdleInTransactionTimeoutMs *uint64
-	IdleSessionTimeoutMs       *uint64
-	YieldGraceMs               *uint64
-	ShutdownGraceMs            *uint64
-	MaxConnections             int
-	Ownership                  Ownership
+	IdleInTransactionTimeout *time.Duration
+	IdleSessionTimeout       *time.Duration
+	YieldGrace               *time.Duration
+	ShutdownGrace            *time.Duration
+	MaxConnections           int
+	Ownership                Ownership
 	// Environment is the handle's outside inputs (spec/design/environment.md): the loaded Unicode and
 	// time-zone data, the host functions, and the random + clock sources, shared by every session,
 	// attachment, and temp domain of the handle. Not stored in the file — a host reopens with its own.
@@ -1857,10 +1875,12 @@ type CreateOptions struct {
 
 // CreateDatabase makes a fresh database — in-memory (opts.Path == "") or file-backed (opts.Path set)
 // — and returns the host handle with its default session (spec/design/api.md §2.1). A file that
-// already exists is 58P02; the page size is locked into a file. The in-memory path cannot fail in
-// substance (its returned error is always nil) but shares the uniform (*Database, error) signature —
-// a caller wanting an infallible in-memory handle wraps this (the test suites' memDB helper does).
+// already exists is 58P02; the page size is locked into a file. Invalid duration
+// options return 22023 before creating storage, including for an in-memory database.
 func CreateDatabase(opts CreateOptions) (*Database, error) {
+	if err := validateDurationOptions(opts.FlushInterval, opts.FileLockTimeout, opts.IdleInTransactionTimeout, opts.IdleSessionTimeout, opts.YieldGrace, opts.ShutdownGrace); err != nil {
+		return nil, err
+	}
 	pageSize := opts.PageSize
 	if pageSize == 0 {
 		pageSize = DefaultPageSize
@@ -1877,7 +1897,7 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 		db.core.storage.budget.limit = opts.MaxStorageBytes
 		return db, nil
 	}
-	coordinator, path, err := prepareCreateCoordinator(opts.Path, opts.Locking, opts.FileLockTimeoutMs)
+	coordinator, path, err := prepareCreateCoordinator(opts.Path, opts.Locking, durationMillisPtr(opts.FileLockTimeout))
 	if err != nil {
 		return nil, err
 	}
@@ -1893,20 +1913,20 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 	}
 	if coordinator != nil && coordinator.lease() == leaseServiceOwner {
 		openOpts := OpenOptions{
-			SkipFsync:                  opts.SkipFsync,
-			Synchronous:                opts.Synchronous,
-			FlushIntervalMs:            opts.FlushIntervalMs,
-			Locking:                    LockingAuto,
-			FileLockTimeoutMs:          opts.FileLockTimeoutMs,
-			IdleInTransactionTimeoutMs: opts.IdleInTransactionTimeoutMs,
-			IdleSessionTimeoutMs:       opts.IdleSessionTimeoutMs,
-			YieldGraceMs:               opts.YieldGraceMs,
-			ShutdownGraceMs:            opts.ShutdownGraceMs,
-			MaxConnections:             opts.MaxConnections,
-			Ownership:                  opts.Ownership,
-			Environment:                env,
-			MaxStorageBytes:            opts.MaxStorageBytes,
-			ScratchEncryption:          opts.ScratchEncryption,
+			SkipFsync:                opts.SkipFsync,
+			Synchronous:              opts.Synchronous,
+			FlushInterval:            opts.FlushInterval,
+			Locking:                  LockingAuto,
+			FileLockTimeout:          opts.FileLockTimeout,
+			IdleInTransactionTimeout: opts.IdleInTransactionTimeout,
+			IdleSessionTimeout:       opts.IdleSessionTimeout,
+			YieldGrace:               opts.YieldGrace,
+			ShutdownGrace:            opts.ShutdownGrace,
+			MaxConnections:           opts.MaxConnections,
+			Ownership:                opts.Ownership,
+			Environment:              env,
+			MaxStorageBytes:          opts.MaxStorageBytes,
+			ScratchEncryption:        opts.ScratchEncryption,
 			// A creator that later yields reconnects as a page client with the credential.
 			Credential: opts.Credential,
 		}
@@ -1914,7 +1934,7 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 	}
 	c := sharedCoreFromEngineCoordinated(e, coordinator)
 	c.storage.budget.limit = opts.MaxStorageBytes
-	c.storage.setSynchronous(opts.Synchronous == SynchronousOff, flushIntervalMs(opts.FlushIntervalMs), c.env)
+	c.storage.setSynchronous(opts.Synchronous == SynchronousOff, flushIntervalMs(opts.FlushInterval), c.env)
 	return databaseOver(c), nil
 }
 
@@ -1950,6 +1970,9 @@ func OpenDatabase(path string) (*Database, error) {
 // OpenDatabaseWithOptions opens an existing file-backed database at path with explicit open settings
 // (buffer-pool budget, read-only mode, work-mem) and returns the host handle with its default session.
 func OpenDatabaseWithOptions(path string, opts OpenOptions) (*Database, error) {
+	if err := opts.validateDurations(); err != nil {
+		return nil, err
+	}
 	mode, err := resolvedLocking(opts.Locking)
 	if err != nil {
 		return nil, err
@@ -1957,7 +1980,7 @@ func OpenDatabaseWithOptions(path string, opts OpenOptions) (*Database, error) {
 	if mode == LockingAuto {
 		return openServiceDatabase(path, opts)
 	}
-	coordinator, real, err := prepareOpenCoordinator(path, mode, opts.FileLockTimeoutMs)
+	coordinator, real, err := prepareOpenCoordinator(path, mode, durationMillisPtr(opts.FileLockTimeout))
 	if err != nil {
 		return nil, err
 	}
@@ -1971,7 +1994,7 @@ func OpenDatabaseWithOptions(path string, opts OpenOptions) (*Database, error) {
 	}
 	c := sharedCoreFromEngineCoordinated(e, coordinator)
 	c.storage.budget.limit = opts.MaxStorageBytes
-	c.storage.setSynchronous(opts.Synchronous == SynchronousOff, flushIntervalMs(opts.FlushIntervalMs), c.env)
+	c.storage.setSynchronous(opts.Synchronous == SynchronousOff, flushIntervalMs(opts.FlushInterval), c.env)
 	return databaseOver(c), nil
 }
 
@@ -1986,11 +2009,11 @@ func (s *Database) Environment() *Environment { return s.core.env }
 
 // LoadedCollations introspects the handle Environment's loaded collation set (collation.md §4.2),
 // ascending by name. C is built in and not listed.
-func (s *Database) LoadedCollations() []collationInfo { return s.core.env.LoadedCollations() }
+func (s *Database) LoadedCollations() []CollationInfo { return s.core.env.LoadedCollations() }
 
 // LoadedTimeZones introspects the handle Environment's loaded zone set (timezones.md §3.3),
 // ascending by name. UTC and fixed offsets are built in and not listed.
-func (s *Database) LoadedTimeZones() []timeZoneInfo { return s.core.env.LoadedTimeZones() }
+func (s *Database) LoadedTimeZones() []TimeZoneInfo { return s.core.env.LoadedTimeZones() }
 
 // Version is the committed version currently published (the monotonic commit counter,
 // transactions.md §8). Advances by 1 on every WriteHandle.Commit.
@@ -2050,6 +2073,11 @@ func (db *Database) StorageBytes(name string) (int64, error) {
 // or one already attached (42710). Opening a file surfaces the same host/file codes as opening `main`
 // (58P01/58P02/XX001/…, hosts.md §4). Publishing the new attachment root is atomic under the writer gate.
 func (db *Database) Attach(name string, source AttachSource, readOnly bool) error {
+	if source.fileLockTimeout != nil {
+		if err := validateDuration("FileLockTimeout", *source.fileLockTimeout); err != nil {
+			return err
+		}
+	}
 	lname := name
 	if lname == "" {
 		return newError(DuplicateObject, "attachment name must not be empty")
@@ -2090,7 +2118,7 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 	} else if source.file {
 		var real string
 		var err error
-		coordinator, real, err = prepareOpenCoordinator(source.path, locking, source.fileLockTimeoutMs)
+		coordinator, real, err = prepareOpenCoordinator(source.path, locking, durationMillisPtr(source.fileLockTimeout))
 		if err != nil {
 			return err
 		}
@@ -2534,23 +2562,6 @@ func (s *Database) committedEngine() *engine {
 	}
 }
 
-// Table is the definition of persistent table name (exact name) in the latest committed
-// snapshot. The *catTable is the doc-hidden introspection type, not the embedding API — hosts
-// introspect through SQL (the jed_ catalog relations, introspection.md); white-box tests reach the
-// detail through it.
-func (s *Database) Table(name string) (*catTable, bool) { return s.committedEngine().Table(name) }
-
-// CompositeType is the definition of composite type name in the latest committed snapshot, or nil.
-func (s *Database) CompositeType(name string) *compositeType {
-	return s.committedEngine().CompositeType(name)
-}
-
-// RowsInKeyOrder is a white-box test helper (CLAUDE.md §10): all rows of persistent table name in
-// primary-key order from the latest committed snapshot. Not the embedding API.
-func (s *Database) RowsInKeyOrder(name string) []storedRow {
-	return s.committedEngine().RowsInKeyOrder(name)
-}
-
 // ToImage serializes the whole committed state to a from-scratch on-disk image (the inverse of
 // LoadEngine; spec/fileformat/format.md), used by the byte-level golden round-trip tests and by
 // hosts snapshotting an in-memory database to bytes.
@@ -2571,7 +2582,7 @@ func (s *Database) PageCount() uint32 { return s.core.pageCount() }
 func (s *Database) Path() string { return s.core.path() }
 
 // setSpillDirForTest overrides the host scratch directory for per-core spill tests and the conformance
-// harness's forced temp-spill mode (SetSpillDirForTooling). Production file hosts install os.TempDir at
+// harness's forced temp-spill mode (setSpillDirForTooling). Production file hosts install os.TempDir at
 // open/create; keeping this a tooling hook keeps the configurable spill-target follow-on out of the
 // embedding API. Sessions minted afterwards inherit it.
 func (s *Database) setSpillDirForTest(dir string) {
@@ -2581,10 +2592,10 @@ func (s *Database) setSpillDirForTest(dir string) {
 	st.spill = sealScratch(osSpillHost{dir: dir}, encrypt, s.core.env)
 }
 
-// SetSpillDirForTooling gives db (and the sessions minted from it afterwards) a spill directory — the
+// setSpillDirForTooling gives db (and the sessions minted from it afterwards) a spill directory — the
 // conformance harness's forced temp-spill mode runs in-memory databases, which otherwise have none
 // (spec/design/temp-tables.md §6, spill.md §2). Conformance tooling, never a production setting.
-func SetSpillDirForTooling(db *Database, dir string) { db.setSpillDirForTest(dir) }
+func setSpillDirForTooling(db *Database, dir string) { db.setSpillDirForTest(dir) }
 
 // ReadOnly reports whether this database was opened read-only. In-memory databases are writable.
 func (s *Database) ReadOnly() bool { return s.core.readOnlyMode() }
@@ -2640,13 +2651,23 @@ func (s *Database) WriteSession() *Session {
 // latest committed for that one statement (no gate); an autocommit write takes the gate per statement,
 // publishes, and releases it; BEGIN/COMMIT/ROLLBACK open and end an explicit block. (The old
 // Engine.NewSession swap → an independent owns-its-Engine session.)
-func (s *Database) Session(opts SessionOptions) *Session {
+// An invalid TimeZone or negative LockTimeout returns 22023 and no session.
+func (s *Database) Session(opts SessionOptions) (*Session, error) {
+	state, err := newSessionWithOptions(opts, s.core.env)
+	if err != nil {
+		return nil, err
+	}
+	return s.sessionWithState(state), nil
+}
+
+// sessionWithState attaches already validated state to the shared database.
+func (s *Database) sessionWithState(state sessionState) *Session {
 	// A read-only file-backed core mints read-only sessions (a write is 25006); it pins the committed
 	// version in the watermark like a read session (atomic load+register, §8). A writable core mints the
 	// autocommit lazy-gate one — no persistent pin (each autocommit read pins per statement).
 	if s.core.readOnlyMode() {
 		rt, v, gen, atts := s.core.pinLatestAll()
-		engine := &engine{committed: rt.committed, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: newSessionWithOptions(opts, s.core.env)}
+		engine := &engine{committed: rt.committed, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: state}
 		engine.core = s.core
 		engine.attachedCommitted = rt.attached
 		engine.readOnly = true // the executor enforces read-only too (rejects BEGIN READ WRITE, poisons a read-only block)
@@ -2655,7 +2676,7 @@ func (s *Database) Session(opts SessionOptions) *Session {
 	}
 	rt := s.core.roots.Load()
 	snap := rt.committed
-	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: newSessionWithOptions(opts, s.core.env)}
+	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: state}
 	engine.core = s.core
 	engine.attachedCommitted = rt.attached
 	return &Session{core: s.core, engine: engine, access: accessReadWrite, baseVersion: snap.txid, planEpoch: s.core.planEpochNow()}
@@ -2672,32 +2693,35 @@ func (s *Database) Session(opts SessionOptions) *Session {
 // the transient session is closed; its watermark pin is held by the Rows (released on its Close), not
 // by the session. Total: a non-query statement returns a no-column cursor carrying the command tag.
 func (db *Database) queryValues(sql string, params []Value) (*Rows, error) {
-	s := db.Session(SessionOptions{})
+	s := db.sessionWithState(newSession(db.core.env))
 	defer s.Close()
 	return s.queryValues(sql, params)
 }
 
 // ExecuteScript runs a multi-statement script on a fresh autocommit session (spec/design/session.md
 // §4.2): the whole run is one implicit transaction (all-or-nothing).
-func (db *Database) ExecuteScript(sql string) (ScriptSummary, error) {
-	s := db.Session(SessionOptions{})
+func (db *Database) ExecuteScript(ctx context.Context, sql string) (ScriptSummary, error) {
+	s := db.sessionWithState(newSession(db.core.env))
 	defer s.Close()
-	return s.ExecuteScript(sql)
+	return s.ExecuteScript(ctx, sql)
 }
 
-// View runs fn in a READ ONLY transaction on a fresh session (scoped sugar, §2.2).
-func (db *Database) View(fn func(tx *Transaction) error) error {
-	s := db.Session(SessionOptions{})
+// View runs fn in a READ ONLY transaction on a fresh session. It rolls back on
+// error or panic. ctx controls admission and the pre-commit check; pass it to
+// queries in fn to cancel their execution too.
+func (db *Database) View(ctx context.Context, fn func(tx *Transaction) error) error {
+	s := db.sessionWithState(newSession(db.core.env))
 	defer s.Close()
-	return s.View(fn)
+	return s.View(ctx, fn)
 }
 
 // Update runs fn in a READ WRITE transaction on a fresh session (scoped sugar, §2.2): the closure's
-// statements commit together, or roll back together on error.
-func (db *Database) Update(fn func(tx *Transaction) error) error {
-	s := db.Session(SessionOptions{})
+// statements commit together, or roll back together on error or panic. ctx
+// controls writer acquisition and the pre-commit check; pass it to statements in fn too.
+func (db *Database) Update(ctx context.Context, fn func(tx *Transaction) error) error {
+	s := db.sessionWithState(newSession(db.core.env))
 	defer s.Close()
-	return s.Update(fn)
+	return s.Update(ctx, fn)
 }
 
 // Prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4): a standalone
@@ -2705,7 +2729,7 @@ func (db *Database) Update(fn func(tx *Transaction) error) error {
 // handle over this database (the statement outlives the transient session used to parse it). Parse
 // errors (42601, …) and the 54000 input-size limit surface here.
 func (db *Database) Prepare(sql string) (*PreparedStatement, error) {
-	s := db.Session(SessionOptions{})
+	s := db.sessionWithState(newSession(db.core.env))
 	defer s.Close()
 	return s.Prepare(sql)
 }
@@ -2713,7 +2737,7 @@ func (db *Database) Prepare(sql string) (*PreparedStatement, error) {
 // UpgradeCollations runs the COLLATION UPGRADE migration on the live database (collation.md §12),
 // returning the number of re-pinned collations. Mints a fresh write session for the migration.
 func (db *Database) UpgradeCollations() (int, error) {
-	s := db.Session(SessionOptions{})
+	s := db.sessionWithState(newSession(db.core.env))
 	defer s.Close()
 	return s.UpgradeCollations()
 }
@@ -3056,7 +3080,7 @@ func (s *Session) dispatch(stmt statement, params []Value, ic *insertStmtCache) 
 	}
 	// Autocommit write — the lazy gate (§2.4): take it, capture the latest committed as the working
 	// base, run, publish at the next version on success, release.
-	if err := s.core.acquireWriter(s.engine.session.lockTimeoutMs); err != nil {
+	if err := s.core.acquireWriterCancel(s.engine.session.lockTimeoutMs, s.engine.session.cancel); err != nil {
 		return outcome{}, err
 	}
 	s.gateHeld = true
@@ -3088,7 +3112,7 @@ func (s *Session) beginBlock(writable, modeSet bool) (outcome, error) {
 		rw = true // the session(opts) engine is not read-only ⇒ a bare BEGIN defaults READ WRITE
 	}
 	if rw {
-		if err := s.core.acquireWriter(s.engine.session.lockTimeoutMs); err != nil {
+		if err := s.core.acquireWriterCancel(s.engine.session.lockTimeoutMs, s.engine.session.cancel); err != nil {
 			return outcome{}, err
 		}
 		s.gateHeld = true
@@ -3325,27 +3349,40 @@ func (s *Session) Close() {
 // host-API spelling of SQL BEGIN). writable true is READ WRITE (eager gate, the BEGIN READ WRITE
 // form); false is READ ONLY (pins + registers in the watermark, no gate). Statements then run on the
 // session until Commit/Rollback. A nested Begin (a block is already open) is 25001.
-func (s *Session) Begin(writable bool) error {
+// ctx controls this begin operation only; cancellation after return does not
+// automatically roll back the transaction. Statements take their own contexts.
+func (s *Session) Begin(ctx context.Context, writable bool) error {
+	done := contextDone(ctx)
+	if err := doneErr(done); err != nil {
+		return contextError(ctx, err)
+	}
+	defer s.engine.restoreCancel(s.engine.armCancel(done))
 	_, err := s.beginBlock(writable, true)
-	return err
+	return contextError(ctx, err)
 }
 
 // View runs fn in a READ ONLY transaction on this session (bbolt-style auto-commit/rollback, §2.2).
-func (s *Session) View(fn func(tx *Transaction) error) error {
-	return s.withBlock(false, true, fn)
+// Errors and panics roll it back. ctx controls admission and the pre-commit check;
+// pass ctx to queries in fn to cancel their execution too.
+func (s *Session) View(ctx context.Context, fn func(tx *Transaction) error) error {
+	return s.withBlock(ctx, false, fn)
 }
 
 // Update runs fn in a READ WRITE transaction on this session (bbolt-style auto-commit/rollback,
 // §2.2): the block is opened (eager gate), fn runs, and the session commits on success / rolls back
-// on error — publishing through the shared core.
-func (s *Session) Update(fn func(tx *Transaction) error) error {
-	return s.withBlock(true, true, fn)
+// on error or panic — publishing through the shared core. ctx controls writer
+// acquisition and the pre-commit check; pass it to statements in fn too.
+func (s *Session) Update(ctx context.Context, fn func(tx *Transaction) error) error {
+	return s.withBlock(ctx, true, fn)
 }
 
-func (s *Session) withBlock(writable, modeSet bool, fn func(tx *Transaction) error) error {
-	if _, err := s.beginBlock(writable, modeSet); err != nil {
+func (s *Session) withBlock(ctx context.Context, writable bool, fn func(tx *Transaction) error) error {
+	if err := s.Begin(ctx, writable); err != nil {
 		return err
 	}
+	// End the block on every exit, including panic and runtime.Goexit. After a
+	// successful commit or an explicit rollback this is an idempotent no-op.
+	defer s.Rollback()
 	// scoped: the session ends the block (publishing through the shared core / releasing the gate), so
 	// the Transaction's own Commit/Rollback — and SQL COMMIT/ROLLBACK through it — are 2D000 (api.md
 	// §2.2): the closure's writes are never discarded by ending the block early.
@@ -3353,6 +3390,9 @@ func (s *Session) withBlock(writable, modeSet bool, fn func(tx *Transaction) err
 	if err := fn(tx); err != nil {
 		_, _ = s.endBlock(false)
 		return err
+	}
+	if err := doneErr(contextDone(ctx)); err != nil {
+		return contextError(ctx, err)
 	}
 	if cur := s.engine.session.tx; cur != nil && cur.failed {
 		// The closure swallowed a statement error: the block is failed, so "commit" would be a silent
@@ -3370,7 +3410,15 @@ func (s *Session) withBlock(writable, modeSet bool, fn func(tx *Transaction) err
 // it, run each in order, discard rows, return the O(1) ScriptSummary. When the session is Idle the
 // whole run is one implicit transaction (all-or-nothing, published through the shared core); when it
 // is Open the run joins that transaction. In-script transaction control is 0A000.
-func (s *Session) ExecuteScript(sql string) (ScriptSummary, error) {
+// ctx cancels writer acquisition, statement execution, and the pre-commit check.
+func (s *Session) ExecuteScript(ctx context.Context, sql string) (summary ScriptSummary, err error) {
+	defer func() { err = contextError(ctx, err) }()
+	done := contextDone(ctx)
+	if err := doneErr(done); err != nil {
+		s.engine.failOpenBlock()
+		return ScriptSummary{}, err
+	}
+	defer s.engine.restoreCancel(s.engine.armCancel(done))
 	ownsWrapper := s.engine.session.tx == nil
 	if !ownsWrapper {
 		if err := s.staleRole(); err != nil {
@@ -3381,9 +3429,14 @@ func (s *Session) ExecuteScript(sql string) (ScriptSummary, error) {
 		if _, err := s.beginBlock(true, true); err != nil {
 			return ScriptSummary{}, err
 		}
+		defer s.Rollback()
 	}
-	summary, err := s.engine.runScriptBody(sql)
+	summary, err = s.engine.runScriptBody(sql)
+	if err == nil {
+		err = doneErr(done)
+	}
 	if err != nil {
+		s.engine.failOpenBlock()
 		if ownsWrapper {
 			_, _ = s.endBlock(false)
 		}
@@ -3411,16 +3464,6 @@ func (s *Session) InTransaction() bool { return s.engine.session.tx != nil }
 // session's engine (its visible snapshot — the open block's working set if any, else the pinned
 // committed); file-storage reads go through the shared core (the authoritative state, reflecting every
 // committed write). The *catTable / *compositeType returns are the doc-hidden introspection types. ---
-
-// Table is the definition of table name (exact name) as this session sees it, or false.
-func (s *Session) Table(name string) (*catTable, bool) { return s.engine.Table(name) }
-
-// CompositeType is the definition of composite type name as this session sees it, or nil.
-func (s *Session) CompositeType(name string) *compositeType { return s.engine.CompositeType(name) }
-
-// RowsInKeyOrder is a white-box test helper (CLAUDE.md §10): all rows of table name in primary-key
-// order as this session sees them. Not the embedding API.
-func (s *Session) RowsInKeyOrder(name string) []storedRow { return s.engine.RowsInKeyOrder(name) }
 
 // ToImage serializes the session's committed view to a from-scratch on-disk image (byte-level golden
 // round-trip, CLAUDE.md §8).
@@ -3462,13 +3505,13 @@ func (s *Session) ReadOnly() bool { return s.core.readOnlyMode() }
 func (s *Session) DefaultCollation() string { return s.engine.DefaultCollation() }
 
 // Collations are the collations available to this session (built-ins + any host-loaded set).
-func (s *Session) Collations() []collationInfo { return s.engine.Collations() }
+func (s *Session) Collations() []CollationInfo { return s.engine.Collations() }
 
 // LoadedCollations are the host-loaded collations currently in effect (collation.md §9).
-func (s *Session) LoadedCollations() []collationInfo { return s.engine.LoadedCollations() }
+func (s *Session) LoadedCollations() []CollationInfo { return s.engine.LoadedCollations() }
 
 // LoadedTimeZones are the host-loaded time zones currently in effect (timezones.md §3.3).
-func (s *Session) LoadedTimeZones() []timeZoneInfo { return s.engine.LoadedTimeZones() }
+func (s *Session) LoadedTimeZones() []TimeZoneInfo { return s.engine.LoadedTimeZones() }
 
 // SetDefaultCollation sets the per-database default collation for new text columns (collation.md §4);
 // 2C000 for an unknown collation. The default is committed snapshot state (persisted as the is_default
@@ -3515,8 +3558,18 @@ func (s *Session) LifetimeCost() int64 { return *s.engine.session.lifetimeTotal 
 func (s *Session) MaxSQLLength() int     { return s.engine.session.maxSQLLength }
 func (s *Session) SetMaxSQLLength(b int) { s.engine.session.maxSQLLength = b }
 
-func (s *Session) LockTimeoutMs() uint64      { return s.engine.session.lockTimeoutMs }
-func (s *Session) SetLockTimeoutMs(ms uint64) { s.engine.session.lockTimeoutMs = ms }
+// LockTimeout returns the writer-lock timeout. Zero means no timeout.
+func (s *Session) LockTimeout() time.Duration { return millisDuration(s.engine.session.lockTimeoutMs) }
+
+// SetLockTimeout sets the writer-lock timeout. Zero means no timeout; negative
+// values return 22023 without changing it. Positive fractions of a millisecond round up.
+func (s *Session) SetLockTimeout(timeout time.Duration) error {
+	if err := validateDuration("LockTimeout", timeout); err != nil {
+		return err
+	}
+	s.engine.session.lockTimeoutMs = durationMillis(timeout)
+	return nil
+}
 
 // WorkMem / SetWorkMem — the work-memory budget in bytes (0 ⇒ unlimited).
 func (s *Session) WorkMem() int     { return s.engine.session.workMem }

@@ -50,7 +50,7 @@ func TestArrayToTextIsExplicitOnly(t *testing.T) {
 
 func TestUuidArrayToByteaArrayAndBack(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	round := castScalar(t, db,
 		"((ARRAY['00000000-0000-0000-0000-000000000001']::uuid[])::bytea[])::uuid[] = "+
 			"ARRAY['00000000-0000-0000-0000-000000000001']::uuid[]")
@@ -67,7 +67,7 @@ func TestUuidArrayToByteaArrayAndBack(t *testing.T) {
 
 func TestArrayForbiddenElementPairs(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	// A scalar element pair with no cast → 42804 (PG reports 42846). i32 → timestamp has no cast.
 	if got := castErr(t, db, "SELECT (ARRAY[1,2,3]::i32[])::timestamp[]"); got != "42804" {
 		t.Fatalf("i32[] → timestamp[]: want 42804, got %s", got)

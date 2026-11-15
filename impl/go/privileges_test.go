@@ -17,7 +17,7 @@ func privCode(t *testing.T, db dbHandle, sql string) string {
 
 func TestDefaultSessionIsFullyPermissive(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if !db.AllowDDL() {
 		t.Fatal("default session should allow DDL")
 	}
@@ -32,7 +32,7 @@ func TestDefaultSessionIsFullyPermissive(t *testing.T) {
 
 func TestSetDefaultPrivilegesMakesAReadOnlySession(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	sessExec(t, db, "INSERT INTO t VALUES (1, 10)")
 	db.SetDefaultPrivileges(PrivSetEmpty.With(PrivSelect))
@@ -55,7 +55,7 @@ func TestSetDefaultPrivilegesMakesAReadOnlySession(t *testing.T) {
 // path. The corpus drives this via the harness's Query re-plumb; this pins it at the Go host surface.
 func TestQueryPathEnforcesSelectPrivilege(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	sessExec(t, db, "INSERT INTO t VALUES (1, 10)")
 	db.SetDefaultPrivileges(PrivSetEmpty) // no SELECT
@@ -71,7 +71,7 @@ func TestQueryPathEnforcesSelectPrivilege(t *testing.T) {
 
 func TestGrantAddsAndRevokeWins(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 
 	db.SetDefaultPrivileges(PrivSetEmpty)
@@ -90,7 +90,7 @@ func TestGrantAddsAndRevokeWins(t *testing.T) {
 
 func TestAllowDDLGateIsIndependentOfTablePrivileges(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	db.SetAllowDDL(false)
 	if got := privCode(t, db, "CREATE TABLE u (id i32 PRIMARY KEY)"); got != "42501" {
@@ -104,7 +104,7 @@ func TestAllowDDLGateIsIndependentOfTablePrivileges(t *testing.T) {
 
 func TestFunctionExecuteIsRevocable(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if !db.Privileges().AllowsFunction("abs") {
 		t.Fatal("functions should default to EXECUTE on all")
 	}
@@ -125,7 +125,7 @@ func TestLeastGreatestCarryNoExecutePrivilege(t *testing.T) {
 	// runs them, exactly like the `+` operator above. Source branch B routed them through the
 	// function-call AST, so revoking made SELECT LEAST(…) wrongly fail 42501 — this guards it.
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	db.Revoke(PrivSetEmpty.With(PrivExecute), "least")
 	db.Revoke(PrivSetEmpty.With(PrivExecute), "greatest")
 	out, err := queryOutcome(db, "SELECT LEAST(3, 1, 2), GREATEST(3, 1, 2)", nil)
@@ -143,13 +143,13 @@ func TestAnAdditionalSessionCarriesItsOwnEnvelope(t *testing.T) {
 	// one rejects a write a permissive session still allows, and they share committed storage through
 	// the core (§2.1/§5.3) — each owns its envelope, no swap.
 	db := memDB()
-	a := db.Session(SessionOptions{})
+	a := mustSession(db, SessionOptions{})
 	if _, err := queryOutcome(a, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)", nil); err != nil {
 		t.Fatal(err)
 	}
 
 	readOnly := PrivSetEmpty.With(PrivSelect)
-	restricted := db.Session(SessionOptions{DefaultPrivileges: &readOnly})
+	restricted := mustSession(db, SessionOptions{DefaultPrivileges: &readOnly})
 	if _, err := queryOutcome(restricted, "SELECT * FROM t", nil); err != nil {
 		t.Fatalf("read should be allowed on the restricted session: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestAnAdditionalSessionCarriesItsOwnEnvelope(t *testing.T) {
 
 func TestMissingObjectIs42P01NotAuthorization(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	db.SetDefaultPrivileges(PrivSetEmpty)
 	if got := privCode(t, db, "SELECT * FROM does_not_exist"); got != "42P01" {
 		t.Fatalf("want 42P01 (existence before authorization), got %s", got)

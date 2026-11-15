@@ -26,6 +26,14 @@ files in the same change.
 - Core implementations are native and evolve in lockstep. The differential set
   is Rust, Go, and TypeScript.
 - Go core is pure Go: no cgo, no FFI.
+- Go host transaction/script APIs take context first. Writer waits are cancelable;
+  cancellation errors retain SQLSTATE `57014` and unwrap to the Go context error.
+  Callback transactions roll back on panic. Cancellation stops before commit work;
+  it cannot turn a completed commit into an error. See `spec/design/api.md` §11.4.
+  Go duration options use `time.Duration`; configured session creation returns
+  errors for invalid time zones or negative timeouts (§11.6).
+  Go repository tooling uses the explicit `jedtooling` build tag; ordinary library
+  builds exclude test hooks and expose `MapRows` for lazy row mapping (§11.7).
 - Rust wrappers are acceptable for later language packages when that gives the
   best user experience, but wrappers echo Rust and are not independent
   conformance voices.

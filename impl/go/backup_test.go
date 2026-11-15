@@ -9,6 +9,7 @@ package jed
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"os"
 	"path/filepath"
@@ -22,7 +23,7 @@ func backupFixture(t *testing.T, path string) *Database {
 	t.Helper()
 	db := createCompactFile(t, path)
 	growAndShrink(t, db)
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	for _, sql := range []string{
 		"CREATE TABLE big (id i64 PRIMARY KEY, body text)",
@@ -79,7 +80,7 @@ func TestCompactedBackupIsTheCompactedFile(t *testing.T) {
 	db := backupFixture(t, path)
 	defer db.Close()
 	dest := filepath.Join(dir, "backup.jed")
-	if err := BackupForTesting(db, dest, false); err != nil {
+	if err := backupForTesting(db, dest, false); err != nil {
 		t.Fatal(err)
 	}
 	backup := readFile(t, dest)
@@ -101,7 +102,7 @@ func TestPageIdenticalBackupCopiesReachablePagesAtTheirIndices(t *testing.T) {
 	db := backupFixture(t, path)
 	defer db.Close()
 	dest := filepath.Join(dir, "backup.jed")
-	if err := BackupForTesting(db, dest, true); err != nil {
+	if err := backupForTesting(db, dest, true); err != nil {
 		t.Fatal(err)
 	}
 	source, mt := committedImage(t, path)
@@ -174,9 +175,9 @@ func TestBackupDoesNotWaitForTheWriterOrReaders(t *testing.T) {
 	dir := t.TempDir()
 	db := backupFixture(t, filepath.Join(dir, "db.jed"))
 	defer db.Close()
-	writer := db.Session(SessionOptions{})
+	writer := mustSession(db, SessionOptions{})
 	defer writer.Close()
-	if err := writer.Begin(true); err != nil {
+	if err := writer.Begin(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := writer.Exec(t.Context(), "INSERT INTO t VALUES (5000, 'pending', 1)"); err != nil {
@@ -189,7 +190,7 @@ func TestBackupDoesNotWaitForTheWriterOrReaders(t *testing.T) {
 	}
 	for i, pageIdentical := range []bool{true, false} {
 		dest := filepath.Join(dir, "backup"+string(rune('a'+i))+".jed")
-		if err := BackupForTesting(db, dest, pageIdentical); err != nil {
+		if err := backupForTesting(db, dest, pageIdentical); err != nil {
 			t.Fatalf("backup (page-identical %v) under an open writer: %v", pageIdentical, err)
 		}
 		copyDB, err := OpenDatabaseWithOptions(dest, OpenOptions{SkipFsync: true})
@@ -215,7 +216,7 @@ func TestBackupPreconditions(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, pageIdentical := range []bool{true, false} {
-		if code := backupCode(t, BackupForTesting(db, dest, pageIdentical)); code != "58P02" {
+		if code := backupCode(t, backupForTesting(db, dest, pageIdentical)); code != "58P02" {
 			t.Fatalf("an existing destination: %s, want 58P02", code)
 		}
 	}
@@ -231,12 +232,12 @@ func TestBackupPreconditions(t *testing.T) {
 	if _, err := mem.Exec(t.Context(), "INSERT INTO m SELECT g, g::text FROM generate_series(1, 50) g"); err != nil {
 		t.Fatal(err)
 	}
-	if code := backupCode(t, BackupForTesting(mem, filepath.Join(dir, "mem.jed"), true)); code != "0A000" {
+	if code := backupCode(t, backupForTesting(mem, filepath.Join(dir, "mem.jed"), true)); code != "0A000" {
 		t.Fatalf("a page-identical backup of an in-memory database: %s, want 0A000", code)
 	}
 	// The compacted form copies an in-memory database to a file (SQLite's VACUUM INTO from :memory:).
 	memDest := filepath.Join(dir, "mem-compacted.jed")
-	if err := BackupForTesting(mem, memDest, false); err != nil {
+	if err := backupForTesting(mem, memDest, false); err != nil {
 		t.Fatal(err)
 	}
 	copyDB, err := OpenDatabaseWithOptions(memDest, OpenOptions{SkipFsync: true})

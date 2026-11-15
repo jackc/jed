@@ -119,7 +119,7 @@ func runLeafEditWorkload(t *testing.T, w leafEditWorkload) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sess := db.Session(SessionOptions{})
+	sess := mustSession(db, SessionOptions{})
 	for _, sql := range w.setup {
 		mustExec(t, sess, sql)
 	}
@@ -167,7 +167,7 @@ func TestLeafShapes(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		sess := db.Session(SessionOptions{})
+		sess := mustSession(db, SessionOptions{})
 		for _, sql := range setup {
 			mustExec(t, sess, sql)
 		}
@@ -273,7 +273,7 @@ func TestLeafWidenGrowth(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			sess := db.Session(SessionOptions{})
+			sess := mustSession(db, SessionOptions{})
 			for _, sql := range c.setup {
 				mustExec(t, sess, sql)
 			}

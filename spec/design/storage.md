@@ -153,6 +153,10 @@ in [validated-cow.md](validated-cow.md) and [../fileformat/format.md](../filefor
 > `create`'s initial write and the golden fixtures (the special case where every node is
 > dirty); the live commit path is the incremental one.
 >
+> Go context cancellation covers writer acquisition and the last check before commit work;
+> it does not interrupt publication or change an already-committed operation into a cancellation
+> error ([api.md](api.md) §11.4). Callback panic cleanup rolls back before releasing the writer gate.
+>
 > The **host API** ([api.md](api.md)): the durability recipe is now a **dirty-page write +
 > alternate-meta-slot publish + `fsync`** (replacing the step-5b temp-file + atomic-`rename`
 > whole-file swap, which only worked because the whole file was rewritten). Atomicity comes

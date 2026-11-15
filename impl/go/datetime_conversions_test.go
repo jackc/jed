@@ -31,7 +31,7 @@ func dtErrCode(t *testing.T, db dbHandle, sql string) string {
 // decimal is finite-only); PG returns numeric ±Infinity.
 func TestExtractMonotonicFieldFromInfinityTraps(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	for _, field := range []string{"year", "decade", "century", "millennium", "julian", "isoyear", "epoch"} {
 		for _, ty := range []string{"timestamp", "timestamptz", "date"} {
 			for _, inf := range []string{"infinity", "-infinity"} {
@@ -48,7 +48,7 @@ func TestExtractMonotonicFieldFromInfinityTraps(t *testing.T) {
 // returns NULL (its NonFiniteTimestampTzPart accepts every unit).
 func TestExtractTimezoneFromInfiniteTimestampIsUnsupported(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	for _, field := range []string{"timezone", "timezone_hour", "timezone_minute"} {
 		sql := "SELECT EXTRACT(" + field + " FROM timestamp 'infinity')"
 		if c := dtErrCode(t, db, sql); c != "0A000" {
@@ -61,7 +61,7 @@ func TestNonDatetimeSourceToDatetimeIsForbidden(t *testing.T) {
 	t.Parallel()
 	// No integer → timestamp cast exists: jed's strict-matrix 42804 (PG 42846). (Runtime text →
 	// datetime has landed — cast_text_string_native_test.go.)
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if c := dtErrCode(t, db, "SELECT CAST(1 + 1 AS timestamp)"); c != "42804" {
 		t.Fatalf("int->timestamp: got %s, want 42804", c)
 	}

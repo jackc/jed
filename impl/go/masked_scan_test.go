@@ -47,7 +47,7 @@ func TestMaskedWideFixedWidthMatchesResident(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	mem := memDB().Session(SessionOptions{})
+	mem := mustSession(memDB(), SessionOptions{})
 	wideFixedSeed(t, mem)
 	paged, err := openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
@@ -174,7 +174,7 @@ func TestMaskedColumnarMultiLevelMatchesResident(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	mem := memDB().Session(SessionOptions{})
+	mem := mustSession(memDB(), SessionOptions{})
 	seed(t, mem)
 	paged, err := openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {

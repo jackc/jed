@@ -71,7 +71,7 @@ when "checks", "checks-corpus", "resources"
   end
   %w[baseline candidate].each do |name|
     src = name == "baseline" ? File.join(work, "impl/go") : Tasks::GO_DIR
-    run.call("build-#{name}-corpus", ["go", "build", "-o", File.join(work, "#{name}-corpus"), "./cmd/conformance"], src)
+    run.call("build-#{name}-corpus", ["go", "build", "-tags", "jedtooling", "-o", File.join(work, "#{name}-corpus"), "./cmd/conformance"], src)
     %w[memory disk spill].each do |host|
       cmd = [File.join(work, "#{name}-corpus")]
       cmd << "disk" unless host == "memory"

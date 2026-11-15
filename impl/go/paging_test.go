@@ -57,7 +57,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 	}
 
 	// A full scan faults every leaf through the bounded pool: results are exact, residency bounded.
-	rows := db.RowsInKeyOrder("t")
+	rows := db.rowsInKeyOrder("t")
 	if len(rows) != n {
 		t.Fatalf("row count %d != %d", len(rows), n)
 	}
@@ -94,7 +94,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows = db.RowsInKeyOrder("t")
+	rows = db.rowsInKeyOrder("t")
 	if len(rows) != n {
 		t.Fatalf("after one delete + one insert, count %d != %d", len(rows), n)
 	}
@@ -213,7 +213,7 @@ func TestTinyBudgetKeepsOneLeafResident(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows := db.RowsInKeyOrder("t")
+	rows := db.rowsInKeyOrder("t")
 	if len(rows) != n {
 		t.Fatalf("row count %d != %d", len(rows), n)
 	}
@@ -340,15 +340,15 @@ func countLeafForms(st *tableStore) (decoded, packed, ondisk int) {
 func TestInSessionTableJoinsResidencyFlip(t *testing.T) {
 	t.Parallel()
 	run := func(t *testing.T, db *Database) {
-		if _, err := db.ExecuteScript("CREATE TABLE t (k i32 PRIMARY KEY, v i32)"); err != nil {
+		if _, err := db.ExecuteScript(context.Background(), "CREATE TABLE t (k i32 PRIMARY KEY, v i32)"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.ExecuteScript("CREATE INDEX t_v ON t (v)"); err != nil {
+		if _, err := db.ExecuteScript(context.Background(), "CREATE INDEX t_v ON t (v)"); err != nil {
 			t.Fatal(err)
 		}
 		// 200 rows at page size 256 → a multi-leaf tree; autocommit runs the flip on every commit.
 		for k := 0; k < 200; k++ {
-			if _, err := db.ExecuteScript(fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", k, k*2)); err != nil {
+			if _, err := db.ExecuteScript(context.Background(), fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", k, k*2)); err != nil {
 				t.Fatal(err)
 			}
 		}

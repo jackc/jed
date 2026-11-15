@@ -2,7 +2,7 @@ package jed
 
 // L2/L3 — defer inline values at fault (spec/design/lazy-record.md §12). On the demand-paged path
 // every variable-length / structured present value (text/bytea/decimal/json/jsonb/composite/
-// array/range) is loaded as a deferred Unfetched (Form 0x00) — a zero-copy slice of the shared page
+// array/range) is loaded as a deferred unfetchedValue (Form 0x00) — a zero-copy slice of the shared page
 // block (form (a), L3) — instead of being eagerly decoded; the scan layer resolves exactly the
 // query's touched columns, an untouched one is dropped still deferred. The reshape is cost-,
 // result-, and byte-neutral (§8) regardless of representation (form (a)/(b)), so a paged file and a
@@ -24,7 +24,7 @@ import (
 
 // inlineSeed builds the schema + rows exercising every deferrable type alongside a join partner
 // and a secondary index. The default page size keeps every value inline-plain, so on a paged
-// reopen each lands as an inline-deferred Unfetched — the L2 case (nothing spills).
+// reopen each lands as an inline-deferred unfetchedValue — the L2 case (nothing spills).
 func inlineSeed(t *testing.T, db dbHandle) {
 	t.Helper()
 	mustExec(t, db, "CREATE TYPE addr AS (street text, zip i32)")
@@ -73,7 +73,7 @@ func TestLazyInlineValuesMatchResidentAcrossQueryShapes(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	mem := memDB().Session(SessionOptions{})
+	mem := mustSession(memDB(), SessionOptions{})
 	inlineSeed(t, mem)
 	paged, err := openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
@@ -147,7 +147,7 @@ func TestLazyInlineMutationsPreserveUntouchedValues(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	mem := memDB().Session(SessionOptions{})
+	mem := mustSession(memDB(), SessionOptions{})
 	inlineSeed(t, mem)
 
 	mutations := []string{
@@ -271,7 +271,7 @@ func TestLazyUntouchedCorruptInlineBodyDefersError(t *testing.T) {
 func TestLazyUntouchedDeferredColumnRidesSpillingSort(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "l2_spill.jed")
-	mem := memDB().Session(SessionOptions{})
+	mem := mustSession(memDB(), SessionOptions{})
 	db, err := create(path, databaseOptions{PageSize: DefaultPageSize, noSync: true})
 	if err != nil {
 		t.Fatal(err)
@@ -365,7 +365,7 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 
 	// Fault the leaf → Packed form (packed-leaf.md §5): the block + PAX directories are retained and
 	// NO value is decoded (the decoded row vector is empty), so rows are reconstructed on demand.
-	// Reconstruction produces the same inline-deferred Unfetched (form (a)) the eager fault used to.
+	// Reconstruction produces the same inline-deferred unfetchedValue (form (a)) the eager fault used to.
 	node, err := decodeLeafNode(block, plainRef(2), colTypes, nil, false)
 	if err != nil {
 		t.Fatalf("decodeLeafNode: %v", err)

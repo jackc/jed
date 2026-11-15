@@ -47,7 +47,7 @@ func TestSpecializationInvocationCoverage(t *testing.T) {
 func TestSpecializationReplacedPlanLifetime(t *testing.T) {
 	db := memDB()
 	defer db.Close()
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	mustExec(t, s, "INSERT INTO t VALUES (1,7)")

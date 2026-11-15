@@ -67,7 +67,7 @@ For each mutant, end to end:
    the original source** plus a replacement string — not an AST rewrite.
 2. **Apply.** Splice the one replacement into a pristine copy of the file. Because every other byte
    is untouched, the mutant is minimal and the compiler's verdict is unambiguous.
-3. **Build.** Recompile the conformance binary (`go build ./cmd/conformance`) in an isolated
+3. **Build.** Recompile the conformance binary (`go build -tags jedtooling ./cmd/conformance`) in an isolated
    workspace (§6). A compile failure means the mutant is **stillborn** — see INVALID (§5).
 4. **Run the corpus.** Execute the binary under a timeout. Its **exit code is the oracle**: the Go
    conformance harness exits 0 iff every applicable `.test` passed.

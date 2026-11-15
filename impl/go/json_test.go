@@ -33,7 +33,7 @@ func errJSON(t *testing.T, db dbHandle, sql string) string {
 // is a documented divergence.
 func TestJsonbPrimaryKeyIsUnsupported(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if got := errJSON(t, db, "CREATE TABLE t (k jsonb PRIMARY KEY)"); got != "0A000" {
 		t.Errorf("jsonb PRIMARY KEY: got %s, want 0A000", got)
 	}
@@ -44,7 +44,7 @@ func TestJsonbPrimaryKeyIsUnsupported(t *testing.T) {
 // undefined-function shape).
 func TestJsonPrimaryKeyIsUnsupported(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if got := errJSON(t, db, "CREATE TABLE t (k json PRIMARY KEY)"); got != "0A000" {
 		t.Errorf("json PRIMARY KEY: got %s, want 0A000", got)
 	}
@@ -54,12 +54,12 @@ func TestJsonPrimaryKeyIsUnsupported(t *testing.T) {
 // encoding exercised yet).
 func TestJsonbIndexAndUniqueAreUnsupported(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)")
 	if got := errJSON(t, db, "CREATE INDEX i ON t (j)"); got != "0A000" {
 		t.Errorf("CREATE INDEX on jsonb: got %s, want 0A000", got)
 	}
-	db2 := memDB().Session(SessionOptions{})
+	db2 := mustSession(memDB(), SessionOptions{})
 	if got := errJSON(t, db2, "CREATE TABLE u (id i32 PRIMARY KEY, j jsonb UNIQUE)"); got != "0A000" {
 		t.Errorf("jsonb UNIQUE: got %s, want 0A000", got)
 	}
@@ -71,7 +71,7 @@ func TestJsonbIndexAndUniqueAreUnsupported(t *testing.T) {
 // behavior (always 42883) and jsonb × jsonb ordering live in suites/json/json_compare.test.
 func TestJsonbCrossFamilyComparisonIs42804(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, b jsonb)")
 	// jsonb vs an integer / a real text value (not an adaptable string literal): 42804.
 	if got := errJSON(t, db, "SELECT id FROM t WHERE b = 5"); got != "42804" {
@@ -89,7 +89,7 @@ func TestJsonbCrossFamilyComparisonIs42804(t *testing.T) {
 // suites/json/json_casts.test.
 func TestInvalidJSONCastSourceIs42804(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if got := errJSON(t, db, "SELECT 5::jsonb"); got != "42804" {
 		t.Errorf("5::jsonb: got %s, want 42804", got)
 	}
@@ -107,7 +107,7 @@ func TestInvalidJSONCastSourceIs42804(t *testing.T) {
 // fresh cursor off the gathered chain). The rendered canonical form is preserved exactly.
 func TestLargeJsonbSpillsAndRoundTrips(t *testing.T) {
 	t.Parallel()
-	db := newInMemoryWithPageSize(4096, NewEnvironment()).Session(SessionOptions{})
+	db := mustSession(newInMemoryWithPageSize(4096, NewEnvironment()), SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)")
 	// A ~6000-byte string node — far above RECORD_MAX (~2034 at page 4096) — forces a spill.
 	big := strings.Repeat("a", 6000)
@@ -141,7 +141,7 @@ func TestLargeJsonbSpillsAndRoundTrips(t *testing.T) {
 // input bytes EXACTLY (insignificant whitespace included — the json verbatim contract, §4).
 func TestLargeJsonSpillsVerbatim(t *testing.T) {
 	t.Parallel()
-	db := newInMemoryWithPageSize(4096, NewEnvironment()).Session(SessionOptions{})
+	db := mustSession(newInMemoryWithPageSize(4096, NewEnvironment()), SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j json)")
 	// Verbatim text with irregular internal spacing, padded past RECORD_MAX.
 	pad := strings.Repeat(" ", 6000)
@@ -167,7 +167,7 @@ func TestLargeJsonSpillsVerbatim(t *testing.T) {
 // value codec decodes back to the canonical render.
 func TestJsonbAllNodeKindsRoundTrip(t *testing.T) {
 	t.Parallel()
-	db := newInMemoryWithPageSize(4096, NewEnvironment()).Session(SessionOptions{})
+	db := mustSession(newInMemoryWithPageSize(4096, NewEnvironment()), SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)")
 	run(t, db, "INSERT INTO t VALUES (1, '{\"a\": 1, \"b\": [true, false, null], \"c\": \"x\"}')")
 	image, err := db.ToImage(4096, 1)
@@ -190,7 +190,7 @@ func TestJsonbAllNodeKindsRoundTrip(t *testing.T) {
 // Mirrors impl/rust/tests/json.rs jsonb_pretty_matches_pg.
 func TestJsonbPrettyMatchesPG(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	q := func(sql string) string {
 		t.Helper()
 		return queryRendered(t, db, sql)[0][0]
@@ -215,7 +215,7 @@ func TestJsonbPrettyMatchesPG(t *testing.T) {
 // Mirrors impl/rust/tests/json.rs json_serialize_jsonb_diverges_from_pg.
 func TestJsonSerializeJsonbDivergesFromPG(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if got, want := queryRendered(t, db, `SELECT JSON_SERIALIZE('{"b":2,"a":1}'::jsonb)`)[0][0],
 		`{"a": 1, "b": 2}`; got != want { // jed: the jsonb canonical text; PG 18: NULL
 		t.Errorf("JSON_SERIALIZE(jsonb) = %q, want %q", got, want)
@@ -229,7 +229,7 @@ func TestJsonSerializeJsonbDivergesFromPG(t *testing.T) {
 // json_record_composite_array_column_is_0a000.
 func TestJsonRecordCompositeArrayColumnIs0A000(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	run(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	if got := errJSON(t, db, `SELECT * FROM jsonb_to_record('{"a":1}') AS t(a addr)`); got != "0A000" {
 		t.Errorf("composite record column: got %s, want 0A000", got)
@@ -247,7 +247,7 @@ func TestJsonRecordCompositeArrayColumnIs0A000(t *testing.T) {
 // impl/rust/tests/json.rs json_populate_non_composite_and_complex_field_divergences.
 func TestJsonPopulateNonCompositeAndComplexFieldDivergences(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	run(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	run(t, db, "CREATE TYPE poly AS (name text, pts i32[])")
 	if got := errJSON(t, db, `SELECT * FROM jsonb_populate_record(NULL::i32, '{"a":1}')`); got != "42804" {
@@ -265,7 +265,7 @@ func TestJsonPopulateNonCompositeAndComplexFieldDivergences(t *testing.T) {
 // json_query_fn_deferred_clauses_are_0a000.
 func TestJSONQueryFnDeferredClausesAre0A000(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	for _, sql := range []string{
 		`SELECT JSON_QUERY('{"a":1}', '$.a' OMIT QUOTES)`,
 		`SELECT JSON_QUERY('{"a":1}', '$.a' RETURNING int)`,
@@ -283,7 +283,7 @@ func TestJSONQueryFnDeferredClausesAre0A000(t *testing.T) {
 // json_table_deferred_features_are_0a000.
 func TestJSONTableDeferredFeaturesAre0A000(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	for _, sql := range []string{
 		`SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32 PATH '$.x') PLAN DEFAULT (x))`,
 		`SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32[] PATH '$.x'))`,

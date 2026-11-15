@@ -21,7 +21,7 @@ import "sort"
 type Environment struct {
 	// collations is the loaded collation set keyed by exact (case-sensitive) name. "C" is never here
 	// (table-free, built in).
-	collations map[string]*Collation
+	collations map[string]*compiledCollation
 	// property is the Unicode property/casing table (collation.md §16), nil ⇒ the ASCII-casing
 	// baseline (casing is table-free, version-free).
 	property *propertyTable
@@ -46,7 +46,7 @@ type Environment struct {
 // present is not replaced, so re-loading the same bundle is an idempotent no-op. Build snapshots the
 // builder, so later builder calls never affect an Environment already built. Not goroutine-safe.
 type EnvironmentBuilder struct {
-	collations map[string]*Collation
+	collations map[string]*compiledCollation
 	property   *propertyTable
 	zones      map[string]*zone
 	functions  []hostFuncEntry
@@ -59,7 +59,7 @@ type EnvironmentBuilder struct {
 // fixed offsets, no host functions, the OS random source, and the wall clock.
 func NewEnvironmentBuilder() *EnvironmentBuilder {
 	return &EnvironmentBuilder{
-		collations: map[string]*Collation{},
+		collations: map[string]*compiledCollation{},
 		zones:      map[string]*zone{},
 		random:     OSRandomSource(),
 		clock:      WallClock(),
@@ -177,7 +177,7 @@ func (b *EnvironmentBuilder) SetInsecureSeededKeyEntropy(seed uint64) {
 // list are copied (their entries are shared by reference — they are immutable), so continuing to use
 // the builder never changes the returned Environment.
 func (b *EnvironmentBuilder) Build() *Environment {
-	collations := make(map[string]*Collation, len(b.collations))
+	collations := make(map[string]*compiledCollation, len(b.collations))
 	for k, v := range b.collations {
 		collations[k] = v
 	}
@@ -218,7 +218,7 @@ func (b *EnvironmentBuilder) Build() *Environment {
 // derived builder may add bundles and functions and replace sources; e itself is unaffected.
 func (e *Environment) ToBuilder() *EnvironmentBuilder {
 	b := &EnvironmentBuilder{
-		collations: make(map[string]*Collation, len(e.collations)),
+		collations: make(map[string]*compiledCollation, len(e.collations)),
 		property:   e.property,
 		zones:      make(map[string]*zone, len(e.zones)),
 		functions:  make([]hostFuncEntry, len(e.hosts.functions)),
@@ -239,11 +239,11 @@ func (e *Environment) ToBuilder() *EnvironmentBuilder {
 // LoadedCollations introspects the loaded collation set (collation.md §4.2) — every collation a
 // loaded bundle provides, ascending by name (no hash-iteration leak, CLAUDE.md §8). IsDefault is
 // always false here (a per-database property). C is built in and not listed.
-func (e *Environment) LoadedCollations() []collationInfo {
+func (e *Environment) LoadedCollations() []CollationInfo {
 	colls := e.collationTables()
-	out := make([]collationInfo, len(colls))
+	out := make([]CollationInfo, len(colls))
 	for i, c := range colls {
-		out[i] = collationInfo{
+		out[i] = CollationInfo{
 			Name:           c.Name,
 			UnicodeVersion: c.UnicodeVersion,
 			CLDRVersion:    c.CldrVersion,
@@ -251,7 +251,7 @@ func (e *Environment) LoadedCollations() []collationInfo {
 			Description:    c.Description,
 			IsDefault:      false,
 			// The loaded set IS the version reference — it can never be skewed against itself.
-			Verdict: verdictFull,
+			Verdict: CollationFull,
 		}
 	}
 	return out
@@ -259,25 +259,25 @@ func (e *Environment) LoadedCollations() []collationInfo {
 
 // LoadedTimeZones introspects the loaded zone set (timezones.md §3.3): every zone + alias a loaded
 // bundle provides, ascending by name. UTC and fixed offsets are built in and not listed.
-func (e *Environment) LoadedTimeZones() []timeZoneInfo {
+func (e *Environment) LoadedTimeZones() []TimeZoneInfo {
 	names := make([]string, 0, len(e.zones))
 	for n := range e.zones {
 		names = append(names, n)
 	}
 	sort.Strings(names)
-	out := make([]timeZoneInfo, len(names))
+	out := make([]TimeZoneInfo, len(names))
 	for i, n := range names {
-		out[i] = timeZoneInfo{Name: n, TzdataVersion: e.zones[n].TzdataVersion}
+		out[i] = TimeZoneInfo{Name: n, TzdataVersion: e.zones[n].TzdataVersion}
 	}
 	return out
 }
 
 // collation looks up a loaded collation by exact name; nil ⇒ no loaded bundle provides it.
-func (e *Environment) collation(name string) *Collation { return e.collations[name] }
+func (e *Environment) collation(name string) *compiledCollation { return e.collations[name] }
 
 // collationTables returns every loaded collation, ascending by name.
-func (e *Environment) collationTables() []*Collation {
-	out := make([]*Collation, 0, len(e.collations))
+func (e *Environment) collationTables() []*compiledCollation {
+	out := make([]*compiledCollation, 0, len(e.collations))
 	for _, c := range e.collations {
 		out = append(out, c)
 	}
@@ -309,20 +309,20 @@ func (e *Environment) versionSkew(name, fileUnicode, fileCldr string) (loadedUni
 
 // resolveZone resolves a zone name to a built-in fixed offset (UTC / ±HH[:MM[:SS]], §3.2) or a loaded
 // named zone. false ⇒ unknown (the caller raises 22023).
-func (e *Environment) resolveZone(name string) (ZoneRef, bool) {
+func (e *Environment) resolveZone(name string) (zoneRef, bool) {
 	if zr, ok := builtinZone(name); ok {
 		return zr, true
 	}
 	if z := e.zones[name]; z != nil {
-		return ZoneRef{zone: z}, true
+		return zoneRef{zone: z}, true
 	}
 	// Case-insensitive like PostgreSQL's pg_tzset (timezones.md §3.2): an exact name wins, else the
 	// ASCII-folded name. The resolved zone keeps its canonical name (the one an index dependency
 	// records).
 	if z := e.zonesFolded[foldZoneName(name)]; z != nil {
-		return ZoneRef{zone: z}, true
+		return zoneRef{zone: z}, true
 	}
-	return ZoneRef{}, false
+	return zoneRef{}, false
 }
 
 // zoneDeps is every loaded zone as an index dependency (index-dependencies.md), ascending by name.

@@ -17,9 +17,15 @@ definitions, comparison/coercion rules, and error codes come from the spec's dat
 ## Running it
 
 ```sh
-go run ./cmd/conformance   # run the shared conformance corpus
-go test ./...              # unit tests
+go run -tags jedtooling ./cmd/conformance   # run the shared conformance corpus
+go test ./...                            # library tests and executable examples
+go test -tags jedtooling ./cmd/...        # tooling tests
 ```
 
 > Status: **built and at parity** with the Rust and TS cores — passes the shared
 > conformance corpus and writes byte-identical on-disk files (`rust == go == ts == ruby`).
+
+The `jedtooling` build tag enables repository-only inspection and fault-injection hooks
+for `cmd/conformance` and `cmd/process_actor`. Normal library builds exclude those exports.
+Use `mise run unit:go` to run both library and tooling tests, and `mise run conformance:go`
+for the memory and disk SQL corpus. Run `go doc` to read the public embedding API.

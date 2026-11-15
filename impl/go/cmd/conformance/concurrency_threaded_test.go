@@ -1,3 +1,5 @@
+//go:build jedtooling
+
 package main
 
 // The stepped-THREADED mode of the concurrency schedule runner (spec/design/concurrency-testing.md

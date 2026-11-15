@@ -19,7 +19,7 @@ import (
 func TestSessionLocalTempRunsThroughBlockStore(t *testing.T) {
 	t.Parallel()
 	db := newInMemoryWithPageSize(256, NewEnvironment())
-	sess := db.Session(SessionOptions{})
+	sess := mustSession(db, SessionOptions{})
 	sessExec(t, sess, "CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)")
 	base := strings.Repeat("x", 40)
 	for i := 1; i <= 60; i++ { // 60 rows at page 256 → a multi-level tree with demoted leaves
@@ -64,7 +64,7 @@ func TestSessionLocalTempPageBudgetBoundsMultiLeaf(t *testing.T) {
 	// ~20 pages of budget: a single leaf (≤ ~240 record bytes) is far under it, so a record-byte measure
 	// would never abort; the page footprint crosses it as the tree grows past ~20 pages.
 	budget := 20 * 256
-	sess := db.Session(SessionOptions{MaxTempStorageBytes: &budget})
+	sess := mustSession(db, SessionOptions{MaxTempStorageBytes: &budget})
 	sessExec(t, sess, "CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)")
 	pad := strings.Repeat("z", 40)
 	aborted := false

@@ -119,7 +119,7 @@ func TestRangeHostValueBindsCanonicalized(t *testing.T) {
 // A Go slice binds as an array parameter, and a nil slice as NULL (api.md §11.2).
 func TestSliceArgBindsAsArray(t *testing.T) {
 	t.Parallel()
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, tags text[])")
 	mustExec(t, s, "INSERT INTO t VALUES (1, '{a}'), (2, '{b}'), (3, '{a,b}')")
 	rows, err := s.Query(context.Background(), "SELECT id FROM t WHERE id = ANY($1) ORDER BY id", []int64{1, 3})

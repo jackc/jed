@@ -10,6 +10,7 @@ package jed
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -397,7 +398,7 @@ func TestEncryptedDatabaseBacksUpInBothForms(t *testing.T) {
 		pageIdentical bool
 	}{{"pages", true}, {"compact", false}} {
 		dest := filepath.Join(dir, "enc_backup_"+form.name+".jed")
-		if err := BackupForTesting(db, dest, form.pageIdentical); err != nil {
+		if err := backupForTesting(db, dest, form.pageIdentical); err != nil {
 			t.Fatalf("%s: %v", form.name, err)
 		}
 		copied, err := os.ReadFile(dest)
@@ -434,7 +435,7 @@ func TestEncryptedDatabaseBacksUpInBothForms(t *testing.T) {
 		t.Fatal(err)
 	}
 	dest := filepath.Join(dir, "enc_backup_changed.jed")
-	if err := BackupForTesting(db, dest, true); err != nil {
+	if err := backupForTesting(db, dest, true); err != nil {
 		t.Fatal(err)
 	}
 	if c := encOpenCode(dest, encKey()); c != "28P01" {
@@ -570,8 +571,8 @@ func TestEncryptedCredentialChangeErrors(t *testing.T) {
 		}
 	}
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
-	writer := db.Session(SessionOptions{})
-	if err := writer.Begin(true); err != nil {
+	writer := mustSession(db, SessionOptions{})
+	if err := writer.Begin(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := writer.Exec(t.Context(), "INSERT INTO t VALUES (1)"); err != nil {
@@ -748,7 +749,7 @@ func TestEncryptedDatabaseSpillsToSealedScratch(t *testing.T) {
 	db.setSpillDirForTest(scratch)
 	mustExec(t, db, "CREATE TABLE t (id i64 PRIMARY KEY, k i32, s text)")
 	mustExec(t, db, "INSERT INTO t SELECT g, g % 37, 'secret-' || (g * 7919 % 1000) FROM generate_series(1, 3000) g")
-	session := db.Session(SessionOptions{})
+	session := mustSession(db, SessionOptions{})
 	defer session.Close()
 	for _, sql := range []string{
 		"SELECT s, id FROM t ORDER BY s DESC, id",
@@ -787,13 +788,13 @@ func TestEncryptedDatabaseSpillsToSealedScratch(t *testing.T) {
 		}
 	}
 	// A temp table past temp_buffers spills its pages to a sealed scratch store.
-	spills := TempSpills()
+	spills := tempSpillsForTooling()
 	session.SetTempBuffers(8192)
 	session.SetMaxTempStorageBytes(0)
-	if _, err := session.ExecuteScript("CREATE TEMP TABLE tt AS SELECT id, s FROM t"); err != nil {
+	if _, err := session.ExecuteScript(context.Background(), "CREATE TEMP TABLE tt AS SELECT id, s FROM t"); err != nil {
 		t.Fatal(err)
 	}
-	if TempSpills() <= spills {
+	if tempSpillsForTooling() <= spills {
 		t.Fatal("the temp table did not spill")
 	}
 	for _, b := range encScratchFiles(t, scratch) {
@@ -980,7 +981,7 @@ func TestEncryptedRekeyErrors(t *testing.T) {
 	}
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1), (2)")
-	reader := db.Session(SessionOptions{})
+	reader := mustSession(db, SessionOptions{})
 	defer reader.Close()
 	rows, err := reader.Query(t.Context(), "SELECT id FROM t")
 	if err != nil {
@@ -1076,11 +1077,11 @@ func TestEncryptedLargeRekeySpillsItsScratchDomain(t *testing.T) {
 	mustExec(t, db, "INSERT INTO big SELECT g, 'secret-' || md5(g::text) || md5((g * 3)::text) FROM generate_series(1, 30000) g")
 	const probe = "SELECT count(*), max(s), sum(length(s)) FROM big"
 	want := fmt.Sprint(encRows(t, db, probe))
-	spills := TempSpills()
+	spills := tempSpillsForTooling()
 	if err := db.Rekey("main", KeyCredential(filledKey(2)), Argon2Params{}); err != nil {
 		t.Fatal(err)
 	}
-	if TempSpills() <= spills {
+	if tempSpillsForTooling() <= spills {
 		t.Fatal("the rebuild did not spill its scratch domain")
 	}
 	if got := fmt.Sprint(encRows(t, db, probe)); got != want {

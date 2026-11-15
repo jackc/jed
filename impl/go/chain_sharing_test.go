@@ -84,8 +84,8 @@ func overflowPages(t *testing.T, path string) map[int][]byte {
 // around it reads the chain: with every chain payload corrupt, both succeed, and the corruption is
 // still there afterwards (the chain was kept, not rewritten).
 func TestChainSharingRewritesNeverReadAKeptChain(t *testing.T) {
-	SetVerifyLivePages(true)
-	t.Cleanup(func() { SetVerifyLivePages(false) })
+	setVerifyLivePages(true)
+	t.Cleanup(func() { setVerifyLivePages(false) })
 	path := filepath.Join(t.TempDir(), "chain_share_corrupt.jed")
 	chainCreate(t, path)
 	corruptOverflowPayloads(t, path)
@@ -121,8 +121,8 @@ func TestChainSharingRewritesNeverReadAKeptChain(t *testing.T) {
 // not assign it: no overflow page is written or changed, and the values, a compaction of the result,
 // and the costs all come back exactly.
 func TestChainSharingReadButUnassignedValuesKeepTheirChains(t *testing.T) {
-	SetVerifyLivePages(true)
-	t.Cleanup(func() { SetVerifyLivePages(false) })
+	setVerifyLivePages(true)
+	t.Cleanup(func() { setVerifyLivePages(false) })
 	path := filepath.Join(t.TempDir(), "chain_share_read.jed")
 	chainCreate(t, path)
 	before := overflowPages(t, path)
@@ -150,7 +150,7 @@ func TestChainSharingReadButUnassignedValuesKeepTheirChains(t *testing.T) {
 	defer host.Close()
 	queries := []string{"SELECT * FROM t", "SELECT body FROM t WHERE id = 101"}
 	costs := func() []int64 {
-		s := host.Session(SessionOptions{})
+		s := mustSession(host, SessionOptions{})
 		defer s.Close()
 		if got := renderedRows(t, s, "SELECT id, body, n FROM t ORDER BY id"); !reflect.DeepEqual(got, want) {
 			t.Fatal("rows changed")
@@ -176,7 +176,7 @@ func TestChainSharingReadButUnassignedValuesKeepTheirChains(t *testing.T) {
 func TestChainSharingRewriteCostsDoNotDependOnResidency(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "chain_share_cost.jed")
-	mem := newInMemoryWithPageSize(lazyPageSize, NewEnvironment()).Session(SessionOptions{})
+	mem := mustSession(newInMemoryWithPageSize(lazyPageSize, NewEnvironment()), SessionOptions{})
 	chainSeed(t, mem)
 	chainCreate(t, path)
 	paged, err := openWithOptions(path, OpenOptions{SkipFsync: true})
@@ -239,10 +239,10 @@ var chainOwnershipPhases = [][]string{
 // own. After each phase the live checker and the image checker (live page count, chain exclusivity)
 // pass, and the rows equal an in-memory replay.
 func TestChainSharingKeptChainsStayExclusive(t *testing.T) {
-	SetVerifyLivePages(true)
-	t.Cleanup(func() { SetVerifyLivePages(false) })
+	setVerifyLivePages(true)
+	t.Cleanup(func() { setVerifyLivePages(false) })
 	path := filepath.Join(t.TempDir(), "chain_share_ownership.jed")
-	mem := newInMemoryWithPageSize(lazyPageSize, NewEnvironment()).Session(SessionOptions{})
+	mem := mustSession(newInMemoryWithPageSize(lazyPageSize, NewEnvironment()), SessionOptions{})
 	chainSeed(t, mem)
 	chainCreate(t, path)
 	originals := renderedRows(t, mem, "SELECT body FROM t WHERE id IN (1, 2) ORDER BY id")
@@ -252,7 +252,7 @@ func TestChainSharingKeptChainsStayExclusive(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		s := host.Session(SessionOptions{})
+		s := mustSession(host, SessionOptions{})
 		for _, sql := range phase {
 			sql = strings.ReplaceAll(sql, "FILLER", fillerText(900))
 			mustExec(t, mem, sql)

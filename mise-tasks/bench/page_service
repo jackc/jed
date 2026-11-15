@@ -41,7 +41,7 @@ BENCH_CORES = (ENV["usage_cores"]&.split(",") || %w[rust go node]).freeze
 Actor.command_timeout = 600
 
 sh "cargo", "build", "--release", "--quiet", "--bin", "process_actor", "--manifest-path", RUST_MANIFEST
-sh "go", "build", "-o", "process_actor", "./cmd/process_actor", chdir: GO_DIR
+sh "go", "build", "-tags", "jedtooling", "-o", "process_actor", "./cmd/process_actor", chdir: GO_DIR
 
 def hex(sql) = sql.unpack1("H*")
 

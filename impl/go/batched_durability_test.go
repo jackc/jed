@@ -8,6 +8,7 @@ package jed
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -27,7 +28,8 @@ func relaxedDB(t *testing.T, path string, pageSize uint32, inline bool) *Databas
 // relaxedDBTimed is a relaxed database whose batches end intervalMs after they start on env's clock.
 func relaxedDBTimed(t *testing.T, path string, pageSize uint32, inline bool, intervalMs uint64, env *Environment) *Database {
 	t.Helper()
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: pageSize, Synchronous: SynchronousOff, FlushIntervalMs: &intervalMs, Environment: env})
+	interval := millisDuration(intervalMs)
+	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: pageSize, Synchronous: SynchronousOff, FlushInterval: &interval, Environment: env})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,8 +196,8 @@ func TestRelaxedNewestMetaVouchesForTheWholeBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	zero := uint64(0)
-	reopened, err := OpenDatabaseWithOptions(path, OpenOptions{Synchronous: SynchronousOff, FlushIntervalMs: &zero})
+	zero := time.Duration(0)
+	reopened, err := OpenDatabaseWithOptions(path, OpenOptions{Synchronous: SynchronousOff, FlushInterval: &zero})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +345,7 @@ func TestSynchronousOnKeepsTxidParitySlots(t *testing.T) {
 
 func mustExecDB(t *testing.T, db *Database, sql string) {
 	t.Helper()
-	if _, err := db.ExecuteScript(sql); err != nil {
+	if _, err := db.ExecuteScript(context.Background(), sql); err != nil {
 		t.Fatalf("%s: %v", sql, err)
 	}
 }
@@ -598,8 +600,8 @@ func TestRelaxedStoragePrecheckIgnoresTheDeadline(t *testing.T) {
 			default:
 				sql = fmt.Sprintf("UPDATE t SET v = left(md5(v), %d) || v WHERE id %% 5 = 0", 1+i%20)
 			}
-			s := db.Session(SessionOptions{})
-			err := s.Begin(true)
+			s := mustSession(db, SessionOptions{})
+			err := s.Begin(context.Background(), true)
 			if err == nil {
 				_, err = queryOutcome(s, sql, nil)
 			}

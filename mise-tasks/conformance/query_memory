@@ -31,7 +31,7 @@ Dir.mktmpdir("jed-query-memory-peaks") do |dir|
     peak_env = ->(core) { env.merge(mode_env, "JED_CONFORMANCE_QUERY_MEMORY_PEAKS" => peaks[core]) }
     sh "cargo", "run", "--release", "--quiet", "--bin", "conformance", "--manifest-path", RUST_MANIFEST, "--", *extra,
        env: peak_env.("rust")
-    sh "go", "run", "./cmd/conformance", *extra, env: peak_env.("go"), chdir: GO_DIR
+    sh "go", "run", "-tags", "jedtooling", "./cmd/conformance", *extra, env: peak_env.("go"), chdir: GO_DIR
     sh "node", "src/bin/conformance.ts", *extra, env: peak_env.("ts"), chdir: TS_DIR
     mismatches.concat(QueryMemoryPeaks.mismatches(mode, peaks))
   end

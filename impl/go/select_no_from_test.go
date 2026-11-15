@@ -25,7 +25,7 @@ func costOf(t *testing.T, db dbHandle, sql string) int64 {
 
 func TestNoFromLiteralSelect(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	out, err := queryOutcome(db, "SELECT 1", nil)
 	if err != nil {
 		t.Fatalf("SELECT 1: %v", err)
@@ -44,7 +44,7 @@ func TestNoFromLiteralSelect(t *testing.T) {
 
 func TestNoFromExpressionCost(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	rows := query(t, db, "SELECT 1 + 2")
 	if len(rows) != 1 || rows[0][0].Int != 3 {
 		t.Errorf("rows: %v", rows)
@@ -57,7 +57,7 @@ func TestNoFromExpressionCost(t *testing.T) {
 
 func TestNoFromWhereFiltersTheVirtualRow(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if rows := query(t, db, "SELECT 1 WHERE false"); len(rows) != 0 {
 		t.Errorf("WHERE false rows: %v", rows)
 	}
@@ -75,7 +75,7 @@ func TestNoFromWhereFiltersTheVirtualRow(t *testing.T) {
 
 func TestNoFromAggregatesFoldTheSingleGroup(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	// The virtual row is the one input row of the whole-table group (aggregates.md §4).
 	if rows := query(t, db, "SELECT count(*)"); len(rows) != 1 || rows[0][0].Int != 1 {
 		t.Errorf("count(*) rows: %v", rows)
@@ -101,7 +101,7 @@ func TestNoFromAggregatesFoldTheSingleGroup(t *testing.T) {
 
 func TestNoFromDistinctAndWindow(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if rows := query(t, db, "SELECT DISTINCT 1"); len(rows) != 1 || rows[0][0].Int != 1 {
 		t.Errorf("DISTINCT rows: %v", rows)
 	}
@@ -115,7 +115,7 @@ func TestNoFromDistinctAndWindow(t *testing.T) {
 
 func TestNoFromSetOperationOperands(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	rows := query(t, db, "SELECT 1 UNION SELECT 2")
 	got := make([]int64, len(rows))
 	for i, r := range rows {
@@ -171,7 +171,7 @@ func TestNoFromInsertSelectSource(t *testing.T) {
 
 func TestNoFromStarIs42601WithPGMessage(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	_, err := queryOutcome(db, "SELECT *", nil)
 	if err == nil {
 		t.Fatal("SELECT *: expected an error")
@@ -190,7 +190,7 @@ func TestNoFromStarIs42601WithPGMessage(t *testing.T) {
 
 func TestNoFromBareColumnsResolveNothing(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if c := errCode(t, db, "SELECT nope"); c != "42703" {
 		t.Errorf("SELECT nope = %s, want 42703", c)
 	}
@@ -213,7 +213,7 @@ func TestNoFromBareColumnsResolveNothing(t *testing.T) {
 
 func TestNoFromParams(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if c := paramErrCode(t, db, "SELECT $1", IntValue(7)); c != "42P18" {
 		t.Errorf("SELECT $1 = %s, want 42P18", c)
 	}

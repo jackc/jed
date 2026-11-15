@@ -305,7 +305,7 @@ func TestSetVersionAdoptsExistingDatabase(t *testing.T) {
 	db := memDB(t)
 	m := newBlogMigrator(t, db)
 	// The database already has migration 001's schema, built outside the migrator.
-	if _, err := db.ExecuteScript(m.Migrations()[0].Up); err != nil {
+	if _, err := db.ExecuteScript(context.Background(), m.Migrations()[0].Up); err != nil {
 		t.Fatalf("pre-build schema: %v", err)
 	}
 	// Baseline at 1: records the version and runs nothing.
@@ -351,7 +351,7 @@ func TestSetVersionRangeAndRepair(t *testing.T) {
 		t.Fatalf("version after rejected SetVersion = %d, want 0 (unmoved)", v)
 	}
 	// A version table outside 0 … N blocks MigrateTo but not SetVersion, which repairs it.
-	if _, err := db.ExecuteScript("update schema_version set version = 99"); err != nil {
+	if _, err := db.ExecuteScript(context.Background(), "update schema_version set version = 99"); err != nil {
 		t.Fatalf("corrupt version: %v", err)
 	}
 	if err := m.Migrate(); !errors.As(err, &bv) || bv.Whence != "database" {

@@ -1183,11 +1183,11 @@ func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value,
 		}
 	}
 	isInf := func(mc int64) bool { return mc == posInfinity || mc == negInfinity }
-	zoneCharge := func() (ZoneRef, error) {
+	zoneCharge := func() (zoneRef, error) {
 		zr := env.exec.session.timeZone
 		m.Charge(costs.Timezone)
 		if err := m.Guard(); err != nil {
-			return ZoneRef{}, err
+			return zoneRef{}, err
 		}
 		return zr, nil
 	}
@@ -2653,7 +2653,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				}
 				return TimestamptzValue(mc), nil
 			}
-			var zr ZoneRef
+			var zr zoneRef
 			if zv != nil {
 				z, ok := env.exec.session.env.resolveZone(zv.str())
 				if !ok {
@@ -3025,7 +3025,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err := m.Guard(); err != nil {
 				return Value{}, err
 			}
-			var zr ZoneRef
+			var zr zoneRef
 			if len(vals) == 7 {
 				z, err := resolveMakeTimestamptzZone(env.exec.session.env, vals[6].str())
 				if err != nil {

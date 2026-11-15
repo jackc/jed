@@ -39,10 +39,13 @@ const remoteStderrTail = 2048
 // command, commits through it, and when the connection ends it runs the command again (re-election,
 // README.md §6.5) — it never becomes the owner, whatever opts.Ownership says. opts.Credential unlocks
 // an encrypted database here and is also sent in every connection's hello, for a serving end that must
-// own the database (README.md §3.1). An open that cannot reach the database in opts.FileLockTimeoutMs
+// own the database (README.md §3.1). An open that cannot reach the database in opts.FileLockTimeout
 // fails 08006 with the command's standard error; an error the remote side reports (58P01, 0A000, …)
 // is returned as is. Unix only.
 func OpenRemote(command []string, name string, opts OpenOptions) (*Database, error) {
+	if err := opts.validateDurations(); err != nil {
+		return nil, err
+	}
 	if len(command) == 0 {
 		return nil, newError(ConnectionFailure, "empty transport command")
 	}

@@ -192,7 +192,7 @@ func TestBlockingSpillFailuresAndEarlyCursorClose(t *testing.T) {
 	}
 	defer db.Close()
 	db.setSpillDirForTest(dir)
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	mustExec(t, s, "CREATE TABLE a(id i32 PRIMARY KEY,k i32)")
 	for i := 0; i < 100; i++ {
@@ -238,7 +238,7 @@ func TestBlockingSpillFailuresAndEarlyCursorClose(t *testing.T) {
 		}
 		assertNoBlockingScratch(t, dir)
 	}
-	limited := db.Session(SessionOptions{MaxCost: 50})
+	limited := mustSession(db, SessionOptions{MaxCost: 50})
 	defer limited.Close()
 	limited.SetWorkMem(128)
 	_, err = queryOutcome(limited, "SELECT DISTINCT id FROM a", nil)

@@ -20,7 +20,10 @@ func main() {
 	// Session variables are PostgreSQL's GUC model — they live on a SESSION, so mint one from the
 	// database rather than using the bare handle. A custom variable must be NAMESPACED — a dotted name
 	// like myapp.tenant; a non-dotted name is 42704.
-	s := db.Session(jed.SessionOptions{})
+	s, err := db.Session(jed.SessionOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
 	defer s.Close()
 	if err := s.SetVar("myapp.tenant", "acme"); err != nil {
 		log.Fatal(err)

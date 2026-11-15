@@ -47,7 +47,7 @@ when "verify"
     puts "#{variant}: #{File.readlines(log).grep(/^\[(memory|disk)\]/).map(&:strip).join('; ')}"
   end
 when "corpus"
-  run("go", "build", "-tags", tags, "-o", "#{out}/conformance", "./cmd/conformance", chdir: "impl/go")
+  run("go", "build", "-tags", "#{tags},jedtooling", "-o", "#{out}/conformance", "./cmd/conformance", chdir: "impl/go")
   %w[memory disk].each do |storage|
     run("#{out}/conformance", *(storage == "disk" ? ["disk"] : []))
   end

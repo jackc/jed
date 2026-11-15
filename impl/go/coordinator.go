@@ -268,7 +268,7 @@ func fileLockDeadline(host lockHost, value *uint64) time.Time {
 	if value != nil {
 		ms = *value
 	}
-	return host.now().Add(time.Duration(ms) * time.Millisecond)
+	return host.now().Add(millisDuration(ms))
 }
 
 func lockBlocking(host lockHost, h lockHandle, exclusive bool, path string) error {

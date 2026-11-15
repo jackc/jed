@@ -42,7 +42,7 @@ func forxWorkload(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sess := db.Session(SessionOptions{})
+	sess := mustSession(db, SessionOptions{})
 	reopen := func() {
 		t.Helper()
 		sess.Close()
@@ -52,7 +52,7 @@ func forxWorkload(t *testing.T) string {
 		if db, err = OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true}); err != nil {
 			t.Fatal(err)
 		}
-		sess = db.Session(SessionOptions{})
+		sess = mustSession(db, SessionOptions{})
 	}
 	var out strings.Builder
 	query := func(sql string) {

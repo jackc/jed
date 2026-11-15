@@ -4,9 +4,10 @@ package main
 import (
 	"context"
 	"fmt"
-	jed "github.com/jackc/jed/impl/go"
 	"os"
 	"path/filepath"
+
+	jed "github.com/jackc/jed/impl/go"
 
 	"jed-bench/internal/bench"
 )
@@ -38,7 +39,11 @@ func openScratch(dataDir string, synchronous jed.Synchronous) (bench.Engine, err
 		return nil, err
 	}
 	e.db = db
-	e.sess = db.Session(jed.SessionOptions{})
+	e.sess, err = db.Session(jed.SessionOptions{})
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
 	return e, nil
 }
 
@@ -64,7 +69,11 @@ func open(dataDir, dataset string) (bench.Engine, error) {
 		return nil, err
 	}
 	e.db = db
-	e.sess = db.Session(jed.SessionOptions{})
+	e.sess, err = db.Session(jed.SessionOptions{})
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
 	return e, nil
 }
 

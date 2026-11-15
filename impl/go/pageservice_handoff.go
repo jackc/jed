@@ -52,19 +52,19 @@ type ownerLimits struct {
 	maxConnections    int
 }
 
-func millisOr(value *uint64, fallback uint64) time.Duration {
+func durationOr(value *time.Duration, fallback uint64) time.Duration {
 	if value == nil {
 		return time.Duration(fallback) * time.Millisecond
 	}
-	return time.Duration(*value) * time.Millisecond
+	return *value
 }
 
 func ownerLimitsFrom(opts OpenOptions) ownerLimits {
 	return ownerLimits{
-		idleInTransaction: millisOr(opts.IdleInTransactionTimeoutMs, defaultIdleInTransactionTimeoutMs),
-		idleSession:       millisOr(opts.IdleSessionTimeoutMs, 0),
-		yieldGrace:        millisOr(opts.YieldGraceMs, defaultYieldGraceMs),
-		shutdownGrace:     millisOr(opts.ShutdownGraceMs, defaultShutdownGraceMs),
+		idleInTransaction: durationOr(opts.IdleInTransactionTimeout, defaultIdleInTransactionTimeoutMs),
+		idleSession:       durationOr(opts.IdleSessionTimeout, 0),
+		yieldGrace:        durationOr(opts.YieldGrace, defaultYieldGraceMs),
+		shutdownGrace:     durationOr(opts.ShutdownGrace, defaultShutdownGraceMs),
 		maxConnections:    opts.MaxConnections,
 	}
 }
@@ -103,8 +103,8 @@ type serviceHandoff struct {
 
 func newServiceHandoff(host lockHost, path string, opts OpenOptions) *serviceHandoff {
 	h := &serviceHandoff{host: host, path: path, opts: opts, ownership: opts.Ownership, limits: ownerLimitsFrom(opts), timeoutMs: defaultFileLockTimeoutMs, background: true}
-	if opts.FileLockTimeoutMs != nil {
-		h.timeoutMs = *opts.FileLockTimeoutMs
+	if opts.FileLockTimeout != nil {
+		h.timeoutMs = durationMillis(*opts.FileLockTimeout)
 	}
 	return h
 }
@@ -348,7 +348,7 @@ func canOpenReadWrite(files fileHost, path string) bool {
 
 // requestWriteOwnership is a writer's request to a read-only owner (README.md §6.5 case 2): it asks for
 // ownership and waits, under the session's lock timeout, for the connection to end, then re-elects.
-func (c *sharedCore) requestWriteOwnership(r *serviceRole, deadline time.Time) error {
+func (c *sharedCore) requestWriteOwnership(r *serviceRole, deadline time.Time, done <-chan struct{}) error {
 	h := c.handoff
 	if h.ownership == OwnershipNever || !canOpenReadWrite(h.fileHost(), h.path) {
 		return newError(ReadOnlySqlTransaction, "the database owner opened the file read-only")
@@ -363,6 +363,8 @@ func (c *sharedCore) requestWriteOwnership(r *serviceRole, deadline time.Time) e
 	}
 	select {
 	case <-cl.done:
+	case <-done:
+		return doneErr(done)
 	case <-expired:
 		return newError(LockNotAvailable, "could not obtain the database writer lock: the read-only owner did not hand over ownership in time")
 	}
@@ -434,21 +436,29 @@ func (c *sharedCore) beginServiceRead() (*roots, uint64, uint64, error) {
 // beginServiceWrite takes the writer gate of the current role (acquireWriter, caller holds writeMu): the
 // owner's gate, or the owner's through begin_write. A writer meeting a read-only owner asks it for
 // ownership first (README.md §6.5).
-func (c *sharedCore) beginServiceWrite(timeoutMs uint64) error {
+func (c *sharedCore) beginServiceWrite(timeoutMs uint64, done <-chan struct{}) error {
 	var deadline time.Time
 	if timeoutMs > 0 {
-		deadline = time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+		deadline = time.Now().Add(millisDuration(timeoutMs))
 	}
 	for {
+		if err := doneErr(done); err != nil {
+			return err
+		}
 		r := c.role.Load()
 		switch {
 		case r.owner != nil:
 			o := r.owner
-			o.waitAdmission()
+			if err := o.waitAdmissionCancel(done); err != nil {
+				return err
+			}
 			if c.role.Load() != r {
 				continue
 			}
-			if err := o.acquireGate(timeoutMs, nil); err != nil {
+			if err := o.acquireGate(timeoutMs, done); err != nil {
+				if canceled := doneErr(done); canceled != nil {
+					return canceled
+				}
 				if isConnectionFailure(err) {
 					// The owner is releasing ownership: wait for the next role, then begin under it.
 					c.handoff.mu.Lock()
@@ -478,12 +488,34 @@ func (c *sharedCore) beginServiceWrite(timeoutMs uint64) error {
 				continue
 			}
 			if cl.ownerReadOnly && !cl.readOnly {
-				if err := c.requestWriteOwnership(r, deadline); err != nil {
+				if err := c.requestWriteOwnership(r, deadline, done); err != nil {
 					return err
 				}
 				continue
 			}
-			if err := c.clientBeginWrite(r, timeoutMs); err != nil {
+			// protocol-v2 has no cancel-request frame. Bound each wait on the
+			// owner, then retry while the context and the original lock timeout
+			// allow it. Every reply is consumed; no orphaned request can later
+			// acquire the gate or disturb this client's readers.
+			waitMs := timeoutMs
+			if done != nil {
+				waitMs = 50
+				if !deadline.IsZero() {
+					remaining := time.Until(deadline)
+					if remaining <= 0 {
+						return newError(LockNotAvailable, "could not obtain the database writer lock")
+					}
+					waitMs = min(waitMs, uint64((remaining+time.Millisecond-1)/time.Millisecond))
+				}
+			}
+			if err := c.clientBeginWrite(r, waitMs); err != nil {
+				if canceled := doneErr(done); canceled != nil {
+					return canceled
+				}
+				var ee *EngineError
+				if done != nil && errors.As(err, &ee) && ee.State == LockNotAvailable {
+					continue
+				}
 				if cl.brokenErr() != nil && isConnectionFailure(err) {
 					continue
 				}
@@ -574,9 +606,9 @@ func isConnectionFailure(err error) bool {
 	return errors.As(err, &engine) && engine.Code() == "08006"
 }
 
-// PageServiceRoleForTesting reports a handle's page-service role: "owner", "client", or "none" (not
+// pageServiceRoleForTesting reports a handle's page-service role: "owner", "client", or "none" (not
 // under the page service, or between roles). Test-only (README.md §6.5).
-func PageServiceRoleForTesting(db *Database) string {
+func pageServiceRoleForTesting(db *Database) string {
 	switch r := db.core.role.Load(); {
 	case r == nil:
 		return "none"

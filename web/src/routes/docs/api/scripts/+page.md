@@ -20,6 +20,13 @@ results in memory.
 
 <CodeTabs topic="scripts" />
 
+Go uses `db.ExecuteScript(ctx, sql)` or `session.ExecuteScript(ctx, sql)`. The context
+cancels writer waits, execution checkpoints, and work between statements. Cancellation
+before commit rolls back the script's implicit transaction. If the script joined an
+existing transaction, it marks that block failed and the caller must roll it back.
+The error has SQLSTATE `57014` and supports Go's `errors.Is` checks for
+`context.Canceled` and `context.DeadlineExceeded`.
+
 ## The splitter is a primitive too
 
 `split_statements` is the library-level building block underneath `execute_script` — a pure,

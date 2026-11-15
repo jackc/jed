@@ -36,7 +36,7 @@ func TestTextCastIsExplicitOnly(t *testing.T) {
 // landed — cast/composite_casts.test).
 func TestRangeToTextIs0A000(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if code := castErrCode(t, db, "SELECT ('[1,5)'::i32range)::text"); code != "0A000" {
 		t.Fatalf("got %s, want 0A000", code)
 	}
@@ -46,7 +46,7 @@ func TestRangeToTextIs0A000(t *testing.T) {
 // varchar(n) target truncates the bound value.
 func TestParamCastToTextDeclaresText(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	for _, c := range []struct {
 		sql  string
 		bind Value

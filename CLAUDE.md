@@ -71,6 +71,15 @@ that language's accidents — which is exactly the leakage we are preventing.
    language. Pure Go: **no cgo, no FFI** (a standing constraint the dependency policy §14
    does not relax).
 
+   Go host transaction/script APIs take context first. Writer waits are cancelable;
+   cancellation errors retain SQLSTATE `57014` and unwrap to the Go context error.
+   Callback transactions roll back on panic. Cancellation stops before commit work;
+   it cannot turn a completed commit into an error. See `spec/design/api.md` §11.4.
+   Go duration options use `time.Duration`; configured session creation returns
+   errors for invalid time zones or negative timeouts (§11.6).
+   Go repository tooling uses the explicit `jedtooling` build tag; ordinary library
+   builds exclude test hooks and expose `MapRows` for lazy row mapping (§11.7).
+
 Rust and Go are about as far apart as two systems languages get, so this pairing does
 the bulk of the honesty work. Build these two in genuine lockstep from the first
 vertical slice.

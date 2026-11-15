@@ -541,7 +541,7 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 		_ = w.WriteByte(8)
 		spillWriteU64(w, uint64(v.Int))
 	case ValInterval:
-		// Interval — tag 12 (tags 9/10/11 are the Unfetched forms below); months, days, micros.
+		// Interval — tag 12 (tags 9/10/11 are the unfetchedValue forms below); months, days, micros.
 		_ = w.WriteByte(12)
 		spillWriteU32(w, uint32(v.interval().Months))
 		spillWriteU32(w, uint32(v.interval().Days))
@@ -767,7 +767,7 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 		n, err := spillReadU64(r)
 		return TimestamptzValue(int64(n)), err
 	// Tags 9/10/11/21 reload a deferred value's pointer fields. The run file cannot carry runtime
-	// handles, so the reloaded Unfetched keeps the NIL SENTINEL handles (types == nil, the Go zero
+	// handles, so the reloaded unfetchedValue keeps the NIL SENTINEL handles (types == nil, the Go zero
 	// value) — it rides the sort output UNREAD by contract (spill.md §4), and touching one stays
 	// the loud pre-B4 poison panic (resolveUnfetchedSelf; bplus-reshape.md §5).
 	case 9:
@@ -780,14 +780,14 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 			return Value{}, err
 		}
 		length, err := spillReadU32(r)
-		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternal, FirstPage: first, firstTag: tag, StoredLen: length}}, err
+		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: tagExternal, FirstPage: first, firstTag: tag, StoredLen: length}}, err
 	case 10:
 		raw, err := spillReadU32(r)
 		if err != nil {
 			return Value{}, err
 		}
 		comp, err := spillReadBytes(r)
-		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagInlineComp, RawLen: raw, Comp: comp}}, err
+		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: tagInlineComp, RawLen: raw, Comp: comp}}, err
 	case 11:
 		first, err := spillReadU32(r)
 		if err != nil {
@@ -802,13 +802,13 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 			return Value{}, err
 		}
 		raw, err := spillReadU32(r)
-		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternalComp, FirstPage: first, firstTag: tag, StoredLen: stored, RawLen: raw}}, err
+		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: tagExternalComp, FirstPage: first, firstTag: tag, StoredLen: stored, RawLen: raw}}, err
 	case 22:
 		body, err := spillReadBytes(r)
 		return JsonPathValue(string(body)), err
 	case 21:
 		body, err := spillReadBytes(r)
-		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: 0x00, Comp: body}}, err
+		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: 0x00, Comp: body}}, err
 	case 12:
 		months, err := spillReadU32(r)
 		if err != nil {

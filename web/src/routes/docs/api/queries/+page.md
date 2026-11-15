@@ -290,8 +290,16 @@ bound values and shows the plan they get.
 Go's `Query`, `QueryPrepared`, `Exec`, and `QueryRow` accept a `context.Context` on database,
 session, and transaction handles. Keep that context alive while consuming the rows: cancellation
 also interrupts engine work inside a long `Rows.Next()` after `Query` has returned. Check
-`Rows.Err()` for SQLSTATE `57014`, and `defer rows.Close()` when you might stop early. Exhaustion
+`Rows.Err()` for SQLSTATE `57014`, and `defer rows.Close()` when you might stop early. The error
+also supports `errors.Is(err, context.Canceled)` or
+`errors.Is(err, context.DeadlineExceeded)`, while `errors.As` still finds its `*jed.EngineError`.
+Waiting for the writer gate is cancelable too. Exhaustion
 and terminal errors release the cursor automatically.
+
+Cancellation remains best effort: it cannot interrupt a synchronous host callback or an
+individual storage operation. Once commit work starts, cancellation cannot undo the commit or
+turn its success into a cancellation error. Already-materialized results, including `RETURNING`
+rows from a completed write, remain readable after cancellation.
 
 Rust's `query_cancelable` and `execute_cancelable` accept a clonable `CancellationToken`; another
 thread can call `cancel()` while the query runs. A Rust `Rows` cursor yields each row as a `Result`,
@@ -328,3 +336,40 @@ best effort, checked periodically during scans, joins, and other execution loops
 every expression. There is no fixed wall-clock response guarantee: sorting, individual scalar kernels,
 host callbacks, and commit work can delay observation. Cancellation does not change completed-query
 cost totals or deterministic cost limits.
+
+## Go row mapping and application interfaces
+
+`jed.MapRows(rows, mapper)` is a lazy, single-use iterator yielding `(value, error)`.
+Use `jed.RowTo[T]` for a single column or `jed.RowToStructByName[T]` for struct fields.
+Check each yielded error. Once iteration starts, completion, errors, and early loop exits
+close the cursor. If you create the iterator but never consume it, close `rows` yourself.
+
+```go
+for user, err := range jed.MapRows(rows, jed.RowToStructByName[User]) {
+    if err != nil {
+        return err
+    }
+    fmt.Println(user.Name)
+}
+```
+
+This is `iter.Seq2[T, error]`. The standard library's `slices.Collect` accepts
+`iter.Seq[T]`, so it cannot consume this iterator directly. To build a slice, append values
+in the loop after checking their errors. Jed does not provide an eager `CollectRows` helper.
+
+Data-access helpers can define the smallest interface they use in the application's package:
+
+```go
+type rowQuerier interface {
+    QueryRow(context.Context, string, ...any) *jed.Row
+}
+
+func accountName(ctx context.Context, q rowQuerier, id int64) (string, error) {
+    var name string
+    err := q.QueryRow(ctx, "SELECT name FROM account WHERE id = $1", id).Scan(&name)
+    return name, err
+}
+```
+
+`*jed.Database`, `*jed.Session`, and `*jed.Transaction` all satisfy this interface.
+`jed.Queryer` remains available for helpers that need all six ordinary and prepared query methods.

@@ -346,14 +346,14 @@ func TestErrorFieldsPositionHintSharedCases(t *testing.T) {
 				t.Fatalf("%s: attach %q: %v", c.name, name, err)
 			}
 		}
-		db := handle.Session(SessionOptions{})
+		db := mustSession(handle, SessionOptions{})
 		for _, s := range c.setup {
 			if _, err := queryOutcome(db, s, nil); err != nil {
 				t.Fatalf("%s: setup %q: %v", c.name, s, err)
 			}
 		}
 		if c.script {
-			_, err = db.ExecuteScript(c.run)
+			_, err = db.ExecuteScript(context.Background(), c.run)
 		} else {
 			_, err = queryOutcome(db, c.run, nil)
 		}

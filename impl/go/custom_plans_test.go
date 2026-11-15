@@ -55,7 +55,7 @@ func seedItems(t *testing.T, s *Session) {
 
 func TestCustomPlanKeyLookupPlannedOnce(t *testing.T) {
 	t.Parallel()
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	seedItems(t, s)
 	stmt, err := s.Prepare("SELECT cat FROM items WHERE id = $1")
 	if err != nil {
@@ -83,7 +83,7 @@ func TestCustomPlanKeyLookupPlannedOnce(t *testing.T) {
 
 func TestCustomPlanSensitiveReplansAndMemoizes(t *testing.T) {
 	t.Parallel()
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	seedItems(t, s)
 	stmt, err := s.Prepare("SELECT id FROM items WHERE cat = $1")
 	if err != nil {
@@ -128,7 +128,7 @@ func TestCustomPlanSensitiveReplansAndMemoizes(t *testing.T) {
 // values, estimates included.
 func TestCustomPlanValueBlindClassificationIsSound(t *testing.T) {
 	t.Parallel()
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	seedItems(t, s)
 	mustExec(t, s, "CREATE TABLE t2 (id i32 PRIMARY KEY, v i32, w text)")
 	mustExec(t, s, "INSERT INTO t2 SELECT CAST(g AS i32), CAST(g % 7 AS i32), CAST(g AS text) FROM generate_series(1, 50) AS g")
@@ -181,7 +181,7 @@ func TestCustomPlanValueBlindClassificationIsSound(t *testing.T) {
 func TestCustomPlanSensitiveConcurrent(t *testing.T) {
 	t.Parallel()
 	db := memDB()
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	seedItems(t, s)
 	stmt, err := s.Prepare("SELECT id FROM items WHERE cat = $1")
 	if err != nil {
@@ -192,7 +192,7 @@ func TestCustomPlanSensitiveConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func(g int) {
 			defer wg.Done()
-			sess := db.Session(SessionOptions{})
+			sess := mustSession(db, SessionOptions{})
 			for i := 0; i < 40; i++ {
 				v, want := int64(1), 900
 				if (g+i)%2 == 0 {
@@ -222,7 +222,7 @@ func TestCustomPlanSensitiveConcurrent(t *testing.T) {
 // another count, and a memo hit returns the rows of its own binding.
 func TestCustomPlanLimitOffsetParameterIsSensitive(t *testing.T) {
 	t.Parallel()
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	seedItems(t, s)
 	stmt, err := s.Prepare("SELECT id FROM items ORDER BY id LIMIT $1 OFFSET $2")
 	if err != nil {

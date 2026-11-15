@@ -83,7 +83,7 @@ func TestCollationSortKeyMatchesVectorsAndIsAscending(t *testing.T) {
 		t.Fatal("no sortkey vectors")
 	}
 	lastColl := ""
-	var coll *Collation
+	var coll *compiledCollation
 	var prev []byte
 	for _, row := range rows {
 		collName := row.str("coll_name")
@@ -137,7 +137,7 @@ func TestCollationBundleVectorsRoundTripAndMerge(t *testing.T) {
 		if len(names) != len(defs) {
 			t.Fatalf("tailoring_names/tailoring_def_files length mismatch")
 		}
-		tailorings := make([]*Collation, len(names))
+		tailorings := make([]*compiledCollation, len(names))
 		for i, n := range names {
 			c, err := compileCollation(n, collDefinition(t, strings.Split(defs[i], "|")))
 			if err != nil {
@@ -165,7 +165,7 @@ func TestCollationBundleVectorsRoundTripAndMerge(t *testing.T) {
 		if err != nil {
 			t.Fatalf("load bundle: %v", err)
 		}
-		find := func(name string) *Collation {
+		find := func(name string) *compiledCollation {
 			for _, c := range colls {
 				if c.Name == name {
 					return c

@@ -2510,7 +2510,7 @@ func inMembership(lv Value, list []Value, negated bool, m *costMeter) (Value, er
 // operator_eval plus the size-scaled work of the comparison, guarded — collate per code point of a
 // collated text pair, else decimal_work / varlen_compare — metered like an explicit `<` (the
 // GREATEST/LEAST rule, cost.md §3).
-func widthBucketArray(operand, thresholds Value, collation *Collation, m *costMeter) (Value, error) {
+func widthBucketArray(operand, thresholds Value, collation *compiledCollation, m *costMeter) (Value, error) {
 	arr := thresholds.arrayVal()
 	if len(arr.Dims) > 1 {
 		return Value{}, newError(ArraySubscriptError, "thresholds must be one-dimensional array")
@@ -2580,7 +2580,7 @@ func widthBucketArray(operand, thresholds Value, collation *Collation, m *costMe
 // collation (non-nil) is the comparison collation of a text / text[] quantifier
 // (spec/design/collation.md §1 "IN / ANY / ALL"): an ORDERING comparison of two text (or text[])
 // values sorts by it, charging collate per code point exactly like a collated reCompare.
-func quantifiedMembership(op binaryOp, all, rowWise bool, lv, av Value, collation *Collation, m *costMeter) (Value, error) {
+func quantifiedMembership(op binaryOp, all, rowWise bool, lv, av Value, collation *compiledCollation, m *costMeter) (Value, error) {
 	if av.Kind == ValNull {
 		return NullValue(), nil
 	}

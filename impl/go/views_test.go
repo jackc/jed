@@ -33,7 +33,7 @@ func viewsCode(t *testing.T, s *Session, sql string) string {
 // definition, and after its underlying table changes (views.md §4: a view expands at every planning,
 // so it is never served from a stale plan).
 func TestPreparedViewQueryNeverServesAStalePlan(t *testing.T) {
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	viewsExec(t, s, "CREATE TABLE t (a i32 PRIMARY KEY, b i32)")
 	viewsExec(t, s, "INSERT INTO t VALUES (1, 10), (2, 20)")
 	viewsExec(t, s, "CREATE VIEW v AS SELECT a, b FROM t WHERE a = 1")
@@ -78,7 +78,7 @@ func TestPreparedViewQueryNeverServesAStalePlan(t *testing.T) {
 // §1.2/§7.1): the replacement's rows come back on the next execution, and a renamed view is gone under
 // its old name while a view that reads it keeps working.
 func TestPreparedViewQueryFollowsReplaceAndRename(t *testing.T) {
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	viewsExec(t, s, "CREATE TABLE t (a i32 PRIMARY KEY, b i32)")
 	viewsExec(t, s, "INSERT INTO t VALUES (1, 10), (2, 20)")
 	viewsExec(t, s, "CREATE VIEW v AS SELECT a, b FROM t WHERE a = 1")
@@ -126,7 +126,7 @@ func TestPreparedViewQueryFollowsReplaceAndRename(t *testing.T) {
 // sequences.md §4): inside a READ ONLY block it is 25006, and in autocommit it advances the sequence
 // exactly once per read.
 func TestQueryLaneSeesANextvalViewAsAWrite(t *testing.T) {
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	viewsExec(t, s, "CREATE SEQUENCE s")
 	viewsExec(t, s, "CREATE VIEW vs AS SELECT nextval('s') AS n")
 	query := func(sql string) ([][]Value, error) {
@@ -165,7 +165,7 @@ func TestQueryLaneSeesANextvalViewAsAWrite(t *testing.T) {
 // Reading a view needs SELECT on the view only, but the functions its body calls need the reader's
 // EXECUTE, as in a derived table (views.md §9).
 func TestViewBodyFunctionsNeedTheReadersExecute(t *testing.T) {
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	viewsExec(t, s, "CREATE TABLE t (a i32 PRIMARY KEY)")
 	viewsExec(t, s, "INSERT INTO t VALUES (-5)")
 	viewsExec(t, s, "CREATE VIEW v AS SELECT abs(a) AS x FROM t")
@@ -191,7 +191,7 @@ func TestViewsSurviveCommitReopenAndCompaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	viewsExec(t, s, "CREATE TABLE t (a i32 PRIMARY KEY, b text)")
 	viewsExec(t, s, "INSERT INTO t VALUES (1, 'x'), (2, 'y')")
 	viewsExec(t, s, "CREATE VIEW v AS SELECT * FROM t WHERE a > 1")
@@ -206,7 +206,7 @@ func TestViewsSurviveCommitReopenAndCompaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s = db.Session(SessionOptions{})
+	s = mustSession(db, SessionOptions{})
 	got := queryRows(t, s, "SELECT name, definition FROM jed_views ORDER BY name")
 	want := [][]Value{
 		{TextValue("v"), TextValue(`select "t" . "a" , "t" . "b" from "t2" as "t" where a > 1`)},
@@ -233,7 +233,7 @@ func TestViewsSurviveCommitReopenAndCompaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s = db.Session(SessionOptions{})
+	s = mustSession(db, SessionOptions{})
 	if got := queryRows(t, s, "SELECT k FROM w"); !reflect.DeepEqual(got, [][]Value{{IntValue(2)}}) {
 		t.Fatalf("SELECT k FROM w after compaction = %v", got)
 	}
@@ -246,7 +246,7 @@ func TestViewsSurviveCommitReopenAndCompaction(t *testing.T) {
 // The dependency-order accessor lists views in dependency order, ties in name byte order (views.md
 // §11).
 func TestViewsInDependencyOrder(t *testing.T) {
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	viewsExec(t, s, "CREATE TABLE t (a i32 PRIMARY KEY)")
 	viewsExec(t, s, "CREATE VIEW z AS SELECT a FROM t")
 	viewsExec(t, s, "CREATE VIEW b AS SELECT a FROM z")
@@ -277,7 +277,7 @@ func TestAttachedDatabaseViews(t *testing.T) {
 		t.Fatalf("attach: %v", err)
 	}
 	defer db.Detach("reports")
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	if got := queryRows(t, s, "SELECT a FROM reports.t"); !reflect.DeepEqual(got, [][]Value{{IntValue(1)}}) {
 		t.Fatalf("SELECT a FROM reports.t = %v", got)

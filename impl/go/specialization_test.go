@@ -60,7 +60,7 @@ func TestSpecializationBudgetPrefixes(t *testing.T) {
 func TestSpecializationAdmissionAndCache(t *testing.T) {
 	db := memDB()
 	defer db.Close()
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32, d date, flag boolean)")
 	mustExec(t, s, "INSERT INTO t VALUES (1, 7, 3, '2020-01-01', true), (2, NULL, 0, '2020-01-02', NULL)")
@@ -158,7 +158,7 @@ func TestSpecializationAdmissionAndCache(t *testing.T) {
 func TestSpecializationSharedStatement(t *testing.T) {
 	db := memDB()
 	defer db.Close()
-	seed := db.Session(SessionOptions{})
+	seed := mustSession(db, SessionOptions{})
 	mustExec(t, seed, "CREATE TABLE t (id i32 PRIMARY KEY, a i32)")
 	mustExec(t, seed, "INSERT INTO t VALUES (1,7)")
 	stmt, err := seed.Prepare("SELECT a + $1 FROM t ORDER BY id")
@@ -171,7 +171,7 @@ func TestSpecializationSharedStatement(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			s := db.Session(SessionOptions{})
+			s := mustSession(db, SessionOptions{})
 			defer s.Close()
 			for j := 0; j < 30; j++ {
 				rows, err := s.queryStmt(stmt.ast, []Value{IntValue(int64(i + j))}, &stmt.sc, &stmt.ic)
@@ -294,7 +294,7 @@ func TestSpecializationFileFaultOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	mustExec(t, s, "INSERT INTO t SELECT i, i%7 FROM generate_series(1,600) AS g(i)")
 	s.Close()
@@ -312,7 +312,7 @@ func TestSpecializationFileFaultOrder(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer db.Close()
-			s := db.Session(SessionOptions{})
+			s := mustSession(db, SessionOptions{})
 			defer s.Close()
 			done := make(chan struct{})
 			if !fail {

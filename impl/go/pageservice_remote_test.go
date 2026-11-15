@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // relayEnv names the endpoint a transport run of this binary relays its stdio to.
@@ -73,13 +74,13 @@ func remoteFixture(t *testing.T) (owner, remote *Database) {
 		t.Fatal("the owner wrote no serving owner record")
 	}
 	t.Setenv(relayEnv, record.endpoint)
-	timeout := uint64(5000)
-	remote, err = OpenRemote([]string{os.Args[0]}, "remote:"+path, OpenOptions{FileLockTimeoutMs: &timeout})
+	timeout := 5000 * time.Millisecond
+	remote, err = OpenRemote([]string{os.Args[0]}, "remote:"+path, OpenOptions{FileLockTimeout: &timeout})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = remote.Close() })
-	if role := PageServiceRoleForTesting(remote); role != "client" {
+	if role := pageServiceRoleForTesting(remote); role != "client" {
 		t.Fatalf("the stream handle is %s, not a client", role)
 	}
 	return owner, remote
@@ -148,8 +149,8 @@ func TestRemoteWriteCommitsAtTheOwner(t *testing.T) {
 
 // A transport that cannot connect fails the open 08006 with its standard error.
 func TestFailingTransportReportsItsStderr(t *testing.T) {
-	timeout := uint64(300)
-	_, err := OpenRemote([]string{"sh", "-c", "echo 'ssh: connect to host nowhere: Connection refused' >&2; exit 255"}, "remote:nowhere", OpenOptions{FileLockTimeoutMs: &timeout})
+	timeout := 300 * time.Millisecond
+	_, err := OpenRemote([]string{"sh", "-c", "echo 'ssh: connect to host nowhere: Connection refused' >&2; exit 255"}, "remote:nowhere", OpenOptions{FileLockTimeout: &timeout})
 	engine, ok := err.(*EngineError)
 	if !ok || engine.Code() != "08006" || !strings.Contains(engine.Error(), "Connection refused") {
 		t.Fatalf("a failing transport opened with %v", err)
@@ -158,8 +159,8 @@ func TestFailingTransportReportsItsStderr(t *testing.T) {
 
 // A transport command that cannot run fails the open 08006 naming it.
 func TestMissingTransportFailsTheOpen(t *testing.T) {
-	timeout := uint64(300)
-	_, err := OpenRemote([]string{"/nonexistent/jed-transport"}, "remote:missing", OpenOptions{FileLockTimeoutMs: &timeout})
+	timeout := 300 * time.Millisecond
+	_, err := OpenRemote([]string{"/nonexistent/jed-transport"}, "remote:missing", OpenOptions{FileLockTimeout: &timeout})
 	engine, ok := err.(*EngineError)
 	if !ok || engine.Code() != "08006" || !strings.Contains(engine.Error(), "could not run /nonexistent/jed-transport") {
 		t.Fatalf("a missing transport opened with %v", err)

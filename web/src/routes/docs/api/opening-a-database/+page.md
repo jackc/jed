@@ -92,7 +92,7 @@ opened with `synchronous` off adds its commits to the owning process's batch, wh
 on makes each of its commits durable before it returns, whatever the other processes chose.
 
 `close` reports a flush that failed. After any failed flush the handle refuses further reads and
-writes until you reopen it. Set the interval with `flush_interval_ms` (Rust), `FlushIntervalMs` (Go),
+writes until you reopen it. Set the interval with `flush_interval_ms` (Rust), `FlushInterval` (Go),
 or `flushIntervalMs` (TypeScript); `0` turns the timed flush off, so an idle database stays unflushed
 until its next batch fills or it closes. The interval is measured on the database's clock source, so
 a test that installs a manual clock controls exactly when it fires. This is different from `skip_fsync`, which skips
@@ -123,9 +123,9 @@ The open/create `locking` option chooses this. `auto` (the default) uses the pag
 that support it (Unix local files) and behaves like `exclusive` elsewhere (Windows, for now).
 `exclusive` owns the file without serving it, so another process's open waits and then fails with
 `55006`. `none` skips coordination and is only for when an external coordinator provides the same
-safety. `file_lock_timeout_ms` / `FileLockTimeoutMs` / `fileLockTimeoutMs` bounds how long an open
+safety. `file_lock_timeout_ms` / `FileLockTimeout` / `fileLockTimeoutMs` bounds how long an open
 waits to own the file or reach its owner (default 5 seconds); the separate session
-`lock_timeout_ms` / `LockTimeoutMs` / `lockTimeoutMs` bounds writer waiting and reports `55P03`.
+`lock_timeout_ms` / `LockTimeout` / `lockTimeoutMs` bounds writer waiting and reports `55P03`.
 An attached file uses the page service too: the first process to attach (or open) it owns and serves
 it, and any other process that attaches it reads and commits through that owner, taking over when it
 leaves. A write transaction takes the writer lock of the main database and of every read-write
@@ -411,3 +411,45 @@ when it is parsed or built — a short string such as `repeat('[', 100000)` can'
 stack), and one view reference may not expand to more than **1024** views (`54001` — views that
 each read the previous view twice would otherwise double at every level). Each limit is
 deterministic and identical across the Rust, Go, and TypeScript cores.
+
+## Go duration options
+
+Go uses `time.Duration` for timeouts and intervals. For example:
+
+```go
+wait := 5 * time.Second
+flush := 250 * time.Millisecond
+db, err := jed.OpenDatabaseWithOptions("app.jed", jed.OpenOptions{
+    FileLockTimeout: &wait,
+    Synchronous: jed.SynchronousOff,
+    FlushInterval: &flush,
+})
+if err != nil {
+    return err
+}
+defer db.Close()
+```
+
+The duration pointers distinguish an omitted option (`nil`, use its default) from an explicit
+zero. A zero `FileLockTimeout` tries acquisition once; a zero `FlushInterval` disables timed
+flushes. `IdleInTransactionTimeout`, `IdleSessionTimeout`, `YieldGrace`, and `ShutdownGrace`
+also use duration pointers. Negative durations return `22023`, including for modes that ignore
+the option. File-lock waits and flush intervals round positive fractions of a millisecond up.
+
+Creating a configured Go session returns an error:
+
+```go
+session, err := db.Session(jed.SessionOptions{
+    LockTimeout: 2 * time.Second,
+    TimeZone: "UTC",
+})
+if err != nil {
+    return err
+}
+defer session.Close()
+```
+
+`LockTimeout` defaults to zero (unlimited), rejects negative values, and rounds positive fractions
+of a millisecond up. `session.SetLockTimeout(duration)` returns an error for invalid values.
+An empty `TimeZone` selects UTC. An invalid zone, including a named zone not loaded into the
+database's environment, returns `22023` from `Session` rather than silently selecting UTC.

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // Locking selects how a file database coordinates with other processes (spec/design/locking.md,
@@ -42,16 +43,16 @@ const (
 	SynchronousOff
 )
 
-// DefaultFlushIntervalMs is the default FlushIntervalMs: how long a SynchronousOff batch may stay
+// DefaultFlushInterval is the default FlushInterval: how long a SynchronousOff batch may stay
 // pending before it is flushed (spec/design/validated-cow.md §4.1).
-const DefaultFlushIntervalMs = 1000
+const DefaultFlushInterval = time.Second
 
-// flushIntervalMs resolves a FlushIntervalMs option: nil is DefaultFlushIntervalMs.
-func flushIntervalMs(opt *uint64) uint64 {
+// flushIntervalMs resolves a FlushInterval option: nil is DefaultFlushInterval.
+func flushIntervalMs(opt *time.Duration) uint64 {
 	if opt == nil {
-		return DefaultFlushIntervalMs
+		return durationMillis(DefaultFlushInterval)
 	}
-	return *opt
+	return durationMillis(*opt)
 }
 
 // ScratchEncryption is whether a handle seals its scratch files — spill runs, hash partitions, row
@@ -159,6 +160,9 @@ func createVia(files fileHost, path string, opts databaseOptions) (*engine, erro
 // OpenOptions are open-time settings for a file-backed database (spec/design/api.md §2.1). Unlike
 // databaseOptions (create-time, fixed into the file), these are handle settings — not stored in the
 // file, so a different host may reopen the same file with different ones.
+// Duration fields reject negative values, even for modes that ignore them.
+// FileLockTimeout and FlushInterval round positive fractions of a millisecond up.
+// A nil duration pointer selects its documented default; a pointer to zero is explicit.
 type OpenOptions struct {
 	// CacheBytes is the buffer-pool budget in bytes: roughly the maximum memory the resident leaf cache
 	// holds at once (spec/design/pager.md §3, P6.4b/c). Bytes, not a page count: the pool charges each
@@ -184,27 +188,27 @@ type OpenOptions struct {
 	// Synchronous is the durability mode (SynchronousOn, the default, or SynchronousOff — transactions.md
 	// §9). A handle setting, not stored in the file; the handle's file attachments follow it.
 	Synchronous Synchronous
-	// FlushIntervalMs is how long a SynchronousOff batch may stay pending, in milliseconds, before it is
+	// FlushInterval is how long a SynchronousOff batch may stay pending before it is
 	// flushed (spec/design/validated-cow.md §4.1), measured on the Environment's clock source. nil is
-	// DefaultFlushIntervalMs (1000); &0 turns the time-based flush off. Ignored under SynchronousOn.
-	FlushIntervalMs *uint64
-	Locking         Locking
+	// DefaultFlushInterval (one second); &0 turns the time-based flush off. Ignored under SynchronousOn.
+	FlushInterval *time.Duration
+	Locking       Locking
 	// nil is the 5s default; a non-nil pointer (including &0) is an explicit deadline.
-	FileLockTimeoutMs *uint64
-	// IdleInTransactionTimeoutMs is a page-service owner's idle-in-transaction timeout for client write
+	FileLockTimeout *time.Duration
+	// IdleInTransactionTimeout is a page-service owner's idle-in-transaction timeout for client write
 	// transactions (spec/design/page-service.md §11.1): a client holding the writer gate that sends
 	// nothing for this long is revoked (25P03 at its next request). nil is the 60 s default; &0
 	// disables it. Only the page service (LockingAuto) reads it.
-	IdleInTransactionTimeoutMs *uint64
-	// IdleSessionTimeoutMs closes a page-service connection idle between transactions for this long
-	// (page-service.md §11.1); nil or &0 never does. YieldGraceMs and ShutdownGraceMs are how long a
+	IdleInTransactionTimeout *time.Duration
+	// IdleSessionTimeout closes a page-service connection idle between transactions for this long
+	// (page-service.md §11.1); nil or &0 never does. YieldGrace and ShutdownGrace are how long a
 	// yielding or closing owner lets running transactions finish (nil: 5 s and 30 s). MaxConnections
 	// bounds an owner's connections (53300 beyond it); 0 is unlimited. Only the page service (LockingAuto) reads them,
 	// as an owner's limits; a client keeps them for the day it becomes owner.
-	IdleSessionTimeoutMs *uint64
-	YieldGraceMs         *uint64
-	ShutdownGraceMs      *uint64
-	MaxConnections       int
+	IdleSessionTimeout *time.Duration
+	YieldGrace         *time.Duration
+	ShutdownGrace      *time.Duration
+	MaxConnections     int
 	// Ownership is the opener's ownership preference under the page service (page-service.md §8.2):
 	// OwnershipPrefer (the default), OwnershipYield, or OwnershipNever. Only the page service (LockingAuto) reads it.
 	Ownership Ownership

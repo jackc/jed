@@ -200,6 +200,12 @@ func (db *engine) commitTx() (outcome, error) {
 	if tx == nil {
 		return outcome{Kind: outcomeStatement, Cost: 0}, nil
 	}
+	// This is the last cancellation boundary before commit work. Once storage
+	// publication starts, a later cancellation must not turn success into rollback.
+	if err := doneErr(db.session.cancel); err != nil {
+		_, _ = db.rollbackTx()
+		return outcome{}, err
+	}
 	db.session.tx = nil
 	if tx.failed || !tx.writable {
 		// A failed or read-only block publishes nothing — a failed COMMIT is a ROLLBACK (PG), so any

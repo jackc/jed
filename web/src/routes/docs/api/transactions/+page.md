@@ -37,6 +37,17 @@ The read-only `view` helper remains useful for enforcing access restrictions and
 
 <CodeTabs topic="transactions" />
 
+In Go, call `db.Update(ctx, fn)` / `db.View(ctx, fn)` or the same methods on a session.
+Both roll back and release their locks and snapshot pins before propagating a panic.
+The context controls transaction admission and the check before commit; pass it to
+`tx.Exec` / `tx.Query` inside the callback to cancel those statements too. Callbacks
+run synchronously and are never forcibly interrupted.
+
+For a manual block, `session.Begin(ctx, true)` starts a writable transaction and
+`session.Begin(ctx, false)` starts a read-only one. That context controls beginning
+the transaction only; after it returns, use each statement's context and explicitly
+call `session.Commit()` or `session.Rollback()`. A deferred `session.Rollback()` is
+safe after commit. Cancellation does not disable rollback or session cleanup.
 
 ## Savepoints
 

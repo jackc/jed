@@ -22,7 +22,7 @@ func jpErr(t *testing.T, db dbHandle, sql string) string {
 // compiles them, so each is a documented divergence; the supported surface is oracle-clean in suites/json/.
 func TestJsonpathUnsupportedConstructsAre0A000(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	for _, path := range []string{
 		"$.a.datetime()", // a datetime item method
 		`$.a.datetime("HH24")`,
@@ -42,7 +42,7 @@ func TestJsonpathUnsupportedConstructsAre0A000(t *testing.T) {
 // ARE has is 2201B when the path compiles, where PostgreSQL accepts it (jsonpath.md §4.3).
 func TestJsonpathLikeRegexSubset(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	for _, pattern := range []string{`\\y`, `\\u0041`, `(?i)a`, `a\\b`} {
 		if got := jpErr(t, db, `SELECT '$ ? (@ like_regex "`+pattern+`")'::jsonpath`); got != "2201B" {
 			t.Errorf("like_regex %q should be 2201B, got %s", pattern, got)
@@ -54,7 +54,7 @@ func TestJsonpathLikeRegexSubset(t *testing.T) {
 // for jsonpath numbers (jsonpath.md §2): 42601 where PostgreSQL accepts them.
 func TestJsonpathAnyLevelLiteral(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	for _, path := range []string{"$.**{1_000}", "$.**{0x10}", "$.**{2 to 0b11}"} {
 		if got := jpErr(t, db, "SELECT '"+path+"'::jsonpath"); got != "42601" {
 			t.Errorf("path %q should be 42601, got %s", path, got)
@@ -66,7 +66,7 @@ func TestJsonpathAnyLevelLiteral(t *testing.T) {
 // A documented contract (jsonpath.md §1); only IS [NOT] NULL applies.
 func TestJsonpathIsNotComparable(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if got := jpErr(t, db, "SELECT '$.a'::jsonpath = '$.a'::jsonpath"); got != "42883" {
 		t.Errorf("jsonpath = jsonpath should be 42883, got %s", got)
 	}
@@ -79,7 +79,7 @@ func TestJsonpathIsNotComparable(t *testing.T) {
 // column). PostgreSQL allows a jsonpath column, so this is a documented divergence.
 func TestJsonpathColumnIsUnsupported(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if got := jpErr(t, db, "CREATE TABLE t (p jsonpath)"); got != "0A000" {
 		t.Errorf("a jsonpath column should be 0A000, got %s", got)
 	}
@@ -89,7 +89,7 @@ func TestJsonpathColumnIsUnsupported(t *testing.T) {
 // is a documented divergence (jsonpath.md §3.1).
 func TestJsonpathDeferredConstructsAre0A000(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	if got := jpErr(t, db, `SELECT jsonb_path_query_array('["2020-01-01"]', '$[*].datetime()')`); got != "0A000" {
 		t.Errorf("jsonb_path_query_array with a datetime method should be 0A000, got %s", got)
 	}
@@ -100,7 +100,7 @@ func TestJsonpathDeferredConstructsAre0A000(t *testing.T) {
 // distinction against the 0A000 ones above.)
 func TestMalformedJsonpathIs42601(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	for _, path := range []string{"$.", "$[", "$[1 to"} {
 		if got := jpErr(t, db, "SELECT '"+path+"'::jsonpath"); got != "42601" {
 			t.Errorf("malformed path %q should be 42601, got %s", path, got)
@@ -113,7 +113,7 @@ func TestMalformedJsonpathIs42601(t *testing.T) {
 // and decimal methods read PostgreSQL's input forms (the corpus).
 func TestJsonpathMethodNumberGrammarDivergence(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	for _, c := range []struct{ doc, path string }{
 		{`"0x10"`, "$.double()"},
 	} {

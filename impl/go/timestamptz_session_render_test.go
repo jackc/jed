@@ -10,6 +10,7 @@ package jed
 // impl/rust/tests/timestamptz_session_render.rs and impl/ts/tests/timestamptz_session_render.test.ts.
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -76,7 +77,7 @@ func TestTransactionRenderUsesTheOwningSessionZone(t *testing.T) {
 		t.Fatal(err)
 	}
 	var text string
-	err := db.Update(func(tx *Transaction) error {
+	err := db.Update(context.Background(), func(tx *Transaction) error {
 		out, err := queryOutcome(tx, "SELECT timestamptz '2024-01-15 12:00:00+00'", nil)
 		if err != nil {
 			return err

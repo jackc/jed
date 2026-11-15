@@ -726,7 +726,7 @@ func (k *integrityChecker) compareCatalog(stored []integrityCatalogPage) error {
 func (k *integrityChecker) checkTable(name string) error {
 	table := k.snap.tables[name]
 	store := k.snap.stores[name]
-	colls := make([]*Collation, len(table.Columns))
+	colls := make([]*compiledCollation, len(table.Columns))
 	for i, c := range table.Columns {
 		if c.Collation != "" {
 			colls[i] = k.snap.resolveCollation(c.Collation)
@@ -774,7 +774,7 @@ func (k *integrityChecker) checkTable(name string) error {
 	return nil
 }
 
-func (k *integrityChecker) checkIndex(table *catTable, store *tableStore, colls []*Collation, tableRoot pageRef, tableDamaged bool, def indexDef) error {
+func (k *integrityChecker) checkIndex(table *catTable, store *tableStore, colls []*compiledCollation, tableRoot pageRef, tableDamaged bool, def indexDef) error {
 	// An index whose walk reported anything, even an order or bounds finding that leaves it readable,
 	// is not checked for agreement: its own lookups cannot be trusted to find what it holds (§5.2).
 	before := len(k.report.Findings)
@@ -1059,7 +1059,7 @@ type integrityTree struct {
 	object   string
 	colTypes []colType
 	table    *catTable // nil for an index
-	colls    []*Collation
+	colls    []*compiledCollation
 	// leafDepth is the depth of the first leaf, -1 before it.
 	leafDepth int
 	// readable is cleared when part of the tree could not be read; badRow when a row stopped at a

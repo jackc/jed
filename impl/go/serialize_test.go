@@ -9,6 +9,7 @@ package jed
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -90,14 +91,14 @@ func TestSerializeRoundTripKeepsRowsCostsAndVersion(t *testing.T) {
 
 func TestSerializeExcludesUncommittedChanges(t *testing.T) {
 	db := serializeMemory(t)
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	for _, sql := range []string{"CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1)"} {
 		if _, err := queryOutcome(s, sql, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := s.Begin(true); err != nil {
+	if err := s.Begin(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := queryOutcome(s, "INSERT INTO t VALUES (2)", nil); err != nil {

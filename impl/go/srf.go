@@ -195,7 +195,7 @@ func (db *engine) resolveJSONRecord(name string, jsonb, set bool, args []*exprNo
 	columns := make([]catColumn, 0, len(columnDefs))
 	for _, d := range columnDefs {
 		// A composite/array column type in the col-def list is a deferred 0A000 follow-on.
-		if strings.HasSuffix(d.TypeName, "[]") || db.CompositeType(d.TypeName) != nil {
+		if strings.HasSuffix(d.TypeName, "[]") || db.compositeType(d.TypeName) != nil {
 			return nil, nil, newError(FeatureNotSupported,
 				"a composite/array column in a record column-definition list is not supported yet")
 		}
@@ -242,7 +242,7 @@ func (db *engine) resolveJSONPopulate(name string, jsonb, set bool, args []*expr
 	if !bt.comp.named {
 		return nil, nil, newError(FeatureNotSupported, "an anonymous record base is not supported yet")
 	}
-	ctype := db.CompositeType(bt.comp.name)
+	ctype := db.compositeType(bt.comp.name)
 	if ctype == nil {
 		return nil, nil, newError(UndefinedObject, "composite type no longer exists")
 	}
@@ -2108,7 +2108,7 @@ func jtScalarType(db *engine, typeName string) (scalarType, *decimalTypmod, erro
 	if st, ok := scalarTypeFromName(typeName); ok {
 		return st, nil, nil
 	}
-	if db.CompositeType(typeName) != nil {
+	if db.compositeType(typeName) != nil {
 		return 0, nil, newError(FeatureNotSupported, "a composite JSON_TABLE column is not supported yet")
 	}
 	return 0, nil, newError(UndefinedObject, fmt.Sprintf("type \"%s\" does not exist", typeName))

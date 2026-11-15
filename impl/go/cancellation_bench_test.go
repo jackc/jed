@@ -40,7 +40,7 @@ func BenchmarkCancellation(b *testing.B) {
 					runCtx, cancel = context.WithCancel(ctx)
 					defer cancel()
 				}
-				s := db.Session(SessionOptions{})
+				s := mustSession(db, SessionOptions{})
 				defer s.Close()
 				if strings.HasPrefix(mode, "scalar-") {
 					s.SetMaxCost(math.MaxInt64)

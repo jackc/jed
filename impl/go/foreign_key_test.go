@@ -16,7 +16,7 @@ import (
 
 func fkSetup(t *testing.T, sql ...string) *Session {
 	t.Helper()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	for _, s := range sql {
 		if _, err := queryOutcome(db, s, nil); err != nil {
 			t.Fatalf("setup %q: %v", s, err)
@@ -36,7 +36,7 @@ func fkErr(t *testing.T, db dbHandle, sql string) string {
 
 func fkNames(t *testing.T, db dbHandle, table string) []string {
 	t.Helper()
-	tab, ok := db.Table(table)
+	tab, ok := db.table(table)
 	if !ok {
 		t.Fatalf("table %s not found", table)
 	}
@@ -129,7 +129,7 @@ func TestForeignKeyParentUpdateEndStateSwap(t *testing.T) {
 // session (temp-tables.md §3).
 func TestForeignKeyActionPreservesMainScopeAcrossTempOverlap(t *testing.T) {
 	base := memDB()
-	shadowed := base.Session(SessionOptions{})
+	shadowed := mustSession(base, SessionOptions{})
 	defer shadowed.Close()
 	mustExec(t, shadowed, "CREATE TEMP TABLE c (temp_id i32 PRIMARY KEY, scratch text)")
 	mustExec(t, shadowed, "INSERT INTO c VALUES (99, 'keep')")
@@ -138,7 +138,7 @@ func TestForeignKeyActionPreservesMainScopeAcrossTempOverlap(t *testing.T) {
 	mustExec(t, shadowed, "CREATE TEMP TABLE ci (temp_id i32 PRIMARY KEY)")
 	mustExec(t, shadowed, "INSERT INTO ci VALUES (98)")
 
-	persistent := base.Session(SessionOptions{})
+	persistent := mustSession(base, SessionOptions{})
 	defer persistent.Close()
 	mustExec(t, persistent, "CREATE TABLE p (id i32 PRIMARY KEY)")
 	mustExec(t, persistent, "CREATE TABLE c (id i32 PRIMARY KEY, pid i32 REFERENCES p ON DELETE CASCADE)")

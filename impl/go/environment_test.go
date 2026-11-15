@@ -73,10 +73,10 @@ func TestEnvironmentsAreIsolated(t *testing.T) {
 	// instant, one empty with a manual clock at another. Each database sees only its own.
 	loadedBuilder := testEnv("unicode", "tz").ToBuilder()
 	loadedBuilder.SetClockSource(NewManualClock(1_000_000))
-	loaded := memDBIn(loadedBuilder.Build()).Session(SessionOptions{})
+	loaded := mustSession(memDBIn(loadedBuilder.Build()), SessionOptions{})
 	emptyBuilder := NewEnvironmentBuilder()
 	emptyBuilder.SetClockSource(NewManualClock(2_000_000))
-	empty := memDBIn(emptyBuilder.Build()).Session(SessionOptions{})
+	empty := mustSession(memDBIn(emptyBuilder.Build()), SessionOptions{})
 
 	if rows := query(t, loaded, `SELECT 'ä' < 'z' COLLATE "unicode"`); len(rows) != 1 || rows[0][0] != BoolValue(true) {
 		t.Fatalf("loaded env collation: got %v", rows)
@@ -148,7 +148,7 @@ func TestEnvironmentDerivation(t *testing.T) {
 	if len(base.LoadedTimeZones()) != 0 || len(derived.LoadedTimeZones()) == 0 {
 		t.Fatal("tz data loaded into the derived builder must not reach the base")
 	}
-	db := memDBIn(derived).Session(SessionOptions{})
+	db := mustSession(memDBIn(derived), SessionOptions{})
 	if got := query(t, db, `SELECT plus_one(41), now()`)[0]; got[0] != IntValue(42) || got[1] != TimestamptzValue(20) {
 		t.Fatalf("derived environment: got %v", got)
 	}
@@ -168,7 +168,7 @@ func TestDatabaseOutlivesEnvironmentReference(t *testing.T) {
 	db := func() *Session {
 		b := testEnv("unicode").ToBuilder()
 		b.SetClockSource(NewManualClock(7))
-		return memDBIn(b.Build()).Session(SessionOptions{})
+		return mustSession(memDBIn(b.Build()), SessionOptions{})
 	}()
 	runtime.GC()
 	if rows := query(t, db, `SELECT 'ä' < 'z' COLLATE "unicode", now()`); rows[0][0] != BoolValue(true) || rows[0][1] != TimestamptzValue(7) {

@@ -67,8 +67,12 @@ func NewMigrator(db *jed.Database, migrations []Migration, opts Options) (*Migra
 	if err := validateSequence(sorted); err != nil {
 		return nil, err
 	}
+	session, err := db.Session(jed.SessionOptions{})
+	if err != nil {
+		return nil, err
+	}
 	return &Migrator{
-		session:      db.Session(jed.SessionOptions{}),
+		session:      session,
 		migrations:   sorted,
 		versionTable: table,
 		onStart:      opts.OnStart,
@@ -140,7 +144,7 @@ func (m *Migrator) SetVersion(version int) error {
 		return &BadVersion{Version: version, N: n, Whence: "target"}
 	}
 	set := fmt.Sprintf("update %s set version = %d", m.versionTable, version)
-	if _, err := m.session.ExecuteScript(set); err != nil {
+	if _, err := m.session.ExecuteScript(context.Background(), set); err != nil {
 		return fmt.Errorf("migrate: setting %s to version %d: %w", m.versionTable, version, err)
 	}
 	return nil
@@ -207,17 +211,17 @@ func (m *Migrator) runStep(mg Migration, direction, sql string, newVersion int) 
 	if m.onStart != nil {
 		m.onStart(mg.Sequence, mg.Name, direction, sql)
 	}
-	if err := m.session.Begin(true); err != nil {
+	if err := m.session.Begin(context.Background(), true); err != nil {
 		return err
 	}
 	for span := range jed.SplitStatements(sql) {
-		if _, err := m.session.ExecuteScript(span.Text); err != nil {
+		if _, err := m.session.ExecuteScript(context.Background(), span.Text); err != nil {
 			_ = m.session.Rollback()
 			return &MigrationError{Name: mg.Name, Direction: direction, Statement: span.Text, Err: err}
 		}
 	}
 	bump := fmt.Sprintf("update %s set version = %d", m.versionTable, newVersion)
-	if _, err := m.session.ExecuteScript(bump); err != nil {
+	if _, err := m.session.ExecuteScript(context.Background(), bump); err != nil {
 		_ = m.session.Rollback()
 		return fmt.Errorf("migrate: updating %s to version %d: %w", m.versionTable, newVersion, err)
 	}
@@ -228,7 +232,7 @@ func (m *Migrator) runStep(mg Migration, direction, sql string, newVersion int) 
 // idempotently, in its own committed transaction (design.md §5). Safe to call repeatedly.
 func (m *Migrator) ensureVersionTable() error {
 	create := fmt.Sprintf("create table %s (version integer not null)", m.versionTable)
-	if _, err := m.session.ExecuteScript(create); err != nil {
+	if _, err := m.session.ExecuteScript(context.Background(), create); err != nil {
 		// A create against an existing table is DuplicateTable (42P07) — tolerated so ensure is
 		// idempotent; any other error is real.
 		if !errIsState(err, jed.DuplicateTable) {
@@ -239,7 +243,7 @@ func (m *Migrator) ensureVersionTable() error {
 		"insert into %s (version) select 0 where not exists (select 1 from %s)",
 		m.versionTable, m.versionTable,
 	)
-	_, err := m.session.ExecuteScript(seed)
+	_, err := m.session.ExecuteScript(context.Background(), seed)
 	return err
 }
 

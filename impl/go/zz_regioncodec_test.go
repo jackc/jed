@@ -71,7 +71,7 @@ func expProse(t testing.TB) (lines, words []string) {
 
 // expExtra adds two tables whose variable-width columns are not drawn from small template sets.
 func expExtra(t testing.TB, db *Database) {
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	lines, words := expProse(t)
 	if len(lines) < 10000 || len(words) < 2000 {
@@ -1312,7 +1312,7 @@ func TestRegionEngineExperiment(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		s := db.Session(SessionOptions{})
+		s := mustSession(db, SessionOptions{})
 		for _, q := range []string{
 			"SELECT count(*), sum(id)::text FROM activity",
 			"SELECT sum(length(title)), sum(length(path)) FROM activity",
@@ -1656,14 +1656,14 @@ func TestColumnSymbolTablesSurviveChange(t *testing.T) {
 	}
 	// Every file commit recounts its live pages by a reachability walk and panics on a difference, so
 	// the symbol-table chains are checked against the incremental count at each step.
-	SetVerifyLivePages(true)
-	t.Cleanup(func() { SetVerifyLivePages(false) })
+	setVerifyLivePages(true)
+	t.Cleanup(func() { setVerifyLivePages(false) })
 	path := filepath.Join(t.TempDir(), "coltab.jed")
 	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	expExec(t, s, "CREATE TABLE t (id i64 PRIMARY KEY, name text, note text, doc jsonb)")
 	fill := func(lo, hi int) string {
 		return fmt.Sprintf("INSERT INTO t SELECT g, 'customer-name-' || (g %% 97), 'a note about order number ' || g || ' for the warehouse', "+
@@ -1744,7 +1744,7 @@ func TestColumnSymbolTablesSurviveChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	s = db.Session(SessionOptions{})
+	s = mustSession(db, SessionOptions{})
 	defer s.Close()
 	o, err = queryOutcome(s, q, nil)
 	if err != nil {
@@ -1780,7 +1780,7 @@ func TestSymDriftExperiment(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	expExec(t, s, "CREATE TABLE log (id i64 PRIMARY KEY, body text NOT NULL)")
 

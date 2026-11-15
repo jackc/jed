@@ -51,7 +51,7 @@ func TestRowMaterializationTrace(t *testing.T) {
 			"SELECT id,a FROM t", // columnar control and finite-memory failure
 			"SELECT txt FROM t WHERE id=1",
 		} {
-			s := db.Session(SessionOptions{})
+			s := mustSession(db, SessionOptions{})
 			out, err := queryOutcome(s, "EXPLAIN "+sql, nil)
 			if err != nil {
 				t.Fatal(err)
@@ -61,14 +61,14 @@ func TestRowMaterializationTrace(t *testing.T) {
 			for _, budget := range []int64{1, 128, 1 << 20} {
 				for mode := 0; mode < 3; mode++ { // statement ceiling, lifetime ceiling, cancellation boundary
 					for prefix := int64(0); prefix <= 96; prefix++ {
-						s := db.Session(SessionOptions{MaxQueryMemoryBytes: budget})
+						s := mustSession(db, SessionOptions{MaxQueryMemoryBytes: budget})
 						if mode == 0 {
 							s.SetMaxCost(prefix)
 						} else if mode == 1 {
 							s.SetLifetimeMaxCost(prefix)
 						}
 						pulls := int64(0)
-						ResetQueryMemoryPeak()
+						resetQueryMemoryPeak()
 						ctx, cancel := context.WithCancel(context.Background())
 						if mode == 2 && prefix == 1 {
 							cancel()
@@ -87,7 +87,7 @@ func TestRowMaterializationTrace(t *testing.T) {
 								}
 								fmt.Fprintf(&trace, " | %v cost=%d used=%d pulls=%d", renderRows([][]Value{rows.Row()}), rows.Cost(), *s.engine.session.queryBytes, pulls)
 							}
-							fmt.Fprintf(&trace, " end=%v cost=%d used=%d peak=%d pulls=%d", rows.Err(), rows.Cost(), *s.engine.session.queryBytes, QueryMemoryPeak(), pulls)
+							fmt.Fprintf(&trace, " end=%v cost=%d used=%d peak=%d pulls=%d", rows.Err(), rows.Cost(), *s.engine.session.queryBytes, queryMemoryPeakForTooling(), pulls)
 							_ = rows.Close()
 						}
 						cancel()

@@ -52,7 +52,10 @@ func TestGistCommittedLoadHasNoPendingWrites(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer db.Close()
-			s := db.Session(jed.SessionOptions{MaxQueryMemoryBytes: 1})
+			s, err := db.Session(jed.SessionOptions{MaxQueryMemoryBytes: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
 			defer s.Close()
 			// The point miss retains no input and stages nothing. It must not inherit
 			// a pending balance from opening the committed GiST leaf store.

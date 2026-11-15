@@ -2064,7 +2064,7 @@ func resolveWidthBucketArray(s *scope, operand, thresholds exprNode, ag *aggCtx,
 	if ot.kind == rtArray || classifyComparable(ot, elem) != nil {
 		return nil, resolvedType{}, noFuncOverload("width_bucket")
 	}
-	var coll *Collation
+	var coll *compiledCollation
 	if ot.kind == rtText && elem.kind == rtText {
 		od, err := deriveCollation(s, operand)
 		if err != nil {
@@ -2117,7 +2117,7 @@ func resolveQuantified(s *scope, q *quantifiedExpr, ag *aggCtx, params *paramTyp
 	}
 	// A text quantifier compares under the left operand's derivation combined with the array's
 	// (spec/design/collation.md §1); a conflict is 42P22.
-	var coll *Collation
+	var coll *compiledCollation
 	if lt.kind == rtText && at.elem.kind == rtText {
 		ld, err := deriveCollation(s, q.Lhs)
 		if err != nil {

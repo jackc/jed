@@ -217,6 +217,9 @@ func (db *engine) runScriptBody(sql string) (ScriptSummary, error) {
 	// position is shifted into the script's coordinates (spec/design/error-fields.md §10.1).
 	counted, before := 0, int32(0)
 	for span := range SplitStatements(sql) {
+		if err := doneErr(db.session.cancel); err != nil {
+			return ScriptSummary{}, err
+		}
 		before += charCount(sql[counted:span.Offset])
 		counted = span.Offset
 		ast, err := db.parse(span.Text)

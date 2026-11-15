@@ -16,7 +16,7 @@ import (
 // onto out: {"name":value,…} in declaration order. pretty separates the members with ",\n " instead
 // of "," (PostgreSQL's use_line_feeds, honored at the top level only). A timestamptz at any depth
 // renders in zone.
-func compositeToJSON(fields []Value, ty *compositeRType, pretty bool, zone ZoneRef, out *strings.Builder) error {
+func compositeToJSON(fields []Value, ty *compositeRType, pretty bool, zone zoneRef, out *strings.Builder) error {
 	sep := ","
 	if pretty {
 		sep = ",\n "
@@ -39,7 +39,7 @@ func compositeToJSON(fields []Value, ty *compositeRType, pretty bool, zone ZoneR
 // datumToJSON writes one value's json image (PostgreSQL's datum_to_json_internal, never a key). ty
 // is the value's static type, read only for the field names of a composite (directly or as an array
 // element).
-func datumToJSON(v Value, ty resolvedType, zone ZoneRef, out *strings.Builder) error {
+func datumToJSON(v Value, ty resolvedType, zone zoneRef, out *strings.Builder) error {
 	switch v.Kind {
 	case ValNull:
 		out.WriteString("null")
@@ -101,7 +101,7 @@ func datumToJSON(v Value, ty resolvedType, zone ZoneRef, out *strings.Builder) e
 // arrayToJSON writes an array's json image (PostgreSQL's array_to_json_internal): one bracket level
 // per dimension, the lower bounds dropped; an empty array is []. pretty separates the OUTERMOST
 // dimension's items with ",\n " (inner dimensions and the elements never break lines).
-func arrayToJSON(a *ArrayVal, elem resolvedType, pretty bool, zone ZoneRef, out *strings.Builder) error {
+func arrayToJSON(a *ArrayVal, elem resolvedType, pretty bool, zone zoneRef, out *strings.Builder) error {
 	if len(a.Elements) == 0 {
 		out.WriteString("[]")
 		return nil
@@ -112,7 +112,7 @@ func arrayToJSON(a *ArrayVal, elem resolvedType, pretty bool, zone ZoneRef, out 
 
 // arrayDimToJSON writes one dimension of arrayToJSON: the innermost dimension renders Dims[dim]
 // elements from next, an outer one recurses once per sub-array (never with line feeds).
-func arrayDimToJSON(a *ArrayVal, dim int, elem resolvedType, pretty bool, zone ZoneRef, next *int, out *strings.Builder) error {
+func arrayDimToJSON(a *ArrayVal, dim int, elem resolvedType, pretty bool, zone zoneRef, next *int, out *strings.Builder) error {
 	sep := ","
 	if pretty {
 		sep = ",\n "
@@ -138,7 +138,7 @@ func arrayDimToJSON(a *ArrayVal, dim int, elem resolvedType, pretty bool, zone Z
 // datumToJSONB is one value's jsonb image (PostgreSQL's datum_to_jsonb_internal, never a key): as
 // datumToJSON, except that a json value is parsed (duplicate keys collapse, last wins), a composite
 // is an object in canonical key order, and the result is a node, not text.
-func datumToJSONB(v Value, ty resolvedType, zone ZoneRef) (JsonNode, error) {
+func datumToJSONB(v Value, ty resolvedType, zone zoneRef) (JsonNode, error) {
 	switch v.Kind {
 	case ValNull:
 		return JsonNode{Kind: JNull}, nil
@@ -201,7 +201,7 @@ func datumToJSONB(v Value, ty resolvedType, zone ZoneRef) (JsonNode, error) {
 }
 
 // arrayDimToJSONB is one dimension of an array's jsonb image (PostgreSQL's array_dim_to_jsonb).
-func arrayDimToJSONB(a *ArrayVal, dim int, elem resolvedType, zone ZoneRef, next *int) (JsonNode, error) {
+func arrayDimToJSONB(a *ArrayVal, dim int, elem resolvedType, zone zoneRef, next *int) (JsonNode, error) {
 	items := make([]JsonNode, 0, a.Dims[dim])
 	for i := 0; i < a.Dims[dim]; i++ {
 		var node JsonNode
@@ -224,7 +224,7 @@ func arrayDimToJSONB(a *ArrayVal, dim int, elem resolvedType, zone ZoneRef, next
 // a key is always a JSON string. A number or boolean is its text, a datetime its ISO 8601 form, any
 // other scalar its text output. An array, composite, json, or jsonb key is 22023. The caller rejects
 // a NULL key first.
-func jsonKeyText(v Value, zone ZoneRef) (string, error) {
+func jsonKeyText(v Value, zone zoneRef) (string, error) {
 	switch v.Kind {
 	case ValArray, ValComposite, ValJson, ValJsonb:
 		return "", newError(InvalidParameterValue, "key value must be scalar, not array, composite, or json")

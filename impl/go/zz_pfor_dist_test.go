@@ -310,7 +310,7 @@ func TestPFORDistributions(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			sess := db.Session(SessionOptions{})
+			sess := mustSession(db, SessionOptions{})
 			mustExec(t, sess, tb.create)
 			start := time.Now()
 			for _, sql := range inserts {

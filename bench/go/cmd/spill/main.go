@@ -43,7 +43,10 @@ func run() error {
 		return err
 	}
 	defer db.Close()
-	sess := db.Session(jed.SessionOptions{})
+	sess, err := db.Session(jed.SessionOptions{})
+	if err != nil {
+		return err
+	}
 	defer sess.Close()
 	if os.Args[1] == "temp" {
 		// Temp-table spill (spec/design/temp-tables.md §6): the budget is the resident temp_buffers.

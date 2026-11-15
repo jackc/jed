@@ -2076,7 +2076,7 @@ func (db *engine) planSetOp(so *setOp, parent *scope, ctes []*cteBinding, ptypes
 		// An explicit COLLATE on a set-operation ORDER BY key (spec/design/collation.md §1): the
 		// output column must be text (42804); the name resolves ("C", else loaded or 42704). Absent
 		// one, a text key sorts by the column's common collation.
-		var coll *Collation
+		var coll *compiledCollation
 		if key.Collation == "" && columnTypes[idx].collatable() {
 			if coll, err = resolveDeriv(db, columnDerivs[idx]); err != nil {
 				return nil, err

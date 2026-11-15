@@ -93,7 +93,7 @@ type windowSpec struct {
 	// sliding-frame optimization (a filtered row can't be cleanly un-folded) — every frame re-folds.
 	filter *rExpr
 	// aggCollation is a text MIN/MAX window aggregate's comparison collation (see aggSpec.collation).
-	aggCollation *Collation
+	aggCollation *compiledCollation
 	// aggJSONTypes is a JSON window aggregate's operand type (see aggSpec.jsonTypes).
 	aggJSONTypes []resolvedType
 }
@@ -274,7 +274,7 @@ type aggSpec struct {
 	// osaCollation is the WITHIN GROUP key's collation (aggregates.md §13) — non-nil for an explicit
 	// COLLATE on the key or a column's frozen non-C collation, nil for the default byte (C) order. The
 	// finalize sort applies it to the buffered text values.
-	osaCollation *Collation
+	osaCollation *compiledCollation
 	// hypo is the hypothetical-set aggregate parameters (rank/dense_rank/percent_rank/cume_dist
 	// WITHIN GROUP — aggregates.md §19), set only for the planHypo* plans, nil otherwise. (operand
 	// is nil here — the keys are buffered as a tuple per row from hypo.keys.)
@@ -286,7 +286,7 @@ type aggSpec struct {
 	// collation is the comparison collation of a text MIN/MAX (spec/design/collation.md §1
 	// "Aggregates and window functions"): the operand's derivation; nil for C, a non-text operand, or
 	// any other aggregate.
-	collation *Collation
+	collation *compiledCollation
 	// jsonTypes is a JSON aggregate's operand type(s) — [value] for json[b]_agg, [key, value] for
 	// json[b]_object_agg (json-sql-functions.md §4); nil for every other aggregate.
 	jsonTypes []resolvedType
@@ -297,7 +297,7 @@ type aggSpec struct {
 type keySort struct {
 	desc       bool
 	nullsFirst bool
-	collation  *Collation
+	collation  *compiledCollation
 }
 
 // aggOrder is an in-aggregate ORDER BY (aggregates.md §22): keys are the sort-key expressions
@@ -342,7 +342,7 @@ type acc struct {
 	hasCur   bool
 	floatSum *floatSumAcc // non-nil for the float SUM/AVG plans (the streaming scan-order fold — float.md §7)
 	// collation is a text MIN/MAX's comparison collation (spec/design/collation.md §1); nil is C.
-	collation *Collation
+	collation *compiledCollation
 	// json_agg / jsonb_agg accumulator (B4): the inputs' JSON images in row order — a json text
 	// (JsonValue; a NULL input NullValue) for json_agg, a JsonbValue node for jsonb_agg. jsonAsJSON
 	// selects the `json` result type (vs jsonb); jsonStrict skips a NULL-valued row. `seen` is reused
@@ -354,7 +354,7 @@ type acc struct {
 	jsonAsJSON bool
 	jsonStrict bool
 	jsonTypes  []resolvedType
-	jsonZone   ZoneRef
+	jsonZone   zoneRef
 	// json[b]_object_agg[_unique] accumulator (B4): the (key, value) pairs in row order. objAgg is
 	// true for the object-agg plans; objUnique errors 22030 on a duplicate key. jsonAsJSON selects
 	// the json (brace-padded, row order, dups) vs jsonb (canonical, last-wins) finalize render, and
@@ -387,7 +387,7 @@ type acc struct {
 	osaFrac *Value
 	// osaCollation is the WITHIN GROUP key collation (aggregates.md §13) applied to the finalize sort
 	// of the buffered text values; nil is the default byte (C) order.
-	osaCollation *Collation
+	osaCollation *compiledCollation
 	osaVals      []Value
 	osaFloats    []float64
 	// hypoRows buffers every row's WITHIN GROUP key TUPLE for a hypothetical-set aggregate
@@ -447,7 +447,7 @@ func newAcc(plan aggPlan) *acc {
 // ordered-set aggregate with OVER is 0A000, rejected at resolve).
 //
 // zone is the session zone a JSON aggregate renders a timestamptz input in.
-func newAccFromSpec(s aggSpec, zone ZoneRef) *acc {
+func newAccFromSpec(s aggSpec, zone zoneRef) *acc {
 	// An in-aggregate ORDER BY buffers the passing rows first (aggregates.md §22); the plan's own
 	// accumulator is built at finalize (newAccFromSpecUnordered) and fed in key order.
 	if s.order != nil {
@@ -458,7 +458,7 @@ func newAccFromSpec(s aggSpec, zone ZoneRef) *acc {
 
 // newAccFromSpecUnordered is newAccFromSpec ignoring any in-aggregate ORDER BY — the accumulator an
 // ordered aggregate's sorted arguments are finally folded into.
-func newAccFromSpecUnordered(s aggSpec, zone ZoneRef) *acc {
+func newAccFromSpecUnordered(s aggSpec, zone zoneRef) *acc {
 	switch s.plan {
 	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
 		// The per-group fraction (osaFrac) is filled in just before finalize (the direct argument
@@ -475,7 +475,7 @@ func newAccFromSpecUnordered(s aggSpec, zone ZoneRef) *acc {
 
 // newAccWithContext is newAcc with a text MIN/MAX's comparison collation (spec/design/collation.md
 // §1) and a JSON aggregate's operand type(s) + session zone; every other plan ignores them.
-func newAccWithContext(plan aggPlan, coll *Collation, jsonTypes []resolvedType, zone ZoneRef) *acc {
+func newAccWithContext(plan aggPlan, coll *compiledCollation, jsonTypes []resolvedType, zone zoneRef) *acc {
 	a := newAcc(plan)
 	if plan == planMin || plan == planMax {
 		a.collation = coll
@@ -1309,7 +1309,7 @@ func dirCmp(c int, desc bool) int {
 //
 // With meter, the decorations are transient operator state (memory.md §6.8): each reserves its sort
 // key's bytea value bytes as it is built, all released once the values are undecorated.
-func sortOsaVals(vals []Value, collation *Collation, desc bool, meter *costMeter) error {
+func sortOsaVals(vals []Value, collation *compiledCollation, desc bool, meter *costMeter) error {
 	if collation == nil {
 		slices.SortStableFunc(vals, func(a, b Value) int {
 			return dirCmp(valueCmp(a, b), desc)
@@ -2449,7 +2449,7 @@ func surfaceMatches(surface, name string) bool {
 
 // jsonAggImage is a JSON aggregate input's image (json-sql-functions.md §4): for the json aggregates
 // its json text (NullValue for a NULL input, rendered null), for the jsonb aggregates a JsonbValue.
-func jsonAggImage(v Value, asJSON bool, ty resolvedType, zone ZoneRef) (Value, error) {
+func jsonAggImage(v Value, asJSON bool, ty resolvedType, zone zoneRef) (Value, error) {
 	if asJSON {
 		if v.IsNull() {
 			return NullValue(), nil

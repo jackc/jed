@@ -53,7 +53,7 @@ func spillDB(dir string) *Database {
 func runTempSpill(t *testing.T, db *Database, tempBuffers int) ([]tempSpillResult, bool, *Session) {
 	t.Helper()
 	unlimited := 0
-	sess := db.Session(SessionOptions{TempBuffers: &tempBuffers, MaxTempStorageBytes: &unlimited})
+	sess := mustSession(db, SessionOptions{TempBuffers: &tempBuffers, MaxTempStorageBytes: &unlimited})
 	var out []tempSpillResult
 	for _, sql := range tempSpillWorkload {
 		o, err := queryOutcome(sess, sql, nil)
@@ -149,7 +149,7 @@ func TestTempSpillDoesNotMoveThe54P03Point(t *testing.T) {
 	dir := t.TempDir()
 	abortAt := func(tempBuffers int) (int, bool) {
 		ceiling := 40 * 256
-		sess := spillDB(dir).Session(SessionOptions{TempBuffers: &tempBuffers, MaxTempStorageBytes: &ceiling})
+		sess := mustSession(spillDB(dir), SessionOptions{TempBuffers: &tempBuffers, MaxTempStorageBytes: &ceiling})
 		defer sess.Close()
 		sessExec(t, sess, "CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)")
 		pad := strings.Repeat("z", 40)

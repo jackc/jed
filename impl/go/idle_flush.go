@@ -4,7 +4,7 @@ import "time"
 
 // The time-based flush of a relaxed batch (spec/design/validated-cow.md §4.1).
 //
-// A relaxed file domain whose handle has a non-zero FlushIntervalMs gives each batch a deadline on the
+// A relaxed file domain whose handle has a non-zero FlushInterval gives each batch a deadline on the
 // handle's clock source: the reading of the batch's first commit plus the interval. A commit that
 // finds the deadline passed flushes before it plans; an idle batch is flushed by a goroutine that
 // wakes when the deadline should have passed. The goroutine flushes only once the clock is past the

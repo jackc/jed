@@ -22,7 +22,7 @@ func lazyWorkload(t *testing.T, lazy bool) (string, []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sess := db.Session(SessionOptions{})
+	sess := mustSession(db, SessionOptions{})
 	var out strings.Builder
 	query := func(sql string) {
 		t.Helper()
@@ -44,7 +44,7 @@ func lazyWorkload(t *testing.T, lazy bool) (string, []byte) {
 		if db, err = OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true}); err != nil {
 			t.Fatal(err)
 		}
-		sess = db.Session(SessionOptions{})
+		sess = mustSession(db, SessionOptions{})
 	}
 	// Integers, a text with few distinct values, a text with unique values, an integer array, a
 	// boolean, NULLs.
@@ -263,8 +263,8 @@ func TestLazyLeavesMatchEagerLeaves(t *testing.T) {
 	defer leafPatchCheck.Store(leafPatchCheck.Load())
 	leafSizesCheck.Store(true)
 	leafPatchCheck.Store(true)
-	SetVerifyLivePages(true)
-	defer SetVerifyLivePages(false)
+	setVerifyLivePages(true)
+	defer setVerifyLivePages(false)
 
 	patched, spans, full := lazyStats.patched.Load(), lazyStats.spans.Load(), lazyStats.full.Load()
 	lazyRows, lazyFile := lazyWorkload(t, true)
@@ -296,7 +296,7 @@ func rootWorkload(t *testing.T, lazy bool) (string, []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sess := db.Session(SessionOptions{})
+	sess := mustSession(db, SessionOptions{})
 	var out strings.Builder
 	query := func(sql string) {
 		t.Helper()
@@ -318,7 +318,7 @@ func rootWorkload(t *testing.T, lazy bool) (string, []byte) {
 		if db, err = OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true}); err != nil {
 			t.Fatal(err)
 		}
-		sess = db.Session(SessionOptions{})
+		sess = mustSession(db, SessionOptions{})
 	}
 	// Incompressible text: stored in an overflow chain at this page size.
 	big := func(seed, n int) string {
@@ -393,8 +393,8 @@ func TestLazyRootLeavesMatchEagerRootLeaves(t *testing.T) {
 	defer leafPatchCheck.Store(leafPatchCheck.Load())
 	leafSizesCheck.Store(true)
 	leafPatchCheck.Store(true)
-	SetVerifyLivePages(true)
-	defer SetVerifyLivePages(false)
+	setVerifyLivePages(true)
+	defer setVerifyLivePages(false)
 
 	lazyRows, lazyFile := rootWorkload(t, true)
 	eagerRows, eagerFile := rootWorkload(t, false)

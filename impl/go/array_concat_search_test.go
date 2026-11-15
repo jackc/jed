@@ -8,7 +8,7 @@ import "testing"
 
 func TestConcatThreeForms(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	cases := map[string]string{
 		"SELECT ARRAY[1,2] || ARRAY[3,4]": "{1,2,3,4}",
 		"SELECT ARRAY[1,2] || 3":          "{1,2,3}",
@@ -29,7 +29,7 @@ func TestConcatThreeForms(t *testing.T) {
 
 func TestConcatNullPrefersCat(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	cases := map[string]string{
 		"SELECT ARRAY[1,2] || NULL":         "{1,2}",      // bare NULL → array_cat identity
 		"SELECT NULL || ARRAY[1,2]":         "{1,2}",      // bare NULL → array_cat identity
@@ -46,7 +46,7 @@ func TestConcatNullPrefersCat(t *testing.T) {
 
 func TestConcatErrors(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	cases := map[string]string{
 		"SELECT ARRAY[1,2] || ARRAY['a','b']":             "42883",
 		"SELECT 5 || ARRAY['a','b']":                      "42883",
@@ -63,7 +63,7 @@ func TestConcatErrors(t *testing.T) {
 
 func TestArrayRemove(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	cases := map[string]string{
 		"SELECT array_remove(ARRAY[1,2,3,2], 2)":                     "{1,3}",
 		"SELECT array_remove(NULL::i32[], 2)":                        "NULL",
@@ -86,7 +86,7 @@ func TestArrayRemove(t *testing.T) {
 
 func TestArrayReplace(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	cases := map[string]string{
 		"SELECT array_replace(ARRAY[1,2,3,2], 2, 9)":               "{1,9,3,9}",
 		"SELECT array_replace(NULL::i32[], 2, 9)":                  "NULL",
@@ -105,7 +105,7 @@ func TestArrayReplace(t *testing.T) {
 
 func TestArrayPosition(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	cases := map[string]string{
 		"SELECT array_position(ARRAY[10,20,30,20], 20)":              "2",
 		"SELECT array_position(ARRAY[10,20], 99)":                    "NULL",
@@ -135,7 +135,7 @@ func TestArrayPosition(t *testing.T) {
 
 func TestArrayPositions(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	cases := map[string]string{
 		"SELECT array_positions(ARRAY[10,20,30,20], 20)":           "{2,4}",
 		"SELECT array_positions(ARRAY[10,20], 99)":                 "{}",

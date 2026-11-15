@@ -130,7 +130,7 @@ run = "ruby impl/ruby-native/test/page_service_test.rb"
 
 [tasks."ruby-native:process:build"]
 description = "Explicit opt-in: build the existing Go process actor for Ruby interoperability"
-run = "cd impl/go && go build -o process_actor ./cmd/process_actor"
+run = "cd impl/go && go build -tags jedtooling -o process_actor ./cmd/process_actor"
 
 [tasks."ruby-native:process"]
 description = "Explicit opt-in: bounded sequential process corpus including experimental Ruby"
@@ -320,7 +320,7 @@ run = [
 [tasks."conformance:go"]
 description = "Walk the conformance corpus on the Go core, both storage modes"
 dir = "{{config_root}}/impl/go"
-run = ["go run ./cmd/conformance", "go run ./cmd/conformance disk"]
+run = ["go run -tags jedtooling ./cmd/conformance", "go run -tags jedtooling ./cmd/conformance disk"]
 
 [tasks."conformance:ts"]
 description = "Walk the conformance corpus on the TS core, both storage modes"
@@ -350,14 +350,14 @@ arg "[filter]" help="Run only corpus files whose path contains this substring"
 run = '''
 if [ -n "${usage_filter:-}" ]; then export JED_CONFORMANCE_FILTER="$usage_filter"; fi
 JED_CONFORMANCE_WORK_MEM="$usage_bytes" cargo run --release --quiet --bin conformance --manifest-path impl/rust/Cargo.toml -- disk
-(cd impl/go && JED_CONFORMANCE_WORK_MEM="$usage_bytes" go run ./cmd/conformance disk)
+(cd impl/go && JED_CONFORMANCE_WORK_MEM="$usage_bytes" go run -tags jedtooling ./cmd/conformance disk)
 (cd impl/ts && JED_CONFORMANCE_WORK_MEM="$usage_bytes" node src/bin/conformance.ts disk)
 # Temp-table spill (spec/design/temp-tables.md §6): the temp-table files in memory mode, each memory
 # database given a spill directory and every session a 1-byte temp_buffers, so each temp domain
 # spills to a scratch file at its first commit and runs on a one-leaf page cache.
 export JED_CONFORMANCE_TEMP_BUFFERS=1
 cargo run --release --quiet --bin conformance --manifest-path impl/rust/Cargo.toml
-(cd impl/go && go run ./cmd/conformance)
+(cd impl/go && go run -tags jedtooling ./cmd/conformance)
 (cd impl/ts && node src/bin/conformance.ts)
 '''
 
@@ -369,9 +369,9 @@ description = "Run the corpus with each core as a page client of another core's 
 depends = ["ts:lock_build"]
 run = [
   "cargo build --release --bin process_actor --bin conformance --manifest-path impl/rust/Cargo.toml",
-  "cd impl/go && go build -o process_actor ./cmd/process_actor",
+  "cd impl/go && go build -tags jedtooling -o process_actor ./cmd/process_actor",
   "JED_SERVICE_OWNER=go impl/rust/target/release/conformance service",
-  "cd impl/go && JED_SERVICE_OWNER=node go run ./cmd/conformance service",
+  "cd impl/go && JED_SERVICE_OWNER=node go run -tags jedtooling ./cmd/conformance service",
   "cd impl/ts && JED_SERVICE_OWNER=rust node src/bin/conformance.ts service",
 ]
 
@@ -382,7 +382,7 @@ description = "Run the real-process corpus (the page service, exclusive owners, 
 depends = ["ts:lock_build"]
 run = [
   "cargo build --release --bin process_actor --manifest-path impl/rust/Cargo.toml",
-  "cd impl/go && go build -o process_actor ./cmd/process_actor",
+  "cd impl/go && go build -tags jedtooling -o process_actor ./cmd/process_actor",
   "ruby scripts/process_conformance.rb",
 ]
 
@@ -394,7 +394,7 @@ run = [
 [tasks."concurrency:race"]
 description = "Run the stepped-threaded concurrency conformance under the race detector (Go + Rust)"
 run = [
-  "cd impl/go && go test -race -run TestConcurrencySchedulesThreaded ./cmd/conformance",
+  "cd impl/go && go test -tags jedtooling -race -run TestConcurrencySchedulesThreaded ./cmd/conformance",
   # Run from impl/rust (not --manifest-path from the root) so cargo finds impl/rust/.cargo/config.toml
   # and gives this DEBUG build's test threads the 8 MiB RUST_MIN_STACK; cargo reads config from the cwd.
   "cd impl/rust && cargo test --bin conformance",
@@ -454,7 +454,7 @@ run = "cargo test --release --manifest-path impl/rust/Cargo.toml"
 [tasks."unit:go"]
 description = "Run the Go core's unit tests"
 dir = "{{config_root}}/impl/go"
-run = "go test ./..."
+run = ["go test ./...", "go test -tags jedtooling ./cmd/..."]
 
 [tasks."unit:ts"]
 description = "Run the TS core's unit tests"

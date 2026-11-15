@@ -100,7 +100,7 @@ func expBuild(t testing.TB, path string, pageSize uint32) *Database {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	base := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 
@@ -914,7 +914,7 @@ func expOne(t *testing.T, dir string, pageSize uint32, detail bool) expRun {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	tm := func(label string, d time.Duration, extra string) {
 		run.timings = append(run.timings, fmt.Sprintf("%-46s %10v %s", label, d, extra))
@@ -1094,7 +1094,7 @@ func TestCommitWriteExperiment(t *testing.T) {
 	r := rand.New(rand.NewSource(9))
 	nOrders := int64(expScale(300000))
 	run := func(tag string) {
-		s := db.Session(SessionOptions{})
+		s := mustSession(db, SessionOptions{})
 		defer s.Close()
 		next := nOrders + int64(len(tag))*1000000
 		phase(tag+": update non-indexed col", s, "UPDATE orders SET shipped = NOT shipped WHERE id = $1", 2000, func() int64 { return 1 + r.Int63n(nOrders) })
@@ -1223,8 +1223,8 @@ func TestDeferInteriorStress(t *testing.T) {
 }
 
 func deferInteriorStress(t *testing.T, cred *Credential) {
-	SetVerifyLivePages(true)
-	defer SetVerifyLivePages(false)
+	setVerifyLivePages(true)
+	defer setVerifyLivePages(false)
 	path := filepath.Join(t.TempDir(), "defer.jed")
 	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true, Credential: cred})
 	if err != nil {
@@ -1238,13 +1238,13 @@ func deferInteriorStress(t *testing.T, cred *Credential) {
 	both := func(sql string) {
 		t.Helper()
 		for _, d := range []*Database{db, mem} {
-			s := d.Session(SessionOptions{})
+			s := mustSession(d, SessionOptions{})
 			expExec(t, s, sql)
 			s.Close()
 		}
 	}
 	dump := func(d *Database) string {
-		s := d.Session(SessionOptions{})
+		s := mustSession(d, SessionOptions{})
 		defer s.Close()
 		var b strings.Builder
 		for _, q := range []string{
@@ -1389,7 +1389,7 @@ func TestLookupExperiment(t *testing.T) {
 	if err := db.Compact("main"); err != nil {
 		t.Fatal(err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	nOrders := int64(expScale(300000))
 	run := func(label, sql string, n int, arg func(r *rand.Rand) int64) {

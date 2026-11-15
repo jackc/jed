@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -872,16 +873,16 @@ func (r *simRunner) openServiceProc(pid int, env *Environment) (*Database, error
 		r.locks = newSimLockTable(&r.clock, r.procBusy)
 	}
 	host := &simLockHost{table: r.locks, pidNum: pid, claimed: map[string]bool{}, net: r.net}
-	zero, grace, timeout := uint64(0), uint64(simServiceGraceMs), uint64(defaultFileLockTimeoutMs)
+	zero, grace, timeout := time.Duration(0), time.Duration(simServiceGraceMs)*time.Millisecond, time.Duration(defaultFileLockTimeoutMs)*time.Millisecond
 	opts := OpenOptions{
-		CacheBytes:                 r.cacheBytes,
-		FileLockTimeoutMs:          &timeout,
-		IdleInTransactionTimeoutMs: &zero,
-		IdleSessionTimeoutMs:       &zero,
-		ShutdownGraceMs:            &grace,
-		Environment:                env,
-		MaxStorageBytes:            r.maxStorageBytes,
-		Credential:                 r.credential(r.main()),
+		CacheBytes:               r.cacheBytes,
+		FileLockTimeout:          &timeout,
+		IdleInTransactionTimeout: &zero,
+		IdleSessionTimeout:       &zero,
+		ShutdownGrace:            &grace,
+		Environment:              env,
+		MaxStorageBytes:          r.maxStorageBytes,
+		Credential:               r.credential(r.main()),
 	}
 	if r.encrypted {
 		// Every process seals its scratch files, so encrypting a plaintext database is allowed (S13).
@@ -890,8 +891,8 @@ func (r *simRunner) openServiceProc(pid int, env *Environment) (*Database, error
 	if r.relaxed {
 		opts.Synchronous = SynchronousOff
 	}
-	interval := r.flushIntervalMs
-	opts.FlushIntervalMs = &interval
+	interval := millisDuration(r.flushIntervalMs)
+	opts.FlushInterval = &interval
 	h := newServiceHandoff(host, simDiskPath, opts)
 	h.files, h.spill, h.background = r.fs, r.fs.spillHost(), false
 	db, err := openServiceWith(h, true)
@@ -2307,7 +2308,7 @@ func (r *simRunner) stepBackup(i int, st simStep) {
 	d := r.main()
 	r.backups++
 	dest := fmt.Sprintf("%s.backup%d", d.file, r.backups)
-	err := BackupForTesting(r.db, dest, st.mode == "page_identical")
+	err := backupForTesting(r.db, dest, st.mode == "page_identical")
 	if err != nil {
 		code := simCode(err)
 		if strings.HasPrefix(code, "non-engine") {

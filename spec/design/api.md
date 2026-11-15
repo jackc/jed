@@ -158,7 +158,7 @@ owner.
 require that external coordinator. An unsupported requested mode fails closed `0A000`.
 
 The page-service options are owner settings a client keeps for the day it becomes owner:
-`idle_in_transaction_timeout_ms` (Go `IdleInTransactionTimeoutMs`, TS `idleInTransactionTimeoutMs`;
+`idle_in_transaction_timeout_ms` (Go `IdleInTransactionTimeout`, TS `idleInTransactionTimeoutMs`;
 default **60000**, `0` disables) is the owner's idle-in-transaction timeout for client write
 transactions (page-service.md §11.1); `yield_grace_ms` (default 5000), `shutdown_grace_ms` (30000),
 `idle_session_timeout_ms` (0, off), and `max_connections` (0, unlimited; `53300` beyond it) are the
@@ -174,7 +174,7 @@ acquisition loop, and a page client's re-election, and returns `55006` on expiry
 the session `lock_timeout_ms` (`0` = no deadline), which bounds the writer gate (local or the owner's)
 and returns `55P03`. Both use monotonic host time and are
 unmetered. File attachments carry these fields in `AttachSource::file(path, options)`; create/open use
-their idiomatic options structs (`locking`, `file_lock_timeout_ms` / `Locking`, `FileLockTimeoutMs` /
+their idiomatic options structs (`locking`, `file_lock_timeout_ms` / `Locking`, `FileLockTimeout` /
 `locking`, `fileLockTimeoutMs`). In-memory databases have no bundle and ignore file-lock options.
 
 **Remote databases — the stream transport (Unix; [spec/pageservice/README.md](../pageservice/README.md)
@@ -238,7 +238,7 @@ with `SynchronousOn` (the zero value) and `SynchronousOff` / TS `{ synchronous: 
 **`on`**) chooses when a commit's durable barrier runs (transactions.md §9). Under `off` a commit is
 visible and acknowledged once its pages and meta are written, and one later **flush** makes a run of
 commits durable together: when the batch reaches its cap, once it has been pending for the handle's
-**`flush_interval_ms`** (Rust `flush_interval_ms` on both options structs / Go `FlushIntervalMs` /
+**`flush_interval_ms`** (Rust `flush_interval_ms` on both options structs / Go `FlushInterval` /
 TS `flushIntervalMs`; default **1000**, `0` turns the time-based flush off; measured on the
 environment's clock source, [validated-cow.md](validated-cow.md) §4.1), at `close` (whose return
 value then reports a failed flush), and at the other flush points of [validated-cow.md](validated-cow.md) §4. A power loss
@@ -876,8 +876,8 @@ the values unknown.
 | infallible in-memory (test/host helper) | `fn mem_db()` wrapping `create` | `memDB()` wrapping `CreateDatabase` | `memDb()` wrapping `createDatabase` |
 | commit (current tx) | `db.commit() -> Result<()>` | `db.Commit() error` | `commit(db): void` |
 | rollback (current tx) | `db.rollback() -> Result<()>` | `db.Rollback() error` | `rollback(db): void` |
-| begin | `db.begin(writable) -> Result<Transaction>` | `db.Begin(writable) (*Transaction, error)` | `begin(db, writable): Transaction` |
-| view / update (closures) | `db.view(\|tx\| …)` / `db.update(\|tx\| …)` | `db.View(fn) error` / `db.Update(fn) error` | `view(db, fn)` / `update(db, fn)` |
+| begin | `db.begin(writable) -> Result<Transaction>` | `session.Begin(ctx, writable) error` | `begin(db, writable): Transaction` |
+| view / update (closures) | `db.view(\|tx\| …)` / `db.update(\|tx\| …)` | `db.View(ctx, fn) error` / `db.Update(ctx, fn) error` | `view(db, fn)` / `update(db, fn)` |
 | tx commit / rollback | `tx.commit()` / `tx.rollback()` | `tx.Commit()` / `tx.Rollback() error` | `tx.commit()` / `tx.rollback()` |
 | close | `db.close()` + `Drop` | `db.Close() error` | `close(db): void` |
 | prepare | `db.prepare(sql) -> Result<PreparedStatement>` | `db.Prepare(sql) (*PreparedStatement, error)` | `db.prepareStatement(sql): PreparedStatement` |
@@ -1217,7 +1217,7 @@ native mapping is a follow-on.
   cursor positioned at each row and **closes it on loop exit** — break, return, panic, or
   exhaustion — eliminating the `defer close` boilerplate and the forget-to-close bug; the terminal
   error is read via `Err()` after the loop (the `bufio.Scanner` idiom, because a single-value
-  `iter.Seq[Row]` has no slot for it). A generic `Collect(rows, fn)` yields `(T, error)` for the
+  `iter.Seq[Row]` has no slot for it). A generic `MapRows(rows, fn)` yields `(T, error)` for the
   fused case. Iterators are a **layer over** the explicit `Next`/`Scan`/`Err` cursor, not a
   replacement — the explicit form is the documented base because it gives the terminal error a
   clean home. Overhead is negligible for a row loop (one indirect `yield` call per row, no
@@ -1230,7 +1230,7 @@ native mapping is a follow-on.
   to field names. An exact `db:"-"` tag excludes the field from mapping. Every result column
   must match an eligible field or mapping returns an error; excluded fields remain zero-valued.
   `RowTo[T]` scans a single-column row into a `T`. Both
-  compose with `Collect` for `for row, err := range Collect(rows, RowToStructByName[T])`.
+  compose with `MapRows` for `for row, err := range MapRows(rows, RowToStructByName[T])`.
 
 ### 11.4 Cancellation (`context.Context` → `57014`)
 
@@ -1280,6 +1280,37 @@ Restoring the live session after `Query` must not disarm the cursor or affect an
 Go closes cursor resources and reader pins on exhaustion or terminal iteration error; an early
 exit still requires `Close`. Once closed or exhausted, later cancellation cannot change its result.
 
+**Go cancellation errors and writer waits.** A context cancellation remains an
+`*EngineError` with SQLSTATE `57014`, and unwraps to the originating context's
+`Err()` (`context.Canceled` or `context.DeadlineExceeded`). This applies at entry,
+inside execution, and during cursor iteration. Context causes are attached at the
+host boundary; hot execution meters still poll only a cached channel. Waiting for
+the local single-writer gate is cancelable without a stranded goroutine or a later
+lock acquisition. Cancellation never reports a rollback after durable publication
+has begun. Callback transactions release their writer gate or reader pin and roll
+back on panic before allowing that panic to propagate, including callbacks on a
+persistent Go `Session`.
+
+The owner's service gate also observes the cancellation channel. For a page client,
+the unchanged protocol-v2 `begin_write` request uses bounded lock waits (at most
+50 ms each for a cancelable call), retried against the original lock-timeout
+deadline. Replies are consumed before retry/return, so cancellation cannot orphan
+a pending writer request or close the shared connection and invalidate other
+readers. Transport I/O and ownership recovery remain best effort, not preemptible.
+
+Go `Database.View`, `Database.Update`, `Database.ExecuteScript` and the matching
+`Session` methods, plus `Session.Begin`, take `context.Context` first. `Begin`'s
+context covers admission and acquisition only, like pgx: it does not automatically
+end a transaction after return. Individual statements take their own contexts.
+`View`/`Update` check cancellation before beginning and before committing; callers
+pass the same context to statements in the callback to cancel their execution.
+The callback itself is synchronous and is never forcibly interrupted. Scripts
+poll between statements and through ordinary execution checkpoints, and check
+before their wrapper commit. Cancellation rolls back a script's owned wrapper or
+aborts the caller's existing block. Rollback/Close remain available for cleanup
+regardless of cancellation. Already-materialized results remain readable after
+cancellation: execution (including any commit) has already completed.
+
 ### 11.5 Status and naming
 
 **Landed (Go, `impl/go/ergonomic.go`):** the arg/scan conversion, `Query`/`Exec`/`QueryRow` on
@@ -1287,7 +1318,7 @@ exit still requires `Close`. Once closed or exhausted, later cancellation cannot
 `QueryRowPrepared` sibling taking a `*PreparedStatement` in place of `sql` (the statement itself
 carries no query methods; the handle supplies the session, §2.4), `Result` command tag,
 `Scan`/`Values`/`Err`/`Close`, the typed
-accessors, `All()`/`Collect`, `RowTo`/`RowToStructByName`, `Null[T]`, `Valuer`/`Scanner`. The
+accessors, `All()`/`MapRows`, `RowTo`/`RowToStructByName`, `Null[T]`, `Valuer`/`Scanner`. The
 conversion + cancellation logic lives once (`ergoQuery`/`ergoExec`); the per-type methods are
 one-liners over the raw `[]Value` primitives. **Cancellation is wired through the cost meter:** each
 operation captures `ctx.Done()` once and arms that channel (`engine.armCancel`) on the
@@ -1295,8 +1326,9 @@ operation captures `ctx.Done()` once and arms that channel (`engine.armCancel`) 
 statement, `sessionState.newMeter` copies it into the statement's meter, and execution
 checkpoints consult it — so a flipped `context.Context` aborts a long-running statement with the
 registered **`57014 query_canceled`** at the next cancellation checkpoint, not only at the cursor/entry
-boundary (`doneErr`). `Rows` retains the same channel for its immediate entry check; neither a
-context interface nor a polling/restoration closure is retained. The channel is `nil` (no channel
+boundary (`doneErr`). A lazy `Rows` retains the same channel for its immediate entry check,
+plus the cancelable context's `Err` method for error identity; Close releases both.
+Meters retain only the channel. The channel is `nil` (no channel
 polling, the §8 cost determinism intact) unless a cancelable ctx is active; a non-cancelable
 background ctx (nil `Done`) arms
 nothing. Verified by `impl/go/cancellation_test.go` (the meter-checkpoint and sampling unit tests, the boundary
@@ -1395,6 +1427,66 @@ language under `web/examples/queries/{rust.rs,go.go,ts.ts}` (rusqlite `run`/`que
 three language variants each render their idiom. The remaining ledgered work is the container-type
 native mapping (follow-up (a) above) and the same ergonomic surface on the shared `ReadHandle`/
 `WriteHandle` (§2.5).
+
+---
+
+### 11.6 Go configuration validation and durations
+
+Go's host API expresses timeouts and intervals with `time.Duration`. The SQL settings,
+shared millisecond units, page-service protocol, and other language APIs are unchanged.
+
+- `SessionOptions.LockTimeout` is a duration; zero retains the unlimited default.
+  `Session.LockTimeout()` returns a duration and `SetLockTimeout(time.Duration) error`
+  rejects a negative value without changing the current setting.
+- `CreateOptions` and `OpenOptions` expose `FlushInterval`, `FileLockTimeout`,
+  `IdleInTransactionTimeout`, `IdleSessionTimeout`, `YieldGrace`, and `ShutdownGrace`
+  as `*time.Duration`. `AttachFileOptions.FileLockTimeout` uses the same type.
+  Nil selects the existing default; a pointer to zero retains each field's explicit-zero
+  meaning (disable the relevant timer, or try file-lock acquisition once).
+  `DefaultFlushInterval` is `time.Second`.
+- Negative durations fail with `22023 invalid_parameter_value` before resource acquisition,
+  even when the selected mode would ignore the option. Create, open, remote open, and attach
+  validate at their public entry points; an attachment source is validated when attached.
+- Millisecond-backed settings (`LockTimeout`, `FileLockTimeout`, `FlushInterval`) round
+  positive fractional milliseconds up, so a positive timeout never becomes unlimited.
+  Page-service idle and grace timers retain duration precision. Conversion back from
+  milliseconds saturates at the largest Go duration, avoiding overflow for large SQL or
+  protocol values and the rounded maximum Go duration.
+- `Database.Session(SessionOptions) (*Session, error)` validates before constructing a
+  session or registering a reader pin. An empty `TimeZone` selects UTC; malformed offsets,
+  unknown zones, and named zones missing from the database's environment fail with `22023`.
+  There is no silent UTC fallback. Loaded named zones and built-in fixed offsets remain valid.
+
+These are Go source-breaking host API changes. Migrate `FileLockTimeoutMs: &ms` to a
+`FileLockTimeout` pointer containing `time.Duration(ms) * time.Millisecond` (checking the
+range when converting arbitrary integers), and handle the error returned by `Session`.
+No persisted bytes, SQL results, or deterministic costs change.
+
+---
+
+### 11.7 Go documentation and tooling boundary
+
+The ordinary Go package documents the embedding API in `impl/go/doc.go`; external-package
+`Example…` tests compile and execute its query, session, transaction, mapping, and prepared-statement
+examples. Applications should define consumer-owned interfaces with the methods they use;
+`Queryer` remains an optional convenience for all six query methods.
+
+The lazy generic row mapper is named `MapRows`, returning `iter.Seq2[T, error]`. It replaces
+`Collect` without changing iteration behavior. It closes the cursor once iteration starts,
+including on early exit, errors, and panic; an unconsumed iterator still requires explicit cursor
+cleanup. It does not compose directly with `slices.Collect`, whose input is `iter.Seq[T]`.
+There is no eager `CollectRows` helper; callers collecting rows must preserve the error channel.
+
+White-box catalog accessors (`table`, `compositeType`, `rowsInKeyOrder`) on `Database` and
+`Session` are test-only. Supported metadata uses the exported `CollationInfo`, `CollationVerdict`
+(`CollationFull` / `CollationSkewed`), and `TimeZoneInfo` types. Compiled collation tables,
+resolved zone references, and unfetched storage values remain private implementation types.
+
+Standalone conformance and process actors require the `jedtooling` build tag. The tag enables
+repository-only fault injection, backup test entry points, page-service inspection, spill controls,
+and memory/storage invariant instrumentation. Ordinary builds export none of those hooks.
+The standard Go unit task checks both the ordinary library and tagged command packages; corpus,
+mutation, reducer, and page-service tools explicitly build with the tag.
 
 ---
 

@@ -144,7 +144,7 @@ func TestRemapEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := db.Session(SessionOptions{})
+	s := mustSession(db, SessionOptions{})
 	exec := func(sql string) {
 		t.Helper()
 		if _, err := s.Exec(ctx, sql); err != nil {

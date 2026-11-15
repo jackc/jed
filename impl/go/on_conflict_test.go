@@ -10,7 +10,7 @@ import "testing"
 
 func ocDB(t *testing.T, sql ...string) *Session {
 	t.Helper()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	for _, s := range sql {
 		if _, err := queryOutcome(db, s, nil); err != nil {
 			t.Fatalf("setup %q: %v", s, err)

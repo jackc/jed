@@ -24,7 +24,10 @@ func main() {
 	// any write or schema change resolves to 42501, with no in-database role catalog.
 	readOnly := jed.PrivSetEmpty.With(jed.PrivSelect)
 	noDDL := false
-	untrusted := db.Session(jed.SessionOptions{DefaultPrivileges: &readOnly, AllowDDL: &noDDL})
+	untrusted, err := db.Session(jed.SessionOptions{DefaultPrivileges: &readOnly, AllowDDL: &noDDL})
+	if err != nil {
+		log.Fatal(err)
+	}
 	defer untrusted.Close() // release the session (and its reader pin)
 	if _, err := untrusted.Exec(ctx, "SELECT body FROM report"); err != nil {
 		log.Fatal(err)
@@ -35,7 +38,10 @@ func main() {
 
 	// Grant/Revoke adjust one object at a time on a session's envelope, and revoke always wins. Revoke
 	// EXECUTE on a volatile function to pin a session's determinism — calls to it then fail 42501.
-	locked := db.Session(jed.SessionOptions{})
+	locked, err := db.Session(jed.SessionOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
 	defer locked.Close()
 	locked.Revoke(jed.PrivSetEmpty.With(jed.PrivExecute), "uuidv4")
 	if _, err := locked.Exec(ctx, "SELECT uuidv4()"); err != nil {

@@ -45,7 +45,7 @@ type contractionEntry struct {
 // Collation is a compiled, fully-resolved collation: jed's own table plus its metadata,
 // database-independent (collation.md §4). The arrays are kept sorted (the §2 contract) so the
 // serialized bytes are deterministic.
-type Collation struct {
+type compiledCollation struct {
 	Name           string
 	UnicodeVersion string // from the definition's @version record ("" if none)
 	CldrVersion    string // "" — root-only / unset in slice 1b
@@ -88,7 +88,7 @@ func corruptErr(format string, a ...any) error {
 // CompileCollation parses a collation definition (spec/collation/README.md §1) and compiles it
 // into a jed table. The definition is a single stream, line-dispatched: @… records, allkeys
 // mapping lines (codepoints ; elements), and LDML rule lines (&anchor < x …). Host-free.
-func compileCollation(name, definition string) (*Collation, error) {
+func compileCollation(name, definition string) (*compiledCollation, error) {
 	unicodeVersion := ""
 	// working map: code-point sequence → CEs, in insertion order.
 	var keys [][]uint32
@@ -145,7 +145,7 @@ func compileCollation(name, definition string) (*Collation, error) {
 	sortSingles(singles)
 	sortContractions(contractions)
 
-	return &Collation{
+	return &compiledCollation{
 		Name:           name,
 		UnicodeVersion: unicodeVersion,
 		Singles:        singles,
@@ -441,7 +441,7 @@ func parseHex16(s string) (uint16, error) {
 
 // SortKey is the byte string whose memcmp order equals the collation's logical order:
 // L1-weights ‖ 0x0000 ‖ L2-weights ‖ 0x0000 ‖ L3-weights ‖ 0x0000 ‖ Ckey(original).
-func sortKey(coll *Collation, s string) ([]byte, error) {
+func sortKey(coll *compiledCollation, s string) ([]byte, error) {
 	var cps []uint32
 	for _, r := range s {
 		cps = append(cps, uint32(r))
@@ -475,7 +475,7 @@ func sortKey(coll *Collation, s string) ([]byte, error) {
 	return key, nil
 }
 
-func collationElements(coll *Collation, cps []uint32) ([]ce, error) {
+func collationElements(coll *compiledCollation, cps []uint32) ([]ce, error) {
 	maxContraction := coll.maxContraction
 	var out []ce
 	i := 0
@@ -519,7 +519,7 @@ func longestContraction(contractions []contractionEntry) int {
 }
 
 // lookupSingle binary-searches Singles, which the table contract keeps ascending by code point.
-func lookupSingle(coll *Collation, cp uint32) ([]ce, bool) {
+func lookupSingle(coll *compiledCollation, cp uint32) ([]ce, bool) {
 	i := sort.Search(len(coll.Singles), func(i int) bool { return coll.Singles[i].cp >= cp })
 	if i < len(coll.Singles) && coll.Singles[i].cp == cp {
 		return coll.Singles[i].ces, true
@@ -529,7 +529,7 @@ func lookupSingle(coll *Collation, cp uint32) ([]ce, bool) {
 
 // lookupContraction binary-searches Contractions, which the table contract keeps lexicographic by
 // sequence.
-func lookupContraction(coll *Collation, seq []uint32) ([]ce, bool) {
+func lookupContraction(coll *compiledCollation, seq []uint32) ([]ce, bool) {
 	i := sort.Search(len(coll.Contractions), func(i int) bool { return !seqLess(coll.Contractions[i].seq, seq) })
 	if i < len(coll.Contractions) && equalSeq(coll.Contractions[i].seq, seq) {
 		return coll.Contractions[i].ces, true
@@ -556,7 +556,7 @@ func equalSeq(a, b []uint32) bool {
 // ============================================================================================
 
 // SerializeTable serializes the compiled table (§2) — the bytes the content hash covers.
-func serializeTable(coll *Collation) []byte {
+func serializeTable(coll *compiledCollation) []byte {
 	return serializeEntries(coll.Singles, coll.Contractions)
 }
 
@@ -598,7 +598,7 @@ func pushCe(out []byte, c ce) []byte {
 // SaveCollation writes the portable .coll artifact (§3): magic + metadata + provenance + CRC-32 +
 // the LZ4-compressed table. OpenCollation is its exact inverse; the round-trip is byte-identical
 // on every core (collation.md §10).
-func saveCollation(coll *Collation) []byte {
+func saveCollation(coll *compiledCollation) []byte {
 	table := serializeTable(coll)
 	hash := crc32IEEE(table)
 	comp := lz4Compress(table)
@@ -624,7 +624,7 @@ func pushStr(out []byte, s string) []byte {
 
 // OpenCollation reads a .coll artifact (§3) back into a Collation. Verifies the magic, the format
 // version, and the content hash; a malformed or tampered artifact is XX001 (data_corrupted).
-func openCollation(bytes []byte) (*Collation, error) {
+func openCollation(bytes []byte) (*compiledCollation, error) {
 	r := &reader{b: bytes}
 	magic, err := r.take(6)
 	if err != nil {
@@ -686,7 +686,7 @@ func openCollation(bytes []byte) (*Collation, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Collation{
+	return &compiledCollation{
 		Name:           name,
 		UnicodeVersion: unicodeVersion,
 		CldrVersion:    cldrVersion,
@@ -1225,7 +1225,7 @@ func openBundle(data []byte) (*bundle, error) {
 // merged onto the root (byte-identical to its fully-resolved .coll table). Every collation takes the
 // bundle header's (unicode, cldr) version + description. Returns the collations and the optional
 // property table.
-func loadBundle(b *bundle) ([]*Collation, *propertyTable, error) {
+func loadBundle(b *bundle) ([]*compiledCollation, *propertyTable, error) {
 	var root *bundleEntries
 	for i := range b.Sections {
 		if b.Sections[i].Kind == sectionRoot {
@@ -1233,14 +1233,14 @@ func loadBundle(b *bundle) ([]*Collation, *propertyTable, error) {
 			break
 		}
 	}
-	mk := func(name string, singles []singleEntry, contractions []contractionEntry) *Collation {
-		return &Collation{
+	mk := func(name string, singles []singleEntry, contractions []contractionEntry) *compiledCollation {
+		return &compiledCollation{
 			Name: name, UnicodeVersion: b.UnicodeVersion, CldrVersion: b.CldrVersion,
 			Description: b.Description, Singles: singles, Contractions: contractions,
 			maxContraction: longestContraction(contractions),
 		}
 	}
-	var colls []*Collation
+	var colls []*compiledCollation
 	var property *propertyTable
 	if root != nil {
 		colls = append(colls, mk(root.name, root.singles, root.contractions))
@@ -1264,7 +1264,7 @@ func loadBundle(b *bundle) ([]*Collation, *propertyTable, error) {
 // BuildBundle builds a JUCD bundle (README §5) from a root collation, per-locale tailorings (each
 // diffed against the root into a sparse override), and an optional property table — the builder
 // tool's core. The header (unicode, cldr) version is the root's.
-func buildBundle(root *Collation, tailorings []*Collation, property *propertyTable, description string) *bundle {
+func buildBundle(root *compiledCollation, tailorings []*compiledCollation, property *propertyTable, description string) *bundle {
 	var sections []section
 	if property != nil {
 		sections = append(sections, section{Kind: sectionProperty, Property: property})
@@ -1312,7 +1312,7 @@ func mergeOntoRoot(root, delta *bundleEntries) ([]singleEntry, []contractionEntr
 // diffAgainstRoot is the sparse override (README §5): the full table's singles/contractions that the
 // root lacks or maps differently. The current LDML subset only adds or replaces (no removals), so
 // applying this back onto the root reproduces the full table (§5.1).
-func diffAgainstRoot(full, root *Collation) ([]singleEntry, []contractionEntry) {
+func diffAgainstRoot(full, root *compiledCollation) ([]singleEntry, []contractionEntry) {
 	rootSingles := make(map[uint32][]ce, len(root.Singles))
 	for _, s := range root.Singles {
 		rootSingles[s.cp] = s.ces

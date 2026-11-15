@@ -38,7 +38,7 @@ func BenchmarkDecimalLanes(b *testing.B) {
 		{"order_by_limit", "SELECT id, amount::text AS amount_text FROM ledger ORDER BY amount DESC, id ASC LIMIT 100"},
 	} {
 		b.Run(q.name, func(b *testing.B) {
-			s := db.Session(SessionOptions{})
+			s := mustSession(db, SessionOptions{})
 			defer s.Close()
 			b.ReportAllocs()
 			b.ResetTimer()

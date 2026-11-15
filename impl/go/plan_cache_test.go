@@ -88,7 +88,7 @@ func seedOrders(t *testing.T, db *Session, n int) {
 // with per-execution mutable cost state were cached, the 2nd execute would report a different cost).
 func TestPlanCachePointLookupReuses(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	seedOrders(t, db, 5)
 	stmt, err := db.Prepare("SELECT id, amount FROM orders WHERE id = $1")
 	if err != nil {
@@ -137,7 +137,7 @@ func TestPlanCachePointLookupReuses(t *testing.T) {
 
 func TestInsertCacheEstimatorRevisionDoesNotInvalidate(t *testing.T) {
 	t.Parallel()
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	mustExec(t, s, "CREATE TABLE ins (id i32 PRIMARY KEY, v i32)")
 	stmt, err := s.Prepare("INSERT INTO ins VALUES ($1, $2) RETURNING id, v")
 	if err != nil {
@@ -169,13 +169,13 @@ func TestInsertCacheEstimatorRevisionDoesNotInvalidate(t *testing.T) {
 
 func TestInsertCacheFillsInRowOnlyTransaction(t *testing.T) {
 	t.Parallel()
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	stmt, err := s.Prepare("INSERT INTO t VALUES ($1, $2)")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Begin(true); err != nil {
+	if err := s.Begin(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := prepOutcome(s, stmt, []Value{IntValue(1), IntValue(10)}); err != nil {
@@ -198,7 +198,7 @@ func TestInsertCacheFillsInRowOnlyTransaction(t *testing.T) {
 
 func TestInsertCacheEligibilityExcludesMutableAndComplexShapes(t *testing.T) {
 	t.Parallel()
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, note text)")
 
 	rx, err := s.Prepare("INSERT INTO t VALUES ($1, $2) RETURNING note ~ 'a'")
@@ -249,7 +249,7 @@ func TestInsertCacheEligibilityExcludesMutableAndComplexShapes(t *testing.T) {
 // result- and cost-identical (grammar.md §16).
 func TestInsertCacheReusesValuesExpressions(t *testing.T) {
 	t.Parallel()
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	stmt, err := s.Prepare("INSERT INTO t VALUES ($1, $2 * 10 + 1) RETURNING v")
 	if err != nil {
@@ -285,7 +285,7 @@ func TestInsertCacheReusesValuesExpressions(t *testing.T) {
 // execute re-reads the table.
 func TestInsertValuesSubqueryIsNotCached(t *testing.T) {
 	t.Parallel()
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	mustExec(t, s, "INSERT INTO t VALUES (1, 0)")
 	stmt, err := s.Prepare("INSERT INTO t VALUES ((SELECT max(id) FROM t) + 1, $1) RETURNING id")
@@ -313,7 +313,7 @@ func TestInsertValuesSubqueryIsNotCached(t *testing.T) {
 
 func TestInsertCacheInvalidationIdentities(t *testing.T) {
 	t.Parallel()
-	s := memDB().Session(SessionOptions{})
+	s := mustSession(memDB(), SessionOptions{})
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	stmt, err := s.Prepare("INSERT INTO t VALUES ($1, $2)")
 	if err != nil {
@@ -341,7 +341,7 @@ func TestInsertCacheInvalidationIdentities(t *testing.T) {
 	}
 	plan = stmt.ic.p.Load().plan
 
-	if err := s.Begin(true); err != nil {
+	if err := s.Begin(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	mustExec(t, s, "DROP INDEX t_v_idx")
@@ -370,7 +370,7 @@ func TestInsertCacheInvalidationIdentities(t *testing.T) {
 		t.Fatal("DROP/CREATE served a stale target plan")
 	}
 
-	other := memDB().Session(SessionOptions{})
+	other := mustSession(memDB(), SessionOptions{})
 	mustExec(t, other, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	beforeOther := stmt.ic.p.Load().plan
 	if _, err := prepOutcome(other, stmt, []Value{IntValue(1), IntValue(100)}); err != nil {
@@ -384,7 +384,7 @@ func TestInsertCacheInvalidationIdentities(t *testing.T) {
 	if err := base.Attach("aux", AttachMemory(), false); err != nil {
 		t.Fatal(err)
 	}
-	attachedSession := base.Session(SessionOptions{})
+	attachedSession := mustSession(base, SessionOptions{})
 	mustExec(t, attachedSession, "CREATE TABLE aux.t (id i32 PRIMARY KEY, v i32)")
 	attached, err := base.Prepare("INSERT INTO aux.t VALUES ($1, $2)")
 	if err != nil {
@@ -409,9 +409,9 @@ func TestInsertCacheInvalidationIdentities(t *testing.T) {
 	}
 
 	shadowed := memDB()
-	b := shadowed.Session(SessionOptions{})
+	b := mustSession(shadowed, SessionOptions{})
 	mustExec(t, b, "CREATE TEMP TABLE t (id i32 PRIMARY KEY, v i32)")
-	a := shadowed.Session(SessionOptions{})
+	a := mustSession(shadowed, SessionOptions{})
 	mustExec(t, a, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	shadowStmt, err := shadowed.Prepare("INSERT INTO t VALUES ($1, $2)")
 	if err != nil {
@@ -438,7 +438,7 @@ func TestInsertCacheInvalidationIdentities(t *testing.T) {
 func TestInsertCacheRechecksPrivilegeAndReadOnly(t *testing.T) {
 	t.Parallel()
 	base := memDB()
-	writer := base.Session(SessionOptions{})
+	writer := mustSession(base, SessionOptions{})
 	mustExec(t, writer, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	stmt, err := base.Prepare("INSERT INTO t VALUES ($1, $2)")
 	if err != nil {
@@ -449,14 +449,14 @@ func TestInsertCacheRechecksPrivilegeAndReadOnly(t *testing.T) {
 	}
 	plan := stmt.ic.p.Load().plan
 	readOnlyPrivileges := PrivSetEmpty.With(PrivSelect)
-	restricted := base.Session(SessionOptions{DefaultPrivileges: &readOnlyPrivileges})
+	restricted := mustSession(base, SessionOptions{DefaultPrivileges: &readOnlyPrivileges})
 	if _, err := prepOutcome(restricted, stmt, []Value{IntValue(2), IntValue(20)}); sessCode(t, err) != "42501" {
 		t.Fatalf("cached INSERT privilege gate = %v, want 42501", err)
 	}
 	if stmt.ic.p.Load().plan != plan {
 		t.Fatal("failed privilege gate changed cache")
 	}
-	if err := writer.Begin(false); err != nil {
+	if err := writer.Begin(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := prepOutcome(writer, stmt, []Value{IntValue(2), IntValue(20)}); sessCode(t, err) != "25006" {
@@ -471,7 +471,7 @@ func TestInsertCacheRechecksPrivilegeAndReadOnly(t *testing.T) {
 func TestInsertCacheCollationUpgradeInvalidates(t *testing.T) {
 	env := loadFixtureBundle(t)
 	base := memDBIn(env)
-	s := base.Session(SessionOptions{})
+	s := mustSession(base, SessionOptions{})
 	mustExec(t, s, `CREATE TABLE t (id i32 PRIMARY KEY, x text COLLATE "unicode")`)
 	stmt, err := base.Prepare("INSERT INTO t VALUES ($1, $2)")
 	if err != nil {
@@ -498,8 +498,8 @@ func TestInsertCacheCollationUpgradeInvalidates(t *testing.T) {
 
 func TestInsertCacheHitMatchesFreshResolution(t *testing.T) {
 	t.Parallel()
-	cachedDB := memDB().Session(SessionOptions{})
-	freshDB := memDB().Session(SessionOptions{})
+	cachedDB := mustSession(memDB(), SessionOptions{})
+	freshDB := mustSession(memDB(), SessionOptions{})
 	for _, s := range []*Session{cachedDB, freshDB} {
 		mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 CHECK (v > 0), note text DEFAULT 'x')")
 		mustExec(t, s, "CREATE UNIQUE INDEX t_v_idx ON t (v)")
@@ -546,7 +546,7 @@ func TestInsertCacheHitMatchesFreshResolution(t *testing.T) {
 
 func TestInsertCacheConcurrentSessions(t *testing.T) {
 	base := memDB()
-	seed := base.Session(SessionOptions{})
+	seed := mustSession(base, SessionOptions{})
 	mustExec(t, seed, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	stmt, err := base.Prepare("INSERT INTO t VALUES ($1, $2)")
 	if err != nil {
@@ -559,7 +559,7 @@ func TestInsertCacheConcurrentSessions(t *testing.T) {
 		wg.Add(1)
 		go func(g int) {
 			defer wg.Done()
-			s := base.Session(SessionOptions{})
+			s := mustSession(base, SessionOptions{})
 			defer s.Close()
 			for i := 0; i < iterations; i++ {
 				id := int64(g*iterations + i + 1)
@@ -585,7 +585,7 @@ func TestInsertCacheConcurrentSessions(t *testing.T) {
 // plan's rows and actual cost must equal an independently fresh prepared statement.
 func TestPlanCacheEstimatorRevisionRelevantAndUnrelated(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE a (id i32 PRIMARY KEY, v i32)")
 	mustExec(t, db, "CREATE TABLE b (id i32 PRIMARY KEY, v i32)")
 	mustExec(t, db, "INSERT INTO a VALUES (1, 10)")
@@ -653,7 +653,7 @@ func TestPlanCacheEstimatorRevisionRelevantAndUnrelated(t *testing.T) {
 
 func TestPlanCacheAnalyzeInvalidatesOnlyRelevantRelation(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE a (id i32 PRIMARY KEY, v i32)")
 	mustExec(t, db, "CREATE INDEX a_v_idx ON a (v)")
 	mustExec(t, db, "INSERT INTO a VALUES (1,0),(2,0),(3,0),(4,0),(5,0),(6,0),(7,0),(8,0),(9,1),(10,NULL)")
@@ -694,7 +694,7 @@ func TestPlanCacheAnalyzeInvalidatesOnlyRelevantRelation(t *testing.T) {
 // entry. Rollback restores the committed token, so the original plan becomes a hit again.
 func TestPlanCacheEstimatorRevisionRollback(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	mustExec(t, db, "INSERT INTO t VALUES (1, 10)")
 	stmt, err := db.Prepare("SELECT id FROM t WHERE v = $1")
@@ -705,7 +705,7 @@ func TestPlanCacheEstimatorRevisionRollback(t *testing.T) {
 		t.Fatal("expected fill")
 	}
 	committed := stmt.sc.p.Load()
-	if err := db.Begin(true); err != nil {
+	if err := db.Begin(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	mustExec(t, db, "INSERT INTO t VALUES (2, 10)")
@@ -733,7 +733,7 @@ func TestPlanCacheAttachmentEstimatorSignature(t *testing.T) {
 	if err := base.Attach("aux", AttachMemory(), false); err != nil {
 		t.Fatal(err)
 	}
-	db := base.Session(SessionOptions{})
+	db := mustSession(base, SessionOptions{})
 	mustExec(t, db, "CREATE TABLE aux.t (id i32 PRIMARY KEY, v i32)")
 	mustExec(t, db, "INSERT INTO aux.t VALUES (1, 10)")
 	stmt, err := base.Prepare("SELECT id FROM aux.t WHERE v = $1")
@@ -788,7 +788,7 @@ func TestPlanCacheAttachmentEstimatorSignature(t *testing.T) {
 // use a dropped index. Exercises the removeIndex catGen bump.
 func TestPlanCacheDropIndexInvalidation(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, a i32)")
 	for i := 1; i <= 50; i++ {
 		mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", i, i))
@@ -827,7 +827,7 @@ func TestPlanCacheDropIndexInvalidation(t *testing.T) {
 // under fill-only-from-committed the new committed generation differs).
 func TestPlanCacheDropCreateInvalidation(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, a i32)")
 	mustExec(t, db, "INSERT INTO t VALUES (1, 10)")
 	stmt, err := db.Prepare("SELECT * FROM t WHERE id = $1")
@@ -854,7 +854,7 @@ func TestPlanCacheDropCreateInvalidation(t *testing.T) {
 // secondary index (cheaper cost), proving the invalidation actually forces a fresh plan.
 func TestPlanCacheIndexInvalidation(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, a i32)")
 	for i := 1; i <= 50; i++ {
 		mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", i, i))
@@ -884,7 +884,7 @@ func TestPlanCacheIndexInvalidation(t *testing.T) {
 // cached — reusing it would bake in one execution's folded params / under-charge the regex compile.
 func TestPlanCacheNonCacheable(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, note text)")
 	mustExec(t, db, "INSERT INTO t VALUES (1, 'abc'), (2, 'xyz'), (3, 'abd')")
 
@@ -927,7 +927,7 @@ func TestPlanCacheNonCacheable(t *testing.T) {
 // and caches normally.
 func TestPlanCacheFillOnlyFromCommitted(t *testing.T) {
 	t.Parallel()
-	db := memDB().Session(SessionOptions{})
+	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, a i32)")
 	mustExec(t, db, "INSERT INTO t VALUES (1, 10)")
 	stmt, err := db.Prepare("SELECT * FROM t WHERE id = $1")
@@ -935,7 +935,7 @@ func TestPlanCacheFillOnlyFromCommitted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := db.Begin(true); err != nil {
+	if err := db.Begin(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	inTx, _ := drainQ(t, db, stmt, IntValue(1))
@@ -960,7 +960,7 @@ func TestPlanCacheFillOnlyFromCommitted(t *testing.T) {
 // committed catalog generation, not on the session that happened to fill it.
 func TestPlanCacheSharedAcrossSessions(t *testing.T) {
 	base := memDB()
-	sA := base.Session(SessionOptions{})
+	sA := mustSession(base, SessionOptions{})
 	defer sA.Close()
 	seedOrders(t, sA, 5)
 	stmt, err := base.Prepare("SELECT id, amount FROM orders WHERE id = $1")
@@ -977,7 +977,7 @@ func TestPlanCacheSharedAcrossSessions(t *testing.T) {
 		t.Fatalf("session A rows = %v", rA)
 	}
 
-	sB := base.Session(SessionOptions{})
+	sB := mustSession(base, SessionOptions{})
 	defer sB.Close()
 	rB, costB := drainQ(t, sB, stmt, IntValue(3))
 	if c := stmt.sc.p.Load(); c == nil || c.sp != entry.sp {
@@ -995,8 +995,8 @@ func TestPlanCacheSharedAcrossSessions(t *testing.T) {
 // within one core, so two databases can share a generation number with different schemas. The entry's
 // core identity forces a re-plan against the other database (and the refill re-keys to it).
 func TestPlanCacheDistinctDatabasesNoFalseHit(t *testing.T) {
-	db1 := memDB().Session(SessionOptions{})
-	db2 := memDB().Session(SessionOptions{})
+	db1 := mustSession(memDB(), SessionOptions{})
+	db2 := mustSession(memDB(), SessionOptions{})
 	// One CREATE each → both cores sit at the SAME catalog generation with different table shapes.
 	mustExec(t, db1, "CREATE TABLE t (id i32 PRIMARY KEY, a i32)")
 	mustExec(t, db2, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)")
@@ -1030,12 +1030,12 @@ func TestPlanCacheTempShadowReplans(t *testing.T) {
 	base := memDB()
 	// Session B creates its temp table FIRST (a temp name may not shadow an existing persistent
 	// table, but a later persistent CREATE in another session cannot see B's temp domain).
-	sB := base.Session(SessionOptions{})
+	sB := mustSession(base, SessionOptions{})
 	defer sB.Close()
 	mustExec(t, sB, "CREATE TEMP TABLE t (id i32 PRIMARY KEY, v i32)")
 	mustExec(t, sB, "INSERT INTO t VALUES (1, 111)")
 
-	sA := base.Session(SessionOptions{})
+	sA := mustSession(base, SessionOptions{})
 	defer sA.Close()
 	mustExec(t, sA, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)")
 	mustExec(t, sA, "INSERT INTO t VALUES (1, 10, 20)")
@@ -1071,7 +1071,7 @@ func TestPlanCacheTempShadowReplans(t *testing.T) {
 // fill/hit safe (run under -race in CI), and every execute sees correct rows.
 func TestPlanCacheConcurrentSessions(t *testing.T) {
 	base := memDB()
-	seed := base.Session(SessionOptions{})
+	seed := mustSession(base, SessionOptions{})
 	seedOrders(t, seed, 10)
 	seed.Close()
 	stmt, err := base.Prepare("SELECT id, amount FROM orders WHERE id = $1")
@@ -1086,7 +1086,7 @@ func TestPlanCacheConcurrentSessions(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s := base.Session(SessionOptions{})
+			s := mustSession(base, SessionOptions{})
 			defer s.Close()
 			for i := 0; i < iters; i++ {
 				id := int64(i%10) + 1

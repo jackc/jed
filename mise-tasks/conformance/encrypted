@@ -21,7 +21,7 @@ Dir.mktmpdir("jed-encrypted-corpus") do |dir|
   with = ->(core) { env.merge("JED_CONFORMANCE_TRANSCRIPT" => transcripts[core]) }
   sh "cargo", "run", "--release", "--quiet", "--bin", "conformance", "--manifest-path", RUST_MANIFEST, "--", "disk",
      env: with.("rust")
-  sh "go", "run", "./cmd/conformance", "disk", env: with.("go"), chdir: GO_DIR
+  sh "go", "run", "-tags", "jedtooling", "./cmd/conformance", "disk", env: with.("go"), chdir: GO_DIR
   sh "node", "src/bin/conformance.ts", "disk", env: with.("ts"), chdir: TS_DIR
   lines = transcripts.transform_values { |path| File.readlines(path, chomp: true) }
   mismatches = []

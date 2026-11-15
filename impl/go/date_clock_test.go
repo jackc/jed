@@ -17,7 +17,7 @@ func clockDB(t *testing.T, micros int64, stmts ...string) (*Session, *ManualCloc
 	clock := NewManualClock(micros)
 	b := NewEnvironmentBuilder()
 	b.SetClockSource(clock)
-	db := memDBIn(b.Build()).Session(SessionOptions{})
+	db := mustSession(memDBIn(b.Build()), SessionOptions{})
 	for _, s := range stmts {
 		if _, err := queryOutcome(db, s, nil); err != nil {
 			t.Fatalf("setup %q: %v", s, err)

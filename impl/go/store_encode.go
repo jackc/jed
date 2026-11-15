@@ -939,7 +939,7 @@ func fkValueAs(target dataType, v Value) (Value, bool, error) {
 // site's column/expression type passes a keyability gate (PRIMARY KEY / CREATE INDEX / UNIQUE, and a
 // foreign-key column's type equals its PK/UNIQUE parent column's, CREATE TABLE §6.2). A DEFERRED
 // value (a spilled large value of a lazily-decoded row) is resolved first (residentValue).
-func encodeKeyValue(ty scalarType, value Value, coll *Collation) ([]byte, error) {
+func encodeKeyValue(ty scalarType, value Value, coll *compiledCollation) ([]byte, error) {
 	switch value.Kind {
 	case ValUnfetched:
 		v, err := resolveUnfetchedSelf(value.unfetched())
@@ -995,7 +995,7 @@ func residentValue(value Value) (Value, error) {
 // the column type; every other keyable value ignores the wrapper and dispatches on its scalar via
 // encodeKeyValue. value is non-NULL (callers handle the NULL slot tag), and a range column always
 // holds a ValRange, so the scalar arm never sees a range type.
-func encodeTypedKey(ty dataType, value Value, coll *Collation) ([]byte, error) {
+func encodeTypedKey(ty dataType, value Value, coll *compiledCollation) ([]byte, error) {
 	value, err := residentValue(value)
 	if err != nil {
 		return nil, err
@@ -1025,7 +1025,7 @@ func encodeTypedKey(ty dataType, value Value, coll *Collation) ([]byte, error) {
 // elements included since the §2.8 lift; the DDL gate rejects only a composite element 0A000), so the
 // per-element key is encodeKeyValue — under coll, a collated text[] column's collation, each text
 // element's §2.12 sort key (nil is the C byte order).
-func encodeArrayKey(elem scalarType, a *ArrayVal, coll *Collation) ([]byte, error) {
+func encodeArrayKey(elem scalarType, a *ArrayVal, coll *compiledCollation) ([]byte, error) {
 	var out []byte
 	for _, e := range a.Elements {
 		if e.Kind == ValNull {
@@ -1056,7 +1056,7 @@ func encodeArrayKey(elem scalarType, a *ArrayVal, coll *Collation) ([]byte, erro
 // Scalar/array/range produce byte-identical output to encodeTypedKey; the extra arm is composite
 // (encoding.md §2.15). value is non-NULL (callers tag the §2.2 slot). coll selects a text / text[]
 // column's collated key form (§2.12/§2.14); it never applies to a composite field.
-func encodeColTypeKey(ct colType, value Value, coll *Collation) ([]byte, error) {
+func encodeColTypeKey(ct colType, value Value, coll *compiledCollation) ([]byte, error) {
 	value, err := residentValue(value)
 	if err != nil {
 		return nil, err
@@ -1167,7 +1167,7 @@ func fkMatchFullViolated(fk *foreignKey, row storedRow) bool {
 // ordinals = fk.RefColumns (the row viewed as a parent). Returns ok=false when any supplied value
 // is NULL (MATCH SIMPLE exempt — §6.3). The probe uses the parent's PK when the referenced set is
 // the PK, else the matching unique index (re-derived deterministically — §6.8).
-func buildFkProbe(fk *foreignKey, parent *catTable, parentColls []*Collation, row storedRow, ordinals []int) (fkProbe, bool, error) {
+func buildFkProbe(fk *foreignKey, parent *catTable, parentColls []*compiledCollation, row storedRow, ordinals []int) (fkProbe, bool, error) {
 	// MATCH SIMPLE: a NULL in any supplied (local/parent) column exempts the whole tuple.
 	for _, o := range ordinals {
 		if row[o].Kind == ValNull {
@@ -1484,7 +1484,7 @@ func (db *engine) fkChildReferences(childTable string, fk *foreignKey, parent *c
 type fkKeyedTarget struct {
 	temp        bool // the FK's domain: the child (and parent) are session-local temp tables (temp-tables.md §8)
 	parent      *catTable
-	parentColls []*Collation
+	parentColls []*compiledCollation
 	fk          *foreignKey
 	tuples      [][]Value
 	next        [][]Value

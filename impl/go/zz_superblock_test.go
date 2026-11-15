@@ -580,7 +580,7 @@ func TestSuperBlockPoolBound(t *testing.T) {
 			t.Fatal(err)
 		}
 		hOpen := sbHeap()
-		sess := bdb.Session(SessionOptions{})
+		sess := mustSession(bdb, SessionOptions{})
 		qs := []string{}
 		for _, tb := range []string{"orders", "line_items", "events", "users", "sessions", "activity", "samples"} {
 			qs = append(qs, "SELECT count(*) FROM "+tb+" WHERE true", "SELECT * FROM "+tb)

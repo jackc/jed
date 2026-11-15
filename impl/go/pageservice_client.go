@@ -99,13 +99,13 @@ type psClient struct {
 }
 
 // readAheadDisabled turns read-ahead off for connections made afterwards
-// (SetPageClientReadAheadForTesting).
+// (setPageClientReadAheadForTesting).
 var readAheadDisabled atomic.Bool
 
-// SetPageClientReadAheadForTesting turns page-client read-ahead (spec/design/page-service.md §5.3) on
+// setPageClientReadAheadForTesting turns page-client read-ahead (spec/design/page-service.md §5.3) on
 // or off for connections this process makes afterwards. On by default for the stream transport. Test-
 // and benchmark-only: the page-service benchmark's no-read-ahead baseline.
-func SetPageClientReadAheadForTesting(enabled bool) { readAheadDisabled.Store(!enabled) }
+func setPageClientReadAheadForTesting(enabled bool) { readAheadDisabled.Store(!enabled) }
 
 func connectionLost(err error) error {
 	return newError(ConnectionFailure, "lost the connection to the database owner: "+err.Error())
