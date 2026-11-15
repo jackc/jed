@@ -72,9 +72,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     - [ ] _follow-on:_ a 16-byte slot for `19 ≤ p ≤ 38` (needs 128-bit slot arithmetic in every
       core; about today's size for typical values). The negative / `s>p` typmod follow-on above must
       keep the slot rule `|value × 10^s| < 10^p`.
-  - [ ] _follow-on (TS, per-core):_ the TS core's decimal lanes are still several times slower than
-    Rust's and Go's; what remains is per-value directory reads, bigint cost arithmetic, and the fold
-    dispatch ([benchmarks.md §11](spec/design/benchmarks.md)).
+  - [ ] _follow-on (TS, per-core):_ two TS decimal lanes still trail Rust and Go: `decimal_arith_scan`
+    (about 2×; a running sum past 2⁵³ folds as a `Decimal` — a wider number-held sum would keep it)
+    and `decimal_order_by_limit` (about 4× Rust; a decimal value per row and per-row bigint charges
+    on the streaming sort) ([benchmarks.md §11](spec/design/benchmarks.md)).
   - [ ] _follow-on:_ the columnar aggregate lane takes one base table, one integer grouping key (a
     column or an expression) and `count`/`sum`/`avg`/`min`/`max`; a non-integer or multi-column key,
     `GROUP BY` on the primary key, and a top-N by an expression still run on the row path

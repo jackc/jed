@@ -1839,6 +1839,33 @@ sides:
 v51, and PostgreSQL returned the same checksum on every lane. The wrapped Node/Rust, Ruby and WASM
 harnesses were not re-run for this change.
 
+**TS: numbers in place of values** ([packed-leaf.md](packed-leaf.md) §11, the TS paragraph after
+Track A5). The TS core's lanes read a fixed-width decimal or integer slot as a JS number, keep a
+`SUM`/`AVG` running sum as a safe integer, look an integer group key up by number, compare a
+fixed-width decimal column with a constant as a span atom, multiply and add short decimals in
+numbers, and charge small cost multiples from shared tables. Alternating base (`d2c30d64`) and branch
+runs of the TS harness — base, after, base, after — p50 in ms; the first base run was taken under
+heavy load from other work on the machine, so the second is the fairer comparison. Rust and Go are
+the v51 table's numbers above, not re-run:
+
+| lane | TS base (2 runs) → after (2 runs) | Rust v51 | Go v51 |
+|---|---|---|---|
+| `decimal_sum_scan` | 44.8, 19.7 → 6.6, 6.4 | 7.5 | 5.3 |
+| `decimal_sum_bigint` | 26.6, 19.5 → 4.4, 4.3 | 5.6 | 6.2 |
+| `decimal_avg_scan` | 19.3, 17.5 → 4.8, 5.1 | 6.5 | 4.7–7.0 |
+| `decimal_filter_scan` | 61.8, 52.0 → 13.5, 12.6 | 15.3 | 16.6–17.7 |
+| `decimal_arith_scan` | 125.0, 102.1 → 75.8, 76.5 | 34.7 | 41.3–43.0 |
+| `decimal_group_by` | 127.3, 46.6 → 22.7, 21.7 | 17.2 | 18.0–26.0 |
+| `decimal_group_by_high_card` | 91.9, 53.5 → 29.3, 30.0 | 15.5 | 18.5–21.2 |
+| `decimal_group_by_ordered` | 40.3, 35.8 → 12.2, 12.4 | 11.6 | 9.6 |
+| `decimal_order_by_limit` | 38.4, 34.7 → 33.2, 31.8 | 7.2 | 15.3–17.9 |
+
+Every run returned the same checksum on every lane. Six non-decimal controls (`point_lookup_pk`,
+`full_scan_agg`, `group_by_agg`, `order_by_limit`, `varscan_text_eq`, `hash_join_equijoin`) moved
+within noise. What remains is `decimal_arith_scan`, whose `sum(amount * fee)` passes 2⁵³ and folds
+as a `Decimal` from there, and `decimal_order_by_limit`, which still builds a decimal value per row
+and accrues its per-row charges as bigints.
+
 ### GIN follow-ons (format_version 47)
 
 The GIN disjunction, multi-column, jsonpath, and posting-run slices (gin.md §2.2/§4.4/§4.5/§6.3) add

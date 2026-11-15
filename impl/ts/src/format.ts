@@ -187,6 +187,7 @@ import {
   typeIsJsonb,
   typeScalar,
   widthBytes,
+  isInteger,
 } from "./types.ts";
 import {
   type TypeRef,
@@ -8790,6 +8791,20 @@ function paxFixedU64(payload: Uint8Array, d: PaxDirs, r: FixedRegion, i: number)
 // A body is a sign-flipped i16 / i32 / i64 / date / timestamp / fixed-width numeric slot. null for an
 // 8-byte value whose magnitude is 2^53 or more, which the caller reads through the body's bytes.
 function paxForValue(ty: ColType, r: FixedRegion, payload: Uint8Array, i: number): Value | null {
+  const x = paxForNum(r, payload, i);
+  if (Number.isNaN(x)) return null;
+  if (ty.kind === "scalar" && ty.fixedDec !== undefined) {
+    return decimalValue(Decimal.fromUnscaledNumber(x, ty.fixedDec.scale));
+  }
+  if (ty.kind === "scalar" && isDate(ty.scalar)) return dateValue(BigInt(x));
+  if (ty.kind === "scalar" && isTimestamp(ty.scalar)) return timestampValue(BigInt(x));
+  if (ty.kind === "scalar" && isTimestamptz(ty.scalar)) return timestamptzValue(BigInt(x));
+  return intValue(BigInt(x));
+}
+
+// paxForNum is present value i of a base-plus-offsets region (not one of its exceptions) as the
+// signed integer its body holds, or NaN for an 8-byte value whose magnitude is 2^53 or more.
+function paxForNum(r: FixedRegion, payload: Uint8Array, i: number): number {
   const bw = r.bw;
   const at = r.offs + i * bw;
   const off =
@@ -8805,7 +8820,12 @@ function paxForValue(ty: ColType, r: FixedRegion, payload: Uint8Array, i: number
               payload[at + 3]!) >>>
             0;
   let x: number;
-  if (r.width <= 4) {
+  if (r.width === 4) {
+    // Mod 2^32 by ToUint32 (baseLo + off is below 2^33, exact).
+    x = ((r.baseLo + off) >>> 0) - 0x80000000;
+  } else if (r.width === 2) {
+    x = ((r.baseLo + off) & 0xffff) - 0x8000;
+  } else if (r.width < 4) {
     x = ((r.baseLo + off) % 2 ** (8 * r.width)) - 2 ** (8 * r.width - 1);
   } else {
     // The low and high 32-bit halves, the carry by hand; the sign-flipped high half within ±2^21
@@ -8817,16 +8837,24 @@ function paxForValue(ty: ColType, r: FixedRegion, payload: Uint8Array, i: number
       hi = (hi + 1) % 0x1_0000_0000;
     }
     const top = hi - 0x80000000;
-    if (top < -0x200000 || top >= 0x200000) return null;
+    if (top < -0x200000 || top >= 0x200000) return Number.NaN;
     x = top * 0x1_0000_0000 + lo;
   }
-  if (ty.kind === "scalar" && ty.fixedDec !== undefined) {
-    return decimalValue(Decimal.fromUnscaledNumber(x, ty.fixedDec.scale));
-  }
-  if (ty.kind === "scalar" && isDate(ty.scalar)) return dateValue(BigInt(x));
-  if (ty.kind === "scalar" && isTimestamp(ty.scalar)) return timestampValue(BigInt(x));
-  if (ty.kind === "scalar" && isTimestamptz(ty.scalar)) return timestamptzValue(BigInt(x));
-  return intValue(BigInt(x));
+  return x;
+}
+
+// fixedSlotNum is the signed integer of a sign-flipped big-endian 2/4/8-byte slot at buf[at], or NaN
+// for an 8-byte value whose magnitude is 2^53 or more (readFixedDecimal's split).
+function fixedSlotNum(buf: Uint8Array, at: number, w: number): number {
+  if (w === 2) return ((buf[at]! << 8) | buf[at + 1]!) - 0x8000;
+  const first =
+    ((buf[at]! << 24) | (buf[at + 1]! << 16) | (buf[at + 2]! << 8) | buf[at + 3]!) >>> 0;
+  if (w === 4) return first - 0x80000000;
+  const top = first - 0x80000000;
+  if (top < -0x200000 || top >= 0x200000) return Number.NaN;
+  const lo =
+    ((buf[at + 4]! << 24) | (buf[at + 5]! << 16) | (buf[at + 6]! << 8) | buf[at + 7]!) >>> 0;
+  return top * 4294967296 + lo;
 }
 
 // FIXED_SPAN_SCRATCH holds one fixed-width value a reader decodes at once (the widest is 16 bytes).
@@ -9243,8 +9271,29 @@ export function decodeLeafNode(
     }
     return readInlineBody(ty, sp.buf, cur, "construct");
   };
+  // A fixed-width numeric(p,s) or integer column's value as a number, read in place (PackedLeaf
+  // numSlot): no Value, Decimal, bigint or limb array is built.
+  const numCol: boolean[] = colTypes.map(
+    (ty) => ty.kind === "scalar" && (ty.fixedDec !== undefined || isInteger(ty.scalar)),
+  );
+  const numSlot = (i: number, c: number): number => {
+    if (!numCol[c]) return Number.NaN;
+    const reg = regions[c]!;
+    if (reg.kind !== "fixed") return Number.NaN;
+    if (reg.bitmap >= 0 && (payload[reg.bitmap + (i >> 3)]! & (0x80 >> (i & 7))) !== 0) {
+      return Number.POSITIVE_INFINITY;
+    }
+    const w = reg.width;
+    if (reg.lazy === 2) {
+      const at = reg.pf === null ? -1 : pfBody(payload, w, reg.pf, i);
+      return at < 0 ? paxForNum(reg, payload, i) : fixedSlotNum(payload, at, w);
+    }
+    if (reg.lazy === 0) return fixedSlotNum(payload, reg.body + i * w, w);
+    return Number.NaN; // an elided key column: read as a value
+  };
   let inline = 0; // inlineOnly's cached answer: 0 not yet known, 1 yes, 2 no
   const packed: PackedLeaf = {
+    numSlot,
     n,
     colTypes,
     payload,

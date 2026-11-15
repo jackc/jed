@@ -334,6 +334,13 @@ export class Decimal {
   // makes the trap order-independent: whether a fold overflows no longer depends on the order
   // rows are summed. Standalone arithmetic uses add (capped).
   addUncapped(o: Decimal): Decimal {
+    if (this.scale === o.scale && this.limbs.length <= 3 && o.limbs.length <= 3) {
+      // Both magnitudes are below 10^12: the signed sum is exact in a number.
+      const x = magToNumber(this.limbs);
+      const y = magToNumber(o.limbs);
+      const r = (this.neg ? -x : x) + (o.neg ? -y : y);
+      return Decimal.fromUnscaledNumber(r, this.scale);
+    }
     const s = Math.max(this.scale, o.scale);
     // magAdd / magSub / magCmp only read their operands, so an operand already at the common scale
     // is used as is.
@@ -361,6 +368,14 @@ export class Decimal {
   // the exact product — spec/design/decimal.md §2).
   mul(o: Decimal): Decimal {
     const scale = this.scale + o.scale;
+    if (this.limbs.length <= 2 && o.limbs.length <= 2 && scale <= MAX_SCALE) {
+      // Both magnitudes are below 10^8: a product below 2^53 is exact in a number, and its at most 16
+      // digits are within the integer-digit cap.
+      const p = magToNumber(this.limbs) * magToNumber(o.limbs);
+      if (p <= Number.MAX_SAFE_INTEGER) {
+        return Decimal.fromUnscaledNumber(this.neg !== o.neg ? -p : p, scale);
+      }
+    }
     let exact = Decimal.fromParts(this.neg !== o.neg, scale, magMul(this.limbs, o.limbs));
     if (scale > MAX_SCALE) exact = exact.roundToScale(MAX_SCALE);
     return exact.checkCap();
@@ -924,6 +939,17 @@ export class Decimal {
     return new Decimal(m === 0 ? false : neg, scale, safeLimbs(m));
   }
 
+  // unscaledNumber is the signed unscaled integer of this value at its own display scale when that
+  // is a safe integer (|·| < 2^53), else NaN — the entry to a running sum kept as a JS number (the
+  // columnar SUM/AVG fold, executor.ts foldSmallDecimal).
+  unscaledNumber(): number {
+    const l = this.limbs;
+    if (l.length > 4) return Number.NaN;
+    const m = magToNumber(l);
+    if (!Number.isSafeInteger(m)) return Number.NaN;
+    return this.neg ? -m : m;
+  }
+
   // fromUnscaledWords is fromUnscaledNumber for a magnitude hi·2^32 + lo given as two unsigned
   // 32-bit words below 2^64 — an 8-byte slot whose value is outside the safe integers. One long
   // division by the limb base takes the low limb (the partial dividend r·2^32 + lo stays below
@@ -1077,11 +1103,31 @@ function alignedDigits(a: Decimal, b: Decimal): [number, number] {
   return [a.precision() + (s - a.scale), b.precision() + (s - b.scale)];
 }
 
+// safeDigitCount is the digit count of a non-negative safe integer (0 for zero) — precision() of
+// the decimal whose unscaled integer it is.
+export function safeDigitCount(m: number): number {
+  if (m < 1e8) {
+    if (m < 1e4) return m < 10 ? (m === 0 ? 0 : 1) : m < 100 ? 2 : m < 1000 ? 3 : 4;
+    return m < 1e5 ? 5 : m < 1e6 ? 6 : m < 1e7 ? 7 : 8;
+  }
+  if (m < 1e12) return m < 1e9 ? 9 : m < 1e10 ? 10 : m < 1e11 ? 11 : 12;
+  return m < 1e13 ? 13 : m < 1e14 ? 14 : m < 1e15 ? 15 : 16;
+}
+
 // W for add/sub/compare: the larger aligned operand.
 export function workLinear(a: Decimal, b: Decimal): number {
   const s = a.scale > b.scale ? a.scale : b.scale;
   const a1 = a.precision() + (s - a.scale);
   const a2 = b.precision() + (s - b.scale);
+  return decGroups(a1 > a2 ? a1 : a2);
+}
+
+// workLinearInt is workLinear(a, the scale-0 decimal of the integer b), without building it.
+export function workLinearInt(a: Decimal, b: bigint): number {
+  const mag = b < 0n ? -b : b;
+  const db = mag <= MAX_SAFE_BIG ? safeDigitCount(Number(mag)) : magDigitCount(magFromBigUint(mag));
+  const a1 = a.precision();
+  const a2 = db + a.scale;
   return decGroups(a1 > a2 ? a1 : a2);
 }
 

@@ -10,7 +10,7 @@ import type {
   ScalarFuncName,
 } from "./executor.ts";
 import type { Row } from "./storage.ts";
-import type { Meter } from "./cost.ts";
+import { type Meter, smallMultiples } from "./cost.ts";
 import type { ThreeValued, Value } from "./value.ts";
 import { codePointCount } from "./memsize.ts";
 import { resolveUnfetchedSelfSteps } from "./format.ts";
@@ -185,7 +185,7 @@ import {
   tsShiftZoned,
   tsShiftZoneConsults,
 } from "./interval.ts";
-import { Decimal, workDiv, workLinear, workMod, workMul } from "./decimal.ts";
+import { Decimal, workDiv, workLinear, workLinearInt, workMod, workMul } from "./decimal.ts";
 import type { Interval } from "./interval.ts";
 import { type EngineError, engineError } from "./errors.ts";
 import { valueMatchesResult } from "./extension.ts";
@@ -1098,7 +1098,7 @@ function applyArith(e: Of<"arith">, a: Value, b: Value, _env: EvalEnv, m: Meter)
     // work (spec/design/cost.md §3 "decimal_work").
     const da = toDecimal(a);
     const db = toDecimal(b);
-    m.charge(COSTS.decimalWork * BigInt(decimalArithWork(e.op, da, db) - 1));
+    m.charge(decimalWorkCost(decimalArithWork(e.op, da, db) - 1));
     m.guard();
     return decimalValue(evalDecimalArith(e.op, da, db));
   }
@@ -1123,7 +1123,7 @@ function evalCompareNode(e: Of<"compare">, row: Row, env: EvalEnv, m: Meter): Ev
 function applyCompare(e: Of<"compare">, a: Value, b: Value, _env: EvalEnv, m: Meter): Value {
   // A decimal(-promotable) pair charges size-scaled decimal_work — once per node, even
   // where <=/>= decompose internally (spec/design/cost.md §3 "decimal_work").
-  m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(a, b) - 1));
+  m.charge(decimalWorkCost(decimalCmpWork(a, b) - 1));
   m.guard();
   // A collated ORDERING comparison (< <= > >=) over two non-NULL text values orders by the
   // collation's UCA sort key (spec/design/collation.md §7), charging the collate unit per code
@@ -1179,7 +1179,7 @@ function applyCompare(e: Of<"compare">, a: Value, b: Value, _env: EvalEnv, m: Me
   // join / correlated re-scan can amplify by fan-out is metered, not flat (spec/design/cost.md
   // §3 "varlen_compare"). Collated ORDERING already charged collate above and returned; this
   // covers =/<>, C/default-collation ordering, and all bytea.
-  m.charge(COSTS.varlenCompare * BigInt(varlenCompareWork(a, b) - 1));
+  m.charge(varlenCompareCost(varlenCompareWork(a, b) - 1));
   m.guard();
   switch (e.op) {
     case "eq":
@@ -1548,7 +1548,7 @@ function evalDistinctNode(e: Of<"distinct">, row: Row, env: EvalEnv, m: Meter): 
 function applyDistinct(e: Of<"distinct">, dl: Value, dr: Value, _env: EvalEnv, m: Meter): Value {
   // IS [NOT] DISTINCT FROM is a comparison: a decimal pair charges its size-scaled
   // decimal_work like "compare" (spec/design/cost.md §3 "decimal_work").
-  m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(dl, dr) - 1));
+  m.charge(decimalWorkCost(decimalCmpWork(dl, dr) - 1));
   m.guard();
   const same = notDistinctFrom(dl, dr);
   // negated carries the NOT keyword: IS NOT DISTINCT FROM (negated) asks "are they
@@ -2018,8 +2018,8 @@ function* evalGreatestLeastNodeSteps(
     } else if (e.collation !== null && cv.kind === "array" && best.kind === "array") {
       c = collatedArrayCmp(e.collation, cv, best, m);
     } else {
-      m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(cv, best) - 1));
-      m.charge(COSTS.varlenCompare * BigInt(varlenCompareWork(cv, best) - 1));
+      m.charge(decimalWorkCost(decimalCmpWork(cv, best) - 1));
+      m.charge(varlenCompareCost(varlenCompareWork(cv, best) - 1));
       m.guard();
       c = valueCmp(cv, best);
     }
@@ -2040,8 +2040,8 @@ function evalNullIfNode(e: Of<"nullIf">, row: Row, env: EvalEnv, m: Meter): Eval
 }
 
 function applyNullIf(e: Of<"nullIf">, a: Value, b: Value, _env: EvalEnv, m: Meter): Value {
-  m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(a, b) - 1));
-  m.charge(COSTS.varlenCompare * BigInt(varlenCompareWork(a, b) - 1));
+  m.charge(decimalWorkCost(decimalCmpWork(a, b) - 1));
+  m.charge(varlenCompareCost(varlenCompareWork(a, b) - 1));
   m.guard();
   // A mixed-width float pair compares at f64 (the implicit f32 → f64 cast).
   const widen = (v: Value): Value => (e.widenFloat && v.kind === "f32" ? float64Value(v.value) : v);
@@ -2733,7 +2733,7 @@ function applyScalarFunc(e: Of<"scalarFunc">, vals: Value[], env: EvalEnv, m: Me
     let acc = Decimal.fromBigInt(1n);
     for (let k = 2n; k <= n; k++) {
       const kd = Decimal.fromBigInt(k);
-      m.charge(COSTS.decimalWork * BigInt(workMul(acc, kd) - 1));
+      m.charge(decimalWorkCost(workMul(acc, kd) - 1));
       m.guard();
       acc = acc.mul(kd);
     }
@@ -3503,8 +3503,8 @@ export function widthBucketArray(
       m.guard();
       c = collatedCmp(collation, operand.text, t.text);
     } else {
-      m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(operand, t) - 1));
-      m.charge(COSTS.varlenCompare * BigInt(varlenCompareWork(operand, t) - 1));
+      m.charge(decimalWorkCost(decimalCmpWork(operand, t) - 1));
+      m.charge(varlenCompareCost(varlenCompareWork(operand, t) - 1));
       m.guard();
       c = widthBucketCmp(operand, t);
     }
@@ -3562,7 +3562,7 @@ export function quantifiedMembership(
   let anyNull = false;
   for (const e of av.elements) {
     m.charge(COSTS.operatorEval);
-    m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(lv, e) - 1));
+    m.charge(decimalWorkCost(decimalCmpWork(lv, e) - 1));
     m.guard();
     // A collated ORDERING comparison of two text values sorts by the collation (spec/design/
     // collation.md §1 "IN / ANY / ALL"), charging collate per code point like the "compare" node.
@@ -4274,13 +4274,18 @@ export function decimalArithWork(op: BinaryOp, a: Decimal, b: Decimal): number {
   }
 }
 
+// decimalWorkCost and varlenCompareCost are decimal_work × k and varlen_compare × k (k = W − 1 >= 0),
+// shared for the small k nearly every charge uses, so a per-row charge builds no bigint.
+export const decimalWorkCost: (k: number) => bigint = smallMultiples(COSTS.decimalWork);
+export const varlenCompareCost: (k: number) => bigint = smallMultiples(COSTS.varlenCompare);
+
 // decimalCmpWork is the decimal_work W of a comparison over a decimal(-promotable) pair — the
 // aligned linear formula after int→decimal promotion; 1 (no charge) for any other pair,
 // including a NULL side, where no decimal compare runs (spec/design/cost.md §3 "decimal_work").
 export function decimalCmpWork(a: Value, b: Value): number {
   if (a.kind === "decimal" && b.kind === "decimal") return workLinear(a.dec, b.dec);
-  if (a.kind === "decimal" && b.kind === "int") return workLinear(a.dec, Decimal.fromBigInt(b.int));
-  if (a.kind === "int" && b.kind === "decimal") return workLinear(Decimal.fromBigInt(a.int), b.dec);
+  if (a.kind === "decimal" && b.kind === "int") return workLinearInt(a.dec, b.int);
+  if (a.kind === "int" && b.kind === "decimal") return workLinearInt(b.dec, a.int);
   return 1;
 }
 

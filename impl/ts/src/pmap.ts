@@ -76,6 +76,11 @@ export interface PackedLeaf {
   // undefined for an out-of-line or compressed value, whose resolve may need a page read (the
   // caller takes the stepping path).
   colNow(i: number, c: number): Value | undefined;
+  // numSlot is column c of row i when c is a fixed-width numeric(p,s) column (format.md v51) or an
+  // integer column: the unscaled integer at the column's scale, or the integer, as a safe integer;
+  // +Infinity for NULL; NaN when the value must be read through col/colNow (another column class,
+  // an elided key column, or a magnitude of 2^53 or more). No value is built.
+  numSlot(i: number, c: number): number;
   // The retained page payload (packed-leaf.md §11 Track A4).
   readonly payload: Uint8Array;
   // The payload's content length: the leaf's serialized size, content-dependent savings included
@@ -261,6 +266,17 @@ export function colAtNow(n: PNode, i: number, c: number): Value | undefined {
   }
   const v = n.vals[i]![c]!;
   return v.kind === "unfetched" ? undefined : v;
+}
+
+// colNumSlot is PackedLeaf.numSlot for any leaf form: NaN off a Packed (or lazily packed)
+// row, whose value the caller reads through colAtNow.
+export function colNumSlot(n: PNode, i: number, c: number): number {
+  if (n.packed) return n.packed.numSlot(i, c);
+  if (n.lazyBase !== undefined) {
+    const at = n.lazy![i]!;
+    if (at >= 0) return n.lazyBase.numSlot(at, c);
+  }
+  return Number.NaN;
 }
 
 // colIsNull reports whether column c of row i is NULL without reconstructing the value (packed-leaf.md

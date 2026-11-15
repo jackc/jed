@@ -602,6 +602,22 @@ expanded row vectors.
   in place through one indirection. Lane choices, charges and logical sizes are unchanged: they are
   defined on the value, not on its stored form.
 
+  **TS: numbers in place of values (2026-11, per-core internal).** The TS core's lanes read a
+  fixed-width `numeric(p,s)` or integer slot as a JS number straight from the page
+  (`PackedLeaf.numSlot`; NaN sends the read through the value path: a Decoded row, an elided key
+  column, or a magnitude of 2⁵³ or more), and use it where a value would only be taken apart again:
+  a `SUM`/`AVG` over such a column folds the unscaled integer into a running sum held as a safe
+  integer at the column's scale (back to a `Decimal` the first time a fold would leave the safe
+  integers, change the scale, or anything else reads it); a single integer `GROUP BY` key is looked
+  up by number; and `col OP k` over a fixed-width decimal column and a constant `k` (a literal, a
+  parameter, or casts of one, at a scale no larger than the column's) is a span atom comparing the
+  slot's integer with `k` scaled to the column — the fixed-width comparison atom deferred above, for
+  decimals. Each charges what the value path charges: the running sum's `decimal_work` is computed
+  from the two digit counts, and the lane charges what its folds owe at least every 256 records and
+  before the scan ends (the same total; charge order is invisible unmetered, and under a ceiling the
+  lane is an attempt that checks its earned cost at the same points, cost.md §6.1). Rust and Go
+  keep their own forms (Go folds a short decimal from its slot, `smallDecimalAt`).
+
   **Budgets.** The lane choice decides which buffers a statement reserves, so under a query-memory
   budget it decides where `54P05` trips; memory.md §5.4 and §6.6.1 specify the choice and the
   bounded group table's charges, and `mise run conformance:query_memory` holds the three cores to the

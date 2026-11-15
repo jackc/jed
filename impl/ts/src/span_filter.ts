@@ -31,6 +31,7 @@ import { colAt, colAtNow, type PNode, type Span, storedIndex, storedLeaf } from 
 import type { Row } from "./storage.ts";
 import { inRange, isBytea, isInteger, isText, widthBytes } from "./types.ts";
 import { isTrue, nullValue, type Value } from "./value.ts";
+import { Decimal, safeDigitCount } from "./decimal.ts";
 
 const UTF8 = new TextEncoder();
 
@@ -250,6 +251,17 @@ type SpanAtom = { expr: RExpr; col: number } & (
       base: bigint;
       spans: number[];
     }
+  | {
+      // col OP k over a fixed-width numeric(p,s) column (format.md v51) and a constant k at a scale
+      // ks <= the column's: the slot's unscaled integer u (scale s) against kN = k·10^(s−ks), both
+      // safe integers. The work is the aligned comparison's (decimalCmpWork): the column's digits
+      // against kDigits, k's precision aligned to scale s.
+      kind: "decCmp";
+      op: "eq" | "ne" | "lt" | "gt" | "le" | "ge";
+      kN: number;
+      kDigits: number;
+      base: bigint;
+    }
 );
 
 // The reusable span scratch (single-threaded).
@@ -371,6 +383,34 @@ function* spanLeafSteps(
 function evalSpan(a: SpanAtom, n: PNode, i: number, m: Meter): boolean | null {
   // A lazy leaf's untouched row is read from its base page, at its index there.
   const p = storedLeaf(n, i);
+  if (a.kind === "decCmp") {
+    if (p === undefined) return null;
+    const u = p.numSlot(storedIndex(n, i), a.col);
+    if (Number.isNaN(u)) return null;
+    m.guard();
+    m.charge(a.base);
+    // A NULL operand: the comparison is NULL (not TRUE) and charges no decimal work.
+    if (u === Number.POSITIVE_INFINITY) return false;
+    const d = safeDigitCount(u < 0 ? -u : u);
+    const w = d > a.kDigits ? d : a.kDigits;
+    if (w > 4) m.charge(COSTS.decimalWork * BigInt(((w + 3) >> 2) - 1));
+    m.guard();
+    const k = a.kN;
+    switch (a.op) {
+      case "eq":
+        return u === k;
+      case "ne":
+        return u !== k;
+      case "lt":
+        return u < k;
+      case "gt":
+        return u > k;
+      case "le":
+        return u <= k;
+      default:
+        return u >= k;
+    }
+  }
   if (a.kind === "nullTest") {
     m.guard();
     m.charge(COSTS.operatorEval);
@@ -568,6 +608,59 @@ function constantOperand(e: RExpr, env: EvalEnv): { value: Value; charge: bigint
   }
 }
 
+// compileDecCmp compiles col OP k over a fixed-width numeric(p,s) column (the decCmp atom), or null.
+// k is a literal, a parameter, or casts of one, evaluated once with its charge replayed per row, as
+// the evaluator charges it each time it evaluates the operand.
+function compileDecCmp(
+  e: Extract<RExpr, { kind: "compare" }>,
+  column: (x: RExpr) => number | null,
+  colTypes: ColType[],
+  env: EvalEnv,
+): SpanAtom | null {
+  const flip = { eq: "eq", ne: "ne", lt: "gt", gt: "lt", le: "ge", ge: "le" } as const;
+  if (!Object.hasOwn(flip, e.op)) return null;
+  const eop = e.op as keyof typeof flip;
+  const lc = column(e.lhs);
+  const rc = column(e.rhs);
+  if ((lc === null) === (rc === null)) return null;
+  const col = (lc ?? rc)!;
+  const t = colTypes[col]!;
+  if (t.kind !== "scalar" || t.fixedDec === undefined) return null;
+  const ke = lc !== null ? e.rhs : e.lhs;
+  const constant = (x: RExpr): boolean =>
+    x.kind === "constInt" ||
+    x.kind === "constDecimal" ||
+    x.kind === "param" ||
+    (x.kind === "cast" && constant(x.operand));
+  if (!constant(ke)) return null;
+  const m = new Meter();
+  let kv: Value;
+  try {
+    kv = evalExpr(ke, [], env, m);
+  } catch {
+    return null;
+  }
+  const kd = kv.kind === "int" ? Decimal.fromBigInt(kv.int) : kv.kind === "decimal" ? kv.dec : null;
+  if (kd === null) return null;
+  const s = t.fixedDec.scale;
+  if (kd.scale > s) return null;
+  const ku = kd.unscaledNumber();
+  if (Number.isNaN(ku)) return null;
+  const kN = ku * 10 ** (s - kd.scale);
+  if (!Number.isSafeInteger(kN)) return null;
+  // k on the right of the column, so the operator flips when k is written first.
+  const op = lc !== null ? eop : flip[eop];
+  return {
+    expr: e,
+    col,
+    kind: "decCmp",
+    op,
+    kN,
+    kDigits: kd.precision() + (s - kd.scale),
+    base: operatorCost(e.op) + m.accrued,
+  };
+}
+
 function compileSpanAtom(
   e: RExpr,
   colTypes: ColType[],
@@ -590,6 +683,8 @@ function compileSpanAtom(
       return { expr: e, col, kind: "nullTest", negated: e.negated };
     }
     case "compare": {
+      const dec = compileDecCmp(e, column, colTypes, env);
+      if (dec !== null) return dec;
       if (e.op !== "eq" && e.op !== "ne") return null;
       const lc = column(e.lhs);
       const rc = column(e.rhs);

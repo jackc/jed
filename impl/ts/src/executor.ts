@@ -326,7 +326,13 @@ import {
   type StorageBudget,
 } from "./persist.ts";
 import type { IncrState } from "./incr_reclaim.ts";
-import { Decimal, momentVariance, workLinear, workMul } from "./decimal.ts";
+import {
+  Decimal,
+  momentVariance,
+  safeDigitCount,
+  workLinear,
+  workMul,
+} from "./decimal.ts";
 import {
   encodeBool,
   encodeInt,
@@ -427,6 +433,7 @@ import {
   type PNode,
   colAt,
   colAtNow,
+  colNumSlot,
   colIsNull,
   compareBytes,
   unboundedBound,
@@ -27117,6 +27124,7 @@ export class Engine {
     const whole: Acc[] = grouped ? [] : fresh();
     let groups: { key: Value; accs: Acc[] }[] = [];
     let index = new Map<bigint, number>();
+    let indexN = new Map<number, number>();
     let nullGi = -1;
     // On a spill-capable host a grouped fold is bounded (memory.md §6.6.1): the group table is measured
     // and charged as a resident keyed state map would be — a fixed part per group, plus each decimal
@@ -27180,6 +27188,29 @@ export class Engine {
         // work, long comparisons) is tracked to be given back.
         const settle = !metered && !exprOps;
         let foldLive = 0n;
+        // A decimal SUM/AVG over a fixed-width numeric(p,s) or integer column read straight from the
+        // leaf folds the slot's unscaled integer with no Value built (foldSmallDecimal); decScale is
+        // the column's scale (0 for an integer, which promotes to a scale-0 decimal), -1 for every
+        // other aggregate. The decimal_work those folds owe is summed
+        // in decWork and charged at least every 256 records and before the scan ends — the same
+        // total as one charge per fold, and an unmetered statement's charge order is invisible (an
+        // attempt under a ceiling checks its earned cost at the same batch points, cost.md §6.1).
+        const colTypes = store.columnTypes();
+        const decScale = plan.aggSpecs.map((spec, s) => {
+          if ((spec.plan !== "sumDecimal" && spec.plan !== "avg") || opKind[s] !== 3) return -1;
+          const ty = colTypes[opCol[s]!]!;
+          if (ty.kind !== "scalar") return -1;
+          return ty.fixedDec !== undefined ? ty.fixedDec.scale : isInteger(ty.scalar) ? 0 : -1;
+        });
+        let decWork = 0;
+        const decimalWorkUnits = COSTS.decimalWork;
+        const flushDecWork = (): void => {
+          if (decWork === 0) return;
+          const owed = decimalWorkUnits * BigInt(decWork);
+          decWork = 0;
+          meter.charge(owed);
+          if (settle) foldLive += owed;
+        };
         let inFilter = false;
         let visited = 0;
         // One loop per leaf (packed-leaf.md §11 Track A5): a record whose filter and operands need
@@ -27192,6 +27223,7 @@ export class Engine {
         ): Steps<void> {
           for (let i = first; i <= last; i++) {
             if ((visited & 255) === 0) {
+              flushDecWork();
               // Cancellation and the ceilings, at most every 256 records (the Rust core's cadence).
               meter.guard();
               // Under a ceiling this fold is an attempt (cost.md §6.1): once the cost it has
@@ -27229,6 +27261,18 @@ export class Engine {
                 if (shouldCooperate()) yield COOPERATE;
                 const k = opKind[s]!;
                 const oc = opCol[s]!;
+                const ds = decScale[s]!;
+                if (ds >= 0) {
+                  const u = colNumSlot(n, i, oc);
+                  if (u === Number.POSITIVE_INFINITY) continue; // NULL: nothing to fold
+                  if (!Number.isNaN(u)) {
+                    const w = foldSmallDecimal(whole[s]!, u, ds);
+                    if (w >= 0) {
+                      decWork += w;
+                      continue;
+                    }
+                  }
+                }
                 let v: Value;
                 if (k === 4) {
                   const reads = opReads[s]!;
@@ -27258,7 +27302,12 @@ export class Engine {
             }
             // A NULL integer key buckets into one sentinel group (matching the scalar/lane path). An
             // expression key is evaluated before the operands (memory.md §5.4).
-            let kv: Value;
+            // An integer key is looked up as a number (kn) whenever it is a safe integer, however it
+            // was read — in place from a packed leaf (its Value built only for a new group or the
+            // spill structures) or as a Value; kn is NaN for a NULL or a larger key, which the
+            // bigint index (or the NULL group) holds. Each key thus lives in exactly one index.
+            let kn = Number.NaN;
+            let kv: Value | null = null;
             if (keyExpr !== null) {
               for (let x = 0; x < keyReads.length; x++) {
                 const c = keyReads[x]!;
@@ -27267,10 +27316,23 @@ export class Engine {
               const r = evalExprMaybeSteps(keyExpr, scratch.vals, env, meter);
               kv = isPendingEval(r) ? yield* r : r;
             } else {
-              kv = colAt(n, i, keyCol);
+              kn = colNumSlot(n, i, keyCol);
+              if (Number.isNaN(kn)) kv = colAt(n, i, keyCol);
+              else if (kn === Number.POSITIVE_INFINITY) {
+                kn = Number.NaN;
+                kv = nullValue();
+              }
             }
-            const key: Value = kv.kind === "int" ? kv : nullValue();
+            if (
+              kv !== null &&
+              kv.kind === "int" &&
+              kv.int <= MAX_SAFE_BIGINT &&
+              kv.int >= -MAX_SAFE_BIGINT
+            )
+              kn = Number(kv.int);
+            if (spilled !== null && kv === null) kv = intValue(BigInt(kn));
             if (spilled !== null) {
+              const key: Value = kv!.kind === "int" ? kv! : nullValue();
               // Handed over: the per-row step the bounded-spill aggregate runs — load the group's
               // state, fold each aggregate, store it back. An integer key charges no hash work.
               const k = distinctRowKey([key]);
@@ -27317,8 +27379,12 @@ export class Engine {
               if (settle && meter.accrued !== foldStart) foldLive += meter.accrued - foldStart;
               continue;
             }
-            let gi = key.kind === "int" ? (index.get(key.int) ?? -1) : nullGi;
+            let gi: number;
+            let key: Value | null = kv === null ? null : kv.kind === "int" ? kv : nullValue();
+            if (!Number.isNaN(kn)) gi = indexN.get(kn) ?? -1;
+            else gi = key!.kind === "int" ? (index.get((key as { int: bigint }).int) ?? -1) : nullGi;
             if (gi < 0) {
+              if (key === null) key = intValue(BigInt(kn));
               if (bounded) {
                 // The bounded table reserves what it measures (memory.md §6.6.1).
                 if (!charge.tryReserveDirect(groupBase)) rejected = true;
@@ -27326,7 +27392,10 @@ export class Engine {
                 charge.reserve(meter, entryBytes([key]));
               }
               gi = groups.length;
-              if (key.kind === "int") index.set(key.int, gi);
+              // A safe integer key is always read as a number, a larger one always as a Value, so
+              // each key lives in exactly one of the two indexes.
+              if (!Number.isNaN(kn)) indexN.set(kn, gi);
+              else if (key.kind === "int") index.set(key.int, gi);
               else nullGi = gi;
               groups.push({ key, accs: fresh() });
               resident += groupBase;
@@ -27336,6 +27405,29 @@ export class Engine {
               if (shouldCooperate()) yield COOPERATE;
               const k = opKind[s]!;
               const oc = opCol[s]!;
+              const ds = decScale[s]!;
+              if (ds >= 0) {
+                const u = colNumSlot(n, i, oc);
+                if (u === Number.POSITIVE_INFINITY) continue; // NULL: nothing to fold
+                if (!Number.isNaN(u)) {
+                  const a = accs[s]!;
+                  const before = variable[s] ? accVariableBytes(a) : 0;
+                  const w = foldSmallDecimal(a, u, ds);
+                  if (w >= 0) {
+                    decWork += w;
+                    if (variable[s]) {
+                      const delta = accVariableBytes(a) - before;
+                      resident += delta;
+                      if (delta > 0) {
+                        if (!charge.tryReserveDirect(delta)) rejected = true;
+                      } else if (delta < 0) {
+                        charge.release(-delta);
+                      }
+                    }
+                    continue;
+                  }
+                }
+              }
               let v: Value;
               if (k === 4) {
                 const reads = opReads[s]!;
@@ -27380,6 +27472,7 @@ export class Engine {
               spilled = this.laneGroupHandover(groups, resources);
               groups = [];
               index = new Map<bigint, number>();
+              indexN = new Map<number, number>();
               nullGi = -1;
             }
           }
@@ -27389,7 +27482,9 @@ export class Engine {
           const r = yield* store.foldLeavesMaskedSteps(b, visitLeaf, progress);
           rowCount = r.rowCount;
           pages = r.nodes;
+          flushDecWork();
         } catch (error) {
+          flushDecWork();
           // Preserve consumed work even though successful scans charge in bulk.
           if (error instanceof EngineError && error.state === "query_canceled") {
             meter.charge(
@@ -42584,7 +42679,12 @@ export type Acc = {
   plan: AggPlan;
   count: bigint;
   sumInt: bigint;
+  // The decimal SUM/AVG running sum. While sumNS >= 0 the running sum is instead the safe integer
+  // sumN at display scale sumNS (the columnar lane's fold, foldSmallDecimal) and sumDec is stale:
+  // every reader goes through accSumDec.
   sumDec: Decimal;
+  sumN: number;
+  sumNS: number;
   seen: boolean;
   cur: Value | null;
   floatTotal: number;
@@ -42667,6 +42767,8 @@ export function newAcc(
     count: 0n,
     sumInt: 0n,
     sumDec: Decimal.fromBigInt(0n),
+    sumN: 0,
+    sumNS: -1,
     seen: false,
     cur: null,
     floatTotal: 0,
@@ -43070,6 +43172,77 @@ export function cloneAcc(a: Acc): Acc {
   };
 }
 
+// accSumDec is a decimal SUM/AVG accumulator's running sum, whichever form it is held in.
+function accSumDec(a: Acc): Decimal {
+  if (a.sumNS >= 0) settleSmallSum(a);
+  return a.sumDec;
+}
+
+// settleSmallSum moves a running sum held as a safe integer (foldSmallDecimal) back into sumDec.
+function settleSmallSum(a: Acc): void {
+  a.sumDec = Decimal.fromUnscaledNumber(a.sumN, a.sumNS);
+  a.sumNS = -1;
+}
+
+// foldSmallDecimal is foldAcc's decimal SUM/AVG fold of the decimal whose unscaled integer at display
+// scale s is the safe integer u, with the running sum kept as a safe integer while it is one at
+// scale s: the same sum, scale and decimal_work as the Decimal fold (decimal.md §7) with no Decimal
+// built. It returns the decimal_work units owed (W − 1, which the caller charges, cost.md §3), or −1
+// when it folded nothing — the sum is not held at scale s, or the result leaves the safe integers —
+// and the caller folds the value through foldAcc. It does not guard: the caller does, at least every
+// 256 records.
+function foldSmallDecimal(a: Acc, u: number, s: number): number {
+  let m: number;
+  if (a.sumNS === s) m = a.sumN;
+  else {
+    // Only a sum already at scale s is entered (its aligned digit count is then its precision, the
+    // same work the Decimal fold measures); the first fold at a new scale goes through foldAcc.
+    if (a.sumNS >= 0 || a.sumDec.scale !== s) return -1;
+    m = a.sumDec.unscaledNumber();
+    if (Number.isNaN(m)) return -1;
+  }
+  const r = m + u;
+  if (!Number.isSafeInteger(r)) {
+    if (a.sumNS >= 0) settleSmallSum(a);
+    return -1;
+  }
+  const am = m < 0 ? -m : m;
+  const au = u < 0 ? -u : u;
+  const d = safeDigitCount(am > au ? am : au);
+  a.sumN = r;
+  a.sumNS = s;
+  if (a.plan === "avg") a.count += 1n;
+  else a.seen = true;
+  return d <= 4 ? 0 : ((d + 3) >> 2) - 1;
+}
+
+// foldSmallValue is the decimal SUM/AVG fold of an integer or decimal value whose unscaled integer is
+// a safe integer, through foldSmallDecimal: the charge and guard of the Decimal fold, with no Decimal
+// built. False when it folded nothing (the caller folds the value as a Decimal).
+function foldSmallValue(a: Acc, v: Value, m: Meter): boolean {
+  let u: number;
+  let s: number;
+  if (v.kind === "decimal") {
+    u = v.dec.unscaledNumber();
+    if (Number.isNaN(u)) return false;
+    s = v.dec.scale;
+  } else if (v.kind === "int") {
+    if (v.int > MAX_SAFE_BIGINT || v.int < -MAX_SAFE_BIGINT) return false;
+    u = Number(v.int);
+    s = 0;
+  } else {
+    return false;
+  }
+  const w = foldSmallDecimal(a, u, s);
+  if (w < 0) return false;
+  // A zero charge accrues nothing and crosses no ceiling, so it is skipped (as foldAcc does).
+  if (w > 0) m.charge(COSTS.decimalWork * BigInt(w));
+  m.guard();
+  return true;
+}
+
+const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+
 // foldAcc folds one input value into the accumulator. NULL arguments are skipped (COUNT(*)
 // ignores the value and always counts). Traps 22003 on SUM overflow at the result bound.
 // A decimal SUM/AVG fold charges size-scaled decimal_work against the running accumulator
@@ -43121,6 +43294,8 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
       break;
     case "sumDecimal":
       if (v.kind !== "null") {
+        if (foldSmallValue(a, v, m)) break;
+        if (a.sumNS >= 0) settleSmallSum(a);
         const inc = toDecimal(v);
         // A zero charge accrues nothing and crosses no ceiling, so it is skipped.
         const w = workLinear(a.sumDec, inc);
@@ -43135,6 +43310,8 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
       break;
     case "avg":
       if (v.kind !== "null") {
+        if (foldSmallValue(a, v, m)) break;
+        if (a.sumNS >= 0) settleSmallSum(a);
         const inc = toDecimal(v);
         // A zero charge accrues nothing and crosses no ceiling, so it is skipped.
         const w = workLinear(a.sumDec, inc);
@@ -43382,11 +43559,13 @@ export function finalizeAcc(a: Acc): Value {
     case "sumDecimal":
       // checkCap is the only cap check for the fold: the FINAL sum traps 22003 if over the §2
       // cap (PG's make_result), but no intermediate does (decimal.md §2).
-      return a.seen ? decimalValue(a.sumDec.checkCap()) : nullValue();
+      return a.seen ? decimalValue(accSumDec(a).checkCap()) : nullValue();
     case "avg":
       // div cap-checks its (in-range) result; the over-cap-capable running sum is never surfaced
       // directly, so AVG matches PG even when SUM would overflow.
-      return a.count === 0n ? nullValue() : decimalValue(a.sumDec.div(Decimal.fromBigInt(a.count)));
+      return a.count === 0n
+        ? nullValue()
+        : decimalValue(accSumDec(a).div(Decimal.fromBigInt(a.count)));
     case "sumFloat": {
       if (!a.seen) return nullValue(); // empty / all-NULL group → NULL
       const s = resolveFloatFold(a);
@@ -48372,7 +48551,7 @@ function encodeBlockingAccs(keys: Value[], accs: Acc[]): Row {
     row.push(
       intValue(a.count),
       intValue(a.sumInt),
-      decimalValue(a.sumDec),
+      decimalValue(accSumDec(a)),
       boolValue(a.seen),
       a.cur ?? nullValue(),
       float64Value(a.floatTotal),
@@ -48460,7 +48639,7 @@ function packedStateBytes(accs: Acc[]): number {
         break;
       case "sumDecimal":
       case "avg":
-        n += valueBytes(decimalValue(a.sumDec)) + MEMORY_VALUE;
+        n += decimalSumBytes(a) + 2 * MEMORY_VALUE;
         break;
       case "sumFloat":
       case "avgFloat":
@@ -48491,6 +48670,14 @@ function packedStateBytes(accs: Acc[]): number {
   return n;
 }
 
+// decimalSumBytes is payload(sum) of a decimal SUM/AVG accumulator's running sum — its base-10^4
+// digit groups (memsize.ts valueBytes) — in either form it is held.
+function decimalSumBytes(a: Acc): number {
+  if (a.sumNS < 0) return MEMORY_DECIMAL_GROUP * a.sumDec.limbs.length;
+  const m = a.sumN < 0 ? -a.sumN : a.sumN;
+  return MEMORY_DECIMAL_GROUP * ((safeDigitCount(m) + 3) >> 2);
+}
+
 // accVariableBytes is the part of an accumulator's packed size that changes as it folds: a decimal
 // sum's digit groups, a MIN/MAX's held value. Every other accumulator the columnar lane folds packs
 // to a fixed size (memory.md §6.6.1).
@@ -48498,7 +48685,7 @@ function accVariableBytes(a: Acc): number {
   switch (a.plan) {
     case "sumDecimal":
     case "avg":
-      return valueBytes(decimalValue(a.sumDec)) - MEMORY_VALUE;
+      return decimalSumBytes(a);
     case "min":
     case "max":
       return a.cur === null || a.cur === undefined ? 0 : valueBytes(a.cur) - MEMORY_VALUE;

@@ -4,10 +4,13 @@
 // is nonzero, so a fixed-width or NULL key moves no abort point.
 
 import type { Collation } from "./collation.ts";
-import type { Meter } from "./cost.ts";
+import { type Meter, smallMultiples } from "./cost.ts";
 import { COSTS } from "./costs.ts";
 import { codePointCount, payloadBytes } from "./memsize.ts";
 import type { Value } from "./value.ts";
+
+const sortKeyCost = smallMultiples(COSTS.sortKey);
+const hashKeyCost = smallMultiples(COSTS.hashKey);
 
 // collatedCodePoints is the code points a collated key's UCA sort key is built from: a text's, or a
 // text[]'s non-NULL elements'.
@@ -27,7 +30,7 @@ export function chargeSortKey(m: Meter, v: Value, coll: Collation | null): void 
   const units =
     coll !== null && (v.kind === "text" || v.kind === "array")
       ? COSTS.collate * BigInt(collatedCodePoints(v))
-      : COSTS.sortKey * BigInt(payloadBytes(v));
+      : sortKeyCost(payloadBytes(v));
   if (units === 0n) return;
   m.charge(units);
   m.guard();
@@ -47,7 +50,7 @@ export function chargeSortKeys(
 // chargeHashKey charges one key value a grouping, dedup, or partition table receives: hash_key per
 // payload byte.
 export function chargeHashKey(m: Meter, v: Value): void {
-  const units = COSTS.hashKey * BigInt(payloadBytes(v));
+  const units = hashKeyCost(payloadBytes(v));
   if (units === 0n) return;
   m.charge(units);
   m.guard();

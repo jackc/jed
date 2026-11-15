@@ -365,6 +365,8 @@ export class Meter {
         this.ceilingHit = 2;
     }
 
+    // Adding nothing leaves both totals as they are.
+    if (units === 0n) return;
     this.accrued = saturatingCostAdd(this.accrued, units);
     if (this.lifetime !== undefined)
       this.lifetime.total = saturatingCostAdd(this.lifetime.total, units);
@@ -475,6 +477,13 @@ export class Meter {
       `query exceeded the cost limit of ${this.limit} (accrued ${this.accrued})`,
     );
   }
+}
+
+// smallMultiples returns k ↦ unit × k with the products for k < 64 built once, so a per-row charge
+// of a small multiple of a cost unit builds no bigint.
+export function smallMultiples(unit: bigint): (k: number) => bigint {
+  const table: bigint[] = Array.from({ length: 64 }, (_, k) => unit * BigInt(k));
+  return (k: number): bigint => (k < 64 ? table[k]! : unit * BigInt(k));
 }
 
 function saturatingCostAdd(a: bigint, b: bigint): bigint {

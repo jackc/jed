@@ -73,6 +73,67 @@ test("decimal folds match the row path", () => {
   });
 });
 
+// ---- Slot reads and the decimal comparison atom ---------------------------------------------
+
+// Fixed-width numeric(p,s) columns of every slot width (2, 4 and 8 bytes) and integer columns, read
+// as numbers in place: a sum held as a number until it leaves the safe integers (h's values and
+// sums pass 2^53), a NULL in every column, and comparisons of each column against constants of
+// lower, equal and higher scale, on either side.
+const SLOT_SEED = [
+  "CREATE TABLE sl (id i32 PRIMARY KEY, g i32, q i64, a numeric(4,2), b numeric(9,3), " +
+    "c numeric(12,2), h numeric(18,4))",
+  "INSERT INTO sl VALUES (-1, NULL, NULL, NULL, NULL, NULL, NULL), " +
+    "(0, 0, 0, 0.00, 0.000, 0.00, 0.0000), " +
+    "(-2, 1, 9007199254740993, -99.99, -999999.999, -9999999999.99, 99999999999999.9999)",
+  "INSERT INTO sl SELECT x, x % 7, " +
+    "CASE WHEN x % 2 = 0 THEN -1 ELSE 1 END * x * 1000000000007, " +
+    "((x * 37) % 19999)::numeric / 100 - 99.99, " +
+    "((x * 7919) % 1999999999)::numeric / 1000 - 999999.999, " +
+    "((x * 104729) % 100000000)::numeric / 100 - 400000, " +
+    "CASE WHEN x % 13 = 0 THEN NULL " +
+    "WHEN x % 5 = 0 THEN 99999999999999.9999 - x " +
+    "ELSE (x * 123457)::numeric / 10000 END " +
+    "FROM generate_series(1, 3000) x",
+];
+
+const SLOT_QUERIES = [
+  "SELECT sum(q), avg(q), sum(g) FROM sl",
+  "SELECT sum(a), sum(b), sum(c), sum(h), avg(a), avg(h) FROM sl",
+  "SELECT g, sum(q), sum(h), avg(c), count(*) FROM sl GROUP BY g",
+  "SELECT g, sum(a), max(h) FROM sl WHERE c > 0 GROUP BY g",
+  "SELECT count(*), max(c) FROM sl WHERE c > 1000::bigint",
+  "SELECT count(*), sum(c) FROM sl WHERE 0.5 <= c",
+  "SELECT count(*), sum(a) FROM sl WHERE a = -0.37",
+  "SELECT count(*), sum(b) FROM sl WHERE b <> 12.3",
+  "SELECT count(*), sum(b) FROM sl WHERE b < 100.0005",
+  "SELECT count(*), sum(h) FROM sl WHERE h >= 99999999999000",
+  "SELECT count(*), sum(h) FROM sl WHERE 99999999999990.5 > h",
+  "SELECT count(*), sum(c) FROM sl WHERE c <= -100 AND a > 0",
+  "SELECT count(*) FROM sl WHERE a >= 100",
+  "SELECT sum(c * a), sum(c + b), avg(a * 2), sum(h * h) FROM sl",
+  "SELECT g, sum(c * a), sum(b - c) FROM sl WHERE b > 0 GROUP BY g",
+];
+
+test("slot reads and decimal comparisons match the row path", () => {
+  for (const file of [true, false]) {
+    withDb(file, SLOT_SEED, (s) => {
+      for (const q of SLOT_QUERIES) check(s, q);
+      // One uncommitted (Decoded) leaf among clean ones, read as Values beside the in-place slots.
+      s.execute("BEGIN");
+      s.execute("INSERT INTO sl VALUES (5000, 3, 7, 1.25, 2.5, 3.75, 99999999999999.9999)");
+      for (const q of SLOT_QUERIES) check(s, q);
+      s.execute("ROLLBACK");
+      s.execute("BEGIN");
+      s.execute("UPDATE sl SET c = c + 1, q = q / 3 WHERE g = 2");
+      for (const q of SLOT_QUERIES) check(s, q);
+      s.execute("ROLLBACK");
+    });
+  }
+  withDb(true, SLOT_SEED, (s) => {
+    for (const q of SLOT_QUERIES.slice(0, 4)) checkUnderBudgets(s, q);
+  });
+});
+
 // ---- The bounded grouped lane -----------------------------------------------------------------
 
 // Each work_mem below places the hand-over somewhere else — after the first row, after a few groups,
