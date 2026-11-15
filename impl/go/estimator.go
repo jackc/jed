@@ -1990,21 +1990,64 @@ func (db *engine) estimateHashWidth(sp *selectPlan, global int, ty dataType) int
 	return defaultVariableKeyBytes
 }
 
+// estimateNumericSeriesRows is the numeric generate_series with plan-time literal bounds/step
+// (estimator.md §7.2): exact when every argument, taken at the largest of their scales, has an
+// unscaled integer within i64 — the integer rule over those unscaled values. Any wider value keeps
+// the default, so the estimate never does big-decimal division.
+func estimateNumericSeriesRows(args []*rExpr) int64 {
+	vals := make([]Decimal, 0, 3)
+	for _, a := range args {
+		if a.kind == reConstDecimal {
+			vals = append(vals, a.cDec)
+		} else {
+			vals = append(vals, decimalFromInt64(a.cInt))
+		}
+	}
+	if len(vals) == 2 {
+		vals = append(vals, decimalFromInt64(1))
+	}
+	var scale uint32
+	for _, v := range vals {
+		scale = max(scale, v.Scale)
+	}
+	var u [3]int64
+	for i, v := range vals {
+		x, ok := v.unscaledInt64(scale)
+		if !ok {
+			return defaultSRFRows
+		}
+		u[i] = x
+	}
+	return seriesRows(u[0], u[1], u[2])
+}
+
 func estimateGenerateSeriesRows(srf *srfPlan) int64 {
 	if srf.kind != srfGenerateSeries || len(srf.args) < 2 || len(srf.args) > 3 {
 		return defaultSRFRows
 	}
 	// A bound parameter is a plan-time literal (estimator.md §6.1); an unbound one keeps the default.
 	args := make([]*rExpr, len(srf.args))
+	numeric := false
 	for i, arg := range srf.args {
-		if args[i] = estimatorValue(arg); args[i] == nil || args[i].kind != reConstInt {
+		args[i] = estimatorValue(arg)
+		if args[i] == nil || (args[i].kind != reConstInt && args[i].kind != reConstDecimal) {
 			return defaultSRFRows
 		}
+		numeric = numeric || args[i].kind == reConstDecimal
+	}
+	if numeric {
+		return estimateNumericSeriesRows(args)
 	}
 	start, stop, step := args[0].cInt, args[1].cInt, int64(1)
 	if len(args) == 3 {
 		step = args[2].cInt
 	}
+	return seriesRows(start, stop, step)
+}
+
+// seriesRows is the exact element count of an integer series start..stop by step, clamped to
+// MAX_ESTIMATE (estimator.md §7.2).
+func seriesRows(start, stop, step int64) int64 {
 	if step == 0 || (step > 0 && start > stop) || (step < 0 && start < stop) {
 		return 0
 	}

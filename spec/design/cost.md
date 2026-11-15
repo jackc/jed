@@ -1524,7 +1524,11 @@ Instead each element the generator emits charges one **`generated_row`**, accrue
 (before the row enters the join/WHERE pipeline) with a `guard()` first — so a runaway
 `generate_series(1, 10^18)` aborts deterministically with `54P01` once accrued cost reaches the
 ceiling, **mid-generation**, never materializing the whole series (CLAUDE.md §13). The arguments
-are evaluated once up front, each charging its own `operator_eval`.
+are evaluated once up front, each charging its own `operator_eval`. The numeric `generate_series`
+([functions.md](functions.md) §10) also charges `decimal_work × (W − 1)` for the bound compare
+before each element (guarded) and for the step add after it, W per the compare / `+` rows below;
+it is zero for values of at most four aligned digits. So `generate_series(100000.5, 100002.5)`
+costs 3 `generated_row` + 3 `row_produced` + 4 compares × 1 + 3 adds × 1 = **13**.
 
 `generated_row` meters **generation**; `row_produced` meters **emission** into the final result.
 They are deliberately distinct and **diverge under `WHERE` / `LIMIT`**: a generated row that a

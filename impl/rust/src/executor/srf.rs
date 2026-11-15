@@ -838,9 +838,10 @@ impl Engine {
     }
 
     /// Resolve `generate_series(start, stop[, step])` (spec/design/functions.md §10): 2 or 3
-    /// integer args (a wrong arity/type → `42883`). The produced column is typed at the PROMOTED
-    /// integer type of the args (PG); a NULL-typed arg contributes no width (the call yields zero
-    /// rows at exec). All-NULL defaults i64.
+    /// integer or decimal args (a wrong arity/type → `42883`). The produced column is typed at the
+    /// PROMOTED integer type of the args (PG), or `decimal` when any arg is a decimal (the numeric
+    /// overload); a NULL-typed arg contributes no width (the call yields zero rows at exec).
+    /// All-NULL defaults i64.
     pub(crate) fn resolve_generate_series(
         &self,
         args: &[Expr],
@@ -853,6 +854,7 @@ impl Engine {
         }
         let mut rargs = Vec::with_capacity(args.len());
         let mut result: Option<ScalarType> = None;
+        let mut numeric = false;
         for a in args {
             let (r, t) = resolve(
                 arg_scope,
@@ -868,12 +870,18 @@ impl Engine {
                         _ => st,
                     });
                 }
+                // A decimal argument selects the numeric overload; integers promote to it.
+                ResolvedType::Decimal => numeric = true,
                 ResolvedType::Null => {}
                 _ => return Err(no_func_overload("generate_series")),
             }
             rargs.push(r);
         }
-        let result = result.unwrap_or(ScalarType::Int64);
+        let result = if numeric {
+            ScalarType::Decimal
+        } else {
+            result.unwrap_or(ScalarType::Int64)
+        };
         let table = srf_table("generate_series", alias, Type::Scalar(result));
         Ok((table, rargs, SrfKind::GenerateSeries))
     }
@@ -1591,24 +1599,24 @@ impl Engine {
         meter: &mut Meter,
         mask: &[bool],
     ) -> Result<Vec<Row>> {
-        let eval_int = |e: &RExpr, m: &mut Meter| -> Result<Option<i64>> {
-            match e.eval(&[], env, m)? {
-                Value::Int(n) => Ok(Some(n)),
-                Value::Null => Ok(None),
-                _ => unreachable!("the resolver restricts generate_series args to integers"),
-            }
-        };
-        let start = eval_int(&srf.args[0], meter)?;
-        let stop = eval_int(&srf.args[1], meter)?;
-        let step = match srf.args.get(2) {
-            None => Some(1),
-            Some(e) => eval_int(e, meter)?,
-        };
+        let mut vals = Vec::with_capacity(3);
+        for e in &srf.args {
+            vals.push(e.eval(&[], env, meter)?);
+        }
         // Any NULL argument yields zero rows (PG).
-        let (start, stop, step) = match (start, stop, step) {
-            (Some(a), Some(b), Some(c)) => (a, b, c),
-            _ => return Ok(Vec::new()),
+        if vals.iter().any(|v| matches!(v, Value::Null)) {
+            return Ok(Vec::new());
+        }
+        // A decimal argument means the numeric overload (the resolver typed the column decimal).
+        if vals.iter().any(|v| matches!(v, Value::Decimal(_))) {
+            return Self::generate_numeric_series(&vals, meter, mask);
+        }
+        let int = |v: &Value| match v {
+            Value::Int(n) => *n,
+            _ => unreachable!("the resolver restricts generate_series args to integers/decimals"),
         };
+        let (start, stop) = (int(&vals[0]), int(&vals[1]));
+        let step = vals.get(2).map_or(1, int);
         if step == 0 {
             return Err(EngineError::new(
                 SqlState::InvalidParameterValue,
@@ -1631,6 +1639,55 @@ impl Engine {
             match cur.checked_add(step) {
                 Some(next) => cur = next,
                 None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// The numeric overload of `generate_series` (spec/design/functions.md §10): every argument
+    /// promotes to decimal (the evaluated values are non-NULL). The first element is `start` at its
+    /// own scale; each later one is the previous plus `step` (decimal add, scale `max(s1, s2)`), so
+    /// `generate_series(3, 1, -0.75)` yields `3, 2.25, 1.50` as in PostgreSQL. A zero step is
+    /// `22023`. Each element charges one `generated_row`; the bound compare and the step add each
+    /// charge `decimal_work × (W − 1)` (cost.md §3), so a series of huge decimals stays bounded. An
+    /// add over the decimal cap ends the series cleanly: the value would already lie past `stop`.
+    fn generate_numeric_series(
+        vals: &[Value],
+        meter: &mut Meter,
+        mask: &[bool],
+    ) -> Result<Vec<Row>> {
+        let dec = |v: &Value| match v {
+            Value::Decimal(d) => d.clone(),
+            Value::Int(n) => Decimal::from_i64(*n),
+            _ => unreachable!("generate_series args are integers or decimals"),
+        };
+        let (start, stop) = (dec(&vals[0]), dec(&vals[1]));
+        let step = vals.get(2).map_or_else(|| Decimal::from_i64(1), dec);
+        if step.is_zero() {
+            return Err(EngineError::new(
+                SqlState::InvalidParameterValue,
+                "step size cannot equal zero",
+            ));
+        }
+        let up = !step.is_negative();
+        let mut out: Vec<Row> = Vec::new();
+        let mut cur = start;
+        loop {
+            meter.charge(COSTS.decimal_work * ((decimal::work_linear(&cur, &stop) - 1) as i64));
+            meter.checkpoint()?;
+            let ord = cur.cmp_value(&stop);
+            let in_range = if up { ord.is_le() } else { ord.is_ge() };
+            if !in_range {
+                break;
+            }
+            meter.charge(COSTS.generated_row);
+            let row = vec![Value::Decimal(cur.clone())];
+            meter.admit_row_masked(&row, mask)?; // a materialized relation row (memory.md §5.1)
+            out.push(row);
+            meter.charge(COSTS.decimal_work * ((decimal::work_linear(&cur, &step) - 1) as i64));
+            match cur.add(&step) {
+                Ok(next) => cur = next,
+                Err(_) => break,
             }
         }
         Ok(out)

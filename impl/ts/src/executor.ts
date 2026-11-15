@@ -5485,12 +5485,16 @@ export class Engine {
       return DEFAULT_SRF_ROWS;
     }
     // A bound parameter is a plan-time literal (estimator.md §6.1); an unbound one keeps the default.
-    const ints: bigint[] = [];
+    const consts: RExpr[] = [];
     for (const arg of srf.args) {
       const c = estimatorValue(arg);
-      if (c === null || c.kind !== "constInt") return DEFAULT_SRF_ROWS;
-      ints.push(c.value);
+      if (c === null || (c.kind !== "constInt" && c.kind !== "constDecimal")) {
+        return DEFAULT_SRF_ROWS;
+      }
+      consts.push(c);
     }
+    if (consts.some((c) => c.kind === "constDecimal")) return estimateNumericSeriesRows(consts);
+    const ints = consts.map((c) => (c.kind === "constInt" ? c.value : 0n));
     const start = ints[0]!;
     const stop = ints[1]!;
     const step = ints[2] ?? 1n;
@@ -23534,9 +23538,9 @@ export class Engine {
   }
 
   // resolveGenerateSeries resolves generate_series(start, stop[, step]) (spec/design/functions.md
-  // §10): 2 or 3 integer args (a wrong arity/type → 42883). The produced column is typed at the
-  // PROMOTED integer type of the args (PG); a NULL-typed arg contributes no width. All-NULL defaults
-  // i64.
+  // §10): 2 or 3 integer or decimal args (a wrong arity/type → 42883). The produced column is typed
+  // at the PROMOTED integer type of the args (PG), or decimal when any arg is a decimal (the numeric
+  // overload); a NULL-typed arg contributes no width. All-NULL defaults i64.
   private resolveGenerateSeries(
     args: Expr[],
     alias: string | null,
@@ -23547,10 +23551,14 @@ export class Engine {
     const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
     const rargs: RExpr[] = [];
     let result: ScalarType | null = null;
+    let numeric = false;
     for (const a of args) {
       const { node, type } = resolve(argScope, a, "i64", forbidden, ptypes);
       if (type.kind === "int") {
         if (result === null || rank(type.ty) > rank(result)) result = type.ty;
+      } else if (type.kind === "decimal") {
+        // A decimal argument selects the numeric overload; integers promote to it.
+        numeric = true;
       } else if (type.kind === "null") {
         // An untyped NULL/param adapts and contributes no width.
       } else {
@@ -23558,7 +23566,8 @@ export class Engine {
       }
       rargs.push(node);
     }
-    const table = srfTable("generate_series", alias, scalarT(result ?? "i64"));
+    const colTy: ScalarType = numeric ? "decimal" : (result ?? "i64");
+    const table = srfTable("generate_series", alias, scalarT(colTy));
     return { table, srf: { kind: "generate_series", args: rargs } };
   }
 
@@ -24121,17 +24130,21 @@ export class Engine {
     meter: Meter,
     mask: boolean[],
   ): Steps<Row[]> {
-    const evalInt = function* (e: RExpr): Steps<bigint | null> {
-      const v = yield* evalExprSteps(e, [], env, meter);
-      if (v.kind === "int") return v.int;
-      if (v.kind === "null") return null;
-      throw new Error("the resolver restricts generate_series args to integers");
-    };
-    const start = yield* evalInt(srf.args[0]!);
-    const stop = yield* evalInt(srf.args[1]!);
-    const step = srf.args.length === 3 ? yield* evalInt(srf.args[2]!) : 1n;
+    const vals: Value[] = [];
+    for (const e of srf.args) vals.push(yield* evalExprSteps(e, [], env, meter));
     // Any NULL argument yields zero rows (PG).
-    if (start === null || stop === null || step === null) return [];
+    if (vals.some((v) => v.kind === "null")) return [];
+    // A decimal argument means the numeric overload (the resolver typed the column decimal).
+    if (vals.some((v) => v.kind === "decimal")) {
+      return yield* this.generateNumericSeriesSteps(vals, meter, mask);
+    }
+    const int = (v: Value): bigint => {
+      if (v.kind === "int") return v.int;
+      throw new Error("the resolver restricts generate_series args to integers/decimals");
+    };
+    const start = int(vals[0]!);
+    const stop = int(vals[1]!);
+    const step = vals.length === 3 ? int(vals[2]!) : 1n;
     if (step === 0n)
       throw engineError("invalid_parameter_value", "step size cannot be equal to zero");
     const out: Row[] = [];
@@ -24148,6 +24161,48 @@ export class Engine {
       // i64 overflow while stepping ends the series cleanly, matching PostgreSQL (and Rust/Go).
       const next = cur + step;
       if (next > 9223372036854775807n || next < -9223372036854775808n) break;
+      cur = next;
+    }
+    return out;
+  }
+
+  // generateNumericSeriesSteps is the numeric overload of generate_series (spec/design/functions.md
+  // §10): every argument promotes to decimal (the values are non-NULL). The first element is start
+  // at its own scale; each later one is the previous plus step (decimal add, scale max(s1, s2)), so
+  // generate_series(3, 1, -0.75) yields 3, 2.25, 1.50 as in PostgreSQL. A zero step is 22023. Each
+  // element charges one generatedRow; the bound compare and the step add each charge
+  // decimalWork × (W − 1) (cost.md §3). An add over the decimal cap ends the series cleanly: the
+  // value would already lie past stop.
+  private *generateNumericSeriesSteps(vals: Value[], meter: Meter, mask: boolean[]): Steps<Row[]> {
+    const dec = (v: Value): Decimal => {
+      if (v.kind === "decimal") return v.dec;
+      if (v.kind === "int") return Decimal.fromBigInt(v.int);
+      throw new Error("generate_series args are integers or decimals");
+    };
+    const start = dec(vals[0]!);
+    const stop = dec(vals[1]!);
+    const step = vals.length === 3 ? dec(vals[2]!) : Decimal.fromBigInt(1n);
+    if (step.isZero()) throw engineError("invalid_parameter_value", "step size cannot equal zero");
+    const up = !step.neg;
+    const out: Row[] = [];
+    let cur = start;
+    for (;;) {
+      if (shouldCooperate()) yield COOPERATE;
+      meter.charge(COSTS.decimalWork * BigInt(workLinear(cur, stop) - 1));
+      meter.guard();
+      const ord = cur.cmpValue(stop);
+      if (up ? ord > 0 : ord < 0) break;
+      meter.charge(COSTS.generatedRow);
+      const row = [decimalValue(cur)];
+      meter.admitRowMasked(row, mask); // a materialized relation row (memory.md §5.1)
+      out.push(row);
+      meter.charge(COSTS.decimalWork * BigInt(workLinear(cur, step) - 1));
+      let next: Decimal;
+      try {
+        next = cur.add(step);
+      } catch {
+        break;
+      }
       cur = next;
     }
     return out;
@@ -39589,6 +39644,32 @@ export function distinctValueKey(v: Value): string {
 // literal range-check live; the evaluator is a pure tree-walk. eval throws on a 22003 /
 // 22012 (the TS idiom), so callers need no Result type.
 // ============================================================================
+
+// estimateNumericSeriesRows is the numeric generate_series with plan-time literal bounds/step
+// (estimator.md §7.2): exact when every argument, taken at the largest of their scales, has an
+// unscaled integer within i64 — the integer rule over those unscaled values. Any wider value keeps
+// the default, so the estimate never does big-decimal division.
+function estimateNumericSeriesRows(consts: RExpr[]): bigint {
+  const vals = consts.map((c) =>
+    c.kind === "constDecimal" ? c.value : Decimal.fromBigInt(c.kind === "constInt" ? c.value : 0n),
+  );
+  if (vals.length === 2) vals.push(Decimal.fromBigInt(1n));
+  const scale = Math.max(...vals.map((v) => v.scale));
+  const u: bigint[] = [];
+  const words = { hi: 0, lo: 0 };
+  for (const v of vals) {
+    if (!v.unscaledWords(scale, words)) return DEFAULT_SRF_ROWS;
+    const mag = (BigInt(words.hi) << 32n) | BigInt(words.lo);
+    const x = v.neg ? -mag : mag;
+    if (x > 9223372036854775807n || x < -9223372036854775808n) return DEFAULT_SRF_ROWS;
+    u.push(x);
+  }
+  const [start, stop, step] = [u[0]!, u[1]!, u[2]!];
+  if (step === 0n || (step > 0n && start > stop) || (step < 0n && start < stop)) return 0n;
+  const distance = start <= stop ? stop - start : start - stop;
+  const rows = distance / (step < 0n ? -step : step) + 1n;
+  return rows > MAX_ESTIMATE ? MAX_ESTIMATE : rows;
+}
 
 // ResolvedType is the static type of a resolved expression. "null" is an untyped NULL
 // literal (its integer type, if needed, is settled by the surrounding operator/context).

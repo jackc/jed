@@ -609,7 +609,9 @@ evaluated.
 ## Set-returning functions in `FROM`
 
 A `FROM` item can be a set-returning function — a computed row source instead of a stored table.
-`generate_series(start, stop[, step])` yields an integer series; `unnest(anyarray)` expands an array
+`generate_series(start, stop[, step])` yields an integer series, or a `decimal` series when any
+argument is a `decimal` (`generate_series(0, 1, 0.25)` → `0, 0.25, 0.50, 0.75, 1.00`, exact, as in
+PostgreSQL); `unnest(anyarray)` expands an array
 into one row per element (a multidimensional array flattens, a `NULL` element becomes a `NULL` row,
 and a `NULL` or empty array yields no rows). The produced relation has one column, named after the
 function or its alias by default — except that a function with a named output parameter keeps that

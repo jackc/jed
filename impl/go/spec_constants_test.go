@@ -351,14 +351,15 @@ func TestSetReturningMatchSpec(t *testing.T) {
 	t.Parallel()
 	// The generated set-returning descriptor table must match the canonical catalog's
 	// [[set_returning]] rows field-for-field (codegen middle path, CLAUDE.md §5). SRFs are
-	// overloaded across ARITY (one row per (name, arity)) — functions.md §10.
+	// overloaded across ARITY and argument family (one row per (name, arity, arg_families)) — functions.md §10.
 	rows := readTomlTables(t, specPath(t, "functions/catalog.toml"), "set_returning")
 	if len(rows) != len(setReturning) {
 		t.Fatalf("set_returning count: spec %d, generated %d", len(rows), len(setReturning))
 	}
-	find := func(name string, arity int64) (setReturningDesc, bool) {
+	// Overloaded across arity and argument family (the integer and numeric generate_series).
+	find := func(name string, arity int64, fams []string) (setReturningDesc, bool) {
 		for _, d := range setReturning {
-			if d.Name == name && int64(d.Arity) == arity {
+			if d.Name == name && int64(d.Arity) == arity && strings.Join(d.ArgFamilies, ",") == strings.Join(fams, ",") {
 				return d, true
 			}
 		}
@@ -367,7 +368,7 @@ func TestSetReturningMatchSpec(t *testing.T) {
 	for _, row := range rows {
 		name := row.str("name")
 		arity := row.int("arity")
-		desc, ok := find(name, arity)
+		desc, ok := find(name, arity, row.strs("arg_families"))
 		if !ok {
 			t.Fatalf("generated table missing set_returning %q/arity-%d", name, arity)
 		}

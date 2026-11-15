@@ -77,7 +77,8 @@
 <h2>Set-returning functions</h2>
 <p>
   Called in <code>FROM</code> position as a computed row source — they <em>expand</em> their
-  arguments into a set of rows. <code>generate_series</code> yields an integer series;
+  arguments into a set of rows. <code>generate_series</code> yields an integer series, or an exact
+  <code>decimal</code> series when any argument is a <code>decimal</code>;
   <code>unnest</code> (polymorphic over <code>anyarray</code>) yields one row per array element. A
   function with a named output parameter (<code>jsonb_array_elements</code> → <code>value</code>)
   keeps that column name under a table alias; any other single-column function's column takes the

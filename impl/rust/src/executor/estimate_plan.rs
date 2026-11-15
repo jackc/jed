@@ -421,6 +421,13 @@ impl Engine {
         if srf.kind != SrfKind::GenerateSeries || !(2..=3).contains(&srf.args.len()) {
             return DEFAULT_SRF_ROWS;
         }
+        if srf
+            .args
+            .iter()
+            .any(|a| matches!(estimator_value(a).as_deref(), Some(RExpr::ConstDecimal(_))))
+        {
+            return Self::estimate_numeric_series_rows(srf);
+        }
         let (Some(start), Some(stop)) = (int(&srf.args[0]), int(&srf.args[1])) else {
             return DEFAULT_SRF_ROWS;
         };
@@ -437,6 +444,42 @@ impl Engine {
         }
         let distance = (*stop as i128 - *start as i128).abs();
         let rows = distance / (step as i128).abs() + 1;
+        rows.min(MAX_ESTIMATE as i128) as i64
+    }
+
+    /// The numeric `generate_series` with plan-time literal bounds/step (estimator.md §7.2): exact
+    /// when every argument, taken at the largest of their scales, has an unscaled integer within
+    /// `i64` — the integer rule over those unscaled values. Any wider value keeps the default, so
+    /// the estimate never does big-decimal division.
+    fn estimate_numeric_series_rows(srf: &SrfPlan) -> i64 {
+        let dec = |arg: &RExpr| match estimator_value(arg).as_deref() {
+            Some(RExpr::ConstDecimal(d)) => Some(d.clone()),
+            Some(RExpr::ConstInt(n)) => Some(Decimal::from_i64(*n)),
+            _ => None,
+        };
+        let mut vals = Vec::with_capacity(3);
+        for a in &srf.args {
+            match dec(a) {
+                Some(d) => vals.push(d),
+                None => return DEFAULT_SRF_ROWS,
+            }
+        }
+        if vals.len() == 2 {
+            vals.push(Decimal::from_i64(1));
+        }
+        let scale = vals.iter().map(Decimal::scale).max().unwrap_or(0);
+        let mut u = [0i128; 3];
+        for (i, v) in vals.iter().enumerate() {
+            match v.unscaled_i64(scale) {
+                Some(x) => u[i] = x as i128,
+                None => return DEFAULT_SRF_ROWS,
+            }
+        }
+        let (start, stop, step) = (u[0], u[1], u[2]);
+        if step == 0 || (step > 0 && start > stop) || (step < 0 && start < stop) {
+            return 0;
+        }
+        let rows = (stop - start).abs() / step.abs() + 1;
         rows.min(MAX_ESTIMATE as i128) as i64
     }
 

@@ -35,7 +35,7 @@
 #      or a reserved aggregate result (sum_widen | same_as_input); null is "aggregate";
 #      (name, arg_families) is unique. Aggregates are NOT operators (no symbol/precedence/
 #      arg_resolution/arity), so they skip the operator-only checks above (functions.md).
-#  12. each [[set_returning]] (kind = "set_returning") has its own field set (name/kind/
+#  12. each [[set_returning]] (kind = "set_returning"; unique on (name, arity, arg_families)) has its own field set (name/kind/
 #      surface/arity/arg_families/arg_resolution/result/column/column_source/null/errors); arity ==
 #      arg_families length; result is a scalar id, a concrete array `<scalar>[]`, or a
 #      reserved set id (set_of_promoted);
@@ -439,11 +439,11 @@ def main
       fail!("set_returning #{id}: error code #{code.inspect} is not in registry.toml") unless error_codes.include?(code)
     end
 
-    srf_sigs << [sf["name"], sf["arity"]]
+    srf_sigs << [sf["name"], sf["arity"], args]
   end
   dup_srfs = srf_sigs.tally.select { |_, n| n > 1 }.keys
   unless dup_srfs.empty?
-    fail!("duplicate set_returning (name, arity): #{dup_srfs.map { |n, a| "#{n}/arity-#{a}" }.join(', ')}")
+    fail!("duplicate set_returning (name, arity, arg_families): #{dup_srfs.map { |n, a, f| "#{n}/arity-#{a}(#{f.join(',')})" }.join(', ')}")
   end
 
   # (13) window functions (kind = "window") — a separate array + field set. Window functions are

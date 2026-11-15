@@ -565,6 +565,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // Set-returning functions in FROM: generate_series, a computed row source, including
   // fixed-output column aliases `AS g(c1, …)` (functions.md §10, grammar.md §35).
   "query.set_returning",
+  // The numeric overload generate_series(numeric, numeric[, numeric]) (functions.md §10).
+  "query.generate_series_numeric",
   // Phase 4 — multi-table FROM: INNER/CROSS/OUTER JOIN, table aliases, qualified columns
   // (grammar.md §15).
   "query.join_inner",

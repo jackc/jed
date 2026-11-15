@@ -431,9 +431,9 @@ func (db *engine) resolveJtColumns(cols []jtColumn, outColumns *[]catColumn, arg
 }
 
 // resolveGenerateSeries resolves generate_series(start, stop[, step]) (spec/design/functions.md
-// §10): 2 or 3 integer args (a wrong arity/type → 42883). The produced column is typed at the
-// PROMOTED integer type of the args (PG); a NULL-typed arg contributes no width. All-NULL defaults
-// i64.
+// §10): 2 or 3 integer or decimal args (a wrong arity/type → 42883). The produced column is typed
+// at the PROMOTED integer type of the args (PG), or decimal when any arg is a decimal (the numeric
+// overload); a NULL-typed arg contributes no width. All-NULL defaults i64.
 func (db *engine) resolveGenerateSeries(args []*exprNode, alias *string, argScope *scope, ptypes *paramTypes) (*catTable, *srfPlan, error) {
 	if len(args) != 2 && len(args) != 3 {
 		return nil, nil, noFuncOverload("generate_series")
@@ -442,7 +442,7 @@ func (db *engine) resolveGenerateSeries(args []*exprNode, alias *string, argScop
 	forbidden := &aggCtx{}
 	rargs := make([]*rExpr, 0, len(args))
 	var result scalarType
-	haveResult := false
+	haveResult, numeric := false, false
 	for _, a := range args {
 		r, t, err := resolve(argScope, *a, &int64Ctx, forbidden, ptypes)
 		if err != nil {
@@ -454,6 +454,9 @@ func (db *engine) resolveGenerateSeries(args []*exprNode, alias *string, argScop
 				result = t.intTy
 				haveResult = true
 			}
+		case rtDecimal:
+			// A decimal argument selects the numeric overload; integers promote to it.
+			numeric = true
 		case rtNull:
 			// An untyped NULL/param adapts and contributes no width.
 		default:
@@ -461,7 +464,9 @@ func (db *engine) resolveGenerateSeries(args []*exprNode, alias *string, argScop
 		}
 		rargs = append(rargs, r)
 	}
-	if !haveResult {
+	if numeric {
+		result = scalarDecimal
+	} else if !haveResult {
 		result = scalarInt64
 	}
 	return srfTable("generate_series", alias, scalarT(result)), &srfPlan{kind: srfGenerateSeries, args: rargs}, nil
@@ -1490,38 +1495,34 @@ func (db *engine) jedViewsRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
 // charges one generated_row AT THE SOURCE, guarded so a max_cost ceiling aborts a runaway series
 // (54P01) mid-generation before the whole thing materializes (CLAUDE.md §13).
 func (db *engine) generateSeriesRows(sp *srfPlan, env *evalEnv, m *costMeter, mask []bool) ([]storedRow, error) {
-	evalInt := func(e *rExpr) (int64, bool, error) {
+	vals := make([]Value, 0, 3)
+	for _, e := range sp.args {
 		v, err := e.eval(nil, env, m)
-		if err != nil {
-			return 0, false, err
-		}
-		switch v.Kind {
-		case ValInt:
-			return v.Int, true, nil
-		case ValNull:
-			return 0, false, nil
-		default:
-			panic("the resolver restricts generate_series args to integers")
-		}
-	}
-	start, okStart, err := evalInt(sp.args[0])
-	if err != nil {
-		return nil, err
-	}
-	stop, okStop, err := evalInt(sp.args[1])
-	if err != nil {
-		return nil, err
-	}
-	step, okStep := int64(1), true
-	if len(sp.args) == 3 {
-		step, okStep, err = evalInt(sp.args[2])
 		if err != nil {
 			return nil, err
 		}
+		vals = append(vals, v)
 	}
 	// Any NULL argument yields zero rows (PG).
-	if !okStart || !okStop || !okStep {
-		return nil, nil
+	numeric := false
+	for _, v := range vals {
+		switch v.Kind {
+		case ValNull:
+			return nil, nil
+		case ValDecimal:
+			numeric = true
+		case ValInt:
+		default:
+			panic("the resolver restricts generate_series args to integers/decimals")
+		}
+	}
+	// A decimal argument means the numeric overload (the resolver typed the column decimal).
+	if numeric {
+		return generateNumericSeriesRows(vals, m, mask)
+	}
+	start, stop, step := vals[0].Int, vals[1].Int, int64(1)
+	if len(vals) == 3 {
+		step = vals[2].Int
 	}
 	if step == 0 {
 		return nil, newError(InvalidParameterValue, "step size cannot be equal to zero")
@@ -1550,6 +1551,55 @@ func (db *engine) generateSeriesRows(sp *srfPlan, env *evalEnv, m *costMeter, ma
 		// i64 overflow while stepping ends the series cleanly, matching PostgreSQL.
 		next := cur + step
 		if (step > 0 && next < cur) || (step < 0 && next > cur) {
+			break
+		}
+		cur = next
+	}
+	return out, nil
+}
+
+// generateNumericSeriesRows is the numeric overload of generate_series (spec/design/functions.md
+// §10): every argument promotes to decimal (the values are non-NULL). The first element is start at
+// its own scale; each later one is the previous plus step (decimal add, scale max(s1, s2)), so
+// generate_series(3, 1, -0.75) yields 3, 2.25, 1.50 as in PostgreSQL. A zero step is 22023. Each
+// element charges one generated_row; the bound compare and the step add each charge
+// decimal_work × (W − 1) (cost.md §3). An add over the decimal cap ends the series cleanly: the
+// value would already lie past stop.
+func generateNumericSeriesRows(vals []Value, m *costMeter, mask []bool) ([]storedRow, error) {
+	dec := func(v Value) Decimal {
+		if v.Kind == ValDecimal {
+			return *v.decimal()
+		}
+		return decimalFromInt64(v.Int)
+	}
+	start, stop, step := dec(vals[0]), dec(vals[1]), decimalFromInt64(1)
+	if len(vals) == 3 {
+		step = dec(vals[2])
+	}
+	if step.IsZero() {
+		return nil, newError(InvalidParameterValue, "step size cannot equal zero")
+	}
+	up := !step.Neg
+	var out []storedRow
+	cur := start
+	for {
+		m.Charge(costs.DecimalWork * (workLinear(cur, stop) - 1))
+		if err := m.Step(); err != nil {
+			return nil, err
+		}
+		ord := cur.CmpValue(stop)
+		if (up && ord > 0) || (!up && ord < 0) {
+			break
+		}
+		m.Charge(costs.GeneratedRow)
+		row := storedRow{DecimalValue(cur)}
+		if err := m.admitRowMasked(row, mask); err != nil { // a materialized relation row (memory.md §5.1)
+			return nil, err
+		}
+		out = append(out, row)
+		m.Charge(costs.DecimalWork * (workLinear(cur, step) - 1))
+		next, err := cur.Add(step)
+		if err != nil {
 			break
 		}
 		cur = next

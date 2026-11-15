@@ -411,11 +411,18 @@ fn set_returning_match_spec() {
     for row in srfs {
         let name = row["name"].as_str().unwrap();
         let arity = row["arity"].as_integer().unwrap() as u8;
+        let row_fams: Vec<&str> = row["arg_families"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        // Overloaded across arity and argument family (the integer and numeric generate_series).
         let desc = SET_RETURNING
             .iter()
-            .find(|d| d.name == name && d.arity == arity)
+            .find(|d| d.name == name && d.arity == arity && d.arg_families == row_fams.as_slice())
             .unwrap_or_else(|| {
-                panic!("generated table missing set_returning {name}/arity-{arity}")
+                panic!("generated table missing set_returning {name}/arity-{arity}{row_fams:?}")
             });
 
         assert_eq!(

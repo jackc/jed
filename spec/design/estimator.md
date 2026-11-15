@@ -398,7 +398,10 @@ the plan contract; the chosen plan still returns identical rows.
 - A FROM-less `Result`: one virtual row before WHERE; the ordinary predicate may reduce it to zero.
 - Literal `VALUES`: exact authored row count.
 - `generate_series` with plan-time literal bounds/step: exact checked cardinality; other SRFs and
-  non-literal bounds: `default_srf_rows`.
+  non-literal bounds: `default_srf_rows`. For the numeric overload ([functions.md](functions.md)
+  §10) the bounds and step are taken at the largest of their scales: when every unscaled integer
+  fits `i64`, the integer rule applies to those unscaled values (`generate_series(1, 3, 0.5)` → 5);
+  otherwise `default_srf_rows` (no big-decimal division at plan time).
 - Built-in catalog relations: the exact count of matching resident catalog entries in the visible
   database/attachment snapshot; they require no storage leaf reads.
 - Derived table / scalar subquery / CTE body: its recursively estimated output.

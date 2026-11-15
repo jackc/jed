@@ -6714,14 +6714,16 @@ errors         = ["22016"]
 #
 # field doc (set_returning) ---------------------------------------------------
 # name          internal identity + AST/resolver selector. Overloaded across ARITY (the 2-arg
-#               and 3-arg generate_series share the name), so the uniqueness key is (name,
-#               arity), not (name, arg_families) — both forms take the same family per position.
+#               and 3-arg generate_series share the name) and across argument FAMILY (the integer
+#               and the numeric generate_series), so the uniqueness key is (name, arity,
+#               arg_families).
 # kind          always "set_returning".
 # surface       SQL spelling, lowercase canonical (matched byte-exactly on the folded name — a
 #               quoted spelling must be lowercase; SRF names are not reserved, grammar.md §3).
 # arity         operand count (generate_series: 2 = start/stop, 3 = start/stop/step; unnest: 1).
 # arg_families  required family of each operand, by position, referencing a `family` in
-#               ../types/scalars.toml. generate_series takes "integer" per position; unnest takes
+#               ../types/scalars.toml. generate_series takes "integer" (or, for the numeric
+#               overload, "decimal") per position; unnest takes
 #               the polymorphic pseudo-family "anyarray" (array-functions.md §2 — matches any array
 #               arg and binds ELEM := its element type), interpreted by the hand-written resolver.
 # arg_resolution "promote" = widen all operands via the promotion tower to a common type (the
@@ -6729,7 +6731,9 @@ errors         = ["22016"]
 #               single-arg unnest uses "none".
 # result        a reserved set-returning result id (NOT a plain scalar — an SRF returns a row
 #               SET): "set_of_promoted" = a row set of ONE column whose type is the promoted
-#               integer type of the args (the SRF analogue of the aggregates' sum_widen);
+#               integer type of the args (the SRF analogue of the aggregates' sum_widen); a plain
+#               scalar id (the numeric generate_series → "decimal") = a row set of one column of
+#               that type;
 #               "set_of_element" = a row set of ONE column whose type is the ELEM bound from the
 #               `anyarray` argument (unnest — the SRF analogue of the `anyelement` result code).
 # column        the fixed output column NAME of the produced relation, PostgreSQL's
@@ -6772,6 +6776,38 @@ arity          = 3
 arg_families   = ["integer", "integer", "integer"]
 arg_resolution = "promote"
 result         = "set_of_promoted"
+column         = "generate_series"
+column_source  = "function"
+null           = "empty_on_null"
+errors         = ["22023"]
+
+# generate_series(numeric, numeric[, numeric]) → setof numeric — the numeric overload (functions.md
+# §10). Selected when ANY argument is a decimal; an integer argument promotes to decimal through the
+# integer↔decimal comparable rule (promote-to-decimal, compare.toml), so `generate_series(1, 3.5)`
+# is numeric. The column is typed decimal (no typmod). The first element is start at its own scale;
+# each later one is the previous plus step (decimal add, scale max(s1, s2)). A zero step is 22023
+# (only the 3-arg form can pass one); NULL → zero rows; no overflow stop is reachable before stop.
+[[set_returning]]
+name           = "generate_series"
+kind           = "set_returning"
+surface        = "generate_series"
+arity          = 2
+arg_families   = ["decimal", "decimal"]
+arg_resolution = "promote"
+result         = "decimal"
+column         = "generate_series"
+column_source  = "function"
+null           = "empty_on_null"
+errors         = []
+
+[[set_returning]]
+name           = "generate_series"
+kind           = "set_returning"
+surface        = "generate_series"
+arity          = 3
+arg_families   = ["decimal", "decimal", "decimal"]
+arg_resolution = "promote"
+result         = "decimal"
 column         = "generate_series"
 column_source  = "function"
 null           = "empty_on_null"

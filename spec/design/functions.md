@@ -448,7 +448,7 @@ among themselves, it never compares two families, the one divergence from the op
 SRF `arg_families` slot, interpreted by the hand-written resolver exactly as for the array
 functions).
 
-**`generate_series` (FROM-clause only, integer only).** The first SRF is a row source in the
+**`generate_series` (FROM-clause only, integer and numeric).** The first SRF is a row source in the
 `FROM` clause ([grammar.md](grammar.md) §35): `generate_series(start, stop)` and
 `generate_series(start, stop, step)` over the integer family. It resolves to a **synthetic
 one-column relation** — a `Table` built at plan time with a single column whose type is the
@@ -470,7 +470,31 @@ outer column, **and** a column of an earlier sibling FROM relation (`FROM t CROS
 generate_series(1, t.n) g`) are all legal — a sibling reference re-evaluates the SRF once per
 left-hand row. Its fixed output columns accept PostgreSQL's column-alias-list form
 `AS g(c1, …)` (§35): rename left-to-right, allow a partial list, reject too many names with
-`42P10`. Deferred: the SELECT-list SRF position and non-integer variants (§35).
+`42P10`. Deferred: the SELECT-list SRF position and the timestamp variant (§35).
+
+**The numeric overload — `generate_series(numeric, numeric[, numeric])`.** When **any** argument
+resolves to `decimal`, the call is PostgreSQL's numeric series: integer arguments promote to
+decimal (the integer↔decimal `promote-to-decimal` rule) and the one column is typed `decimal`, with
+no typmod (`generate_series(1, 3.5)` ⇒ `1, 2, 3`). A float argument has no overload (`42883` — no
+implicit float → numeric, as in PostgreSQL); untyped NULL and `$N` arguments keep their integer
+default, so only a typed decimal selects this form. The semantics are PostgreSQL's
+`generate_series_step_numeric` (oracle-verified): the first element is `start` **at its own scale**,
+and each later element is the previous one plus `step` by exact decimal addition, whose scale is
+`max(s1, s2)` — so `generate_series(3, 1, -0.75)` is `3, 2.25, 1.50` and `generate_series(1.0, 3)`
+is `1.0, 2.0, 3.0`. The series is inclusive of `stop` (exactly — no float drift); any NULL argument
+yields zero rows; `start` past `stop` for the step's direction yields zero rows; a zero step is
+`22023` with PostgreSQL's numeric message (*"step size cannot equal zero"*). There is no NaN or
+infinity to reject (jed's decimal is always finite, [decimal.md](decimal.md) §2). An addition past
+the decimal cap ends the series cleanly, like the i64 overflow stop: such a value would already lie
+past `stop`, so the rows are PostgreSQL's. The catalog carries the overload as its own
+`[[set_returning]]` rows (`arg_families = ["decimal", …]`, `result = "decimal"`), unique on
+`(name, arity, arg_families)`. **Cost:** each element charges one `generated_row`, and — because a
+decimal can reach ~147k digits — the bound compare before each element and the step add after it
+each charge `decimal_work × (W − 1)` ([cost.md](cost.md) §3), in that order: compare charge, guard,
+`generated_row`, the row, add charge. For values of at most four aligned digits W = 1, so a small
+numeric series costs exactly what the integer series does. The EXPLAIN estimate is exact for
+literal arguments whose unscaled integers at their common scale fit `i64` ([estimator.md](estimator.md)
+§7.2), else `default_srf_rows`, so planning never divides big decimals.
 
 **The second SRF — `unnest(anyarray)`** ([array-functions.md §9](array-functions.md)) reuses this
 exact machinery: a FROM-clause synthetic relation, the same implicitly-lateral arg scope, the same

@@ -190,13 +190,17 @@ test("aggregates match spec/functions/catalog.toml", () => {
 test("set-returning functions match spec/functions/catalog.toml", () => {
   // The generated set-returning descriptor table must match the canonical catalog's
   // [[set_returning]] rows field-for-field (codegen middle path, CLAUDE.md §5). SRFs are
-  // overloaded across ARITY (one row per (name, arity)) — functions.md §10.
+  // overloaded across ARITY and argument family (one row per (name, arity, arg_families)) — functions.md §10.
   const rows = readTomlTables(specPath("functions/catalog.toml"), "set_returning");
   assert.equal(rows.length, SET_RETURNING.length, "set_returning count");
   for (const row of rows) {
     const name = row.str("name");
     const arity = Number(row.big("arity"));
-    const desc = SET_RETURNING.find((d) => d.name === name && d.arity === arity);
+    const fams = row.strs("arg_families").join(",");
+    // Overloaded across arity and argument family (the integer and numeric generate_series).
+    const desc = SET_RETURNING.find(
+      (d) => d.name === name && d.arity === arity && d.argFamilies.join(",") === fams,
+    );
     assert.notEqual(
       desc,
       undefined,

@@ -83,7 +83,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     a cost ceiling. A grouped fold over ~100k groups is bound by scattered accumulator access (each
     group's accumulators are separate heap objects in every core); a flat per-aggregate state array
     would be the next step.
-  - [ ] _follow-on:_ `generate_series(numeric, numeric[, numeric])` — PostgreSQL has a numeric series (`generate_series(1, 3.5)`); jed's SRF is integer-only (`42883`).
 - [x] **`timestamp` / `timestamptz`.** → [timestamp.md](spec/design/timestamp.md), [timezones.md](spec/design/timezones.md), [formatting.md](spec/design/formatting.md)
   - [ ] _follow-on:_ a separate `time` type; `current_timestamp(p)` / `localtimestamp(p)`; the `timestamp(p) with[out] time zone '…'` typed literal; zone abbreviations in `to_timestamp` input (`'… EST'` under `TZ` is `0A000` until the abbreviation-table decision, [timezones.md §15](spec/design/timezones.md), [formatting.md §5](spec/design/formatting.md)).
 - [x] **`interval`.** → [interval.md](spec/design/interval.md) (element typmods: *Array element typmods* above)

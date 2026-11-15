@@ -2926,9 +2926,9 @@ sibling, so an arg sees only `$N`/outer, as before.)
 
 **Deferred narrowings** (each the relevant error, relaxable later, and shared by both SRFs): the
 **SELECT-list** SRF position (`SELECT generate_series(1, 5)` / `SELECT unnest(…)` — an SRF is not a
-scalar function, `42883`), **`WITH ORDINALITY`**, and `generate_series`'s non-integer variants
-(numeric/timestamp). The `generate_series` integer forms and their PostgreSQL edge cases (NULL arg →
-zero rows, step zero → `22023`, overflow → clean stop), and `unnest`'s element-expansion semantics,
+scalar function, `42883`), **`WITH ORDINALITY`**, and `generate_series`'s timestamp variant. The
+`generate_series` integer and numeric forms and their PostgreSQL edge cases (NULL arg → zero rows,
+step zero → `22023`, overflow → clean stop), and `unnest`'s element-expansion semantics,
 are spec'd in [functions.md](functions.md) §10 and [array-functions.md §9](array-functions.md).
 
 ## 36. Typed string literals (`type '…'`) and string-literal casts
