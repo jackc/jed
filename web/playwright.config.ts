@@ -10,6 +10,8 @@ import { defineConfig, devices } from '@playwright/test';
 // This worktree's allocated preview port (port-tamer.toml -> .dev/ports.env), or the historical
 // default when there is no allocation.
 const PORT = Number(process.env.WEB_PREVIEW_PORT) || 4173;
+// Exercise the production project prefix by default; BASE_PATH='' also supports root hosting.
+const BASE = process.env.BASE_PATH ?? '/jed';
 
 export default defineConfig({
   testDir: 'e2e',
@@ -22,16 +24,17 @@ export default defineConfig({
   // a wrong answer still fails, just later. No retries: a flake stays visible.
   timeout: 60_000,
   expect: { timeout: 20_000 },
-  use: { baseURL: `http://localhost:${PORT}` },
+  use: { baseURL: `http://localhost:${PORT}${BASE}/` },
   projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
   // Build (incl. the Pagefind index), then serve the `build/` artifact WHOLESALE via a tiny static
   // server (e2e/serve.mjs) — faithful to GitHub Pages, and unlike `vite preview` it serves the
-  // post-build Pagefind files, so search is testable. reuseExistingServer keeps local iteration
-  // fast; CI always builds fresh.
+  // post-build Pagefind files, so search is testable. Always build fresh so the tested artifact
+  // belongs to this invocation and uses the requested base path.
   webServer: {
     command: `npm run build && PORT=${PORT} node e2e/serve.mjs`,
-    url: `http://localhost:${PORT}`,
-    reuseExistingServer: !process.env.CI,
+    env: { BASE_PATH: BASE, BASE },
+    url: `http://localhost:${PORT}${BASE}/`,
+    reuseExistingServer: false,
     timeout: 120_000
   }
 });

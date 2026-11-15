@@ -315,7 +315,7 @@ CREATE RECURSIVE VIEW countdown (n) AS
 This is PostgreSQL's shorthand for a view over `WITH RECURSIVE countdown (n) AS (…) SELECT n FROM
 countdown`, and jed stores it that way. The column list is required.
 
-<a id="temporary-views"></a>
+<span id="temporary-views"></span>
 
 ## Temporary views
 
@@ -340,7 +340,7 @@ that reads the replaced view uses a bare name that the new column would capture.
 PostgreSQL accepts such changes. To avoid the error, qualify column references in view queries
 (`e.name` rather than `name`).
 
-<a id="writing-through-a-view"></a>
+<span id="writing-through-a-view"></span>
 
 ## Writing through a view
 
@@ -394,7 +394,7 @@ Everything in the clause is written in the view's columns:
 `CREATE INDEX … ON` a view and a foreign key that references a view are `42809`. `ANALYZE` on a view
 succeeds and does nothing.
 
-<a id="with-check-option"></a>
+<span id="with-check-option"></span>
 
 ## `WITH CHECK OPTION`
 
@@ -433,7 +433,7 @@ write. Two orderings differ from PostgreSQL: a row that violates both an `EXCLUD
 check option reports `44000`, and an `UPDATE` reports a later row's `CHECK` or `UNIQUE` failure
 before an earlier row's check-option failure.
 
-<a id="privileges"></a>
+<span id="privileges"></span>
 
 ## Privileges
 

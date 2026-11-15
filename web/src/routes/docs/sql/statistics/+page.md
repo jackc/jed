@@ -81,7 +81,7 @@ later writes, or when the list was truncated, a missing term gets a small positi
 A bound parameter is estimated like the literal it carries: `WHERE category = $1` and
 `tags @> ARRAY[$1]` use the MCV list, histogram, and GIN terms for each execution's value, because
 every execution is planned with its values (its *custom plan* —
-[prepared statements](/docs/api/queries)). `EXPLAIN` given bound values shows that plan; without
+[prepared statements](../../api/queries/)). `EXPLAIN` given bound values shows that plan; without
 values it shows the estimate for an unknown value — the distinct-value average, never an MCV
 bucket.
 

@@ -5,7 +5,7 @@ import { expect, test } from '@playwright/test';
 // shown per language. Targets the API docs page, where CodeTabs lives (the SQL pages have no
 // selector — that's the two-axis split).
 
-const API = '/docs/api/opening-a-database/';
+const API = './docs/api/opening-a-database/';
 
 test('default language (Rust) example is shown', async ({ page }) => {
   await page.goto(API);

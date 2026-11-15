@@ -17,13 +17,13 @@ async function setEditor(page: Page, sql: string): Promise<void> {
 }
 
 test('autoruns the default SQL and populates the schema sidebar', async ({ page }) => {
-  await page.goto('/tool/');
+  await page.goto('./tool/');
   await expect(page.getByTestId('result-rows')).toContainText('hello');
   await expect(page.getByTestId('schema-sidebar')).toContainText('note');
 });
 
 test('output-format selector renders csv / json / markdown', async ({ page }) => {
-  await page.goto('/tool/');
+  await page.goto('./tool/');
   await expect(page.getByTestId('result-rows')).toContainText('hello');
 
   await page.getByTestId('format-select').selectOption('csv');
@@ -37,7 +37,7 @@ test('output-format selector renders csv / json / markdown', async ({ page }) =>
 });
 
 test('editing and running updates the grid and shows cost', async ({ page }) => {
-  await page.goto('/tool/');
+  await page.goto('./tool/');
   await expect(page.getByTestId('run-button')).toBeEnabled();
   await setEditor(page, 'SELECT count(*) AS n FROM note');
   await page.getByTestId('run-button').click();
@@ -49,7 +49,7 @@ test('schema sidebar refreshes with column and expression indexes', async ({ pag
   const pageErrors: string[] = [];
   page.on('pageerror', (error) => pageErrors.push(error.message));
 
-  await page.goto('/tool/');
+  await page.goto('./tool/');
   await expect(page.getByTestId('run-button')).toBeEnabled();
   await setEditor(
     page,
@@ -64,13 +64,13 @@ test('schema sidebar refreshes with column and expression indexes', async ({ pag
 });
 
 test('OPFS is supported and the file manager is available', async ({ page }) => {
-  await page.goto('/tool/');
+  await page.goto('./tool/');
   await expect(page.getByTestId('create-db')).toBeVisible();
   await expect(page.getByTestId('opfs-unsupported')).toHaveCount(0);
 });
 
 test('OPFS: create, insert, then reopen across a reload persists data', async ({ page }) => {
-  await page.goto('/tool/');
+  await page.goto('./tool/');
   await expect(page.getByTestId('run-button')).toBeEnabled();
 
   await page.getByTestId('new-db-name').fill('persist');
@@ -94,7 +94,7 @@ test('OPFS: create, insert, then reopen across a reload persists data', async ({
 });
 
 test('OPFS: export then re-import round-trips a database', async ({ page }) => {
-  await page.goto('/tool/');
+  await page.goto('./tool/');
   await expect(page.getByTestId('run-button')).toBeEnabled();
 
   await page.getByTestId('new-db-name').fill('rt');
@@ -129,7 +129,7 @@ test('OPFS: export then re-import round-trips a database', async ({ page }) => {
 });
 
 test('OPFS: importing a non-jed file surfaces XX001 on open', async ({ page }) => {
-  await page.goto('/tool/');
+  await page.goto('./tool/');
   await expect(page.getByTestId('run-button')).toBeEnabled();
 
   await page.getByTestId('import-input').setInputFiles({

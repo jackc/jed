@@ -64,11 +64,7 @@
     >
       {#each results as r (r.url)}
         <li class="border-b border-slate-100 last:border-0">
-          <a
-            href="{base}{r.url}"
-            class="block px-3 py-2 hover:bg-slate-50"
-            onclick={() => (open = false)}
-          >
+          <a href={r.url} class="block px-3 py-2 hover:bg-slate-50" onclick={() => (open = false)}>
             <span class="text-sm font-medium text-jed-ink">{r.title}</span>
             <!-- eslint-disable-next-line svelte/no-at-html-tags - Pagefind excerpt from our own indexed content -->
             <span class="mt-0.5 block text-xs text-jed-muted">{@html r.excerpt}</span>

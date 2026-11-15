@@ -54,6 +54,7 @@ def ci_steps
     step("lint:rust"),
     step("typecheck:ts"),
     step("web:check"),
+    step("web:examples"),
     *test_steps(checked: true),
     step("concurrency:process"),
     step("sim:regress"),

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { base } from '$app/paths';
   import { onMount } from 'svelte';
   import ResultGrid from '$lib/components/ResultGrid.svelte';
   import SqlEditor from '$lib/components/SqlEditor.svelte';
@@ -269,6 +270,13 @@ SELECT * FROM note ORDER BY id;`;
   <p class="text-sm text-jed-muted">
     A real jed database, in your browser. The scratch database is in memory; create, open, import,
     or export single-file <code>.jed</code> databases stored in your browser's private file system (OPFS).
+  </p>
+  <p class="mt-1 text-sm text-jed-muted">
+    v0.3.0 opens plaintext format-54 files. Older preview files need to be recreated; exporting
+    keeps their original bytes. See the <a
+      class="text-jed-accent underline"
+      href="{base}/docs/releases/">release &amp; upgrade notes</a
+    > before replacing an older database.
   </p>
 </div>
 

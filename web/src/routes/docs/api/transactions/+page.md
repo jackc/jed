@@ -83,18 +83,13 @@ lock-free.
 
 ## Durability
 
-When a file-backed commit returns, its changes are on stable storage and survive a crash or a
-sudden power loss. Each commit costs one flush, and its cost depends on the platform:
+With the default `synchronous = on`, a successful file-backed commit makes its persistent changes
+durable. Steady-state commits write changed pages and a validation manifest, then issue one durable
+flush. File growth and recovery may require additional flushes; a transaction with no persistent
+changes needs none. On macOS, jed uses `F_FULLFSYNC`; latency depends on the storage device and host.
 
-- **Linux:** a commit costs about as much as SQLite's `synchronous=FULL` or a PostgreSQL commit.
-  All three use the same flush.
-- **macOS:** jed flushes with `F_FULLFSYNC`, which forces the drive to write its own cache to flash.
-  That takes about 4 ms per commit on Apple SSDs. SQLite and PostgreSQL, in their default
-  configurations, use plain `fsync` on macOS. It returns sooner because the data can still sit in
-  the drive's volatile cache. If the machine loses power at the wrong moment, they can lose
-  recently committed transactions or be left with a corrupt file. jed accepts the cost to keep that
-  guarantee. For a matching comparison, set SQLite's `PRAGMA fullfsync = ON` or PostgreSQL's
-  `wal_sync_method = fsync_writethrough`.
+With `synchronous = off`, commits become visible before the later batch flush and can be lost after
+an OS crash or power failure. `skip_fsync` is a separate, unsafe scratch-data option. See
+[durability settings](../opening-a-database/#durability) for the guarantees and flush interval.
 
-To commit many changes quickly, group them in one transaction: the flush is paid once per commit,
-not once per statement.
+Group related writes in one transaction to make them atomic and amortize durable flushing.

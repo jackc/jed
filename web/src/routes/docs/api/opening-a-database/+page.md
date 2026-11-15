@@ -61,9 +61,11 @@ long scalar functions may delay it. Execution runs in a dedicated worker. Blocki
 retain their existing memory limits and may materialize rows before a batch becomes available.
 
 
+<span id="durability"></span>
+
 ## Durability
 
-A bare `execute` **autocommits durably**: it runs on a fresh session that commits before the call
+With the default `synchronous = on`, a bare `execute` **autocommits durably**: it runs on a fresh session that commits before the call
 returns, so the new state is on disk (an in-memory database has nothing to flush). To apply several
 statements **atomically**, run them in one `update` closure — or on a single session's explicit
 `begin` / `commit` block, where a `rollback` (or dropping the session) discards the uncommitted work.
@@ -100,7 +102,10 @@ the flushes entirely and can leave a corrupted file after an OS crash: use it on
 
 ## Opening a file from a newer jed
 
-A newer jed can store SQL that an older one cannot parse: a view, a `CHECK`, an expression
+Different file-format versions cannot be opened this way: v0.3.0 uses format 54 and cannot open
+v0.2.0’s format 25. See [the upgrade notes](../../releases/#upgrading-from-v020).
+
+When two builds use the **same file-format version**, a newer jed can store SQL that an older one cannot parse: a view, a `CHECK`, an expression
 `DEFAULT`, or an expression or partial index written with syntax added since. The older jed still
 opens the file and runs everything else. Only a statement that needs such an object fails, with
 `XX003`: reading the view (and `jed_columns`, which plans every view), a write that would evaluate
@@ -166,7 +171,22 @@ unlocks an encrypted database. The serving side is `jed pages` (Rust's
 `Database::serve_page_stream`), so the remote host needs the `jed` binary whichever language your
 program is written in.
 
+## Copying and exporting a database
+
+Close all handles successfully before copying a database file, and prevent another process from
+opening it during the copy. Copying a file while commits are in flight is not a snapshot backup.
+For a live **plaintext** database, `serialize` exports a consistent committed snapshot as bytes
+([below](#a-database-as-bytes)); it does not change the file format. For encrypted files, close the
+database before copying, since byte export does not yet support encryption.
+
+The engine has tested online-backup machinery, including page-identical and compacted copies, but
+it is currently exposed only through repository test hooks. A public backup API and CLI command
+remain pending.
+
+<span id="reclaiming-space-compaction"></span>
+
 ## Reclaiming space (compaction)
+
 
 jed reuses the pages that deletes and updates free. When the free pages are at the end of a file, a
 later commit cuts them off and the file gets shorter by itself, but free pages in the middle of the
@@ -261,7 +281,8 @@ of at least 1024 bytes.
 | `0A000` | the page size is below 1024 |
 | `28P04` | another process rotated the key while this one was connected; reopen |
 
-Encryption protects the file's contents at rest: backups, snapshots and copies of the file, and
+The encryption implementation is still awaiting its security review. Within its documented threat
+model, encryption protects the file's contents at rest: backups, snapshots and copies of the file, and
 anyone who can read the disk. It does not hide the file's size or how many commits it has had, and
 it cannot protect a process that is already running with the key.
 
@@ -315,6 +336,8 @@ browser — the same engine, no file. Create one by calling the unified create c
 `Database::create(CreateOptions::default())` (Rust), `jed.CreateDatabase(jed.CreateOptions{})` (Go), or
 `await createDatabase({})` (TypeScript).
 
+<span id="a-database-as-bytes"></span>
+
 ## A database as bytes
 
 A database can be exported to a byte buffer and loaded back from one, jed's version of SQLite's
@@ -322,7 +345,7 @@ A database can be exported to a byte buffer and loaded back from one, jed's vers
 web page, to save a browser's in-memory database somewhere of your choosing, or to give each test
 its own copy of a fixture.
 
-`db.serialize("main")` (Rust, TypeScript) or `db.Serialize("main")` (Go) returns the committed state
+`db.serialize("main")` (Rust), `await db.serialize("main")` (TypeScript), or `db.Serialize("main")` (Go) returns the committed state
 as the bytes of a clean database file: it holds no free pages, and the same committed data gives the
 same bytes in every language. Write them to disk and you have a file `open` accepts. Pass an
 attachment's name to export that database instead. The export reads a snapshot like any reader, so it

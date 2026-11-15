@@ -159,3 +159,28 @@ Each checkout runs its own instance on its own control port, which process-compo
 - **The devcontainer forwards 5173/4173** as fallbacks. With a port allocation (the normal case)
   the web servers bind the allocated ports instead, which VS Code detects and forwards. Unset
   `WEB_DEV_PORT` / `WEB_PREVIEW_PORT` to pin them back.
+
+## 6. Preparing a public preview release
+
+1. Compare changes since the previous repository tag against the website, including installation,
+   preview limitations, API examples, SQL panels, and file-format compatibility. Keep generated
+   references derived from the spec. Add release/upgrade notes to the website and `CHANGELOG.md`.
+2. Bump the release-tracked versions together: `cli/Cargo.toml`, `impl/wasm/Cargo.toml`,
+   `impl/ruby/ext/Cargo.toml`, their lockfile package entries, and `impl/ruby/lib/jed/version.rb`.
+   Unpublished core packages retain their own development versions; a preview tag does not authorize
+   publishing them to new registries.
+3. Start this checkout's oracle with `mise run dev`, check `mise run oracle:status`, and run
+   `mise run ci`. The website suite builds and tests the GitHub Pages project path, including links,
+   search navigation, live SQL, and OPFS import/export. Run any additional package/example checks
+   relevant to breaking API changes. Record the source commit and any verification limitations.
+4. Commit locally and create matching annotated tags `vX.Y.Z` and `impl/go/vX.Y.Z`. The second tag is
+   required for the Go module in the repository's subdirectory. Verify both point to the tested
+   release commit. Integrate into `master` with linear history only after verification is green.
+5. Brief the maintainer before publishing. Once publication is authorized, push the intended branch
+   and both tags explicitly, then publish the GitHub Release for `vX.Y.Z` using the changelog notes.
+   A branch or tag push alone does **not** deploy the website: publishing the GitHub Release triggers
+   `.github/workflows/web-deploy.yml`, which checks out that tag and deploys the exact browser-tested
+   artifact. Check that workflow and the resulting Pages site before declaring publication complete.
+
+The current distribution is the Go module plus website/playground. Keep older binaries and files
+when validating a format-changing upgrade; there is no automatic preview-format migration.

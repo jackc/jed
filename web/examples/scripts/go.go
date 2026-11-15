@@ -34,7 +34,15 @@ func main() {
 	// statement's rows, loop it yourself and run the spans through the normal path — the host owns
 	// the policy (one transaction or autocommit, drain rows or drop them).
 	for stmt := range jed.SplitStatements("SELECT id FROM account; SELECT balance FROM account") {
-		if _, err := db.Query(ctx, stmt.Text); err != nil {
+		rows, err := db.Query(ctx, stmt.Text)
+		if err != nil {
+			log.Fatal(err)
+		}
+		for rows.Next() {
+			fmt.Println(rows.Row())
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
 			log.Fatal(err)
 		}
 	}

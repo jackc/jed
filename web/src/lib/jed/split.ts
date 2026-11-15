@@ -3,8 +3,8 @@
 // (grammar.md §1), so the website (like the CLI) owns splitting a multi-statement editor buffer:
 // `;` outside strings/comments terminates a statement; the semicolon is stripped and everything
 // else — including comments, which the engine accepts — passes through verbatim. The state machine
-// mirrors the engine lexer exactly: `'...'` with `''` escaping is the only quoting; `--` runs to
-// end of line; `/* */` nests. Whitespace-/comment-only statements are skipped.
+// mirrors the engine lexer: strings and quoted identifiers escape their delimiter by doubling it;
+// `--` runs to end of line; `/* */` nests. Whitespace-/comment-only statements are skipped.
 
 export type SplitStmt = { sql: string; line: number };
 
@@ -19,13 +19,14 @@ export class SplitError extends Error {
   }
 }
 
-type State = 'normal' | 'string' | 'lineComment' | 'blockComment';
+type State = 'normal' | 'quoted' | 'lineComment' | 'blockComment';
 
 // splitSql splits `input` into complete statements (terminator stripped, outer whitespace trimmed).
-// The final statement needs no `;`. Throws SplitError on an unterminated string / block comment,
+// The final statement needs no `;`. Throws SplitError on unterminated quoting or a block comment,
 // rejecting the whole input (script semantics must not half-run a malformed buffer).
 export function splitSql(input: string): SplitStmt[] {
   let state: State = 'normal';
+  let quote = "'";
   let depth = 0; // block-comment nesting depth
   const stmts: SplitStmt[] = [];
   let buf = '';
@@ -55,10 +56,11 @@ export function splitSql(input: string): SplitStmt[] {
       if (c === ';') {
         finalize();
         i += 1;
-      } else if (c === "'") {
+      } else if (c === "'" || c === '"') {
         if (contentLine === null) contentLine = line;
         openerLine = line;
-        state = 'string';
+        state = 'quoted';
+        quote = c;
         buf += c;
         i += 1;
       } else if (c === '-' && at(i + 1) === '-') {
@@ -78,11 +80,11 @@ export function splitSql(input: string): SplitStmt[] {
         buf += c;
         i += 1;
       }
-    } else if (state === 'string') {
-      if (c === "'" && at(i + 1) === "'") {
-        buf += "''";
+    } else if (state === 'quoted') {
+      if (c === quote && at(i + 1) === quote) {
+        buf += quote + quote;
         i += 2;
-      } else if (c === "'") {
+      } else if (c === quote) {
         state = 'normal';
         buf += c;
         i += 1;
@@ -112,7 +114,12 @@ export function splitSql(input: string): SplitStmt[] {
     }
   }
 
-  if (state === 'string') throw new SplitError('unterminated string literal', openerLine);
+  if (state === 'quoted') {
+    throw new SplitError(
+      quote === "'" ? 'unterminated string literal' : 'unterminated quoted identifier',
+      openerLine
+    );
+  }
   if (state === 'blockComment') throw new SplitError('unterminated /* comment', openerLine);
   finalize();
   return stmts;

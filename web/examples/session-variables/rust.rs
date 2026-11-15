@@ -26,7 +26,7 @@ fn main() -> jed::Result<()> {
     // The built-in session time zone (UTC by default) decides how a timestamptz renders as text. A
     // query returns a zone-free value; render it through the session to show it in the session zone.
     s.set_time_zone("+05:00")?; // a fixed offset uses the POSIX sign: "+05:00" is UTC-5
-    let at = s.query("SELECT timestamptz '2024-01-15 12:00:00+00'", &[])?.next().unwrap()[0].clone();
+    let at = s.query("SELECT timestamptz '2024-01-15 12:00:00+00'", &[])?.next().unwrap()?[0].clone();
     assert_eq!(s.render(&at)?, "2024-01-15 07:00:00-05");
     assert_eq!(at.render(), "2024-01-15 12:00:00+00"); // a Value's own render is always UTC
     s.close();

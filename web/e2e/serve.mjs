@@ -28,8 +28,9 @@ const TYPES = {
 const server = createServer(async (req, res) => {
   try {
     let path = decodeURIComponent((req.url ?? '/').split('?')[0]);
-    if (BASE && path.startsWith(BASE)) path = path.slice(BASE.length) || '/';
-    else if (BASE && path !== '/') {
+    if (BASE && (path === BASE || path.startsWith(BASE + '/')))
+      path = path.slice(BASE.length) || '/';
+    else if (BASE) {
       res.writeHead(404);
       return res.end('not found');
     }
@@ -37,7 +38,7 @@ const server = createServer(async (req, res) => {
     const s = await stat(file).catch(() => null);
     if (s?.isDirectory()) {
       if (!path.endsWith('/')) {
-        res.writeHead(301, { location: path + '/' });
+        res.writeHead(301, { location: BASE + path + '/' });
         return res.end();
       }
       file = new URL('index.html', file);

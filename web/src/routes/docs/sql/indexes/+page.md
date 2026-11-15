@@ -473,7 +473,7 @@ GIN this release covers a focused surface (it grows from here):
 
 `DROP INDEX`, auto-naming, and the `DROP TABLE` cascade work the same as for an ordered index.
 
-<a id="reindex"></a>
+<span id="reindex"></span>
 
 ## Rebuilding indexes (`REINDEX`)
 

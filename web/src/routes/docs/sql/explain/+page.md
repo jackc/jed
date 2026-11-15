@@ -293,7 +293,7 @@ none of its `SET` or `RETURNING` expressions, and changes nothing.
 <LiveSql demo="contradiction" seed={seed} query={contradiction} rows={4} />
 
 A **bound parameter** counts as a literal here and in every estimate: each execution is planned with
-its values (its *custom plan* — see [prepared statements](/docs/api/queries)), so `zone > $1 AND zone
+its values (its *custom plan* — see [prepared statements](../../api/queries/)), so `zone > $1 AND zone
 < $2` bound to 5 and 3 reads no table either. Run `EXPLAIN` from your host with the values to see the
 plan they get; a `$N` still prints as `$N`. Without values, `EXPLAIN` plans the parameters as unknown.
 

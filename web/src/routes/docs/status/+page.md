@@ -26,10 +26,10 @@ It has not yet reached a stable release.
 - **Limited distribution.** This release ships the **Go module** (`go get`) and the
   **website/playground**. The Rust crate, the `jed` CLI, the npm package, and the Ruby gem build
   from source but are not yet published. See [Installation](../install/).
-- **Performance is not yet tuned.** Some features are implemented but unoptimized — a query can run
-  noticeably slower than on a mature database (for example, a pattern that currently falls back to a
-  full table scan, or a large sort materialized before its `LIMIT`). Correctness and cross-core
-  byte-identity come first during the preview; performance work is ongoing.
+- **Performance depends on the workload.** The cost-based planner, columnar aggregate paths,
+  compact leaves, and bounded top-k sorts have received substantial optimization. Other query shapes
+  still materialize data or fall back to scans; no universal performance parity with another database
+  is claimed.
 
 ## Deliberate differences from PostgreSQL
 
@@ -56,13 +56,19 @@ Each intentional divergence is recorded in the relevant design doc in the
 
 jed implements a broad surface, but notable gaps remain. As representative (not exhaustive) examples:
 
-- Some date/time surface is pending — `to_char` / `to_timestamp` and a separate
-  `time` type.
-- Spill-to-disk covers `ORDER BY`; the spilling hash join, aggregate, and `DISTINCT` are still in
-  progress.
-- Composite (row) types cannot yet be a `PRIMARY KEY` or index key.
-- Views: materialized views and temporary views are pending.
-- A file does not yet shrink back to the OS (dead space is reused internally, but not returned).
+- A separate `time` type, enum types, and domains.
+- Generated stored columns, materialized views, and views in or over attached databases.
+- Deferred constraints, custom range types, and multiranges.
+- Ordered `jsonb` primary/index keys and arrays of composites as keys; composite foreign keys.
+- Browser/OPFS disk spill. Native file hosts spill sorts, hash joins, aggregates, and `DISTINCT`;
+  browser and in-memory hosts keep that work resident. Resource budgets are guardrails, not a heap cap.
+- A public online-backup API/CLI command, automatic file-format upgrades, replication, and a
+  completed encryption security review.
+
+Temporary and recursive views, keyable composites with keyable fields, `to_char` / `to_timestamp`,
+file compaction, and automatic truncation of trailing free pages **are implemented**. See
+[types](../sql/types/), [views](../sql/views/), [resource limits](../api/resource-limits/), and
+[database maintenance](../api/opening-a-database/#reclaiming-space-compaction).
 
 The authoritative, always-current picture lives in the project's
 [spec](https://github.com/jackc/jed/tree/master/spec) and

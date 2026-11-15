@@ -406,7 +406,7 @@ backing sequence inline — `GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREM
 with `serial`, the owned sequence is named `event_id_seq` and is dropped with the table.
 `SEQUENCE NAME` among those options picks a different name.
 
-<a id="changing-an-identity-column"></a>
+<span id="changing-an-identity-column"></span>
 
 ### Changing an identity column
 

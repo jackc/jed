@@ -10,20 +10,20 @@ function livePanel(page: Page, demo: string): Locator {
 }
 
 test('the types page autoruns a decimal demo (0.1 + 0.2 = 0.3, exactly)', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // The decimals demo; exact decimal so the sum is 0.3, not 0.30000000004.
   await expect(livePanel(page, 'decimalDemo').getByTestId('result-rows')).toContainText('0.3');
 });
 
 test('the types page shows the integer overflow trap (22003)', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // The i16 overflow demo; it autoruns to a 22003 error.
   const overflowPanel = livePanel(page, 'overflowDemo');
   await expect(overflowPanel.getByTestId('error-code')).toHaveText('22003');
 });
 
 test('the types page runs float input and extreme rounding demos', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   const inputs = livePanel(page, 'floatInputDemo').getByTestId('result-rows');
   await expect(inputs).toContainText('NaN');
   await expect(inputs).toContainText('1.0000001');
@@ -33,7 +33,7 @@ test('the types page runs float input and extreme rounding demos', async ({ page
 });
 
 test('the types page autoruns the boolean ⇄ i32 cast demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // The boolean⇄i32 cast demo: true→1, false→0, 0→false, -5→true.
   const boolCastPanel = livePanel(page, 'boolCastDemo');
   const rows = boolCastPanel.getByTestId('result-rows');
@@ -43,7 +43,7 @@ test('the types page autoruns the boolean ⇄ i32 cast demo', async ({ page }) =
 });
 
 test('the types page autoruns the runtime text → number/boolean cast demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // The runtime text→scalar cast demo: '42'→42, '  -7 '→-7, '3.14159'→3.14, 'yes'→true.
   const textNumPanel = livePanel(page, 'textNumCastDemo');
   const rows = textNumPanel.getByTestId('result-rows');
@@ -54,7 +54,7 @@ test('the types page autoruns the runtime text → number/boolean cast demo', as
 });
 
 test('the types page autoruns the varchar(n) truncation demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // The varchar(n) demo: 'hello world'::varchar(5) truncates to 'hello', 'café'
   // fits varchar(4) by code point, 'ok' is within varchar(8), and the two-word
   // 'jedi'::character varying(3) truncates to 'jed'.
@@ -69,7 +69,7 @@ test('the types page autoruns the varchar(n) truncation demo', async ({ page }) 
 });
 
 test('the types page autoruns the timestamp precision / interval fields demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // timestamp(1) rounds .678 to .7; timestamp(0) rounds .5 up (after 2000); interval HOUR cuts to
   // 1 day 02:00:00; '2:03' MINUTE TO SECOND is 00:02:03; '5' DAY is 5 days; interval(2) rounds.
   const rows = livePanel(page, 'precisionDemo').getByTestId('result-rows');
@@ -82,14 +82,14 @@ test('the types page autoruns the timestamp precision / interval fields demo', a
 });
 
 test('the types page reports timestamp calendar-step overflow', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   await expect(livePanel(page, 'timestampStepOverflowDemo').getByTestId('error-code')).toHaveText(
     '22008'
   );
 });
 
 test('the types page autoruns the uuid ⇄ text/bytea cast demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // The uuid cast demo: text→uuid (canonical lowercase), uuid→text, uuid→bytea
   // (\x + 16 hex bytes), bytea→uuid (back to the canonical uuid).
   const uuidCastPanel = livePanel(page, 'uuidCastDemo');
@@ -99,7 +99,7 @@ test('the types page autoruns the uuid ⇄ text/bytea cast demo', async ({ page 
 });
 
 test('the types page autoruns the text concatenation demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // 'jed' || '-' || 'db', 'row ' || 42, 1.50 || ' USD' (the numeric keeps its scale).
   const rows = livePanel(page, 'concatDemo').getByTestId('result-rows');
   await expect(rows).toContainText('jed-db');
@@ -108,7 +108,7 @@ test('the types page autoruns the text concatenation demo', async ({ page }) => 
 });
 
 test('the types page autoruns the concat / format demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // concat skips the NULL and renders true as t; %L quotes the decimal; %I quotes the identifier.
   const rows = livePanel(page, 'formatDemo').getByTestId('result-rows');
   await expect(rows).toContainText('order 42 t');
@@ -118,7 +118,7 @@ test('the types page autoruns the concat / format demo', async ({ page }) => {
 });
 
 test('the types page autoruns the bytea input demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // hex input '\xdead beef' (whitespace between pairs) = \xdeadbeef, escape-format 'abc' =
   // \x616263, 'a\\b\101' = \x615c6241.
   const panel = livePanel(page, 'byteaInputDemo');
@@ -129,7 +129,7 @@ test('the types page autoruns the bytea input demo', async ({ page }) => {
 });
 
 test('the types page autoruns the bytea functions demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // The bytea demo: length 3, \x0102 || \xff = \x0102ff, SUBSTRING(… FROM 2 FOR 3) = \x020304,
   // get_byte(…, 2) = 255.
   const byteaPanel = livePanel(page, 'byteaDemo');
@@ -140,7 +140,7 @@ test('the types page autoruns the bytea functions demo', async ({ page }) => {
 });
 
 test('the types page autoruns the interval input forms demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // SQL-standard '1-2' = 1 year 2 mons and '1 1:00' = 1 day 01:00:00; both ISO 8601 spellings
   // = 1 year 2 mons 3 days 04:05:06.
   const panel = livePanel(page, 'intervalInputDemo');
@@ -150,7 +150,7 @@ test('the types page autoruns the interval input forms demo', async ({ page }) =
 });
 
 test('the types page autoruns the interval justify demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // justify_hours('50 hours') = 2 days 02:00:00, justify_days('45 days') = 1 mon 15 days,
   // justify_interval('1 mon -1 hour') = 29 days 23:00:00.
   const justifyPanel = livePanel(page, 'justifyDemo');
@@ -161,7 +161,7 @@ test('the types page autoruns the interval justify demo', async ({ page }) => {
 });
 
 test('the types page autoruns the age demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // age keeps years and months (43 years 9 mons 27 days; Jan 31 → Mar 1 = 1 mon 1 day) where plain
   // subtraction counts days (30 days).
   const panel = livePanel(page, 'ageDemo');
@@ -172,7 +172,7 @@ test('the types page autoruns the age demo', async ({ page }) => {
 });
 
 test('the types page autoruns the bytea position / overlay demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // position = 3, overlay(… PLACING \xaabb FROM 2) = \x01aabb0405, set_byte(…, 0, 255) = \xff0203,
   // get_bit(\x0102, 9) = 1, btrim(…, \x0001) = \x02.
   const panel = livePanel(page, 'byteaEditDemo');
@@ -183,7 +183,7 @@ test('the types page autoruns the bytea position / overlay demo', async ({ page 
 });
 
 test('the types page autoruns the bytea digest demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // md5 of text and of the same bytes agree; sha256('abc') is the FIPS 180-4 vector; sha512 is 64 bytes.
   const panel = livePanel(page, 'byteaHashDemo');
   const rows = panel.getByTestId('result-rows');
@@ -195,7 +195,7 @@ test('the types page autoruns the bytea digest demo', async ({ page }) => {
 });
 
 test('the types page autoruns the to_char demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // to_char over a timestamp (FM, TH, AM), an ISO week, an interval, grouping, PR, and RN.
   const panel = livePanel(page, 'toCharDemo');
   const rows = panel.getByTestId('result-rows');
@@ -208,7 +208,7 @@ test('the types page autoruns the to_char demo', async ({ page }) => {
 });
 
 test('the types page autoruns the template parsing demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // to_timestamp with and without an offset, to_date by day of year, to_number, and epoch seconds.
   const panel = livePanel(page, 'parseDemo');
   const rows = panel.getByTestId('result-rows');
@@ -219,7 +219,7 @@ test('the types page autoruns the template parsing demo', async ({ page }) => {
 });
 
 test('the types page autoruns the array cast demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // The array cast demo: array→text ({1,2,3}), text→i32[], i32[]→i64[] widening, and
   // numeric[]→i32[] element rounding (1.7→2, 2.2→2, -2.5→-3, half away from zero).
   const arrayCastPanel = livePanel(page, 'arrayCastDemo');
@@ -229,7 +229,7 @@ test('the types page autoruns the array cast demo', async ({ page }) => {
 });
 
 test('the types page updates json/jsonb through the shared assignment rule', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // The jsonb expression assignment plus jsonb → json assignment from the OLD row.
   const jsonUpdatePanel = livePanel(page, 'jsonUpdateDemo');
   const rows = jsonUpdatePanel.getByTestId('result-rows');
@@ -238,7 +238,7 @@ test('the types page updates json/jsonb through the shared assignment rule', asy
 });
 
 test('the types page autoruns the jsonb_set_lax demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // jsonb_set replaces a; jsonb_set_lax stores a JSON null by default, or deletes the key by name.
   const rows = livePanel(page, 'jsonSetLaxDemo').getByTestId('result-rows');
   await expect(rows).toContainText('{"a": 99, "b": 2}');
@@ -247,7 +247,7 @@ test('the types page autoruns the jsonb_set_lax demo', async ({ page }) => {
 });
 
 test('the types page autoruns the verbatim json accessor demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // json -> keeps the last duplicate's exact text; jsonb -> is canonical; #>> renders 1.50 verbatim.
   const rows = livePanel(page, 'jsonReadDemo').getByTestId('result-rows');
   await expect(rows).toContainText('{"b" :  1.50}');
@@ -255,7 +255,7 @@ test('the types page autoruns the verbatim json accessor demo', async ({ page })
 });
 
 test('the types page autoruns the row_to_json demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // A named composite keys by field name; an anonymous ROW by f1, f2, …; a timestamp is ISO 8601.
   const rows = livePanel(page, 'rowToJsonDemo').getByTestId('result-rows');
   await expect(rows).toContainText('{"street":"Main","zip":90210}');
@@ -264,7 +264,7 @@ test('the types page autoruns the row_to_json demo', async ({ page }) => {
 });
 
 test('the types page autoruns the whole-row demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // A derived table's alias is its whole row, keyed by its column names.
   const rows = livePanel(page, 'wholeRowDemo').getByTestId('result-rows');
   await expect(rows).toContainText('{"id":1,"name":"pen"}');
@@ -272,7 +272,7 @@ test('the types page autoruns the whole-row demo', async ({ page }) => {
 });
 
 test('the types page autoruns the to_json demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // A jsonb object sorts its keys; arrays nest; a date key and value take the ISO 8601 form.
   const rows = livePanel(page, 'toJsonDemo').getByTestId('result-rows');
   await expect(rows).toContainText('{"f1": "b", "f2": 1}');
@@ -282,7 +282,7 @@ test('the types page autoruns the to_json demo', async ({ page }) => {
 });
 
 test('the types page autoruns the jsonpath item method demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // .type() per element; .integer() unwraps the array and rounds 3.7 → 4; .keyvalue().key lists keys.
   const rows = livePanel(page, 'jsonpathMethodDemo').getByTestId('result-rows');
   await expect(rows).toContainText('["number", "string", "number"]');
@@ -291,7 +291,7 @@ test('the types page autoruns the jsonpath item method demo', async ({ page }) =
 });
 
 test('the types page autoruns the jsonpath arithmetic demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // 2.50 * 3 keeps the scale (7.50); the filter keeps even numbers; last - 1 is the second-to-last.
   const rows = livePanel(page, 'jsonpathArithDemo').getByTestId('result-rows');
   await expect(rows).toContainText('7.50');
@@ -300,7 +300,7 @@ test('the types page autoruns the jsonpath arithmetic demo', async ({ page }) =>
 });
 
 test('the types page autoruns the jsonpath variables demo', async ({ page }) => {
-  await page.goto('/docs/sql/types/');
+  await page.goto('./docs/sql/types/');
   // vars bound $min/$max; silent stopped at "x" keeping [1]; PASSING bound $qty (2.50 * 4).
   const rows = livePanel(page, 'jsonpathVarsDemo').getByTestId('result-rows');
   await expect(rows).toContainText('[8, 12]');
@@ -309,7 +309,7 @@ test('the types page autoruns the jsonpath variables demo', async ({ page }) => 
 });
 
 test('the tables page decodes Unicode-escape literals and names live', async ({ page }) => {
-  await page.goto('/docs/sql/tables/');
+  await page.goto('./docs/sql/tables/');
   // U&'caf\00e9' is café in a column named näme; the UESCAPE '!' form decodes to data.
   const panel = livePanel(page, 'unicodeEscapeDemo');
   await expect(panel.getByTestId('result-rows')).toContainText('café');
@@ -318,7 +318,7 @@ test('the tables page decodes Unicode-escape literals and names live', async ({ 
 });
 
 test('the tables page enforces a CHECK constraint live and resets to seed', async ({ page }) => {
-  await page.goto('/docs/sql/tables/');
+  await page.goto('./docs/sql/tables/');
   const panel = livePanel(page, 'accountDemo');
   await expect(panel.getByTestId('result-rows')).toContainText('Ada');
 
@@ -331,7 +331,7 @@ test('the tables page enforces a CHECK constraint live and resets to seed', asyn
 });
 
 test('the tables page enforces a FOREIGN KEY and cascades parent deletes', async ({ page }) => {
-  await page.goto('/docs/sql/tables/');
+  await page.goto('./docs/sql/tables/');
   const panel = livePanel(page, 'accountDemo');
   await expect(panel.getByTestId('result-rows')).toContainText('Ada');
 
@@ -353,7 +353,7 @@ test('the tables page enforces a FOREIGN KEY and cascades parent deletes', async
 });
 
 test('the tables page creates a table from a query with CREATE TABLE AS live', async ({ page }) => {
-  await page.goto('/docs/sql/tables/');
+  await page.goto('./docs/sql/tables/');
   const panel = livePanel(page, 'accountDemo');
   await expect(panel.getByTestId('result-rows')).toContainText('Ada');
 
@@ -378,7 +378,7 @@ test('the tables page creates a table from a query with CREATE TABLE AS live', a
 });
 
 test('the tables page upserts with ON CONFLICT DO UPDATE (excluded) live', async ({ page }) => {
-  await page.goto('/docs/sql/tables/');
+  await page.goto('./docs/sql/tables/');
   const panel = livePanel(page, 'accountDemo');
   await expect(panel.getByTestId('result-rows')).toContainText('Ada');
 
@@ -396,7 +396,7 @@ test('the tables page upserts with ON CONFLICT DO UPDATE (excluded) live', async
 });
 
 test('the tables page upserts with DO UPDATE SET col = DEFAULT live', async ({ page }) => {
-  await page.goto('/docs/sql/tables/');
+  await page.goto('./docs/sql/tables/');
   const panel = livePanel(page, 'accountDemo');
   await expect(panel.getByTestId('result-rows')).toContainText('Ada');
 
@@ -416,7 +416,7 @@ test('the tables page upserts with DO UPDATE SET col = DEFAULT live', async ({ p
 });
 
 test('the tables page upserts through an INSERT target alias live', async ({ page }) => {
-  await page.goto('/docs/sql/tables/');
+  await page.goto('./docs/sql/tables/');
   const panel = livePanel(page, 'accountDemo');
   await expect(panel.getByTestId('result-rows')).toContainText('Ada');
 
@@ -441,7 +441,7 @@ test('the tables page upserts through an INSERT target alias live', async ({ pag
 });
 
 test('the select page names a column with a bare label (no AS)', async ({ page }) => {
-  await page.goto('/docs/sql/select/');
+  await page.goto('./docs/sql/select/');
   // The grouped demo: `count(*) items` labels its column without AS
   // (spec/design/grammar.md §8) — office 2 / kitchen 2.
   const panel = livePanel(page, 'grouped');
@@ -450,7 +450,7 @@ test('the select page names a column with a bare label (no AS)', async ({ page }
 });
 
 test('the select page orders an aggregate input live', async ({ page }) => {
-  await page.goto('/docs/sql/select/');
+  await page.goto('./docs/sql/select/');
   // An in-aggregate ORDER BY (spec/design/aggregates.md §22): each category's names, priciest first.
   const panel = livePanel(page, 'aggOrder');
   await expect(panel.getByTestId('result-rows')).toContainText('["Mug", "Coffee"]');
@@ -463,7 +463,7 @@ test('the select page orders an aggregate input live', async ({ page }) => {
 });
 
 test('the select page keeps one row per group with DISTINCT ON live', async ({ page }) => {
-  await page.goto('/docs/sql/select/');
+  await page.goto('./docs/sql/select/');
   // DISTINCT ON (spec/design/grammar.md §11.1): each category's cheapest product.
   const panel = livePanel(page, 'distinctOn');
   await expect(panel.getByTestId('result-rows')).toContainText('Coffee');
@@ -480,7 +480,7 @@ test('the select page keeps one row per group with DISTINCT ON live', async ({ p
 });
 
 test('the select page inserts the rows of a set operation live', async ({ page }) => {
-  await page.goto('/docs/sql/select/');
+  await page.goto('./docs/sql/select/');
   // A set operation as an INSERT source (spec/design/grammar.md §24): the two office products are
   // copied as refills and a literal kitchen row is appended, all through one UNION ALL.
   const panel = livePanel(page, 'setOps');
@@ -500,7 +500,7 @@ test('the select page inserts the rows of a set operation live', async ({ page }
 });
 
 test('the select page runs a VALUES query as a set-operation operand live', async ({ page }) => {
-  await page.goto('/docs/sql/select/');
+  await page.goto('./docs/sql/select/');
   // A VALUES list as a query (spec/design/grammar.md §25): two literal rows appended to the office
   // products with UNION ALL, ordered by price.
   const panel = livePanel(page, 'valuesQuery');
@@ -515,7 +515,7 @@ test('the select page runs a VALUES query as a set-operation operand live', asyn
 });
 
 test('the select page runs the data-modifying CTE demo live', async ({ page }) => {
-  await page.goto('/docs/sql/select/');
+  await page.goto('./docs/sql/select/');
   // The data-modifying CTE demo (spec/design/writable-cte.md): an
   // UPDATE ... RETURNING fed to a SELECT — kitchen prices cut 10%: Coffee 9.99 → 8.99, Mug 12.50 → 11.25.
   const panel = livePanel(page, 'dataModifying');
@@ -524,7 +524,7 @@ test('the select page runs the data-modifying CTE demo live', async ({ page }) =
 });
 
 test('the select page runs the WITH RECURSIVE series demo live', async ({ page }) => {
-  await page.goto('/docs/sql/select/');
+  await page.goto('./docs/sql/select/');
   // The WITH RECURSIVE demo: the recursive series 1..5 (spec/design/recursive-cte.md).
   const panel = livePanel(page, 'recursive');
   await expect(panel.getByTestId('result-rows')).toContainText('1');
@@ -532,7 +532,7 @@ test('the select page runs the WITH RECURSIVE series demo live', async ({ page }
 });
 
 test('the select page runs the SEARCH / CYCLE demo live', async ({ page }) => {
-  await page.goto('/docs/sql/select/');
+  await page.goto('./docs/sql/select/');
   // SEARCH DEPTH FIRST + CYCLE (spec/design/recursive-cte.md §9): the walk 1 → 2 → 3 revisits 1,
   // which is flagged as a cycle and not expanded; 3 → 4 is the other branch.
   const panel = livePanel(page, 'searchCycle');
@@ -541,7 +541,7 @@ test('the select page runs the SEARCH / CYCLE demo live', async ({ page }) => {
 });
 
 test('the select page runs the nested WITH demo live', async ({ page }) => {
-  await page.goto('/docs/sql/select/');
+  await page.goto('./docs/sql/select/');
   // The nested-WITH demo (spec/design/cte.md §7): a derived table whose body
   // is `WITH cheap AS (… min(price) per category …) SELECT … WHERE cheapest <= 10` — office (1.50)
   // and kitchen (9.99).
@@ -553,7 +553,7 @@ test('the select page runs the nested WITH demo live', async ({ page }) => {
 });
 
 test('the select page runs the LATERAL top-N-per-group demo live', async ({ page }) => {
-  await page.goto('/docs/sql/select/');
+  await page.goto('./docs/sql/select/');
   // The CROSS JOIN LATERAL demo: the priciest product of each category —
   // kitchen → Mug (12.50), office → Notebook (4.00); the dependent subquery re-runs per category.
   const panel = livePanel(page, 'lateral');
@@ -562,7 +562,7 @@ test('the select page runs the LATERAL top-N-per-group demo live', async ({ page
 });
 
 test('the select page runs the parenthesized-join demo live', async ({ page }) => {
-  await page.goto('/docs/sql/select/');
+  await page.goto('./docs/sql/select/');
   // The parenthesized-join demo (spec/design/grammar.md §15): customer LEFT JOIN
   // (orders JOIN product) keeps Linus, who has no orders, with a NULL product.
   const panel = livePanel(page, 'parenthesized');
@@ -571,7 +571,7 @@ test('the select page runs the parenthesized-join demo live', async ({ page }) =
 });
 
 test('the select page runs the CASE/COALESCE conditional demo live', async ({ page }) => {
-  await page.goto('/docs/sql/select/');
+  await page.goto('./docs/sql/select/');
   // The conditional-expressions demo: CASE tiers each product by price
   // (Coffee/Mug → premium, Notebook/Pen → basic) and coalesce substitutes Coffee's nickname.
   const panel = livePanel(page, 'conditional');
@@ -583,14 +583,14 @@ test('the select page runs the CASE/COALESCE conditional demo live', async ({ pa
 test('the select page runs the array containment operators live (@> / <@ / &&)', async ({
   page
 }) => {
-  await page.goto('/docs/sql/select/');
+  await page.goto('./docs/sql/select/');
   // The @>/<@/&& demo; every column is true (the array sets contain/overlap).
   const panel = livePanel(page, 'containmentExample');
   await expect(panel.getByTestId('result-rows')).toContainText('true');
 });
 
 test('the select page runs the ANY/ALL quantified comparisons live', async ({ page }) => {
-  await page.goto('/docs/sql/select/');
+  await page.goto('./docs/sql/select/');
   // The = ANY / > ALL demo: any_match true, all_greater true, no_match false.
   const panel = livePanel(page, 'quantifiedExample');
   await expect(panel.getByTestId('result-rows')).toContainText('true');
@@ -598,7 +598,7 @@ test('the select page runs the ANY/ALL quantified comparisons live', async ({ pa
 });
 
 test('the select page runs the VARIADIC num_nulls demo live', async ({ page }) => {
-  await page.goto('/docs/sql/select/');
+  await page.goto('./docs/sql/select/');
   // The num_nulls demo: spread 1, variadic 1, non_nulls 2 (both forms agree).
   const panel = livePanel(page, 'variadicExample');
   await expect(panel.locator('thead')).toContainText('non_nulls');
@@ -609,7 +609,7 @@ test('the select page runs the VARIADIC num_nulls demo live', async ({ page }) =
 test('the select page runs the array-of-composite demo live (field access into array elements)', async ({
   page
 }) => {
-  await page.goto('/docs/sql/select/');
+  await page.goto('./docs/sql/select/');
   // The addr[] demo: row 1's first element renders (Main,90210), its street
   // is Main and zip 90210 — array-of-composite construction, subscript, and field access (§12 AC1).
   const panel = livePanel(page, 'arrayCompositeExample');
@@ -621,7 +621,7 @@ test('the select page runs the array-of-composite demo live (field access into a
 test('the select page runs the composite-with-array-field demo live (field access + subscript)', async ({
   page
 }) => {
-  await page.goto('/docs/sql/select/');
+  await page.goto('./docs/sql/select/');
   // The poly(name, pts i32[]) demo: row 1 renders its array field
   // {10,20,30}, (p).pts reads the whole array, and (p).pts[1] reads the first element 10 —
   // a composite type with an array-typed field (array.md §12, the mirror of array-of-composite).
@@ -631,7 +631,7 @@ test('the select page runs the composite-with-array-field demo live (field acces
 });
 
 test('the select page runs the date demo live', async ({ page }) => {
-  await page.goto('/docs/sql/select/');
+  await page.goto('./docs/sql/select/');
   // The date demo: WHERE on_day < '2024-03-01' ORDER BY on_day keeps
   // only the two early dates, chronologically — review (2023-11-02) then launch (2024-01-15); the
   // 2024-06-15 and infinity rows are filtered out (spec/design/date.md).
@@ -643,7 +643,7 @@ test('the select page runs the date demo live', async ({ page }) => {
 });
 
 test('the indexes page runs an ordered-index lookup live', async ({ page }) => {
-  await page.goto('/docs/sql/indexes/');
+  await page.goto('./docs/sql/indexes/');
   // The ordered city_region index: WHERE region = 1 ORDER BY name →
   // Kyoto, Osaka, Tokyo (the index narrows the scan; the result set is unchanged).
   const panel = livePanel(page, 'orderedQuery');
@@ -652,7 +652,7 @@ test('the indexes page runs an ordered-index lookup live', async ({ page }) => {
 });
 
 test('the indexes page runs the expression-index lookup live', async ({ page }) => {
-  await page.goto('/docs/sql/indexes/');
+  await page.goto('./docs/sql/indexes/');
   // The UNIQUE index on lower(email): WHERE lower(email) = 'ada@example.com'
   // seeks the expression index to Ada's row (id 1); grace's row (id 2) is excluded.
   const panel = livePanel(page, 'exprQuery');
@@ -661,7 +661,7 @@ test('the indexes page runs the expression-index lookup live', async ({ page }) 
 });
 
 test('the indexes page runs the partial-index lookup live', async ({ page }) => {
-  await page.goto('/docs/sql/indexes/');
+  await page.goto('./docs/sql/indexes/');
   // The partial orders_active index: WHERE status = 'active' AND customer = 10 →
   // orders 1 and 4; the shipped order 2 and the cancelled order 5 are excluded.
   const panel = livePanel(page, 'partialQuery');
@@ -671,7 +671,7 @@ test('the indexes page runs the partial-index lookup live', async ({ page }) => 
 });
 
 test('the indexes page runs the full partial-index walk live', async ({ page }) => {
-  await page.goto('/docs/sql/indexes/');
+  await page.goto('./docs/sql/indexes/');
   // The soft-delete task_live index walked in priority order: the two live tasks with the lowest
   // priority are plan (1) and ship (2); review (3) is past the LIMIT and triage is deleted.
   const panel = livePanel(page, 'softQuery');
@@ -682,7 +682,7 @@ test('the indexes page runs the full partial-index walk live', async ({ page }) 
 });
 
 test('the indexes page runs the DESC index leaderboard live', async ({ page }) => {
-  await page.goto('/docs/sql/indexes/');
+  await page.goto('./docs/sql/indexes/');
   // ORDER BY points DESC walks score_points (points DESC): the NULL score sorts first, then 98, 90.
   const panel = livePanel(page, 'sortQuery');
   await expect(panel.getByTestId('result-rows')).toContainText('grace');
@@ -692,7 +692,7 @@ test('the indexes page runs the DESC index leaderboard live', async ({ page }) =
 });
 
 test('the indexes page runs the GIN @> contains scan live', async ({ page }) => {
-  await page.goto('/docs/sql/indexes/');
+  await page.goto('./docs/sql/indexes/');
   // The GIN containment scan: tags @> ARRAY[10,20] → intro and gin (both hold
   // {10,20}); arrays/storage/empty do not — the posting-list intersection of the index.
   const panel = livePanel(page, 'containsQuery');
@@ -702,7 +702,7 @@ test('the indexes page runs the GIN @> contains scan live', async ({ page }) => 
 });
 
 test('the indexes page runs the GIN && overlaps scan live', async ({ page }) => {
-  await page.goto('/docs/sql/indexes/');
+  await page.goto('./docs/sql/indexes/');
   // The GIN overlap scan: tags && ARRAY[30,40] → intro (30), arrays (40),
   // storage (40) — the posting-list union; empty shares nothing and is excluded.
   const panel = livePanel(page, 'overlapsQuery');
@@ -711,7 +711,7 @@ test('the indexes page runs the GIN && overlaps scan live', async ({ page }) => 
 });
 
 test('the indexes page runs the GIN = ANY membership scan live', async ({ page }) => {
-  await page.goto('/docs/sql/indexes/');
+  await page.goto('./docs/sql/indexes/');
   // The GIN membership scan: 20 = ANY(tags) → intro, arrays, gin (all hold 20)
   // — the single term's posting list; storage ({40,50}) and empty do not and are excluded.
   const panel = livePanel(page, 'memberQuery');
@@ -721,7 +721,7 @@ test('the indexes page runs the GIN = ANY membership scan live', async ({ page }
 });
 
 test('the indexes page runs the GIN = array-equality scan live', async ({ page }) => {
-  await page.goto('/docs/sql/indexes/');
+  await page.goto('./docs/sql/indexes/');
   // The GIN equality scan: tags = ARRAY[10,20] → gin ONLY (its tags ARE {10,20});
   // intro ({10,20,30}) merely contains them, so the residual = excludes it — stricter than @>.
   const panel = livePanel(page, 'equalQuery');
@@ -730,7 +730,7 @@ test('the indexes page runs the GIN = array-equality scan live', async ({ page }
 });
 
 test('the indexes page runs the jsonb GIN @> and ? scans live', async ({ page }) => {
-  await page.goto('/docs/sql/indexes/');
+  await page.goto('./docs/sql/indexes/');
   // jsonb_ops containment: only event 3 is a login from ios (event 4's device is android).
   const contains = livePanel(page, 'jsonbContainsQuery');
   await expect(contains.getByTestId('result-rows')).toContainText('3');
@@ -743,7 +743,7 @@ test('the indexes page runs the jsonb GIN @> and ? scans live', async ({ page })
 });
 
 test('the indexes page runs REINDEX live without changing the answer', async ({ page }) => {
-  await page.goto('/docs/sql/indexes/');
+  await page.goto('./docs/sql/indexes/');
   // REINDEX TABLE city rebuilds city_region in place; the lookup after it still answers
   // Lyon, Paris (region 2) and excludes the region-1 cities (indexes.md §10).
   const panel = livePanel(page, 'reindexQuery');
@@ -756,7 +756,7 @@ test('the indexes page runs REINDEX live without changing the answer', async ({ 
 test('the views page reads views live and rejects bad writes and breaking drops', async ({
   page
 }) => {
-  await page.goto('/docs/sql/views/');
+  await page.goto('./docs/sql/views/');
   // active_staff JOIN dept_payroll (spec/design/views.md §4): Ada in eng with the eng
   // payroll 19400.00; Ken is inactive, so the view hides him.
   const panel = livePanel(page, 'query');
@@ -776,7 +776,7 @@ test('the views page reads views live and rejects bad writes and breaking drops'
 });
 
 test('the views page plans a view like its derived table', async ({ page }) => {
-  await page.goto('/docs/sql/views/');
+  await page.goto('./docs/sql/views/');
   // EXPLAIN over the view: a Subquery node whose outer id = 2 became a PK lookup.
   const panel = livePanel(page, 'explain');
   await expect(panel.getByTestId('result-rows')).toContainText('Subquery active_staff');
@@ -784,7 +784,7 @@ test('the views page plans a view like its derived table', async ({ page }) => {
 });
 
 test('the views page freezes * at CREATE VIEW', async ({ page }) => {
-  await page.goto('/docs/sql/views/');
+  await page.goto('./docs/sql/views/');
   // SELECT * FROM all_notes after note gained a pinned column: the view still has
   // only id and body (views.md §5).
   const panel = livePanel(page, 'starQuery');
@@ -794,7 +794,7 @@ test('the views page freezes * at CREATE VIEW', async ({ page }) => {
 });
 
 test('the views page rewrites view definitions on RENAME', async ({ page }) => {
-  await page.goto('/docs/sql/views/');
+  await page.goto('./docs/sql/views/');
   // RENAME COLUMN + RENAME TO, then jed_views: the stored text now reads the renamed
   // table under its old label with a column alias list keeping the old column name (views.md §7).
   const panel = livePanel(page, 'rename');
@@ -803,7 +803,7 @@ test('the views page rewrites view definitions on RENAME', async ({ page }) => {
 });
 
 test('the views page replaces a view and refuses dropping its columns', async ({ page }) => {
-  await page.goto('/docs/sql/views/');
+  await page.goto('./docs/sql/views/');
   // CREATE OR REPLACE VIEW appending salary and narrowing to eng (views.md §1.2).
   const panel = livePanel(page, 'replace');
   await expect(panel.getByTestId('result-rows')).toContainText('9900.00');
@@ -818,7 +818,7 @@ test('the views page replaces a view and refuses dropping its columns', async ({
 });
 
 test('the views page renames a view and rewrites its dependents', async ({ page }) => {
-  await page.goto('/docs/sql/views/');
+  await page.goto('./docs/sql/views/');
   // ALTER VIEW RENAME TO + RENAME COLUMN, then jed_views: the dependent view reads the
   // renamed view under its old label, with a column alias list keeping the old column name (§7.1).
   const panel = livePanel(page, 'renameView');
@@ -827,7 +827,7 @@ test('the views page renames a view and rewrites its dependents', async ({ page 
 });
 
 test('the views page writes through an updatable view', async ({ page }) => {
-  await page.goto('/docs/sql/views/');
+  await page.goto('./docs/sql/views/');
   // UPDATE / INSERT / DELETE through open_tasks, then the table (views.md §15): task 1
   // renamed, task 4 inserted with done defaulted to false, Ken's open task 3 deleted, and the done
   // task 2 untouched.
@@ -845,7 +845,7 @@ test('the views page writes through an updatable view', async ({ page }) => {
 });
 
 test('the views page upserts through an updatable view', async ({ page }) => {
-  await page.goto('/docs/sql/views/');
+  await page.goto('./docs/sql/views/');
   // INSERT … ON CONFLICT through open_tasks (views.md §15.7): the done task 2, which the view hides,
   // is updated anyway, and task 5 is inserted.
   const panel = livePanel(page, 'upsertQuery');
@@ -862,7 +862,7 @@ test('the views page upserts through an updatable view', async ({ page }) => {
 });
 
 test('the views page enforces WITH CHECK OPTION', async ({ page }) => {
-  await page.goto('/docs/sql/views/');
+  await page.goto('./docs/sql/views/');
   // INSERT through ada_tasks of a row the view shows succeeds (views.md §15.6).
   const panel = livePanel(page, 'checkQuery');
   await expect(panel.getByTestId('result-rows')).toContainText('blog post');
@@ -878,7 +878,7 @@ test('the views page enforces WITH CHECK OPTION', async ({ page }) => {
 });
 
 test('the queries API page wires up the idiomatic example for each language', async ({ page }) => {
-  await page.goto('/docs/api/queries/');
+  await page.goto('./docs/api/queries/');
   // Default (Rust): the rusqlite-style run/query_row methods.
   await expect(page.getByTestId('code-rust')).toBeVisible();
   await expect(page.getByTestId('code-rust')).toContainText('db.run');
@@ -898,7 +898,7 @@ test('the queries API page wires up the idiomatic example for each language', as
 test('the host-functions API page wires up the idiomatic example for each language', async ({
   page
 }) => {
-  await page.goto('/docs/api/host-functions/');
+  await page.goto('./docs/api/host-functions/');
   // Default (Rust): build an Environment and register a HostFunction.
   await expect(page.getByTestId('code-rust')).toBeVisible();
   await expect(page.getByTestId('code-rust')).toContainText('Environment::builder');
@@ -916,24 +916,32 @@ test('the host-functions API page wires up the idiomatic example for each langua
 });
 
 test('the reference pages are generated from the spec', async ({ page }) => {
-  await page.goto('/docs/reference/errors/');
+  await page.goto('./docs/reference/errors/');
   // 54P01 (cost limit) and 23514 (check violation) come straight from spec/errors/registry.toml.
   await expect(page.getByRole('cell', { name: '54P01' })).toBeVisible();
   await expect(page.getByRole('cell', { name: '23514', exact: true })).toBeVisible();
 });
 
 test('docs search (Pagefind) returns results from the built index', async ({ page }) => {
-  await page.goto('/docs/');
+  await page.goto('./docs/');
   const input = page.getByTestId('search-input');
   await expect(input).toBeEnabled();
   await input.fill('decimal');
   // Pagefind loads index shards on demand; results appear asynchronously.
   await expect(page.getByTestId('search-results')).toBeVisible();
   await expect(page.getByTestId('search-results')).toContainText('Types');
+  await page
+    .getByTestId('search-results')
+    .getByRole('link')
+    .filter({ hasText: 'Types' })
+    .first()
+    .click();
+  await expect(page).toHaveURL(/\/docs\/(?:sql|reference)\/types\//);
+  await expect(page.locator('article h1')).toBeVisible();
 });
 
 test('the explain page renders a live plan with the PK-bound access path', async ({ page }) => {
-  await page.goto('/docs/sql/explain/');
+  await page.goto('./docs/sql/explain/');
   // EXPLAIN SELECT ... WHERE id = 3: a PK point lookup under the residual Filter.
   const panel = livePanel(page, 'pkBound');
   await expect(panel.getByTestId('result-rows')).toContainText('Scan city');
@@ -944,14 +952,14 @@ test('the explain page renders a live plan with the PK-bound access path', async
 });
 
 test('the explain page shows bounded top-k on a blocking sort', async ({ page }) => {
-  await page.goto('/docs/sql/explain/');
+  await page.goto('./docs/sql/explain/');
   const panel = livePanel(page, 'fullScan');
   await expect(panel.getByTestId('result-rows')).toContainText('Sort');
   await expect(panel.getByTestId('result-rows')).toContainText('keys=1, top-k=2');
 });
 
 test('the explain page shows the OR / IN-list interval-set access path', async ({ page }) => {
-  await page.goto('/docs/sql/explain/');
+  await page.goto('./docs/sql/explain/');
   // EXPLAIN SELECT ... WHERE id IN (1, 3, 5): a union of point probes, labelled
   // "PK interval set" (cost.md §3 "OR / IN-list").
   const panel = livePanel(page, 'pointSet');
@@ -960,7 +968,7 @@ test('the explain page shows the OR / IN-list interval-set access path', async (
 });
 
 test('the explain page shows key = ANY(array) as an interval set', async ({ page }) => {
-  await page.goto('/docs/sql/explain/');
+  await page.goto('./docs/sql/explain/');
   // EXPLAIN SELECT ... WHERE id = ANY(ARRAY[1, 3, 5]): one array disjunct whose elements are the
   // point probes (cost.md §3 "OR / IN-list").
   const panel = livePanel(page, 'anyPointSet');
@@ -971,7 +979,7 @@ test('the explain page shows key = ANY(array) as an interval set', async ({ page
 });
 
 test('the explain page shows a composite-key tuple set', async ({ page }) => {
-  await page.goto('/docs/sql/explain/');
+  await page.goto('./docs/sql/explain/');
   // EXPLAIN ... WHERE store = 3 AND sku = ANY(ARRAY[7, 42, 99]): one tuple probe per (store, sku)
   // pair (cost.md §3 "Composite primary keys").
   const panel = livePanel(page, 'tupleSet');
@@ -982,7 +990,7 @@ test('the explain page shows a composite-key tuple set', async ({ page }) => {
 });
 
 test('the explain page shows a multi-column index tuple set', async ({ page }) => {
-  await page.goto('/docs/sql/explain/');
+  await page.goto('./docs/sql/explain/');
   // EXPLAIN ... WHERE store = 3 AND sku = ANY(ARRAY[7, 42, 99]) over an index on (store, sku): one
   // index probe per (store, sku) pair (cost.md §3 "Multi-column secondary indexes").
   const panel = livePanel(page, 'indexTupleSet');
@@ -993,7 +1001,7 @@ test('the explain page shows a multi-column index tuple set', async ({ page }) =
 });
 
 test('the explain page shows the index-nested-loop access path on a join', async ({ page }) => {
-  await page.goto('/docs/sql/explain/');
+  await page.goto('./docs/sql/explain/');
   // The demo authors city first, but P7 physically drives trip and makes city the per-outer-row
   // PK seek, labelled Index-nested-loop.
   const panel = livePanel(page, 'indexNestedLoop');
@@ -1004,7 +1012,7 @@ test('the explain page shows the index-nested-loop access path on a join', async
 });
 
 test('the explain page shows the deterministic hash-join operator', async ({ page }) => {
-  await page.goto('/docs/sql/explain/');
+  await page.goto('./docs/sql/explain/');
   // An equality join between two columns with no usable index.
   const panel = livePanel(page, 'hashJoin');
   await expect(panel.getByTestId('result-rows')).toContainText('Hash Join');
@@ -1012,7 +1020,7 @@ test('the explain page shows the deterministic hash-join operator', async ({ pag
 });
 
 test('the explain page shows a bounded N-way physical join tree', async ({ page }) => {
-  await page.goto('/docs/sql/explain/');
+  await page.goto('./docs/sql/explain/');
   const panel = livePanel(page, 'nwayJoin');
   await expect(panel.getByTestId('result-rows')).toContainText('Scan city');
   await expect(panel.getByTestId('result-rows')).toContainText('Scan trip');
@@ -1020,7 +1028,7 @@ test('the explain page shows a bounded N-way physical join tree', async ({ page 
 });
 
 test('the explain page shows a WHERE conjunct pushed into its scan', async ({ page }) => {
-  await page.goto('/docs/sql/explain/');
+  await page.goto('./docs/sql/explain/');
   // a join whose single-table conjuncts run inside each table's scan (planner.md §3.2).
   const panel = livePanel(page, 'pushdown');
   await expect(panel.getByTestId('result-rows')).toContainText('filter:conjuncts=1');
@@ -1028,14 +1036,14 @@ test('the explain page shows a WHERE conjunct pushed into its scan', async ({ pa
 });
 
 test('the explain page shows a proven WHERE contradiction', async ({ page }) => {
-  await page.goto('/docs/sql/explain/');
+  await page.goto('./docs/sql/explain/');
   // `zone > 5 AND zone < 3`: nothing is read (planner.md §3.1).
   const panel = livePanel(page, 'contradiction');
   await expect(panel.getByTestId('result-rows')).toContainText('conjuncts=2; contradiction');
 });
 
 test('the explain page shows a WHERE conjunct moved into a FROM subquery', async ({ page }) => {
-  await page.goto('/docs/sql/explain/');
+  await page.goto('./docs/sql/explain/');
   // The subquery's body plans the moved `id = 3` as a PK lookup (planner.md §3.2).
   const panel = livePanel(page, 'derivedPushdown');
   await expect(panel.getByTestId('result-rows')).toContainText('Subquery v');
@@ -1043,7 +1051,7 @@ test('the explain page shows a WHERE conjunct moved into a FROM subquery', async
 });
 
 test('the explain page shows a WHERE conjunct moved below a grouped subquery', async ({ page }) => {
-  await page.goto('/docs/sql/explain/');
+  await page.goto('./docs/sql/explain/');
   // The grouping-column `region = 2` bounds city_region under the Aggregate (§3.2).
   const panel = livePanel(page, 'groupedPushdown');
   await expect(panel.getByTestId('result-rows')).toContainText('Aggregate');
@@ -1051,7 +1059,7 @@ test('the explain page shows a WHERE conjunct moved below a grouped subquery', a
 });
 
 test('the explain page shows a WHERE conjunct moved below a window', async ({ page }) => {
-  await page.goto('/docs/sql/explain/');
+  await page.goto('./docs/sql/explain/');
   // `region = 2` is every window's PARTITION BY key, so it bounds city_region below the Window (§3.2).
   const panel = livePanel(page, 'windowPushdown');
   await expect(panel.getByTestId('result-rows')).toContainText('Window');
@@ -1059,7 +1067,7 @@ test('the explain page shows a WHERE conjunct moved below a window', async ({ pa
 });
 
 test('the explain page shows a WHERE conjunct moved into an inlined CTE', async ({ page }) => {
-  await page.goto('/docs/sql/explain/');
+  await page.goto('./docs/sql/explain/');
   // The single-reference CTE is planned at its CTE Scan, where `id = 3` is a PK lookup (§3.4).
   const panel = livePanel(page, 'ctePushdown');
   await expect(panel.getByTestId('result-rows')).toContainText('CTE Scan c');
@@ -1069,7 +1077,7 @@ test('the explain page shows a WHERE conjunct moved into an inlined CTE', async 
 test('the explain page shows a WHERE conjunct moved into every set-operation branch', async ({
   page
 }) => {
-  await page.goto('/docs/sql/explain/');
+  await page.goto('./docs/sql/explain/');
   // `x.id = 3` seeks city's PK in one UNION branch and filters trip in the other.
   const panel = livePanel(page, 'setopPushdown');
   await expect(panel.getByTestId('result-rows')).toContainText('Union');
@@ -1078,7 +1086,7 @@ test('the explain page shows a WHERE conjunct moved into every set-operation bra
 });
 
 test('the explain page shows an ON conjunct pushed to the NULL-extended side', async ({ page }) => {
-  await page.goto('/docs/sql/explain/');
+  await page.goto('./docs/sql/explain/');
   // `t.id > 5` runs in trip's scan; the LEFT join keeps one ON conjunct (§3.3).
   const panel = livePanel(page, 'onPushdown');
   await expect(panel.getByTestId('result-rows')).toContainText('left; on:conjuncts=1');
@@ -1086,7 +1094,7 @@ test('the explain page shows an ON conjunct pushed to the NULL-extended side', a
 });
 
 test('the explain page runs EXPLAIN ANALYZE with a deterministic cost', async ({ page }) => {
-  await page.goto('/docs/sql/explain/');
+  await page.goto('./docs/sql/explain/');
   // EXPLAIN ANALYZE: the Analyze root reports the real accrued cost + row count.
   const panel = livePanel(page, 'analyze');
   await expect(panel.getByTestId('result-rows')).toContainText('Analyze');
@@ -1094,7 +1102,7 @@ test('the explain page runs EXPLAIN ANALYZE with a deterministic cost', async ({
 });
 
 test('the pattern-matching page autoruns the regexp_matches and split demos', async ({ page }) => {
-  await page.goto('/docs/sql/pattern-matching/');
+  await page.goto('./docs/sql/pattern-matching/');
   // regexp_matches with `g`: one row per key=value pair.
   const matchesRows = livePanel(page, 'regexpMatches').getByTestId('result-rows');
   await expect(matchesRows).toContainText('port');

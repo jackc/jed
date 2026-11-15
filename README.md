@@ -21,7 +21,7 @@ nothing is sent to a server) and the docs are at **<https://jackc.github.io/jed/
 
 ## Use it from Go
 
-The Go core is pure Go — no cgo, no FFI — so it installs with no native toolchain:
+Go 1.26 or later is required. The Go core is pure Go — no cgo, no FFI — so it installs with no native toolchain:
 
 ```sh
 go get github.com/jackc/jed/impl/go@latest
@@ -31,6 +31,7 @@ go get github.com/jackc/jed/impl/go@latest
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 
@@ -38,31 +39,37 @@ import (
 )
 
 func main() {
-	// A path creates a single-file database on disk; jed.NewDatabase() is a transient
-	// in-memory one. Writes accumulate until an explicit Commit (Close discards uncommitted
-	// changes).
-	db, err := jed.Create("people.jed", jed.DatabaseOptions{PageSize: jed.DefaultPageSize})
+	// Open a database. CreateDatabase/OpenDatabase return a *Database — the handle you run SQL
+	// through. A path gives a single-file database on disk; jed.CreateDatabase(jed.CreateOptions{}) (no path) is a transient
+	// in-memory one. Each bare Exec autocommits durably (it runs on a fresh session); for a
+	// multi-statement transaction use db.Update(ctx, ...) or mint a Session.
+	db, err := jed.CreateDatabase(jed.CreateOptions{Path: "people.jed"})
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
-	if _, err := db.ExecuteSQL("CREATE TABLE person (id i32 PRIMARY KEY, name text NOT NULL)", nil); err != nil {
-		log.Fatal(err)
-	}
-	if _, err := db.ExecuteSQL("INSERT INTO person VALUES (1, 'Ada'), (2, 'Grace')", nil); err != nil {
-		log.Fatal(err)
-	}
-	if err := db.Commit(); err != nil {
-		log.Fatal(err)
-	}
+	ctx := context.Background()
+	mustExec(db, "CREATE TABLE person (id i32 PRIMARY KEY, name text NOT NULL)")
+	mustExec(db, "INSERT INTO person VALUES (1, 'Ada'), (2, 'Grace')")
 
-	rows, err := db.QuerySQL("SELECT name FROM person ORDER BY id", nil)
+	// Query returns a row cursor; Exec is for statements that produce no rows.
+	rows, err := db.Query(ctx, "SELECT name FROM person ORDER BY id")
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer rows.Close()
 	for rows.Next() {
 		fmt.Println(rows.Row()[0].Render())
+	}
+	if err := rows.Err(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func mustExec(db *jed.Database, sql string) {
+	if _, err := db.Exec(context.Background(), sql); err != nil {
+		log.Fatal(err)
 	}
 }
 ```
@@ -79,8 +86,9 @@ are **not yet published** to their registries.)
 - **Resource controls for untrusted SQL** ([CLAUDE.md §13](CLAUDE.md)). Memory-safe cores
   and pure built-ins prevent memory corruption and host access. Deterministic cost budgets,
   parser limits, a finite scalar-allocation allowance, and an opt-in live query-memory budget
-  over row buffers and operator state bound their documented surfaces. Whole-query memory
-  admission (pending writes, caches) remains in progress; see [memory coverage](spec/design/memory.md).
+  over row buffers, operator state, and pending writes bound their documented surfaces. Committed
+  storage and file-page caches have separate limits. These are guardrails, not a process-memory
+  cap; see [memory coverage](spec/design/memory.md).
 - **No reference implementation.** jed is implemented natively in multiple languages **in
   lockstep**, so every spec ambiguity becomes a failing cross-core test the day it is
   written. The honesty mechanism is divergence under a shared contract, not implementation

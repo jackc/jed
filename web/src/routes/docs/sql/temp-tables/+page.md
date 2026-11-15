@@ -117,8 +117,9 @@ private scratch file in the operating system's temp directory (removed when the 
 keeps only a `temp_buffers`-sized page cache in memory. Spilling never changes results, costs, or
 where `54P03` fires. In-memory and browser (OPFS) databases have no scratch directory, so their temp
 tables stay in memory, bounded by `max_temp_storage_bytes` alone. Configure the
-[execution and scalar limits](../../api/resource-limits/) separately; transient query memory
-and pending writes still need broader memory admission.
+[execution, scalar, and query-memory limits](../../api/resource-limits/) separately. The query-memory
+account covers retained rows, operator state, and pending main/attachment writes; these logical
+budgets do not cap all process memory.
 
 ## Indexes
 

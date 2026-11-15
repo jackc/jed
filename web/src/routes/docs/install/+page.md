@@ -21,11 +21,14 @@ browser's origin-private file system (OPFS) — so nothing is sent to a server. 
 
 ## Embed it in Go
 
-The Go core is **pure Go** — no cgo, no FFI — so it installs with no native toolchain:
+**Go 1.26 or later is required.** The Go core is **pure Go** — no cgo, no FFI — so it installs with no native toolchain:
 
 ```sh
-go get github.com/jackc/jed/impl/go@latest
+go get github.com/jackc/jed/impl/go@v0.3.0
 ```
+
+Upgrading from v0.2.0 requires recreating databases and updating API calls; read the
+[release & upgrade notes](../releases/) first.
 
 Because the import path's last element is `go`, Go imports the package under an alias (`jed`):
 

@@ -47,7 +47,7 @@ A separate **`allow_ddl`** flag (default on) gates all `CREATE` / `DROP` / `ALTE
   needs only `INSERT`; `INSERT … ON CONFLICT (id) DO UPDATE …` needs `INSERT`, `UPDATE`, and
   `SELECT`.
 - **Views** are granted like tables. Reading a [view](../../sql/views/) needs `SELECT` on the view
-  only, not on the tables its query reads. `CREATE VIEW` needs `allow_ddl` plus `SELECT` on every
+  only by default; a `security_invoker` view also checks the relations its query reads. `CREATE VIEW` needs `allow_ddl` plus `SELECT` on every
   table and view its query reads, so a session cannot create a view over data it could not read.
 - **`EXECUTE`** on every named function it calls, wherever the call appears — including an
   aggregate's `FILTER`, a `WITHIN GROUP` or window `OVER (…)` clause, and `ORDER BY` — and on the

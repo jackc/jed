@@ -28,8 +28,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer rows.Close()
 	for rows.Next() {
 		fmt.Println(rows.Row()[0].Render())
+	}
+	if err := rows.Err(); err != nil {
+		log.Fatal(err)
 	}
 }
 

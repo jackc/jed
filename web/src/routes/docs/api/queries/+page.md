@@ -83,7 +83,7 @@ binds the array of `id`'s type, which is how you pass a list:
 - **TypeScript** — pass a JS array: `await db.all("… WHERE id = ANY($1)", [1, 3])`.
 
 On a primary key or an indexed column, `id = ANY($1)` looks up each element of the list, like
-`id IN (1, 3)` ([EXPLAIN](/docs/sql/explain) shows it as an interval set). On a composite primary key,
+`id IN (1, 3)` ([EXPLAIN](../../sql/explain/) shows it as an interval set). On a composite primary key,
 `tenant = $1 AND id = ANY($2)` looks up each `(tenant, id)` pair, and so does an index on `(tenant, id)`.
 
 Any container also binds from its text form, read like a string literal of that type: `'{1,3}'`,
@@ -270,7 +270,7 @@ how fast it gets there.
 ### Plans see your values
 
 Every execution is planned **as if its bound values were literals** — its *custom plan*. After
-[`ANALYZE`](/docs/sql/statistics), `WHERE status = $1` uses the most-common-value list and histogram
+[`ANALYZE`](../../sql/statistics/), `WHERE status = $1` uses the most-common-value list and histogram
 for the value you bind, exactly as `WHERE status = 'shipped'` would: a value in nearly every row can
 choose a full scan while a rare one takes the index, from one prepared statement. The first planning
 works out whether any estimate actually depends on a value:

@@ -1,7 +1,7 @@
 # Build and deploy the jed website (/web) to GitHub Pages (CLAUDE.md §6/§10). The site is entirely
 # static (SvelteKit adapter-static); this workflow gates on svelte-check and the interactive-feature
-# Playwright suite (the contract for the live database / language switcher / OPFS tool), then builds
-# with the project base path and publishes the artifact. The website is a non-core tooling module,
+# Playwright suite (the contract for the live database / language switcher / OPFS tool), which builds
+# with the project base path. The exact tested artifact is published. The website is a non-core tooling module,
 # so this is separate from the engine's `mise run ci` gate.
 
 name: Deploy website
@@ -28,15 +28,21 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      BASE_PATH: '/${{ github.event.repository.name }}'
+      SITE_URL: 'https://${{ github.repository_owner }}.github.io'
     defaults:
       run:
         working-directory: web
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: '${{ github.event.release.tag_name || github.ref }}'
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '24.16.0'
+          # Match the pinned development toolchain used by mise run ci.
+          node-version: '26.10.0'
           cache: npm
           cache-dependency-path: |
             web/package-lock.json
@@ -60,16 +66,7 @@ jobs:
       - name: Interactive-feature tests
         run: npm run test:browser
 
-      - name: Build static site
-        run: npm run build
-        env:
-          # Project-page base path (served from https://<owner>.github.io/<repo>/). SvelteKit also
-          # emits relative asset URLs, so the build is relocatable, but the base keeps in-app links
-          # and the sitemap correct.
-          BASE_PATH: '/${{ github.event.repository.name }}'
-          # Origin only — the sitemap appends BASE_PATH itself.
-          SITE_URL: 'https://${{ github.repository_owner }}.github.io'
-
+      # Publish the exact project-path build that passed the browser tests above.
       - uses: actions/upload-pages-artifact@v3
         with:
           path: web/build

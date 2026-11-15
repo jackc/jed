@@ -4,7 +4,7 @@
 
 <svelte:head>
 	<title>Resource limits — jed</title>
-	<meta name="description" content="Bound what an untrusted jed query can consume: a per-statement cost ceiling (max_cost, 54P01), a per-session cumulative cost budget (lifetime_max_cost, 54P02), scalar and query-memory budgets (54P04, 54P05), and an in-memory storage limit (54P06)." />
+	<meta name="description" content="Bound what an untrusted jed query can consume: a per-statement cost ceiling (max_cost, 54P01), a per-session cumulative cost budget (lifetime_max_cost, 54P02), scalar and query-memory budgets (54P04, 54P05), and committed-storage limits (54P06)." />
 </svelte:head>
 
 # Resource limits
@@ -12,8 +12,8 @@
 jed meters the **execution cost** of every query deterministically — the same query against the same
 database always costs the same, on every core. Cost ceilings bound metered work; a separate
 scalar allocation budget rejects large repeat/padding results and decimal scratch allocations
-before construction; an opt-in query-memory budget bounds the rows a statement holds at
-once; and an opt-in storage limit bounds how much an in-memory database keeps. These are
+before construction; an opt-in query-memory budget bounds retained rows, operator state, and
+pending writes; and an opt-in storage limit bounds committed in-memory pages or live file pages. These are
 independent limits, with the coverage described below.
 
 ## Two ceilings
@@ -162,8 +162,9 @@ the exact count in the file and updates it on every commit, so opening a file ne
 the count is the same whether one process writes the file or several share it. Each process
 enforces the limit its own handle was given.
 
-The file itself can be longer than the live count: freed pages wait for reuse, and while another
-process shares the file or an old read session is open, commits append instead of reusing them.
+The file itself can be longer than the live count: freed pages wait for safe reuse. Old read
+snapshots, including page-client snapshots, can keep pages pinned; the owner reclaims pages once
+the reader watermark allows it.
 That extra space is bounded by how much writing produced it, which `max_cost` and
 `lifetime_max_cost` limit, and `compact` returns it.
 
@@ -197,7 +198,7 @@ buffers and operator state: hash-join tables, group, `DISTINCT`, and set-operati
 `json_agg`-style and ordered-set accumulators, window partitions and operand caches, sort buffers,
 top-k heaps, and collation sort keys, the resident part of spilling operators and the rows they
 merge back, and the writes pending in an open transaction. The
-storage limit covers an in-memory database's committed pages. A file-backed database's page cache
+storage limit covers an in-memory database's committed pages and a file database's live pages. A file-backed database's page cache
 is bounded by its `cache_bytes` open option, which evicts pages and never fails a query (see the
 page cache section above). On native file hosts,
 sort, hash JOIN, aggregation, and DISTINCT spill when they exceed `work_mem` — and also when the

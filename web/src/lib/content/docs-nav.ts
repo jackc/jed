@@ -12,7 +12,8 @@ export const DOCS_NAV: readonly DocSection[] = [
     links: [
       { title: 'Introduction', href: '/docs/' },
       { title: 'Installation', href: '/docs/install/' },
-      { title: 'Preview status', href: '/docs/status/' }
+      { title: 'Preview status', href: '/docs/status/' },
+      { title: 'Release & upgrade notes', href: '/docs/releases/' }
     ]
   },
   {

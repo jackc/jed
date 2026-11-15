@@ -59,6 +59,41 @@ fn remove_db(path: &std::path::Path) {
 }
 
 #[test]
+fn create_and_reopen_a_bare_relative_filename() {
+    let dir = tmp("relative_create");
+    std::fs::create_dir(&dir).unwrap();
+    // Set only the child's directory: tests run in parallel, so changing this process's cwd
+    // would race unrelated database opens. The CLI exercises the ordinary Rust create API.
+    let created = Command::new(env!("CARGO_BIN_EXE_jed"))
+        .current_dir(&dir)
+        .args([
+            "--create",
+            "app.jed",
+            "-c",
+            "CREATE TABLE t (id i32 PRIMARY KEY); INSERT INTO t VALUES (42)",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let reopened = Command::new(env!("CARGO_BIN_EXE_jed"))
+        .current_dir(&dir)
+        .args(["app.jed", "--format", "csv", "-c", "SELECT id FROM t"])
+        .output()
+        .unwrap();
+    assert!(
+        reopened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reopened.stderr)
+    );
+    assert_eq!(String::from_utf8(reopened.stdout).unwrap(), "id\n42\n");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn basic_aligned_session_matches_golden() {
     let r = run(&[], &testdata("basic.sql"));
     assert_eq!(r.stderr, "", "stderr should be empty");

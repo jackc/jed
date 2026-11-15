@@ -22,7 +22,7 @@ npm run check          # svelte-check (website + browser-consumed TS core module
 ```
 
 The deploy target is a GitHub Pages project page (`.github/workflows/web-deploy.yml`), which gates
-on `test:browser` and builds with `BASE_PATH=/<repo>`. Deployment runs when a GitHub Release is
+on `test:browser` and publishes the exact tested build with `BASE_PATH=/<repo>`. Deployment runs when a GitHub Release is
 published or the workflow is dispatched manually. A push to `master` does not publish the site.
 
 ## How it's wired
@@ -51,8 +51,11 @@ and add to `src/lib/content/docs-nav.ts`. The type/function/error reference rege
 spec automatically. Run `npm run test:browser` when touching the bridge or a documented behavior;
 the repo's `mise run ci` also runs it (the `e2e:web` step).
 
-The website browser suite checks the built site's live SQL panels, structured errors, reset,
+The website browser suite defaults to the production-shaped `/jed/` base path (`BASE_PATH=''`
+selects root hosting), checks internal links and heading fragments, and always builds fresh. It
+checks the built site's live SQL panels, structured errors, reset,
 language tabs, and OPFS tool. Displayed TypeScript examples also run against the public Node API
 in `impl/ts/tests/website_examples.test.ts`, through `mise run unit:ts` and `mise run ci`.
+`mise run web:examples` compiles the displayed Go and Rust sources and also runs in CI.
 Actual browser custom-worker registration is exercised by `impl/ts/e2e/host_functions.spec.ts`
 through `mise run e2e:ts`; the website's host-function API page displays the integration code.

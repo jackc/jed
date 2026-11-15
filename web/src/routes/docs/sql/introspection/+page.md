@@ -38,7 +38,7 @@ the database's catalog. Nothing is stored, so they are always current.
 
 Nine relations ship today:
 
-- **`jed_tables`** — one row per user table: `name` (the table name as written in `CREATE TABLE`).
+- **`jed_tables`** — one row per user table: `name` (the resolved table name: unquoted identifiers are folded to lowercase).
 - **`jed_columns`** — one row per column of every user table and [view](../views/): `table_name`
   (the table or view name), `name`, `ordinal`
   (1-based, declaration order), `type` (the canonical type text — `i32`, `varchar(80)`,
@@ -50,7 +50,7 @@ Nine relations ship today:
   `identity_generation` (`ALWAYS` or `BY DEFAULT` for an identity column, `NULL` otherwise). A view
   column's `type` is the type a query over the view produces: a column read straight from a table
   keeps its length or precision (`varchar(80)`), and a computed one has none (`text`); a view column
-  is never `not_null`, keyed, defaulted, or an identity. Views
+  is never `not_null`, keyed, or an identity; its view default appears in `column_default`. Views
   in attached databases are not listed.
 - **`jed_indexes`** — one row per secondary index: `name`, `table_name`, `columns` (a `text[]` of
   the indexed column names in key order), `is_unique`, `method` (`btree` / `gin` / `gist`),

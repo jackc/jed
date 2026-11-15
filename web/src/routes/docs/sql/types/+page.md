@@ -492,7 +492,7 @@ bytes and raises `22P02` otherwise:
 `uuid → text` explicit-only (PostgreSQL assignment-casts any type to `text`), and the `bytea` ↔ `uuid`
 casts are a jed convenience PostgreSQL does not offer at all.
 
-<a id="binary-strings-bytea"></a>
+<span id="binary-strings-bytea"></span>
 
 ## Binary strings (bytea)
 
@@ -651,7 +651,7 @@ only when its clause applies:
 Besides comparisons, a `jsonpath` filter or top-level predicate may use PostgreSQL's other
 predicates: `exists (path)`, `starts with "prefix"` (or a variable), `like_regex "pattern"` with an
 optional `flag` string, and `(predicate) is unknown`. `like_regex` uses jed's regular expressions (see
-[pattern matching](/docs/sql/pattern-matching)), with the flags `i` (ignore case), `s` (`.` matches a
+[pattern matching](../pattern-matching/)), with the flags `i` (ignore case), `s` (`.` matches a
 newline), `m` (`^` and `$` also match at the start and end of each line), and `q` (the pattern is
 literal text). Without `s`, `.` and `[^…]` do not match a newline. The `x` flag is not supported, as
 in PostgreSQL. The `.**`
@@ -738,7 +738,7 @@ the gap instead:
 Beside a range, a bare string literal is read as that range type, so `during && '[2,6)'` and
 `r = '[1,3)'` need no cast.
 
-<a id="time-zones"></a>
+<span id="time-zones"></span>
 
 ## Time zones
 

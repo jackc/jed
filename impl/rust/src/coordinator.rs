@@ -294,7 +294,10 @@ impl FileCoordinator {
         if mode == Locking::None {
             return Ok(None);
         }
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
         let parent =
             fs::canonicalize(parent).map_err(|e| io_error("resolve database parent", e))?;
         let name = path.file_name().ok_or_else(|| {

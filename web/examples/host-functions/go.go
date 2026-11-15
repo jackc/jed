@@ -72,10 +72,14 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer rows.Close()
 	for rows.Next() {
 		r := rows.Row()
 		// Mug -> 1063 / 1350, Notebook -> 340 / 432
 		fmt.Printf("%s -> %s / %s\n", r[0].Render(), r[1].Render(), r[2].Render())
+	}
+	if err := rows.Err(); err != nil {
+		log.Fatal(err)
 	}
 }
 

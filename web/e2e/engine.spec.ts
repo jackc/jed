@@ -5,7 +5,7 @@ import { expect, test } from '@playwright/test';
 // and the cost ceiling stops a runaway query.
 
 test('home hero autoruns a seeded query and renders rows', async ({ page }) => {
-  await page.goto('/');
+  await page.goto('./');
   const rows = page.getByTestId('result-rows');
   await expect(rows).toContainText('Grace');
   await expect(rows).toContainText('99.25');
@@ -15,7 +15,7 @@ test('home hero autoruns a seeded query and renders rows', async ({ page }) => {
 });
 
 test('editing and running executes against the same in-memory database', async ({ page }) => {
-  await page.goto('/');
+  await page.goto('./');
   await expect(page.getByTestId('run-button')).toBeEnabled();
   await page.getByTestId('sql-input').fill('SELECT count(*) AS n FROM person');
   await page.getByTestId('run-button').click();
@@ -23,7 +23,7 @@ test('editing and running executes against the same in-memory database', async (
 });
 
 test('a SQL error surfaces its SQLSTATE code', async ({ page }) => {
-  await page.goto('/');
+  await page.goto('./');
   await expect(page.getByTestId('run-button')).toBeEnabled();
   await page.getByTestId('sql-input').fill('SELECT * FROM nonexistent_table');
   await page.getByTestId('run-button').click();
@@ -33,7 +33,7 @@ test('a SQL error surfaces its SQLSTATE code', async ({ page }) => {
 });
 
 test('a runaway query trips the cost ceiling (54P01), not a hang', async ({ page }) => {
-  await page.goto('/');
+  await page.goto('./');
   await expect(page.getByTestId('run-button')).toBeEnabled();
   await page.getByTestId('sql-input').fill('SELECT * FROM generate_series(1, 100000000)');
   await page.getByTestId('run-button').click();
@@ -41,11 +41,30 @@ test('a runaway query trips the cost ceiling (54P01), not a hang', async ({ page
 });
 
 test('reset restores the widget to its seed + initial query', async ({ page }) => {
-  await page.goto('/');
+  await page.goto('./');
   await expect(page.getByTestId('run-button')).toBeEnabled();
   await page.getByTestId('sql-input').fill('DROP TABLE person');
   await page.getByTestId('run-button').click();
   await page.getByTestId('reset-button').click();
   // After reset the seed re-creates person and the initial query runs again.
   await expect(page.getByTestId('result-rows')).toContainText('Grace');
+});
+
+test('scripts preserve quoted identifier delimiters and reject incomplete quoting before execution', async ({
+  page
+}) => {
+  await page.goto('./');
+  await expect(page.getByTestId('run-button')).toBeEnabled();
+  await page.getByTestId('sql-input').fill(`CREATE TABLE "semi;--/*quote""'" (v text);
+INSERT INTO "semi;--/*quote""'" VALUES ('kept;value');
+SELECT v FROM "semi;--/*quote""'";`);
+  await page.getByTestId('run-button').click();
+  await expect(page.getByTestId('result-rows')).toContainText('kept;value');
+
+  await page.getByTestId('sql-input').fill('DROP TABLE person; SELECT "unfinished');
+  await page.getByTestId('run-button').click();
+  await expect(page.getByTestId('result-error')).toContainText('unterminated quoted identifier');
+  await page.getByTestId('sql-input').fill('SELECT count(*) AS n FROM person');
+  await page.getByTestId('run-button').click();
+  await expect(page.getByTestId('result-rows')).toContainText('3');
 });

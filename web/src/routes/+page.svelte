@@ -26,7 +26,7 @@ ORDER BY score DESC;`;
     },
     {
       title: 'Single file',
-      body: 'One database is one file on disk. Copy it, back it up, ship it. Commits are atomic and crash-safe.'
+      body: 'One database is one file on disk. Close all database handles before copying the file. Commits are atomic, with durable flushing enabled by default.'
     },
     {
       title: 'Rich type system',
@@ -38,7 +38,7 @@ ORDER BY score DESC;`;
     },
     {
       title: 'Safe for untrusted SQL',
-      body: 'Safe by design — memory-safe cores, a pure built-in surface with no host access, and a deterministic cost ceiling on every query.'
+      body: 'Memory-safe cores and pure built-ins, with configurable cost, scalar-allocation, query-memory, and storage budgets.'
     },
     {
       title: 'Many native cores',
@@ -78,10 +78,15 @@ ORDER BY score DESC;`;
   <p
     class="mx-auto mt-5 max-w-2xl rounded-md border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-800"
   >
-    <span class="font-semibold text-red-900">0.x preview — not ready for production use.</span>
+    <span class="font-semibold text-red-900">v0.3.0 preview — not ready for production use.</span>
     Heavily tested, but not yet proven by real-world use, and the on-disk format may still change.
     <a class="font-medium text-red-900 underline hover:text-red-700" href="{base}/docs/status/"
       >Read the preview status →</a
+    >
+  </p>
+  <p class="mt-3 text-sm">
+    <a class="text-jed-accent hover:underline" href="{base}/docs/releases/"
+      >v0.3.0 release &amp; upgrade notes →</a
     >
   </p>
 </section>
@@ -115,21 +120,23 @@ ORDER BY score DESC;`;
       <p class="mt-1 text-sm text-slate-600">
         Let your users write and run their own queries with memory-safe cores, pure built-ins, and
         configurable work, scalar-allocation, and query-memory budgets.
-        <a href="/docs/api/resource-limits/">See resource coverage and remaining memory limits.</a>
+        <a href="{base}/docs/api/resource-limits/"
+          >See resource coverage and remaining memory limits.</a
+        >
       </p>
     </div>
     <div class="rounded-lg border border-slate-200 bg-white p-4">
       <h3 class="font-semibold text-jed-ink">Local dev &amp; test</h3>
       <p class="mt-1 text-sm text-slate-600">
-        When production is PostgreSQL, run your test suite and local development against an embedded
-        database — no server to provision, behavior you can rely on.
+        For applications using jed’s supported SQL surface, keep development and tests in process,
+        with no database server to provision.
       </p>
     </div>
     <div class="rounded-lg border border-slate-200 bg-white p-4">
       <h3 class="font-semibold text-jed-ink">An embedded PostgreSQL companion</h3>
       <p class="mt-1 text-sm text-slate-600">
-        Embed jed at small scale, and scale up to PostgreSQL with the same SQL. One codebase, two
-        footprints.
+        Use familiar SQL and PostgreSQL-modeled behavior in an embedded library. Check the
+        documented differences when sharing queries with PostgreSQL.
       </p>
     </div>
   </div>

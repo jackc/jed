@@ -1,0 +1,41 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Compile the exact Go and Rust embedding examples displayed on the website"
+
+require "tmpdir"
+require_relative "../../scripts/lib/tasks"
+include Tasks
+
+# Highlighted CodeTabs are strings to the web build: svelte-check cannot catch an outdated host
+# API call. Compile the original source files, without editing snippets into something that passes.
+# TypeScript examples have execution fixtures in impl/ts/tests/website_examples.test.ts.
+Dir.mktmpdir("jed-web-examples-") do |dir|
+  Dir.glob(File.join(WEB_DIR, "examples/*/go.go")).sort.each do |source|
+    topic = File.basename(File.dirname(source))
+    sh "go", "build", "-o", File.join(dir, topic), source, chdir: GO_DIR
+  end
+
+  manifest = <<~TOML
+    [package]
+    name = "jed-web-examples"
+    version = "0.0.0"
+    edition = "2024"
+
+    [dependencies]
+    jed = { path = #{File.dirname(RUST_MANIFEST).inspect} }
+  TOML
+  Dir.glob(File.join(WEB_DIR, "examples/*/rust.rs")).sort.each do |source|
+    manifest << <<~TOML
+
+      [[bin]]
+      name = #{File.basename(File.dirname(source)).inspect}
+      path = #{source.inspect}
+    TOML
+  end
+  File.write(File.join(dir, "Cargo.toml"), manifest)
+  # Preserve the core's pinned dependency graph; Cargo adds only this temporary package entry.
+  FileUtils.cp(File.join(ROOT, "impl/rust/Cargo.lock"), File.join(dir, "Cargo.lock"))
+  sh "cargo", "check", "--bins", "--manifest-path", File.join(dir, "Cargo.toml"),
+     env: { "CARGO_TARGET_DIR" => ENV.fetch("CARGO_TARGET_DIR", File.join(ROOT, "impl/rust/target")) }
+end
+puts "Website Go and Rust examples compile."

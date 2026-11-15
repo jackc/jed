@@ -30,7 +30,7 @@ The error has SQLSTATE `57014` and supports Go's `errors.Is` checks for
 ## The splitter is a primitive too
 
 `split_statements` is the library-level building block underneath `execute_script` — a pure,
-streaming statement scanner that needs no open database. A `;` inside a string literal, a
+streaming statement scanner that needs no open database. A `;` inside a string literal, a quoted identifier, a
 dollar-quoted string, or a comment is never treated as a boundary. When you *do* want each
 statement's rows (not just a success/fail summary), loop it yourself and run the spans through the
 normal `execute` / `query` path — you own the policy (one transaction or autocommit, drain the rows
