@@ -1,408 +1,184 @@
-# Agent Instructions
+# jed — agent instructions
 
-This repository is **jed**, an embedded SQL database: SQLite's footprint,
-PostgreSQL's behavior, and a real strict static type system.
+jed is an **embedded SQL database**: SQLite's footprint (a library, one database = one file),
+PostgreSQL's behavior, and a strict static type system.
 
-`CLAUDE.md` is the canonical project brief and architectural record. Read it
-before making design or implementation changes. This file is the agent-facing
-working summary derived from it; if the standing decisions change, update both
-files in the same change.
+This file holds instructions for working here and the few commitments every change must respect.
+Design decisions live in the spec: **[spec/design/README.md](spec/design/README.md)** indexes every
+subsystem doc, and [TODO.md](TODO.md) is the roadmap. Do not restate a design decision here — link
+to its doc. This file mirrors [CLAUDE.md](CLAUDE.md); read it before design or implementation changes.
+When a commitment below changes, update both files in the same change. Section numbers match
+`CLAUDE.md` and are cited across the repo (`CLAUDE.md §8`), so keep them stable.
 
-## North Star
+---
 
-- Build an embeddable, single-file SQL database library, not a server.
-- Match PostgreSQL behavior for the SQL surface jed implements unless there is
-  a documented overriding reason.
-- PostgreSQL is the behavioral default, not a compatibility target. jed does
-  not owe wire-protocol compatibility, `pg_catalog` fidelity, the whole PG
-  coercion lattice, or arbitrary SQL coverage.
-- The strict, static type system is the product. Design type behavior as spec
-  data before executor code.
+## 1. PostgreSQL is the behavioral default
 
-## Non-Negotiable Architecture
+When a decision has an option that matches PostgreSQL and no overriding reason against it, take
+it. PostgreSQL is **not a compatibility target**: we choose which surface to implement, and for
+that surface behavior tracks PG. An overriding reason is a genuine engineering tradeoff (simplicity,
+determinism, the type system, single-writer, safety/cost bounds), documented where it is taken.
+Record every deliberate divergence in the relevant spec doc and in the corpus override ledger.
 
-- The language-neutral spec and conformance corpus are canonical. No
-  implementation is the reference implementation.
-- Core implementations are native and evolve in lockstep. The differential set
-  is Rust, Go, and TypeScript.
-- Go core is pure Go: no cgo, no FFI.
-- Go host transaction/script APIs take context first. Writer waits are cancelable;
-  cancellation errors retain SQLSTATE `57014` and unwrap to the Go context error.
-  Callback transactions roll back on panic. Cancellation stops before commit work;
-  it cannot turn a completed commit into an error. See `spec/design/api.md` §11.4.
-  Go duration options use `time.Duration`; configured session creation returns
-  errors for invalid time zones or negative timeouts (§11.6).
-  Go repository tooling uses the explicit `jedtooling` build tag; ordinary library
-  builds exclude test hooks and expose `MapRows` for lazy row mapping (§11.7).
-- Rust wrappers are acceptable for later language packages when that gives the
-  best user experience, but wrappers echo Rust and are not independent
-  conformance voices.
-- The browser/Node runtime (`spec/design/ts-runtime.md`) implements async-only package entry
-  points, dedicated execution workers, bounded typed transport and one TS semantic core with
-  platform adapters. Results use transferable binary batches with lossless values and bounded
-  decoding. Synchronous core APIs remain internal for conformance/tooling. Node and
-  shared-memory-capable browsers poll atomic cancellation flags; all hosts also cooperate at
-  logical page boundaries and common execution loops through retained continuations shared by
-  sync and async drivers. Common resident expressions return immediate values; pending operands
-  retain continuations without replay or duplicate evaluation semantics. Cancellation is best
-  effort: sorting, parsing/planning and long scalar kernels stay synchronous. Node data-page reads
-  can await I/O. Commit, open/recovery and storage maintenance are the same kind of continuation
-  (`spec/design/ts-runtime.md` §11): they await any page-codec or byte-device stage that has an
-  asynchronous form, keep validated-COW ordering, and run inline over today's synchronous hosts.
-  Async crypto providers remain separate work. No encryption suite or Rust delivery default is
-  selected.
-  Host functions register inside the execution worker: Node uses `extensionModule`; browsers
-  supply a fresh worker through `workerFactory` and call the public
-  `startDatabaseWorker({ configure })` helper. Jed owns worker cleanup. Configuration may await;
-  SQL kernels remain synchronous, with no application-thread callback RPC.
-- Experimental cores (`impl/ruby-native`, `impl/swift-native`, `impl/csharp-native`, and `impl/java-native`) are opt-in: exclude them
-  from normal tests, benchmarks, CI, and future feature updates unless explicitly
-  requested. Record coverage and omissions against the experiment's source revision;
-  promotion to supported status requires a separate decision. See
-  `spec/design/ruby-native-experiment.md` and `spec/design/swift-native-experiment.md`.
-  The native Java experiment was authorized 2026-11-14 against
-  `3e5962f9affc06c768df1688765162a65a893848`, format v53. Full frozen parity on Linux
-  x86-64 is verified; Java 25 is the stable target with matched JDK 28/value-class
-  comparisons. Blocking streaming APIs support ordinary/virtual threads and explicit
-  cancellation. Narrow JDK FFM OS host calls and Bouncy Castle Java
-  `bcprov-jdk18on:1.86` for Argon2id/internal helpers are approved. Setup downloads,
-  subagent implementation/review, verification, profiling and local commits are
-  authorized. The frozen experiment is complete: 42/42 correctness gates pass
-  across the three variants, and 24 workloads across five actors and three repeats plus
-  separate memory probes are recorded. Shared-host load and bounded warmup limit
-  timing conclusions; performance parity is not established. See the exact source,
-  artifact identities and limitations in `impl/java-native/VERIFICATION.md` and
-  `impl/java-native/BENCHMARKS.md`. No promotion, default CI, website,
-  publication, JDBC/ORM, Native Image or other-platform obligation is included.
-  See `spec/design/java-native-experiment.md`.
-  The explicitly authorized C# parity/performance refresh (2026-11-13) targets
-  `6b2355d98a7fd3738c60474779d1d63548f350dc` and format v53. Linux x86-64,
-  pinned .NET 11 and async-first APIs remain its scope: resident kernels run
-  inline and storage I/O is awaited, with no Task.Run wrapper. All 766 SQL files
-  pass across applicable storage modes under four JIT/NativeAOT configurations
-  (12 inventories); all four host suites, 496 mixed-core process cases, 16,000
-  threaded snapshot checks and 85 complete fault traces pass (76 exact peer
-  comparisons, nine intrinsic checks). The refresh adds generation/remap and
-  incremental-reclamation parity and removes measured query/storage allocation
-  and algorithm overhead. Artifact identities and acceptance evidence are in
-  `impl/csharp-native/VERIFICATION.md`; repeated matched measurements and their
-  limits are in `impl/csharp-native/BENCHMARKS.md`. The results show substantial
-  improvement but do not establish universal Go parity. Tmpfs commit timings
-  are not physical-disk durability latency. Production delivery and promotion
-  remain separate decisions; future updates remain opt-in.
-  The original C# freeze at `2849dd23f3e28b0e91674e27f99be2da58681805`, against
-  semantic baseline `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`, and its measurements
-  remain historical evidence. BouncyCastle.Cryptography 2.7.0 is approved for
-  SHA-224 and Argon2id plus their reviewed internal crypto helpers. Subagent
-  implementation/review was authorized. See `spec/design/csharp-native-experiment.md`
-  and its scope/host/crypto matrices.
-  The explicitly requested Ruby refresh (2026-11-13) tracks supported-core revision
-  `32feb48fd`: format v53, deferred interiors, narrow manifests, page stamps,
-  incremental reclamation and sibling-leaf redistribution. Coverage and remaining
-  omissions are recorded in `impl/ruby-native/PARITY_UPDATE_2026-11-13.md`.
-  Integration on 2026-11-14 also covers the numeric-resolver and aggregate-memory
-  corpus additions plus the statistics hash correction through `1840ab5d7`.
-  Its experimental status and prior benchmark evidence are unchanged.
-  The explicitly authorized Swift refresh (2026-11-13) targets supported-core
-  revision `32feb48fd961598c2d7e60f0de284ba619a74ab0` and format v53.
-  Its recorded inventory is 764 SQL files, 121 database fixtures and 19 saved
-  simulations; Linux verification and historical measured results are in
-  `impl/swift-native/VERIFICATION.md` and `impl/swift-native/BENCHMARKS.md`.
-  Apple platforms remain unverified. Production Swift delivery is undecided;
-  the experiment adds no website docs, references, or live panels.
-  The explicitly authorized structural follow-up (2026-11-06) is complete,
-  including correctness revalidation and diagnostic comparisons of 22 peer,
-  eight paired Swift and three Ruby workloads. Original `3db8fc2` full-suite
-  evidence is preserved; see
-  `spec/design/swift-native-performance.md`. It remains opt-in and experimental.
-- SQL is the primary access path and every built-in capability must be reachable
-  through SQL, while storage must keep room for non-SQL access paths later.
+## 2. The spec is the project; cores are in lockstep
 
-## Scope Simplifications
+There is **no reference implementation**. The language-neutral spec and conformance corpus are
+canonical; every core is a downstream consumer. Never let one core's code define behavior — change
+the spec, then the cores.
 
-- Single writer. Readers observe the last committed state and block only during
-  the short commit window.
-- This is not MVCC: there is one committed version plus one writer pending set.
-- No users, roles, RBAC, or in-database auth. Host session capabilities live
-  above the engine.
-- Keep these simplifications load-bearing unless the spec explicitly revises
-  them.
+- **The differential set — Rust, Go, TypeScript (`impl/rust`, `impl/go`, `impl/ts`)** — must move
+  together: a feature lands in all three, passing the same corpus and producing byte-identical files.
+- **Go is pure Go: no cgo, no FFI.**
+- Other languages (wrapped or native) and the rationale: [cores.md](spec/design/cores.md).
+- **Frozen experiments** (`impl/ruby-native`, `impl/swift-native`, `impl/csharp-native`,
+  `impl/java-native`) are opt-in: excluded from normal tests, benchmarks, CI and the website, and
+  not updated by new features. **Touch one only when explicitly asked.** Each has its own
+  `spec/design/*-native-experiment.md`. Never cite their measurements as general parity.
 
-## Spec First
+## 3. Load-bearing scope limits (do not quietly relax)
 
-- Put subsystem decisions in `spec/design/` and shared mechanical facts in
-  language-neutral data.
-- Shared data belongs in the spec, not duplicated per language:
-  comparison/coercion/promotion matrices, function/operator catalog, error-code
-  registry, range/type facts, byte fixtures, and similar tables.
-- Use codegen only for large mechanical surfaces such as generated stubs from
-  shared catalogs.
-- Do not codegen parsers, planners, executors, storage layers, expression
-  evaluators, or recursive open-type behavior.
-- Explicit maintainer exception: the frozen Ruby experiment may compile resolved
-  query expressions, single-table scan/filter/projection loops, typed ORDER BY
-  comparators, primitive aggregate input/reduction loops, and materialized WHERE
-  and grouping-key loops into Ruby methods
-  at runtime using a handwritten, bounded template emitter. SQL text and values
-  remain data; admitted scalar operations include bounded C-text comparisons
-  and bounded literal LIKE predicates. Identical generated methods may share a
-  bounded process cache; each kernel keeps its own immutable constant pool.
-  All conformance contracts still apply. See
-  `spec/design/ruby-runtime-compilation.md`.
-- Record deliberate PostgreSQL divergences in the relevant spec doc or ledger.
-- Consult `TODO.md` when planning new feature work and update it when the plan
-  moves.
+- **Single writer, not MVCC** — one committed version plus one writer's pending set
+  ([transactions.md](spec/design/transactions.md)).
+- **No users, roles or auth in the database** — authorization is a host-supplied session envelope
+  ([session.md](spec/design/session.md)).
 
-## Conformance Is The Contract
+## 4. The type system is the product
 
-- Implement features as vertical slices driven by shared corpus entries.
-- Prefer conformance tests over per-core unit tests. A corpus entry tests every
-  core at once.
-- Add per-core unit tests only for behavior the corpus cannot express:
-  byte-level fixtures, host API surfaces, internal invariants, cost-meter values,
-  catalog/host introspection, or deliberate PG divergences.
-- For PostgreSQL-comparable behavior, use PostgreSQL as the oracle and run the
-  oracle check when relevant.
-- SQLite is not a semantic oracle. It is the deployment-model inspiration and
-  the origin of sqllogictest.
-- Concurrency behavior belongs in the shared concurrency corpus, not mirrored
-  hand tests.
+Types are specified as data before code ([types.md](spec/design/types.md), `spec/types/`). Column
+types are strict and static; values are never silently reinterpreted. New types and container
+rules follow the existing docs (composite, array, ranges, json, decimal, float).
 
-## Determinism
+## 5. Data over code
 
-- Results must be deterministic in values, types, errors, costs, and byte
-  encodings.
-- Row order is defined only when `ORDER BY` is present. Without `ORDER BY`, the
-  multiset must be correct and conformance should compare order-insensitively.
-- No hashmap or host iteration order may leak into observable values, types,
-  names, errors, or costs.
-- Entropy and clock access happen only through the sanctioned host-injected
-  seam, so tests can inject fixed inputs.
-- Cost is part of conformance: the same query and database state must accrue
-  identical cost in every core.
+Anything mechanical and data-shaped — type/compare matrices, the function catalog, error codes,
+cost schedule, estimator facts — is **shared data** in `spec/`, codegen'd or cross-checked per core
+([codegen.md](spec/design/codegen.md)). **Never codegen** the parser, planner, executor, storage
+layer, or evaluator; those are hand-written per core. Don't hand-write per core what can be shared
+data.
 
-Persisted expression keys and partial-index predicates must use the compositional dependency
-contract in `spec/design/index-dependencies.md`: admit safe operations regardless of type, reject
-session/clock/state dependencies, and pin named timezone data until an explicit atomic rebuild.
+## 6. Repository layout
 
-## Type System Rules
+`spec/` is canonical (design docs, grammar, types, functions, errors, file format and key-encoding
+fixtures, conformance corpus). `impl/` holds the cores. `cli/`, `bench/`, `migrate/` and `web/`
+are non-core consumers whose dependencies never touch a core manifest. Tasks: `mise.toml` and
+`mise-tasks/` (§10). Long-running dev services: `process-compose.yaml` (`mise run dev`).
 
-- Columns have strict static types; values are not silently reinterpreted.
-- Current integer naming uses `i16`, `i32`, `i64` and aliases PostgreSQL names
-  where specified.
-- Preserve PostgreSQL-compatible three-valued NULL logic where the spec says so.
-- Exact decimal behavior follows the spec, including PostgreSQL-style
-  round-half-away-from-zero.
-- Open types are real database facts. Composite, array, and range behavior must
-  be derived recursively from their element or field types and verified by
-  conformance and golden fixtures.
+## 7. Testing
 
-## Storage And File Format
+- **The corpus is the contract** ([conformance.md](spec/design/conformance.md)). A feature is a
+  vertical slice — one SQL construct parsed, planned, executed and tested — that makes corpus
+  entries pass on every core.
+- **Tests go in the corpus by default.** Write a per-core unit test **only** for what the corpus
+  cannot express: deliberate PG divergences, catalog/host introspection, byte-level checks, cost
+  values no cost suite pins, host-API surface, internal invariants. When unsure, write the corpus
+  entry. (Model: per-core `foreign_key` tests vs. `ddl/foreign_key.test`.)
+- On the PG-comparable surface, **oracle-check** rows (`mise run corpus:check <file>`) and ledger
+  any divergence. **PostgreSQL is the only result oracle — never SQLite.**
+- A query optimization adds a **NoREC** metamorphic relation.
+- Concurrency behavior belongs in the shared schedule/process corpora, not mirrored per-core tests
+  ([concurrency-testing.md](spec/design/concurrency-testing.md)).
+- When a storage feature lands (page type, commit path, host operation, setting), **grow the
+  simulation generator and checkers** with it ([simulation-testing.md](spec/design/simulation-testing.md)).
+- Gate before merging: `mise run ci`.
 
-- One database is one file.
-- Durable on-disk storage is the dominant mode; in-memory databases are valid
-  but secondary.
-- Datasets are expected to often fit in RAM, but no design above the storage
-  seam may harden a full-residency assumption.
-- Preserve the block/page storage seam. Hosts provide byte devices; the core
-  owns host-independent policy above them.
-- On-disk format and key encoding are byte-exact contracts. Cross-core
-  round-trip and golden fixtures are required for file-format changes.
-- Durable commits use v33 validated COW: body writes, content manifest, alternate meta,
-  then one durable barrier. Protect every current manifest dependency from reuse; stabilize
-  recovered/foreign generations before further writes; poison storage on I/O failure.
-  Serialization errors before storage work discard the transaction without poisoning the handle.
-  Follow `spec/design/validated-cow.md` and the shared byte format. No WAL or redo copies.
-- Meta offset 56 (v34) holds the exact live page count; every commit advances it by an exact
-  delta, and the file form of `max_storage_bytes` limits it (memory.md §8.7).
-- Writable commits persist only changed database domains. Empty/read-only work in a writable
-  transaction and temporary-only changes do not rewrite main, advance its txid, or issue a
-  durability barrier. Attachment-only commits publish their roots independently of main; zero-row
-  DML without other effects preserves statistics and does not persist (transactions.md §2.1).
-- Key encoding must preserve logical order in raw byte order.
-- Do not assume on-disk page bytes are plaintext-comparable; leave room for the
-  encryption-at-rest design. The deferred design uses envelope encryption: credential changes
-  rewrap the data key; data-key rotation rewrites live pages. Nonce safety across failed commits,
-  restores and writable copies is unresolved; `(page_index, txid)` alone is insufficient.
-- Multi-process file access is the page service (`spec/design/page-service.md`,
-  `spec/design/locking.md`), landed across Rust, Go, and Node/TypeScript: the
-  process holding `presence EX` on the stable `<path>.lock/` bundle owns the file
-  and alone reads and writes it; every other process is a page client running its
-  own engine, and every commit to the file passes through the owner. Reuse and
-  reclamation run only on the owner, gated by its reader watermark (which counts
-  client pins). The owner's foreground path must retain zero coordination
-  syscalls and zero per-transaction meta reads.
-- Never use PID files, mtime leases, or automatic stale-lock stealing for database
-  safety. A host without the required crash-clean OS lock fails closed.
-- Node file locking uses the approved minimal Node-API lock helper while
-  keeping the independent TypeScript engine; an owner's foreground path makes no
-  addon calls. A full Rust-core Node wrapper
-  exists only as a reach experiment: it wins heavy/parallel reads but not cheap
-  queries or writes uniformly, and it is not a TypeScript conformance voice.
-- Treat the lock-bundle protocol version (`protocol-v2`) as a compatibility
-  boundary: a binary that does not take the bundle's locks cannot overlap safely.
-- Replication, where relevant, is block-delta shipping at the block seam, not a
-  WAL.
-- Blocking hash JOIN, aggregation, and DISTINCT use bounded row spools and disk
-  hash partitions under `work_mem` on native file hosts. Ordered partition replay
-  preserves probe/bucket order, aggregate fold order, and cost. Upstream window,
-  CTE/index materialization and result buffers are charged by the separate
-  query-memory account (memory.md Q1); `work_mem` is not a whole-query memory
-  ceiling (spill.md, memory.md).
+## 8. Cross-core determinism
 
-## Safety And Resource Boundaries
+Results, values, types, errors, selected plan, estimates and cost must be **byte-identical across
+cores** and reproducible ([determinism.md](spec/design/determinism.md)). Row order is defined only
+by `ORDER BY`. No hashmap iteration order, wall clock, or library/locale behavior may leak.
+Relaxations are default-deny, listed in `spec/conformance/determinism_exceptions.toml`. On-disk
+bytes and key encodings are pinned by shared fixtures ([encoding.md](spec/design/encoding.md),
+[format.md](spec/fileformat/format.md)). Decide any new divergence hotspot in the spec before coding.
 
-**Resource enforcement status.** Cost ceilings are work limits, not memory limits.
-Amplifiers (`repeat`/padding, `replace`, `regexp_replace`, `array_replace`, `jsonb_pretty`) charge their input
-and exact output bytes and check them before allocating; exact decimal transcendentals charge
-guarded internal steps. A finite 64 MiB default `max_scalar_bytes` allowance bounds their
-cumulative logical output/scratch allocation per statement (`54P04`), including internal meters
-and frozen cursors. Growth kernels (`ARRAY[…]`, the array builders, JSON construction, and escaping renders) charge their output
-bytes to cost instead, so a cost ceiling bounds geometric growth through recursion
-(`spec/design/cost.md` §8.1). A live, opt-in
-`max_query_memory_bytes` account (unlimited by default; `54P05`) bounds row buffers and
-engine result collectors — relation materialization, join outputs, grouped/DISTINCT rows,
-set operations, CTE/recursive-CTE buffers, RETURNING/EXPLAIN results (slice Q1) — and
-operator state — hash-join, group, and dedup tables, retained aggregate inputs, window
-partitions, sort state, columnar lanes, and spill structures' resident elements (slice Q2) —
-in deterministic logical bytes (`spec/design/memory.md`). Spill structures measure their
-`work_mem` residency on the same schedule, so they spill at the same row in every core and
-release their charge as they spill; they also spill, instead of failing, when the account rejects
-a reservation, so a budget below `work_mem` spills earlier rather than aborting. The same budget
-holds a transaction's pending writes (slice Q3): every record version it stages reserves its stored
-bytes until commit/rollback, each statement's account opens holding them, and they must fit after
-every statement. A database-owned, opt-in `max_storage_bytes` (unlimited by default; `54P06`)
-bounds an in-memory database's or attachment's committed pages, checked at commit before any write
-(slice Q4a), and a file-backed database's or attachment's **live** pages — reachable from the catalog
-root, an exact count persisted in the meta page, so the trip point is independent of the free list
-(slice Q4c, memory.md §8.7); file-backed page caches stay
-evict-only under `cache_bytes` and never fail a query. A file's dead pages are bounded by the work
-that wrote them (`max_cost`/`lifetime_max_cost`), not by this limit. These are guardrails, not heap caps: resource-
-exhaustion resistance remains a requirement; do not claim the current limits are a
-whole-engine memory guarantee. Host extensions remain outside these guarantees.
+## 9. Storage
 
-- Untrusted SQL must be safe to run against the built-in surface.
-- Core languages and dependencies must preserve memory safety.
-- Built-ins must be pure and side-effect-free: no filesystem, network, process,
-  environment, shell, or arbitrary host access.
-- Host-defined functions and extensions are outside jed's built-in safety and
-  determinism guarantees. Keep the boundary legible and fail closed where the
-  spec requires it.
-- Thread cost metering and parser nesting limits through relevant code paths so
-  resource exhaustion can be bounded deterministically.
+Design: [storage.md](spec/design/storage.md) and the docs it links; bytes:
+[format.md](spec/fileformat/format.md). Two standing rules for all code:
 
-## Dependencies
+- **Never harden a full-residency assumption above the storage seam** — no "read the whole file",
+  no operator that requires its whole input or output in memory. Larger-than-RAM must stay possible.
+- A **format change** bumps the format version, updates `format.md`, the goldens, and every core
+  in the same change.
 
-- The parser, planner, executor, storage layer, type system, and expression
-  evaluator are written from scratch in every core.
-- Add third-party dependencies only for narrow edge utilities when they preserve
-  deterministic cross-core behavior, provide a significant platform-specific
-  speedup while remaining byte-identical, or are vetted cryptography.
-- Always get explicit human confirmation before adding a dependency.
-- Engine code and dependency APIs remain memory-safe. Vetted crypto backends may use explicitly
-  reviewed assembly/intrinsics and narrowly approved Rust unsafe internals behind safe APIs;
-  evaluate constant-time behavior separately. Go stays free of cgo/external C-library FFI.
-  Dependencies must not introduce nondeterminism, locale or library-version-sensitive behavior,
-  or divergence across cores. Identical crypto inputs must produce identical bytes.
-- The isolated AEAD benchmark dependencies are approved (2026-10-17): RustCrypto aes-gcm and
-  chacha20poly1305, Go x/crypto/chacha20poly1305, and TS @noble/ciphers, including their standard
-  accelerated backends for measurement. This selects no production cipher or engine dependency.
-- The Ruby experiment has explicit maintainer approval for Ruby's OpenSSL binding
-  for vetted cryptographic digest functions and stdlib Zlib for byte-identical
-  CRC32 checksums. The maintainer also permits a well-supported native checksum
-  gem if profiling justifies it; prefer the standard library. Its parser, planner,
-  other evaluation, and storage algorithms remain handwritten Ruby; no native
-  engine dependency or Rust/WASM binding is authorized by these utility exceptions.
-- Bench modules are not cores, but new benchmark dependencies still require
-  explicit confirmation.
-- The Swift experiment has explicit maintainer approval (2026-11-05) for Apple's
-  `swift-crypto` (including CryptoExtras), pinned reference Argon2 source, and their
-  necessary cryptographic C/assembly backends behind narrow safe Swift interfaces.
-  No OpenSSL substitution, native engine component, or unrelated dependency is
-  authorized. Its engine and exact arithmetic stay handwritten Swift; ordinary OS
-  interfaces are confined to sanctioned host seams. Prefer self-contained SwiftPM
-  packaging without application-installed system crypto libraries.
+## 10. How to work here
 
-## Local References And Heavy Operations
+- **Spec first.** Read the subsystem's design doc and corpus before changing it; update the doc in
+  the same change as the code.
+- **Consult [TODO.md](TODO.md)** when planning a feature; update it when the plan moves.
+- **Keep `/web` in sync**: a change to user-facing SQL or the host API updates the matching
+  `web/src/routes/docs/` page and `web/examples/<topic>/` in the same change. Run
+  `mise run e2e:web` when touching `web/src/lib/jed/` or documented behavior.
+- **Benchmarks** ([benchmarks.md](spec/design/benchmarks.md)) are outside CI. A perf-relevant
+  feature adds a benchmark; a perf-sensitive change reports before/after numbers
+  (`mise run bench:diff`). Benchmarks never overlap other work.
+- **Boring, explicit code** — no deep generics or macro magic in Rust, no over-interfacing in Go.
+- **Tasks: `mise run <task>` is the only entry point** (no Rakefile, no Make). Prefer Ruby over
+  bash. A composite or straight-line task is a shell `run` in `mise.toml`; a task with real logic
+  is an executable Ruby script in `mise-tasks/` named by its path (helpers in
+  `scripts/lib/tasks.rb`, larger tools in `scripts/`). `mise run <task> --help` shows arguments.
+  mise runs `depends` **in parallel**, so sequence steps as `{ task = … }` entries in `run`.
+- **Worktrees share one object store.** Claude and Codex sessions each work in a git worktree of
+  one checkout; a commit is visible to all of them immediately, so committing (even WIP) is the
+  hand-off. **Never use bare `git stash` / `stash pop`.** `master` lives in the main checkout:
+  fast-forward there (`git -C <main> merge --ff-only <sha>`) after checking it is clean. Verify
+  another session's claims against git, not its prose.
+- **`origin` is the public GitHub repo** — pushing publishes. **Push only when the user asks.**
+  Merge to `master` only when green. **`master` is strictly linear**: rebase then fast-forward,
+  squash, or cherry-pick; never a merge commit; never `git pull` without `--ff-only`/`--rebase`.
+- Memory notes about landed work say whether it is "pushed" or "local only, NOT pushed".
 
-- Do not automatically provision or update `references/`.
-- Never run `mise run references:setup`, `mise run references:update`, or any large
-  download on your own initiative.
-- If reference sources are missing, work without them or ask the user.
-- The PostgreSQL oracle is this checkout's own cluster (`.dev/postgres`), started by
-  `mise run dev` and reached over its Unix socket. `PGHOST`/`PGPORT` come from `.dev/`
-  via mise (`PGPORT` from port-tamer's allocation, `PGHOST` derived from it), along with
-  the cluster's fixed `PGUSER=postgres` / `PGDATABASE=postgres` defaults — do not override
-  `PGHOST` or `PGPORT`, and never set one without the other. If the oracle is unreachable,
-  the cluster is probably not running.
-- The oracle's configuration is declared in `spec/conformance/oracle_profile.toml`
-  (cluster facts asserted at connect, session GUCs applied per probe). A mismatch
-  aborts. Changing a profile value changes what the oracle answers, so treat it as a
-  spec edit and re-run `corpus:check`. `mise run oracle:status` shows declared vs live.
-- Corpus probes run against the dedicated `jed_oracle` database (builtin `C.UTF-8`
-  provider, whose ordering is jed's `C` collation). `mise run oracle:setup` provisions it;
-  the harness passes `-d`, so bare `psql` is `psql -d jed_oracle` for corpus work.
+## 11. Roadmap
 
-## Coding Style
+Forward work is in [TODO.md](TODO.md). Keep each step independently testable — no point where
+progress blocks on one giant subsystem.
 
-- Prefer boring, explicit code over clever abstraction.
-- In Rust, avoid unnecessary macro magic and deep generics.
-- In Go, avoid unnecessary interfaces and abstraction layers.
-- Keep modules flat, well named, and single purpose.
-- Prefer Ruby for scripts, codegen drivers, and automation. Use shell only when
-  clearly better for the job.
-- Long-running services live in `process-compose.yaml`, one-shot work in mise
-  tasks. `mise run dev` starts this checkout's stack (its own PostgreSQL cluster
-  under `.dev/postgres`); `mise run dev:ports` shows its allocated ports. Corpus and
-  benchmark work needs that stack running.
-- `mise run <task>` is the only task runner (there is no Rakefile). Composite tasks
-  and straight-line commands are shell in `mise.toml`; a task with real logic is an
-  executable Ruby script under `mise-tasks/` (`mise-tasks/stress` is `stress`). `mise tasks`
-  lists them; `mise run <task> --help` shows arguments. `mise run` loads this
-  checkout's `PGHOST`/`PGPORT`, so invoke tasks through it rather than running the
-  scripts behind them directly. Composite tasks sequence steps with `{ task = … }`
-  entries, because mise runs `depends` in parallel.
+## 12. Reference sources and the PostgreSQL oracle
 
-## Website And Docs
+`references/` (gitignored) holds source checkouts of postgres, sqlite, duckdb, bbolt and
+sqllogictest-rs for reading. CockroachDB is excluded (BSL).
 
-- `/web` is a downstream consumer of the user-facing SQL and embedding surface.
-- When a change adds or alters user-facing SQL behavior or host APIs, update the
-  relevant docs, examples, and live panels in the same change.
-- Generated reference pages should continue to derive from spec data rather
-  than hand-maintained duplicates.
+> **Never provision references or start any large download or heavy operation on your own
+> initiative** — work without it or ask the user. Exception: if every `<name>.git` mirror already
+> exists with refs at the machine-level mirror path (`REFERENCES_MIRROR_DIR`, default
+> `${XDG_DATA_HOME:-~/.local/share}/jed/references/` or `/persist/shared/references/` in a
+> devcontainer), `mise run references:setup` only adds local worktrees and you may run it.
+> `references:update` is never covered.
 
-## Git And Collaboration
+The live oracle is this checkout's own PostgreSQL cluster (`mise run db:init`, `mise run dev`),
+reached over a Unix socket configured by `.dev/ports.env` / `.dev/derived.env`, which mise loads.
+**Never set `PGHOST` and `PGPORT` independently.** Corpus probes use the `jed_oracle` database
+(`mise run oracle:setup`, `psql -d jed_oracle`); its configuration is declared in
+`spec/conformance/oracle_profile.toml` (`mise run oracle:status`).
 
-- Multiple agent sessions share one checkout, each in its own git worktree, so
-  they share one object store and one ref namespace: a commit in any worktree is
-  readable from every other with no push and no fetch. Working tree, index, and
-  HEAD are per-worktree, so committing — not pushing — is what hands work over.
-- The shared refs are writable by every session: another may move or delete a
-  branch under you, bare `git stash` / `git stash pop` is unsafe in a worktree,
-  and a branch checked out in one worktree cannot be checked out in another.
-  `master` lives in the main checkout, the only place it can be fast-forwarded.
-- Before continuing work reported by another session, verify the referenced
-  commit or branch against git rather than its prose. This is a local lookup; a
-  fetch is needed only for work from another machine.
-- `origin` is the public GitHub repository, so a push publishes. It is not how
-  work reaches another session; push a branch or `master` only when asked.
-- Merge to `master` only when verification is green.
-- `master` history must stay linear. Use fast-forward-only integration, rebased
-  branches, squash merges, or cherry-picks; do not create merge commits on
-  `master`.
-- A note that work is "landed" or committed at a hash should say whether it is
-  pushed or local-only — not for another session to find it, which needs no
-  push, but because only a pushed commit is published and backed up.
+## 13. Untrusted SQL must be safe to run
 
-## Typical Workflow
+A standing requirement on the engine and its built-in surface
+([session.md](spec/design/session.md), [cost.md](spec/design/cost.md),
+[memory.md](spec/design/memory.md)):
 
-1. Read `CLAUDE.md`, relevant `spec/design/*` docs, shared spec data, and
-   existing implementation patterns.
-2. Add or update shared conformance entries for the behavior.
-3. Implement the smallest vertical slice across the affected core or cores.
-4. Add per-core unit tests only for behavior outside corpus reach.
-5. Update specs, TODO, website docs, and examples when user-facing behavior or
-   standing design changes.
-6. Run the relevant verification. Prefer `mise run ci` for broad confidence and
-   narrower mise tasks or per-core tests for scoped changes.
-7. Report what changed, what was verified, and any remaining gaps.
+- **Memory safety** — any `unsafe`, cgo or FFI path must be justified against this and §14.
+- **No dangerous built-ins** — every built-in function is pure: no filesystem, network, process,
+  environment, or clock access except the host-injected entropy/clock seam. Never add one that
+  isn't.
+- **Bounded resources** — new execution work is metered by the deterministic cost meter (identical
+  in every core) and charged to the memory accounts. These limits are guardrails, not a
+  whole-engine heap cap; never claim otherwise.
+
+These guarantees bind **jed's own surface only**. A host extension may relax any of them and owns
+the consequence; don't argue host extensions down on core guarantees
+([extensibility.md](spec/design/extensibility.md) §2).
+
+## 14. Third-party dependencies
+
+The parser, planner, executor, storage, type system and evaluator are written from scratch, never
+delegated to a library. A dependency at the edges is allowed only if (1) every core can match it
+byte-for-byte, (2) a per-language library is *significantly* faster with identical output, or (3)
+it is cryptography — never roll our own.
+
+**Always get explicit human confirmation before adding any dependency**: name the clause and wait
+for a yes. Dependencies must not break memory safety, leak nondeterminism, or make cores diverge;
+the Go core stays free of cgo and external FFI. `bench/` modules are not cores, but new bench
+dependencies still need confirmation.
+
+Approved dependencies, with exact pins and scope, are recorded in
+[dependencies.md](spec/design/dependencies.md); record any new approval there.
