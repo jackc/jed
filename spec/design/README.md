@@ -23,6 +23,8 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   per-core cross-check.
 - [conformance.md](conformance.md) — the conformance corpus: sqllogictest-style format,
   structured-error matching, the tier + capability-flag system, and determinism rules.
+- [dependencies.md](dependencies.md) — the ledger of approved third-party dependencies: exact
+  pins, approval dates, the CLAUDE.md §14 clause each rests on, and their scope.
 - [determinism.md](determinism.md) — the determinism contract decomposed into four
   guarantees, the taxonomy of sanctioned relaxations (underspecified order, boundary inputs,
   approximate/float, identity, plan/parallelism), the clock/entropy seams, the
