@@ -1657,7 +1657,7 @@ func resolveBooleanFilter(s *scope, e *exprNode, params *paramTypes) (*rExpr, er
 	if ty.kind != rtBool && ty.kind != rtNull {
 		return nil, positionError(typeError("argument of WHERE must be boolean"), exprLocation(*e))
 	}
-	return node, nil
+	return foldConstants(s, node), nil
 }
 
 // resolveOrderedFilter resolves a WHERE or join ON clause and cost-orders its top-level conjuncts

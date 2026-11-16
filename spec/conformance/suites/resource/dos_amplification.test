@@ -13,7 +13,7 @@
 #
 # jed-SPECIFIC (PostgreSQL has no execution-cost ceiling — a documented divergence, CLAUDE.md §1/§13),
 # so the 54P01 records are NOT oracle-checked; the `# cost:` baselines are the cross-core contract.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.point_lookup, query.cross_join, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_correlated, query.aggregates, types.i32, types.text, types.decimal, expr.decimal_arithmetic, resource.cost_metering, resource.cost_limit
+# requires: harness.params, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.point_lookup, query.cross_join, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_correlated, query.aggregates, types.i32, types.text, types.decimal, expr.decimal_arithmetic, resource.cost_metering, resource.cost_limit
 
 statement ok
 CREATE TABLE s (id i32 PRIMARY KEY, v i32)
@@ -121,32 +121,38 @@ SELECT 99999999999999999999999999999999999999999999999999
 
 # ...and there the size-scaled `decimal_work` unit bounds it. A 50-digit x 50-digit multiply
 # accrues decimal_work proportional to the operation's digit groups: W = q(50)*q(50) = 13*13 = 169,
-# charged as W-1 = 168, plus 1 (the multiply node) + 1 (row produced) = 170. (The ::decimal casts
-# fold at parse, so they add nothing.)
-# cost: 170
+# charged as W-1 = 168, plus 1 (the multiply node) + 1 (the run-time cast of the bound right operand)
+# + 1 (row produced) = 171. (The left ::decimal cast folds at parse, so it adds nothing. The right
+# operand is bound, because two literals would fold to a constant at plan time — planner.md §3.7 —
+# and the multiply would charge nothing.)
+# params: '99999999999999999999999999999999999999999999999999'
+# cost: 171
 query R nosort
-SELECT '99999999999999999999999999999999999999999999999999'::decimal * '99999999999999999999999999999999999999999999999999'::decimal
+SELECT '99999999999999999999999999999999999999999999999999'::decimal * $1::text::decimal
 ----
 9999999999999999999999999999999999999999999999999800000000000000000000000000000000000000000000000001
 
 # The decimal_work charge is GUARDED before the limb loop runs (cost.md §3), so a tiny ceiling
 # aborts the multiply BEFORE doing the expensive work — not after burning the CPU. Even at a ceiling
-# of 3 (far below 170), this 100-digit product never executes — the guard catches it at the
+# of 3 (far below 171), this 100-digit product never executes — the guard catches it at the
 # decimal_work charge, well before the limb loop.
+# params: '99999999999999999999999999999999999999999999999999'
 # max_cost: 3
 statement error 54P01
-SELECT '99999999999999999999999999999999999999999999999999'::decimal * '99999999999999999999999999999999999999999999999999'::decimal
+SELECT '99999999999999999999999999999999999999999999999999'::decimal * $1::text::decimal
 
-# A ceiling at the decimal_work charge (169 = 1 multiply node + 168 decimal_work, guarded before
-# the limb loop) aborts; one above the full cost (171) completes and returns the product.
-# max_cost: 169
+# A ceiling at the decimal_work charge (170 = 1 multiply node + 1 cast + 168 decimal_work, guarded
+# before the limb loop) aborts; one above the full cost (172) completes and returns the product.
+# params: '99999999999999999999999999999999999999999999999999'
+# max_cost: 170
 statement error 54P01
-SELECT '99999999999999999999999999999999999999999999999999'::decimal * '99999999999999999999999999999999999999999999999999'::decimal
+SELECT '99999999999999999999999999999999999999999999999999'::decimal * $1::text::decimal
 
-# max_cost: 171
-# cost: 170
+# params: '99999999999999999999999999999999999999999999999999'
+# max_cost: 172
+# cost: 171
 query R nosort
-SELECT '99999999999999999999999999999999999999999999999999'::decimal * '99999999999999999999999999999999999999999999999999'::decimal
+SELECT '99999999999999999999999999999999999999999999999999'::decimal * $1::text::decimal
 ----
 9999999999999999999999999999999999999999999999999800000000000000000000000000000000000000000000000001
 

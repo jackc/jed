@@ -6,7 +6,7 @@
 # (num_nulls(NULL) is 1), while the VARIADIC-array form returns NULL on a NULL whole-array operand.
 # A VARIADIC keyword on a non-array (or a bare untyped NULL) operand is 42804; a spread of zero args
 # (num_nulls()) is 42883. PostgreSQL-oracle-verified (postgres:18).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, types.array, types.array_multidim, types.i32, types.text, types.boolean, func.variadic, resource.cost_metering
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, types.array, types.array_multidim, types.i32, types.text, types.boolean, func.variadic, resource.cost_metering
 
 # --- spread form: count the NULL / non-NULL arguments (heterogeneous; the "any" element family) ---
 # num_nulls(NULL) is 1, NOT NULL — the non-strict discipline (the kernel counts, never short-circuits).
@@ -66,9 +66,10 @@ SELECT num_nonnulls(ARRAY[1, NULL, 3])
 1
 
 # --- VARIADIC-array form: the array's flattened elements are the arguments -------------------------
-# Cost: 1 (the ARRAY[…] constructor node) + 1 (the num_nulls node) + 1 (the produced row) = 3 — the
-# per-element count walk is UNMETERED (like the array introspectors, §3.3), byte-identical cross-core.
-# cost: 3
+# Cost: 1 (the num_nulls node) + 1 (the produced row) = 2 — the constant ARRAY[…] folds at plan time
+# (planner.md §3.7), and the per-element count walk is UNMETERED (like the array introspectors, §3.3),
+# byte-identical cross-core.
+# cost: 2
 query I nosort
 SELECT num_nulls(VARIADIC ARRAY[1, NULL, 3])
 ----

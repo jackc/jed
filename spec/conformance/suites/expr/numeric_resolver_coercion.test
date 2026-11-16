@@ -4,16 +4,16 @@
 # div/gcd/lcm reject the float island during resolution, including under EXPLAIN.
 # NULL pairs use jed's integer-width promotion; PostgreSQL reports ambiguous
 # gcd overloads for all-NULL and i16/NULL pairs (documented in oracle_overrides.toml).
-# requires: query.select, query.select_no_from, query.explain, cast.operator, types.i16, types.i32, types.i64, types.decimal, types.f32, types.f64, types.boolean, types.text, null.three_valued, func.arg_coercion, resource.cost_metering
+# requires: query.constant_folding, query.select, query.select_no_from, query.explain, cast.operator, types.i16, types.i32, types.i64, types.decimal, types.f32, types.f64, types.boolean, types.text, null.three_valued, func.arg_coercion, resource.cost_metering
 
-# cost: 3
+# cost: 2
 # types: i32
 query I nosort
 SELECT width_bucket(16777216::f32, 16777217, 16777220, 4)
 ----
 0
 
-# cost: 3
+# cost: 2
 # types: i32
 query I nosort
 SELECT width_bucket(16777216::f32, 16777217.0, 16777220.0, 4)

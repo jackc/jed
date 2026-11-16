@@ -448,6 +448,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.join_pushdown",
   // Stage-2 WHERE rewrites (spec/design/planner.md §3): contradiction detection and join pushdown.
   "query.where_pushdown",
+  "query.constant_folding",
   "query.where_contradiction",
   "dml.where_contradiction",
   // Stage-2 predicate pushdown into derived bodies / computed relations, and out of a join's ON

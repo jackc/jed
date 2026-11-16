@@ -1,0 +1,161 @@
+# Plan-time constant folding (spec/design/planner.md §3.7). An admitted expression node whose operands
+# are all constants is evaluated once, as the expression resolves, and replaced by its value; AND/OR
+# drop a constant operand that cannot change the result. The rows are unchanged and no error is
+# introduced; the folded nodes charge nothing at run time, and the folded literals reach contradiction
+# proofs, access-path bounds, estimates, and EXPLAIN VERBOSE.
+#
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: query.constant_folding, harness.params, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.where_contradiction, query.explain, expr.arithmetic, expr.case, types.i32, types.text, types.decimal, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, x i32, s text)
+
+statement ok
+INSERT INTO t VALUES (1, 6, 'ab'), (2, 7, 'cd'), (3, NULL, NULL)
+
+# --- a folded constant costs what the literal costs ------------------------------------------------
+
+# The literal form: 1 page + 3 rows + 1 comparison per row + 1 produced row.
+# cost: 8
+query I nosort
+SELECT id FROM t WHERE x = 6
+----
+1
+
+# `2 * 3` folds to 6, so the per-row comparison is all that is charged: the same cost.
+# cost: 8
+query I nosort
+SELECT id FROM t WHERE x = 2 * 3
+----
+1
+
+# A bound parameter is never folded: `$1 * 3` is evaluated on every row, one more charge per row.
+# params: 2
+# cost: 11
+query I nosort
+SELECT id FROM t WHERE x = $1 * 3
+----
+1
+
+# A constant select-list item charges only the produced rows (and the scan).
+# cost: 7
+query I rowsort
+SELECT 2 + 3 * 4 FROM t
+----
+14
+14
+14
+
+# Casts, CASE, COALESCE, decimal arithmetic, and text comparison of constants fold too.
+# cost: 1
+query TIIRB nosort
+SELECT CAST(12 AS text), CASE WHEN 1 < 2 THEN 10 ELSE 20 END, COALESCE(NULL, 2 + 2), 1.25 * 4, 'a' < 'b'
+----
+12
+10
+4
+5.00
+true
+
+# --- AND / OR drop a constant operand that cannot change the result --------------------------------
+
+# `1 = 1` folds to TRUE, and `TRUE AND x = 6` is `x = 6`: the same cost as the literal form.
+# cost: 8
+query I nosort
+SELECT id FROM t WHERE 1 = 1 AND x = 6
+----
+1
+
+# `x = 6 AND TRUE` is `x = 6` as well.
+# cost: 8
+query I nosort
+SELECT id FROM t WHERE x = 6 AND 2 > 1
+----
+1
+
+# `FALSE OR x = 6` is `x = 6`.
+# cost: 8
+query I nosort
+SELECT id FROM t WHERE 1 = 2 OR x = 6
+----
+1
+
+# A decided connective folds whole: `TRUE OR …` is TRUE, so every row survives without evaluating
+# anything (1 page + 3 rows + 3 produced).
+# cost: 7
+query I rowsort
+SELECT id FROM t WHERE 1 = 1 OR x / 0 = 1
+----
+1
+2
+3
+
+# `FALSE AND …` is FALSE, which the contradiction proof turns into reading nothing (planner.md §3.1).
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE 1 = 2 AND x / 0 = 1
+----
+
+# A NULL operand folds through arithmetic: `x = NULL + 1` is `x = NULL`, which is never TRUE.
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE x = NULL + 1
+----
+
+# --- no error is introduced -----------------------------------------------------------------------
+
+# `1 / 0` cannot fold (its evaluation fails), so it stays as written and is never reached: the
+# preceding conjunct rejects every row first.
+query I nosort
+SELECT id FROM t WHERE x > 100 AND 1 / 0 = 1
+----
+
+# Over an empty input the unfoldable `1 / 0` is never evaluated at all.
+query I nosort
+SELECT 1 / 0 FROM t WHERE id > 100
+----
+
+# Where execution does reach it, the error is the same as without folding.
+statement error 22012
+SELECT 1 / 0 FROM t
+
+# An unfoldable operand blocks only its own subtree: `(2 + 3)` still folds beside it.
+statement error 22012
+SELECT id FROM t WHERE x = (2 + 3) + 1 / 0
+
+# A constant that does not decide the connective leaves the other operand to run: `x / 0 = 1 OR
+# FALSE` is `x / 0 = 1`, which still raises on the first row.
+statement error 22012
+SELECT id FROM t WHERE x / 0 = 1 OR 1 = 2
+
+# Out-of-range arithmetic stays unfolded and raises where it runs.
+statement error 22003
+SELECT 2147483647::i32 + 1::i32 FROM t
+
+# --- folded literals reach access paths and EXPLAIN ------------------------------------------------
+
+# `1 + 1` folds to 2, so the primary key bounds the scan.
+query ITTII nosort
+EXPLAIN SELECT x FROM t WHERE id = 1 + 1
+----
+0
+Filter
+conjuncts=1
+1
+4
+1
+Scan t
+PK bound: id = 2; touched=2
+1
+2
+
+# VERBOSE prints the folded expressions: the WHERE is `x = 6` alone and the select list holds 6.
+query ITT nosort
+EXPLAIN (VERBOSE, COSTS FALSE) SELECT id, 10 - 4 FROM t WHERE x = 2 * 3 AND 1 = 1
+----
+0
+Filter
+filter=(#1 = 6); output=[#0, 6]
+1
+Scan t
+Full scan; touched=2

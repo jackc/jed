@@ -173,7 +173,10 @@ Attributes are separated by `; `. A node with no attributes is `-`.
 - With VERBOSE, those counts become `filter=<expr>`, `having=<expr>`, or `on=<expr>`; the outermost
   SELECT node also appends `output=[<expr>, ...]`.
 
-The verbose printer consumes resolved expressions, not source text. It uses zero-based column slots
+The verbose printer consumes resolved expressions, not source text, after plan-time constant folding
+([planner.md](planner.md) §3.7): a folded subtree prints as its literal (`x = 2 * 3` prints
+`(#1 = 6)`; a folded array prints as its text literal, `'{1,5}'`), and a conjunct that folding drops
+(`1 = 1 AND …`) is absent from both `filter=<expr>` and the `conjuncts=N` count. It uses zero-based column slots
 (`#0`), `outer(level,index)`, one-based parameters (`$1`), lowercase function/operator names,
 canonical quoted constants, and full parentheses around compound operators. It prints every
 resolved expression variant explicitly; adding a new resolved variant without a printer arm is a

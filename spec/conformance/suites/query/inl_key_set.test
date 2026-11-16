@@ -8,7 +8,7 @@
 # PostgreSQL 18 oracle; the costs are jed-owned, so the `# cost:` lines are the cross-core pin. The
 # plans are pinned in inl_key_set_explain.test.
 # Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.where_eq, query.point_lookup, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.join_inner, query.join_left, query.index_nested_loop, query.logical_connectives, query.set_returning, func.array_quantified, types.array, cast.array, types.i32, types.i64, null.three_valued, resource.cost_metering
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.where_eq, query.point_lookup, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.join_inner, query.join_left, query.index_nested_loop, query.logical_connectives, query.set_returning, func.array_quantified, types.array, cast.array, types.i32, types.i64, null.three_valued, resource.cost_metering
 
 statement ok
 CREATE TABLE orders (id i64 PRIMARY KEY, v i64)
@@ -175,7 +175,7 @@ statement ok
 CREATE INDEX ti_tk ON ti (tenant, k)
 
 # An index tuple set: the sibling tenant, then the array's points.
-# cost: 47
+# cost: 43
 query II rowsort
 SELECT t.name, ti.id FROM tenants t JOIN ti ON ti.tenant = t.tenant AND ti.k = ANY(ARRAY[7, 300])
 ----

@@ -18,6 +18,7 @@ A query statement moves through these stages, per core:
 ```
 parse                    → AST
 resolve                  → the LOGICAL plan     (stage 1 — planSelect's body)
+  constant folding       → each expression folded as it resolves (§3.7)
 rewrite rules            → logical plan         (stage 2 — rewriteWhere, §3)
 physical selection       → physical decisions   (stage 3 — optimizeSelect, §4)
 —— the planner ends here ——
@@ -158,8 +159,8 @@ The contract every rewrite rule meets:
 - **A NoREC relation in the same change** ([conformance.md §8](conformance.md)) — the
   metamorphic sweep does not discover new optimizations on its own.
 
-General constant folding, CSE, and redundant-recheck elimination remain unimplemented; each would
-need its own cost decision under this contract.
+CSE and redundant-recheck elimination remain unimplemented; each would need its own cost decision
+under this contract. Constant folding (§3.7) is implemented.
 
 ### 3.1 Contradiction detection (`query.where_contradiction`)
 
@@ -584,6 +585,91 @@ same-typed arm does. A bare arm reference can bound the arm's access path; a cas
 but still filters the arm's rows before the combine. Previously such a conjunct stayed in the outer
 SELECT and was charged once per combined row.
 
+### 3.7 Constant folding (`query.constant_folding`)
+
+Constant folding rewrites an expression in place, so unlike the rules below it does not record a
+`pushdown` annotation. It runs as each expression finishes resolving, before conjunct ordering
+(§3.0) and the stage-2 driver, so the conjunct order, contradiction detection, pushdown, every
+access-path and join detector, the estimator, the touched-set walk, and EXPLAIN all see the folded
+tree. It applies to every expression resolved as a
+filter (a WHERE of a SELECT, UPDATE, or DELETE; a join ON; a partial-index predicate; a view filter,
+read or written through; `ON CONFLICT … DO UPDATE … WHERE`), to HAVING, to each select-list item,
+and to each expression-index key. Partial-index predicates and index keys fold by the same rules as
+queries, so structural matching between a query and an index is unchanged in effect. (Not yet
+folded: UPDATE assignments, `INSERT … VALUES` slots, RETURNING lists, CHECK expressions, DEFAULTs,
+and ORDER BY, GROUP BY, and window keys. ORDER BY skip-sort matches only bare index columns, so an
+unfolded ORDER BY key loses no access path.)
+
+**The rule.** The tree is folded bottom-up. A node is folded when it is one of the **admitted
+kinds** and every operand is a **constant of the fold domain**:
+
+- admitted kinds: cast (to a scalar type), unary minus, NOT, the arithmetic operators `+ - * / %`
+  (not `||`, which resolves to a function call), comparison (any collation), AND, OR,
+  IS [NOT] NULL, IS [NOT] DISTINCT FROM, CASE (both forms), COALESCE, GREATEST/LEAST, and the
+  `ARRAY[…]` constructor;
+- the fold domain: NULL, the integer types, decimal, f32/f64, boolean, text, bytea, uuid, and a
+  one-level array whose elements are all of those.
+
+The node is evaluated once by the ordinary evaluator — no row, no parameter, and a fresh meter whose
+ceiling is **10000** cost units — and replaced by the constant it produces, when that constant is
+itself in the fold domain. If the evaluation raises any error (including that ceiling), or its value
+is outside the domain, the node stays as written and its error surfaces only where execution reaches
+it, exactly as before.
+
+Then, whether or not the node folded, AND and OR drop a constant operand that cannot change the
+value:
+
+| shape | result |
+|---|---|
+| `TRUE AND x`, `x AND TRUE` | `x` |
+| `FALSE AND x` | `FALSE` |
+| `FALSE OR x`, `x OR FALSE` | `x` |
+| `TRUE OR x` | `TRUE` |
+
+Each is exact under three-valued logic and in both filter and value contexts. A constant **left**
+operand that decides the connective drops the right operand, which the left-to-right short-circuit
+([cost.md](cost.md) §3) would never evaluate either. A constant **right** operand is dropped only
+when it is the identity: a right operand that decides the connective (`x AND FALSE`) is kept, so in
+a value context `x` still runs first, as written. (In a filter's top-level chain the conjunct order,
+§3.0, then moves the zero-cost constant conjunct first, and the contradiction proof, §3.1, reads
+nothing.)
+
+**What is never folded.** Columns, outer references, parameters (a bound parameter is a literal to
+the estimator — [estimator.md](estimator.md) §6.1 — but is not folded, so a cached plan never
+depends on a bound value), subqueries (the uncorrelated ones still fold at execution, §1), every
+function call, LIKE/regex, the JSON, range, and array operators other than the constructor, array
+casts, and any value of a datetime, interval, json, jsonb, jsonpath, range, or composite type. These
+exclusions keep the pass free of session state (the time zone, input zone, and loaded zone data),
+clock, entropy, sequences, and host code, and they keep folded output O(query text): no admitted
+kind amplifies its input.
+
+**Contract (§3).**
+
+- *Results-identical, and never a new error.* A folded subtree has the value execution would have
+  computed, and a subtree whose evaluation fails is not folded. Dropping a connective's operand skips
+  only what the short-circuit skips, except that an uncorrelated subquery inside a dropped operand,
+  which would have run once at execution, now does not run; an error it would have raised (a 21000
+  cardinality violation, say) goes unraised, as the planner contract allows.
+- *Cost decision: folded work is free.* A folded node becomes a leaf, and leaves charge nothing
+  ([cost.md](cost.md) §3), so every `operator_eval` and size-scaled unit (`decimal_work`,
+  `varlen_compare`, `collate`, growth bytes) its subtree charged per evaluation is gone; the
+  plan-time evaluation is not metered. A dropped connective operand charges nothing, and the
+  connective node that carried it is gone too. A `WHERE` that folds to `FALSE` or `NULL` is a
+  contradiction (§3.1), which reads nothing. Folded literals can also change access paths and
+  estimates (`b = 1::i32` bounds an i16 key; `ARRAY[1, 2+1]` is a plan-time array to the interval-
+  set path), and those changes are deliberate.
+- *EXPLAIN shows the folded tree.* VERBOSE prints a folded constant as a literal (`(#1 = 6)`; a
+  folded array prints as its text literal, `'{1,5}'`), as PostgreSQL's EXPLAIN VERBOSE does.
+- *NoREC relation:* `constant_folding` in `scripts/norec_gen.rb` compares random constant
+  arithmetic / CASE / COALESCE / NULL trees, in a WHERE comparison, in the select list, and as
+  AND/OR/NOT operands beside a column predicate, with the same trees whose every literal is bound
+  as a parameter.
+
+**PostgreSQL.** PostgreSQL's `eval_const_expressions` folds more (every immutable function and
+operator, in every clause) and raises a folding error at plan time, so `SELECT 1 / 0 FROM t WHERE
+false` fails there. jed folds a narrower set and never raises at plan time: that query returns no
+rows, as it did before folding existed. The rows of every query that succeeds in both are the same.
+
 ## 4. Stage 3 — physical/access-path selection: the rule inventory
 
 `optimizeSelect` applies the rules below **in this fixed order** (later rules read earlier
@@ -832,6 +918,8 @@ bound.
 ## 7. Where future passes plug in
 
 - **Further stage-2 rewrites** (TODO.md) — pushdown into widened set-operation arms and through
-  lateral relations; constant folding — each under the §3 contract with its own cost decision.
+  lateral relations; widening constant folding (§3.7) to immutable functions, the remaining
+  operators and types, and the remaining clauses — each under the §3 contract with its own cost
+  decision.
 - **New physical rules** (the hash join above and later access paths tracked in TODO.md) land as
   discrete rule functions in the §4 inventory, each with its NoREC relation.

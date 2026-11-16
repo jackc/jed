@@ -1,7 +1,7 @@
 # P6b: one-relation SELECTs cost the complete access/order/residual/LIMIT pipeline across GIN,
 # GiST, PK/index interval sets, and order-only B-tree walks. These cases pin row-count flips,
 # cross-method selectivity and kind/name ties, natural-order composition, and actual costs.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, ddl.gist_index, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.or_in_point_lookup, query.interval_set, query.gin_scan, query.gist_scan, query.order_by, query.order_by_keys, query.limit, query.order_by_index_scan, query.explain, types.i32, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators, resource.cost_metering
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, ddl.gist_index, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.or_in_point_lookup, query.interval_set, query.gin_scan, query.gist_scan, query.order_by, query.order_by_keys, query.limit, query.order_by_index_scan, query.explain, types.i32, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators, resource.cost_metering
 
 # --- GIN and GiST row-count flips ------------------------------------------------------------
 
@@ -22,7 +22,7 @@ EXPLAIN SELECT id FROM p6b_g WHERE tags && ARRAY[1]
 Filter
 conjuncts=1
 1
-5
+4
 1
 Scan p6b_g
 Full scan; touched=2
@@ -40,14 +40,14 @@ EXPLAIN SELECT id FROM p6b_g WHERE tags && ARRAY[1]
 Filter
 conjuncts=1
 1
-7
+6
 1
 Scan p6b_g
 GIN bound: using p6b_g_tags; touched=2
 1
 4
 
-# cost: 13
+# cost: 11
 query I nosort
 SELECT id FROM p6b_g WHERE tags && ARRAY[1] ORDER BY id
 ----
@@ -302,7 +302,7 @@ EXPLAIN SELECT id FROM p6b_m WHERE a = 1 AND tags && ARRAY[1]
 Filter
 conjuncts=2
 1
-8
+7
 1
 Scan p6b_m
 Index bound: using p6b_m_a; touched=3
@@ -317,7 +317,7 @@ EXPLAIN SELECT id FROM p6b_m WHERE a > 0 AND tags && ARRAY[1]
 Filter
 conjuncts=2
 1
-9
+8
 1
 Scan p6b_m
 GIN bound: using p6b_m_tags; touched=3
@@ -332,7 +332,7 @@ EXPLAIN SELECT id FROM p6b_m WHERE tags && ARRAY[1] AND span && i32range(4,5)
 Filter
 conjuncts=2
 1
-10
+9
 1
 Scan p6b_m
 GiST bound: using p6b_m_span; touched=3

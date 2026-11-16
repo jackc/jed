@@ -12,7 +12,7 @@
 # suite is the cross-core contract (it is jed-specific, so it is NOT oracle-checked). The
 # over-limit statements below are nested 300 deep (> 256); each aborts at PARSE time, so no rows
 # are produced and no cost is metered. Ordinary, modestly-nested SQL is unaffected.
-# requires: ddl.create_table, ddl.primary_key, ddl.check, dml.insert, query.select, query.union, query.setop_parenthesized, query.subquery_scalar, query.join_inner, query.table_alias, query.join_parenthesized, expr.arithmetic, types.array, types.i32, resource.depth_limit, resource.cost_metering
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, ddl.check, dml.insert, query.select, query.union, query.setop_parenthesized, query.subquery_scalar, query.join_inner, query.table_alias, query.join_parenthesized, expr.arithmetic, types.array, types.i32, resource.depth_limit, resource.cost_metering
 
 
 statement ok
@@ -82,10 +82,11 @@ CREATE TABLE u (a i32 CHECK (1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 +
 
 # G17 — the exact MAX_EXPR_DEPTH = 256 boundary, bracketed. An additive chain increments the
 # depth counter once per step, so a chain of 256 ones (255 `+` steps) sits at depth exactly 256 —
-# the highest ALLOWED depth (the counter must EXCEED 256 to abort) — and evaluates to 256. 255
-# operator_eval + 1 page + 1 scanned + 1 produced = 258.
+# the highest ALLOWED depth (the counter must EXCEED 256 to abort) — and evaluates to 256. The chain
+# is all constants, so it folds at plan time to 256 (planner.md §3.7) and charges no operator_eval:
+# 1 page + 1 scanned + 1 produced = 3.
 # names: ?column?
-# cost: 258
+# cost: 3
 query I nosort
 SELECT 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 FROM t
 ----

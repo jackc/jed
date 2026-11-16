@@ -21,8 +21,9 @@ function code(fn: () => unknown): string {
   throw new Error("expected an error, got none");
 }
 
-// COST5 — "SELECT 1 + 1 + 1 + 1 + 1" — five 1s, four +, costs 5 (4 operator_eval + 1 row_produced).
-const COST5 = "SELECT 1 + 1 + 1 + 1 + 1";
+// COST5 costs 5: the uncorrelated subquery's 1 row_produced, 3 operator_eval for the `+`s, and 1
+// row_produced. The subquery keeps the chain from folding to a constant at plan time (planner.md §3.7).
+const COST5 = "SELECT (SELECT 1) + 1 + 1 + 1";
 
 test("default session has no budget but tracks the cumulative", () => {
   // A fresh session is unlimited (budget 0) yet still TRACKS the cumulative cost — the gauge is

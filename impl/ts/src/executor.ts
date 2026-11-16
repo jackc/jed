@@ -1,4 +1,5 @@
 import { cancellationCheckpoint } from "./cancel.ts";
+import { foldConstants } from "./fold.ts";
 import {
   callSteps,
   uncancelableSteps,
@@ -8645,6 +8646,12 @@ export class Engine {
   // (spec/design/indexes.md §4): params/CTEs are empty (an index expression cannot reference them) and
   // the seam rng is shared/threaded (an immutable index expression never reads it). Used by the index
   // maintenance helpers and CREATE INDEX build.
+  // foldEnv is the environment plan-time constant folding evaluates a closed subtree in
+  // (spec/design/planner.md §3.7): no parameters, no outer rows, a fresh statement rng.
+  foldEnv(): EvalEnv {
+    return this.maintenanceEnv(new StmtRng());
+  }
+
   private maintenanceEnv(rng: StmtRng): EvalEnv {
     return {
       params: [],
@@ -8694,7 +8701,7 @@ export class Engine {
         throw new Error("index expression result type validated indexable at CREATE INDEX");
       }
       const coll = resolveDeriv(scope.catalog, deriveCollation(scope, k.expr));
-      return { kind: "expr", expr: node, type: ty, coll };
+      return { kind: "expr", expr: foldConstants(node, this.foldEnv()), type: ty, coll };
     });
     // A partial index's predicate (indexes.md §9), re-resolved against the table's columns — it was
     // validated boolean + immutable at CREATE INDEX, so this cannot newly fail.
@@ -22020,7 +22027,8 @@ export class Engine {
           exprLocation(sel.having),
         );
       }
-      having = orderFilterConjuncts(node);
+      // Constant folding (planner.md §3.7) runs before the conjuncts are cost-ordered, as for WHERE.
+      having = orderFilterConjuncts(foldConstants(node, this.foldEnv()));
       aggSpecs = hctx.specs;
       groupingSpecs = hctx.groupingSpecs ?? groupingSpecs;
     }
@@ -22103,6 +22111,12 @@ export class Engine {
     for (const c of pushed)
       fullFilter = fullFilter === null ? c : { kind: "and", lhs: fullFilter, rhs: c };
     if (fullFilter !== null) fullFilter = orderFilterConjuncts(fullFilter);
+    // Plan-time constant folding of the select list (planner.md §3.7); the WHERE, each ON, and HAVING
+    // were folded as they resolved.
+    const foldEnv = this.foldEnv();
+    for (let i = 0; i < projections.length; i++) {
+      projections[i] = foldConstants(projections[i]!, foldEnv);
+    }
 
     // Assemble the owned LOGICAL plan (table NAMES + offsets/widths replace the scope's tables, so
     // the plan outlives the scope and a correlated subquery can re-execute it per row). Resolve

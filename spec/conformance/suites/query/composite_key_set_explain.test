@@ -4,7 +4,7 @@
 # pinned in composite_key_set.test. The plans are jed-owned, so this file is cross-core checked, not
 # oracle-checked.
 # Format + `requires`: ../../../design/conformance.md.
-# requires: harness.params, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, dml.insert, dml.insert_select, dml.update, query.select, query.where_eq, query.point_lookup, query.composite_pk_pushdown, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.logical_connectives, query.order_by, query.limit, query.explain, query.set_returning, func.array_quantified, types.array, cast.array, types.i32, types.i64
+# requires: query.constant_folding, harness.params, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, dml.insert, dml.insert_select, dml.update, query.select, query.where_eq, query.point_lookup, query.composite_pk_pushdown, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.logical_connectives, query.order_by, query.limit, query.explain, query.set_returning, func.array_quantified, types.array, cast.array, types.i32, types.i64
 
 statement ok
 CREATE TABLE cp (tenant i32, id i64, v i64, PRIMARY KEY (tenant, id))
@@ -20,7 +20,7 @@ EXPLAIN SELECT v FROM cp WHERE tenant = 1 AND id = ANY(ARRAY[2, 4, 900])
 Filter
 conjuncts=2
 3
-29
+26
 1
 Scan cp
 PK interval set: tenant, id; intervals=1; arrays=1; touched=3
@@ -81,7 +81,7 @@ EXPLAIN SELECT v FROM cp WHERE tenant = ANY(ARRAY[1, 2]) AND id IN (2, 3)
 Filter
 conjuncts=2
 2
-22
+20
 1
 Scan cp
 PK interval set: tenant, id; intervals=3; arrays=1; touched=3
@@ -156,7 +156,7 @@ EXPLAIN SELECT v FROM cp WHERE tenant = 1 AND id = ANY(ARRAY[2, 4]::i32[])
 Filter
 conjuncts=2
 2
-40
+34
 1
 Scan cp
 PK bound: tenant = 1; touched=3
@@ -171,12 +171,12 @@ EXPLAIN SELECT tenant, id FROM cp WHERE tenant IN (1, 2, 3) AND id = ANY(ARRAY[3
 Limit
 limit=2
 2
-26
+24
 1
 Filter
 conjuncts=2
 2
-24
+22
 2
 Scan cp
 PK interval set: tenant, id; intervals=4; arrays=1; touched=2; ordered: pk ordered

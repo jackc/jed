@@ -11,7 +11,7 @@
 #     seeks all bound an ordered index exactly as an ASC one.
 # Rows agree with the PostgreSQL oracle; the plans (EXPLAIN) and costs are jed-owned and cross-core
 # checked.
-# requires: ddl.index_key_order, ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.index_range, query.index_prefix, query.index_mutation, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.order_by, query.order_by_keys, query.order_by_index_scan, query.bounded_limit_streaming, query.order_by_topk, query.limit, query.offset, query.join_inner, query.index_nested_loop, query.explain, query.set_returning, query.is_null, expr.between, expr.in_list, func.array_quantified, types.array, types.i32, types.text, resource.cost_metering
+# requires: query.constant_folding, ddl.index_key_order, ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.index_range, query.index_prefix, query.index_mutation, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.order_by, query.order_by_keys, query.order_by_index_scan, query.bounded_limit_streaming, query.order_by_topk, query.limit, query.offset, query.join_inner, query.index_nested_loop, query.explain, query.set_returning, query.is_null, expr.between, expr.in_list, func.array_quantified, types.array, types.i32, types.text, resource.cost_metering
 
 statement ok
 CREATE TABLE o (id i32 PRIMARY KEY, a i32, b i32, pad text)
@@ -254,7 +254,7 @@ SELECT id FROM o WHERE a IN (3, 47) AND id < 200
 53
 
 # A set on the leading column, then an equality on the DESC b.
-# cost: 13
+# cost: 12
 query III rowsort
 SELECT id, a, b FROM o WHERE a = ANY(ARRAY[7, 9]) AND b = 9
 ----

@@ -263,6 +263,16 @@ before and after, returned the same per-lane checksums (`e4d18600a94a2e49`, `971
 non-gating; the shared corpus pins, oracle-checked rows, and the `where_pushdown` / `contradiction`
 NoREC relations are the correctness proof.
 
+**Plan-time constant folding result (2026-11-15).** The new `constant_folding_scan` /
+`constant_folding_scan_bound` pair counts 100,000 rows filtered by `v = 3 * 7 + 1 AND 1 = 1`; the
+bound twin binds every literal as a parameter, which is never folded, so its arithmetic and its
+second conjunct run on every row. Median per-query time for the folded spelling went from **7.94 ms
+to 4.45 ms Go**, **9.90 ms to 5.43 ms Rust**, and **37.2 ms to 18.8 ms TypeScript**; the bound twin
+was unchanged (7.96 / 7.89 ms Go, 11.11 / 11.00 ms Rust, 36.23 / 36.22 ms TypeScript). Every core,
+before and after, returned checksum `61667171acf9b825`; the PostgreSQL lane was not run in this
+environment. Timings remain non-gating; the corpus pins and the `constant_folding` NoREC relation
+are the correctness proof.
+
 **GiST sibling-INL result (2026-07-13).** The permanent `gist_inl` /
 `gist_inl_nested_fallback` pair joins ten scalar probes to 50,000 inner rows and returns the same
 500-row result per iteration (checksum `342dce43410acbad`). The bare equality uses jed's scalar GiST

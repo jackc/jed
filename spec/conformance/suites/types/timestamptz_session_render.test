@@ -9,7 +9,7 @@
 # OUT of this corpus (per-core tested): the host render API itself (the canonical Value render stays
 # UTC), and EXPLAIN's canonical UTC spelling of a timestamptz constant (a documented divergence).
 # Format + the `requires` gate: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, dml.insert, query.select, query.select_no_from, query.order_by, types.i32, types.text, types.timestamptz, types.array, types.range, types.composite, func.range_constructors, cast.explicit, cast.operator, cast.array, cast.scalar_text, session.timezone, resource.cost_metering, types.timestamptz_session_render
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, dml.insert, query.select, query.select_no_from, query.order_by, types.i32, types.text, types.timestamptz, types.array, types.range, types.composite, func.range_constructors, cast.explicit, cast.operator, cast.array, cast.scalar_text, session.timezone, resource.cost_metering, types.timestamptz_session_render
 
 # load-timezone: America/New_York
 # load-timezone: Asia/Kolkata
@@ -159,7 +159,7 @@ SELECT ARRAY[timestamptz '2024-01-15 12:00:00+00', NULL, timestamptz 'infinity',
 {"2024-01-15 07:00:00-05",NULL,infinity,"2024-07-01 08:00:00-04"}
 
 # An array of a zone-free element type charges no timezone unit.
-# cost: 3
+# cost: 2
 query T nosort
 SELECT ARRAY[1, 2, 3]::text
 ----

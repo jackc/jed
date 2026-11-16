@@ -10,7 +10,7 @@
 # The vendored `unicode` collation is the CLDR-DUCET root: a < A < b < B (lowercase before its
 # uppercase). Built-in C is byte / code-point order: A(0x41) < B < a(0x61) < b.
 # Format + the `requires` gate: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, query.order_by_expr, query.where_eq, query.comparison_order, query.derived_table, query.union, query.distinct, query.aggregates, query.group_by, query.window, query.limit, types.array, expr.array_subscript, func.array, func.array_quantified, func.array_containment, func.unnest, query.lateral, expr.greatest_least, expr.coalesce, expr.collate, ddl.collate_column, types.array_collation, cast.explicit, cast.operator, types.i32, types.text, resource.cost_metering
+# requires: query.constant_folding, harness.params, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, query.order_by_expr, query.where_eq, query.comparison_order, query.derived_table, query.union, query.distinct, query.aggregates, query.group_by, query.window, query.limit, types.array, expr.array_subscript, func.array, func.array_quantified, func.array_containment, func.unnest, query.lateral, expr.greatest_least, expr.coalesce, expr.collate, ddl.collate_column, types.array_collation, cast.explicit, cast.operator, types.i32, types.text, resource.cost_metering
 
 # load-collation: unicode = collation/17.0.0/root.allkeys
 
@@ -359,8 +359,9 @@ SELECT id, width_bucket(t, ARRAY['a', 'b']) FROM at ORDER BY id
 statement error 42P22
 SELECT width_bucket(s, c) FROM at
 
-# Each search step charges collate per code point of both strings (two steps × 2 code points).
-# cost: 9
+# Each search step charges collate per code point of both strings (two steps × 2 code points). The
+# constant ARRAY constructor folds at plan time, so it charges no operator_eval.
+# cost: 8
 query I nosort
 SELECT width_bucket('A', ARRAY['a', 'b'] COLLATE "unicode")
 ----
@@ -476,8 +477,10 @@ INSERT INTO au VALUES (5, '{A}')
 # it walks (collation.md §11): operator_eval(1) + collate((b,b) 2 + (a,c) 2) + row_produced(1).
 # ============================================================================================
 
+# (The right operand is bound: two literals would fold to a constant at plan time — planner.md §3.7.)
+# params: ARRAY['b', 'c']
 # cost: 6
 query B nosort
-SELECT '{b,a,z}'::text[] < '{b,c}'::text[] COLLATE "unicode"
+SELECT '{b,a,z}'::text[] < $1::text[] COLLATE "unicode"
 ----
 true

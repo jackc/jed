@@ -1035,6 +1035,15 @@ test('the explain page shows a WHERE conjunct pushed into its scan', async ({ pa
   await expect(panel.getByTestId('result-rows')).not.toContainText('Filter');
 });
 
+test('the explain page folds constant expressions', async ({ page }) => {
+  await page.goto('./docs/sql/explain/');
+  // `1 + 2` folds to 3 and bounds the primary key; `1 = 1` drops out; VERBOSE prints the folded
+  // select-list item (planner.md §3.7).
+  const panel = livePanel(page, 'constantFolding');
+  await expect(panel.getByTestId('result-rows')).toContainText('PK bound: id = 3');
+  await expect(panel.getByTestId('result-rows')).toContainText('100]');
+});
+
 test('the explain page shows a proven WHERE contradiction', async ({ page }) => {
   await page.goto('./docs/sql/explain/');
   // `zone > 5 AND zone < 3`: nothing is read (planner.md §3.1).

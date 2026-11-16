@@ -154,6 +154,11 @@
 #              as written guard-first. WHERE, a three-conjunct chain with a NULL-bearing guard, an
 #              INNER ON, HAVING, and a guard pushed into a derived body must all match
 #              by-construction rows (and never raise 22012).
+#   constant_folding — an expression whose operands are all literals folds to a constant at plan time
+#              (planner.md §3.7); the same expression with every literal bound as a parameter is
+#              evaluated per row. Random arithmetic / CASE / COALESCE / NULL trees compared with a
+#              column, in the select list, and as constant AND/OR/NOT operands beside a column
+#              predicate must return the same by-construction rows in both spellings.
 #   contradiction — a provably-never-TRUE bare-column literal AND-chain reads no relation
 #              (planner.md §3.1); the same predicate over `col + 0` is not proven and scans. Both must be
 #              empty (an ungrouped COUNT returns 0), and satisfiable near-miss ranges must match.
@@ -639,6 +644,11 @@ VIEW_WRITE_REQ = %w[ddl.view dml.view_write dml.view_on_conflict ddl.create_tabl
                     query.select query.where_eq query.comparison_order query.logical_connectives
                     query.order_by query.is_null query.is_distinct_from expr.arithmetic expr.between
                     expr.comparison_value null.three_valued types.i32].freeze
+CONSTANT_FOLDING_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+                          query.where_eq query.comparison_order query.logical_connectives query.order_by
+                          query.constant_folding harness.params expr.arithmetic expr.case expr.coalesce
+                          expr.comparison_value null.three_valued types.i32].freeze
+
 CONTRADICTION_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
                        query.where_eq query.comparison_order query.logical_connectives query.order_by
                        query.aggregates query.qualified_column query.join_inner
@@ -4657,6 +4667,111 @@ def gen_where_pushdown(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: plan-time constant folding ------------------------------------------------------
+# `opt` spells each constant expression with literals, which fold at plan time (planner.md §3.7);
+# `ref` binds every literal as a parameter (`$k::i32`), which is never folded and so is evaluated
+# per row. Both must return the rows computed here under three-valued logic.
+def gen_constant_folding(seed)
+  rng = Random.new(seed)
+  rows = (1..30).to_a.sample(8, random: rng).sort.map { |id| [id, rng.rand < 0.2 ? nil : rng.rand(-20..20)] }
+  lit = ->(v) { v.nil? ? "NULL" : v.to_s }
+
+  # A random integer expression: [literal spelling, parameter spelling, value]. Literals stay small
+  # and the depth shallow, so no node can overflow i32.
+  gen_expr = lambda do |depth, params|
+    if depth.zero? || rng.rand < 0.3
+      v = rng.rand < 0.1 ? nil : rng.rand(-6..6)
+      params << v
+      next [v.nil? ? "NULL::i32" : v.to_s, "$#{params.size}::i32", v]
+    end
+    case rng.rand(4)
+    when 0
+      op = %w[+ - *].sample(random: rng)
+      l = gen_expr.call(depth - 1, params)
+      r = gen_expr.call(depth - 1, params)
+      v = l[2].nil? || r[2].nil? ? nil : l[2].send(op, r[2])
+      ["(#{l[0]} #{op} #{r[0]})", "(#{l[1]} #{op} #{r[1]})", v]
+    when 1
+      a = gen_expr.call(depth - 1, params)
+      b = gen_expr.call(depth - 1, params)
+      t = gen_expr.call(depth - 1, params)
+      e = gen_expr.call(depth - 1, params)
+      cond = a[2].nil? || b[2].nil? ? nil : a[2] < b[2]
+      ["CASE WHEN #{a[0]} < #{b[0]} THEN #{t[0]} ELSE #{e[0]} END",
+       "CASE WHEN #{a[1]} < #{b[1]} THEN #{t[1]} ELSE #{e[1]} END", cond ? t[2] : e[2]]
+    when 2
+      a = gen_expr.call(depth - 1, params)
+      b = gen_expr.call(depth - 1, params)
+      ["COALESCE(#{a[0]}, #{b[0]})", "COALESCE(#{a[1]}, #{b[1]})", a[2].nil? ? b[2] : a[2]]
+    else
+      a = gen_expr.call(depth - 1, params)
+      ["(- #{a[0]})", "(- #{a[1]})", a[2].nil? ? nil : -a[2]]
+    end
+  end
+  cmp = { "=" => :==, "<>" => :!=, "<" => :<, "<=" => :<=, ">" => :>, ">=" => :>= }
+  cmp3 = ->(a, op, b) { a.nil? || b.nil? ? nil : a.send(cmp[op], b) }
+  and3 = ->(a, b) { a == false || b == false ? false : (a.nil? || b.nil? ? nil : true) }
+  or3 = ->(a, b) { a == true || b == true ? true : (a.nil? || b.nil? ? nil : false) }
+  pair = lambda do |out, sql_opt, sql_ref, params, coltypes, exp|
+    out << "# folded (literals)"
+    q(out, coltypes, sql_opt, exp)
+    out << "# evaluated per row (every literal bound)"
+    out << "# params: #{params.map { |v| lit.call(v) }.join(', ')}"
+    q(out, coltypes, sql_ref, exp)
+  end
+
+  out = header(seed, CONSTANT_FOLDING_REQ, "plan-time constant folding (folded vs bound)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, x i32)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, x| "(#{id}, #{lit.call(x)})" }.join(', ')}")
+
+  # A column compared with a constant expression.
+  4.times do
+    params = []
+    e = gen_expr.call(3, params)
+    op = cmp.keys.sample(random: rng)
+    exp = rows.select { |_, x| cmp3.call(x, op, e[2]) == true }.map { |id, _| id.to_s }
+    pair.call(out, "SELECT id FROM t WHERE x #{op} #{e[0]} ORDER BY id",
+              "SELECT id FROM t WHERE x #{op} #{e[1]} ORDER BY id", params, "I", exp)
+  end
+
+  # A constant expression in the select list.
+  2.times do
+    params = []
+    e = gen_expr.call(3, params)
+    exp = rows.flat_map { |id, _| [id.to_s, lit.call(e[2])] }
+    pair.call(out, "SELECT id, #{e[0]} FROM t ORDER BY id", "SELECT id, #{e[1]} FROM t ORDER BY id",
+              params, "II", exp)
+  end
+
+  # A constant comparison as an AND / OR / NOT operand beside a column predicate, on either side.
+  6.times do
+    params = []
+    a = gen_expr.call(2, params)
+    b = gen_expr.call(2, params)
+    op = cmp.keys.sample(random: rng)
+    c = cmp3.call(a[2], op, b[2])
+    k = rng.rand(-10..10)
+    params << k
+    conn = %w[AND OR].sample(random: rng)
+    neg = rng.rand < 0.3
+    const_opt = "#{neg ? 'NOT ' : ''}(#{a[0]} #{op} #{b[0]})"
+    const_ref = "#{neg ? 'NOT ' : ''}(#{a[1]} #{op} #{b[1]})"
+    cval = neg && !c.nil? ? !c : c
+    col_ref = "x > $#{params.size}::i32"
+    left = rng.rand < 0.5
+    pred_opt = left ? "#{const_opt} #{conn} x > #{k}" : "x > #{k} #{conn} #{const_opt}"
+    pred_ref = left ? "#{const_ref} #{conn} #{col_ref}" : "#{col_ref} #{conn} #{const_ref}"
+    exp = rows.select do |_, x|
+      col = cmp3.call(x, ">", k)
+      (conn == "AND" ? and3.call(cval, col) : or3.call(cval, col)) == true
+    end.map { |id, _| id.to_s }
+    pair.call(out, "SELECT id FROM t WHERE #{pred_opt} ORDER BY id",
+              "SELECT id FROM t WHERE #{pred_ref} ORDER BY id", params, "I", exp)
+  end
+
+  out.join("\n") + "\n"
+end
+
 # --- scenario: WHERE contradiction ------------------------------------------------------------
 def gen_contradiction(seed)
   rng = Random.new(seed)
@@ -5742,6 +5857,7 @@ SCENARIOS = {
   "paren_lateral" => method(:gen_paren_lateral),
   "right_lateral" => method(:gen_right_lateral),
   "where_pushdown" => method(:gen_where_pushdown),
+  "constant_folding" => method(:gen_constant_folding),
   "contradiction" => method(:gen_contradiction),
   "conjunct_order" => method(:gen_conjunct_order),
   "dml_contradiction" => method(:gen_dml_contradiction),

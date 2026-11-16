@@ -7,7 +7,7 @@
 # index (the WHERE stays the residual filter); the `# cost:` lines pin which queries use it — each
 # implied query reads only the index range, each non-implied one costs the full scan.
 # Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_partial, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.where_eq, query.comparison_order, query.logical_connectives, expr.in_list, query.set_returning, query.index_range, query.index_partial, query.index_partial_implication, types.i32, types.text, types.decimal, types.date, null.three_valued, resource.cost_metering
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_partial, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.where_eq, query.comparison_order, query.logical_connectives, expr.in_list, query.set_returning, query.index_range, query.index_partial, query.index_partial_implication, types.i32, types.text, types.decimal, types.date, null.three_valued, resource.cost_metering
 
 statement ok
 CREATE TABLE pi (id i32 PRIMARY KEY, status text, amt i32, price decimal, d date)
@@ -59,7 +59,7 @@ SELECT id FROM pi WHERE amt IN (4, 33)
 93
 
 # `amt = ANY(array)` premises likewise
-# cost: 54
+# cost: 46
 query I rowsort
 SELECT id FROM pi WHERE amt = ANY(ARRAY[4, 33])
 ----

@@ -1019,7 +1019,8 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		if ty.kind != rtBool && ty.kind != rtNull {
 			return nil, positionError(typeError("argument of HAVING must be boolean"), exprLocation(*sel.Having))
 		}
-		having = orderFilterConjuncts(node)
+		// Constant folding (planner.md §3.7) runs before the conjuncts are cost-ordered, as for WHERE.
+		having = orderFilterConjuncts(foldConstants(s, node))
 		aggSpecs = hctx.specs
 		groupingSpecs = hctx.groupingSpecs
 	}
@@ -1450,6 +1451,11 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	// (planner.md §3.0).
 	if filter != nil {
 		filter = orderFilterConjuncts(filter)
+	}
+	// Plan-time constant folding of the select list (planner.md §3.7); the WHERE, each ON, and
+	// HAVING were folded as they resolved.
+	for _, p := range projections {
+		foldConstants(s, p)
 	}
 	planRels := make([]planRel, len(s.rels))
 	for i, rel := range s.rels {

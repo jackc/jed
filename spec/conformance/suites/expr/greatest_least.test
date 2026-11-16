@@ -11,7 +11,7 @@
 # forms); a distinct grammar node — not a catalog function — so `greatest` / `least` stay usable as
 # column names and carry no EXECUTE privilege. Output names `greatest` / `least`. Oracle-checked
 # against PostgreSQL 18. Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.check, ddl.column_default_expr, ddl.secondary_index, ddl.index_expr, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, query.order_by_expr, query.index_expr, query.aggregates, query.group_by, query.group_by_expr, expr.greatest_least, expr.comparison_value, expr.arithmetic, cast.explicit, error.division_by_zero, types.i16, types.i32, types.i64, types.text, types.decimal, types.f32, types.f64, types.boolean, types.bytea, types.uuid, types.timestamp, types.timestamptz, types.date, types.interval, types.array, types.range, func.range_constructors, types.composite, types.jsonb_compare, types.json, types.jsonpath, null.three_valued, resource.cost_metering
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, ddl.check, ddl.column_default_expr, ddl.secondary_index, ddl.index_expr, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, query.order_by_expr, query.index_expr, query.aggregates, query.group_by, query.group_by_expr, expr.greatest_least, expr.comparison_value, expr.arithmetic, cast.explicit, error.division_by_zero, types.i16, types.i32, types.i64, types.text, types.decimal, types.f32, types.f64, types.boolean, types.bytea, types.uuid, types.timestamp, types.timestamptz, types.date, types.interval, types.array, types.range, func.range_constructors, types.composite, types.jsonb_compare, types.json, types.jsonpath, null.three_valued, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32, s text)
@@ -245,10 +245,11 @@ CREATE TABLE one (id i32 PRIMARY KEY)
 statement ok
 INSERT INTO one VALUES (1)
 
-# Both arguments are evaluated (eager), so the `1 + 1` and `2 + 2` each charge their Add: 1 node +
-# 2 adds + 1 scan + 1 produced + 1 page = 6 (the integer comparison is metered zero).
+# Every operand is a constant, so the whole call folds at plan time to the constant 4 (planner.md
+# §3.7) and charges nothing per row: 1 scan + 1 produced + 1 page = 3. (The eager evaluation of every
+# argument is pinned over columns above: `GREATEST(a + 1, b + 1)`.)
 # names: greatest
-# cost: 6
+# cost: 3
 query I nosort
 SELECT GREATEST(1 + 1, 2 + 2) FROM one
 ----

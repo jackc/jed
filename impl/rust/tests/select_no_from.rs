@@ -67,13 +67,13 @@ fn literal_select_returns_one_row_costing_one_row_produced() {
 }
 
 #[test]
-fn expression_select_charges_its_operator_evals() {
+fn constant_expression_select_folds_at_plan_time() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
     assert_eq!(query(&mut db, "SELECT 1 + 2"), vec![vec![Value::Int(3)]]);
-    // 1 operator_eval (the `+` node) + 1 row_produced.
-    assert_eq!(cost(&mut db, "SELECT 1 + 2"), 2);
+    // Only the 1 row_produced: the `+` of two constants folds at plan time (planner.md §3.7).
+    assert_eq!(cost(&mut db, "SELECT 1 + 2"), 1);
 }
 
 #[test]
@@ -91,7 +91,7 @@ fn where_filters_the_virtual_row() {
         query(&mut db, "SELECT 1 WHERE 1 = 1"),
         vec![vec![Value::Int(1)]]
     );
-    assert_eq!(cost(&mut db, "SELECT 1 WHERE 1 = 1"), 2); // the `=` + the produced row
+    assert_eq!(cost(&mut db, "SELECT 1 WHERE 1 = 1"), 1); // the `=` folds; the produced row
 }
 
 #[test]

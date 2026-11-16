@@ -17,7 +17,10 @@
 # (one row_produced) and each `+` adds one operator_eval, so `SELECT 1 + … + 1` over ten `1`s (nine
 # `+`) costs 10 (9 operator_eval + 1 row_produced).
 # Format + the `requires` gate: ../../../design/conformance.md.
-# requires: query.select_no_from, expr.arithmetic, types.i32, resource.cost_metering, resource.cost_limit, session.lifetime_cost
+# requires: harness.params, query.select_no_from, expr.arithmetic, types.i32, resource.cost_metering, resource.cost_limit, session.lifetime_cost
+
+# Each arithmetic chain starts from a bound parameter, so it is evaluated at run time rather than
+# folded to a constant at plan time (planner.md §3.7).
 
 # --- a far budget leaves the per-statement max_cost as the binding gate (54P01) ------------------
 
@@ -25,10 +28,11 @@
 # is reached FIRST: this 11-cost statement aborts 54P01, not 54P02 (a statement aborts at whichever
 # ceiling it reaches first). Its partial cost (the 5 the max_cost admitted) still counts toward the
 # session budget — the cumulative is now 5.
+# params: 1
 # lifetime_max_cost: 1000000
 # max_cost: 5
 statement error 54P01
-SELECT 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
+SELECT $1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
 
 # --- the session budget as the binding gate (54P02), cumulative across statements ----------------
 
@@ -38,23 +42,26 @@ SELECT 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
 # lifetime_max_cost: 30
 
 # cumulative 5 → 15: under budget, runs fine.
+# params: 1
 # cost: 10
 query I
-SELECT 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
+SELECT $1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
 ----
 10
 
 # cumulative 15 → 25: still under budget.
+# params: 1
 # cost: 10
 query I
-SELECT 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
+SELECT $1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
 ----
 10
 
 # cumulative 25 → would reach 35, but crosses the budget (30) MID-FLIGHT: the instant the running
 # total reaches 30 the statement aborts 54P02 (CLAUDE.md §13 "the instant accrued cost reaches it").
+# params: 1
 statement error 54P02
-SELECT 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
+SELECT $1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
 
 # The aborted statement's partial cost counted, so the session budget is now spent: every further
 # statement is rejected 54P02 at ADMISSION, before it can accrue — even a trivial `SELECT 1`.

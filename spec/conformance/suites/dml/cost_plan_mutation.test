@@ -4,7 +4,7 @@
 # path's natural emission order is the phase-1 visitation order, so it decides which row's error is
 # reported first and the order of per-row volatile assignments. The complete WHERE is always the
 # residual filter, so the affected rows never depend on the chosen path.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, ddl.gist_index, ddl.sequence, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.returning, dml.costed_access, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.index_range, query.index_mutation, query.gin_scan, query.gist_scan, query.explain, dml.explain, func.sequence, expr.arithmetic, error.overflow_trap, error.division_by_zero, resource.cost_metering, types.i32, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, ddl.gist_index, ddl.sequence, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.returning, dml.costed_access, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.index_range, query.index_mutation, query.gin_scan, query.gist_scan, query.explain, dml.explain, func.sequence, expr.arithmetic, error.overflow_trap, error.division_by_zero, resource.cost_metering, types.i32, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators
 
 statement ok
 CREATE TABLE m (id i32 PRIMARY KEY, a i32, b i32, x i32)
@@ -227,12 +227,12 @@ EXPLAIN DELETE FROM g WHERE tags @> ARRAY[1] AND span && i32range(3, 4)
 Delete g
 -
 1
-9
+8
 1
 Filter
 conjuncts=2
 1
-9
+8
 2
 Scan g
 GiST bound: using g_span; touched=2
@@ -240,7 +240,7 @@ GiST bound: using g_span; touched=2
 4
 
 # g_span gathers the three overlapping spans (ids 1, 2, 5); the residual keeps ids 1 and 5.
-# cost: 23
+# cost: 20
 statement ok
 DELETE FROM g WHERE tags @> ARRAY[1] AND span && i32range(3, 4)
 

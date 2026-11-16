@@ -28,11 +28,11 @@ test("SELECT 1 returns one row costing one row_produced", () => {
   assert.equal(out.cost, 1n);
 });
 
-test("an expression select charges its operator_evals", () => {
+test("a constant expression select folds at plan time", () => {
   const db = memDb().session();
   assert.deepStrictEqual(query(db, "SELECT 1 + 2"), [["3"]]);
-  // 1 operator_eval (the `+` node) + 1 row_produced.
-  assert.equal(cost(db, "SELECT 1 + 2"), 2n);
+  // Only the 1 row_produced: the `+` of two constants folds at plan time (planner.md §3.7).
+  assert.equal(cost(db, "SELECT 1 + 2"), 1n);
 });
 
 test("WHERE filters the virtual row", () => {
@@ -41,7 +41,7 @@ test("WHERE filters the virtual row", () => {
   // The constant filter is a leaf (no operator_eval) and no row is produced.
   assert.equal(cost(db, "SELECT 1 WHERE false"), 0n);
   assert.deepStrictEqual(query(db, "SELECT 1 WHERE 1 = 1"), [["1"]]);
-  assert.equal(cost(db, "SELECT 1 WHERE 1 = 1"), 2n); // the `=` + the produced row
+  assert.equal(cost(db, "SELECT 1 WHERE 1 = 1"), 1n); // the `=` folds; the produced row
 });
 
 test("aggregates fold the single group", () => {

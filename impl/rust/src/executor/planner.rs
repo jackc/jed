@@ -1449,6 +1449,10 @@ impl Engine {
                         }
                         match ty {
                             ResolvedType::Bool | ResolvedType::Null => {
+                                // Constant folding (planner.md §3.7) runs before the conjuncts are
+                                // cost-ordered, as for WHERE.
+                                let mut node = node;
+                                fold::fold_constants(scope.catalog, &mut node);
                                 Some(order_filter_conjuncts(node))
                             }
                             _ => {
@@ -2016,6 +2020,12 @@ impl Engine {
                     })
                 })
                 .collect();
+            // Plan-time constant folding of the select list (planner.md §3.7); the WHERE, each ON,
+            // and HAVING were folded as they resolved.
+            let mut projections = projections;
+            for p in &mut projections {
+                fold::fold_constants(scope.catalog, p);
+            }
             let mut filter = filter;
             for c in pushed {
                 filter = Some(match filter {

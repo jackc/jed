@@ -7,7 +7,7 @@
 # scan's, across INSERT/UPDATE/DELETE maintenance — the oracle agrees. The `# cost:` assertions pin
 # that the bound is taken, cross-core identical; query/gin_multi_column_explain.test pins the plans.
 # Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, ddl.gin_multi_column, query.gin_scan, query.gin_any_eq, query.gin_mutation, query.gin_jsonb_ops, query.gin_disjunction, query.logical_connectives, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, types.i32, types.text, types.array, types.jsonb, func.array_containment, func.array_quantified, func.jsonb_contains, resource.cost_metering
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, ddl.gin_index, ddl.gin_multi_column, query.gin_scan, query.gin_any_eq, query.gin_mutation, query.gin_jsonb_ops, query.gin_disjunction, query.logical_connectives, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, types.i32, types.text, types.array, types.jsonb, func.array_containment, func.array_quantified, func.jsonb_contains, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, tags i32[], doc jsonb, words text[])
@@ -26,7 +26,7 @@ INSERT INTO t VALUES
 
 # ---- the first key column ---------------------------------------------------------------------
 
-# cost: 19
+# cost: 16
 query I nosort
 SELECT id FROM t WHERE tags @> ARRAY[3] ORDER BY id
 ----
@@ -57,7 +57,7 @@ SELECT id FROM t WHERE doc @> '{"a": 1}' ORDER BY id
 ----
 1
 
-# cost: 20
+# cost: 17
 query I nosort
 SELECT id FROM t WHERE words && ARRAY['blue', 'green'] ORDER BY id
 ----
@@ -67,7 +67,7 @@ SELECT id FROM t WHERE words && ARRAY['blue', 'green'] ORDER BY id
 
 # ---- conjuncts on two columns: the first key column's bound, the other conjunct filters --------
 
-# cost: 17
+# cost: 15
 query I nosort
 SELECT id FROM t WHERE doc ? 'a' AND tags @> ARRAY[2] ORDER BY id
 ----
@@ -86,7 +86,7 @@ SELECT id FROM t WHERE doc ? 'k' OR doc @> '{"a": 2}' ORDER BY id
 5
 
 # an OR across two columns of the index is not one GIN bound: a full scan
-# cost: 33
+# cost: 27
 query I nosort
 SELECT id FROM t WHERE tags @> ARRAY[1] OR doc ? 'k' ORDER BY id
 ----
@@ -97,7 +97,7 @@ SELECT id FROM t WHERE tags @> ARRAY[1] OR doc ? 'k' ORDER BY id
 
 # ---- maintenance --------------------------------------------------------------------------------
 
-# cost: 7
+# cost: 6
 statement ok
 UPDATE t SET doc = '{"k": "z"}', tags = ARRAY[9] WHERE words @> ARRAY['green']
 
@@ -145,7 +145,7 @@ CREATE INDEX r_twice ON r USING gin (a, a)
 statement ok
 INSERT INTO r VALUES (1, ARRAY[1,2]), (2, ARRAY[2]), (3, NULL)
 
-# cost: 13
+# cost: 11
 query I nosort
 SELECT id FROM r WHERE a @> ARRAY[2] ORDER BY id
 ----

@@ -8,7 +8,7 @@
 # The rows and end state match PostgreSQL's bytea[] array_ops GIN (index presence never changes
 # results). query/gin_decimal_bytea_explain.test pins the plan.
 # Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, query.gin_element_types, query.gin_bytea_elements, query.gin_scan, query.gin_any_eq, query.gin_array_eq, query.gin_mutation, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, query.where_eq, func.array_containment, func.array_quantified, func.array, expr.text_concat, types.bytea, types.text, types.i32, types.array, cast.operator, resource.cost_metering
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, query.gin_element_types, query.gin_bytea_elements, query.gin_scan, query.gin_any_eq, query.gin_array_eq, query.gin_mutation, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, query.where_eq, func.array_containment, func.array_quantified, func.array, expr.text_concat, types.bytea, types.text, types.i32, types.array, cast.operator, resource.cost_metering
 
 statement ok
 CREATE TABLE tb (id i32 PRIMARY KEY, b bytea[])
@@ -41,7 +41,7 @@ SELECT id FROM tb WHERE b @> ARRAY['\x61'::bytea] ORDER BY id
 1
 2
 
-# cost: 10
+# cost: 9
 query I nosort
 SELECT id FROM tb WHERE b @> ARRAY['\x6162'::bytea, '\x61'::bytea] ORDER BY id
 ----
@@ -88,7 +88,7 @@ SELECT id FROM tb WHERE b = ARRAY['\x61'::bytea] ORDER BY id
 ----
 2
 
-# cost: 10
+# cost: 9
 query I nosort
 SELECT id FROM tb WHERE b = ARRAY['\x00'::bytea, '\x0000'::bytea, '\x00'::bytea] ORDER BY id
 ----

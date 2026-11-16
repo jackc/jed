@@ -14,7 +14,7 @@
 # 42703; an aggregate in WHERE stays 42803. PG-divergent forms that fall out of non-reserved
 # keywords (`SELECT`, `SELECT from`, `SELECT distinct` — §34) are deliberately NOT tested
 # here: the corpus pins the PG-agreeing surface.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.aggregates, query.having, query.distinct, query.limit, query.offset, query.order_by, query.column_alias, query.union, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, query.table_alias, query.qualified_column, query.point_lookup, expr.arithmetic, expr.comparison_value, types.i32, types.boolean, resource.cost_metering
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.aggregates, query.having, query.distinct, query.limit, query.offset, query.order_by, query.column_alias, query.union, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, query.table_alias, query.qualified_column, query.point_lookup, expr.arithmetic, expr.comparison_value, types.i32, types.boolean, resource.cost_metering
 
 # --- the virtual row ------------------------------------------------------------------
 # A literal projection is a leaf (no operator_eval): the whole query costs the single
@@ -26,9 +26,10 @@ SELECT 1
 ----
 1
 
-# An expression charges its interior nodes: 1 operator_eval (the `+`) + 1 row_produced.
+# An expression of constants folds to a constant at plan time (planner.md §3.7), so it charges no
+# operator_eval: only the 1 row_produced.
 # names: ?column?
-# cost: 2
+# cost: 1
 query I nosort
 SELECT 1 + 2
 ----
@@ -36,7 +37,7 @@ SELECT 1 + 2
 
 # Multiple items, AS naming; an unaliased expression is ?column? (grammar.md §8).
 # names: ?column?, b
-# cost: 2
+# cost: 1
 query II nosort
 SELECT 1, 2 + 3 AS b
 ----
@@ -50,8 +51,9 @@ query I nosort
 SELECT 1 WHERE false
 ----
 
-# A TRUE filter keeps the row: the `=` (1) + the produced row (1).
-# cost: 2
+# A TRUE filter keeps the row. The `1 = 1` folds to TRUE at plan time, so only the produced row (1)
+# is charged.
+# cost: 1
 query I nosort
 SELECT 1 WHERE 1 = 1
 ----

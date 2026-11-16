@@ -99,6 +99,7 @@ import { starHiddenCount } from "./search_cycle.ts";
 import { castTrapClass } from "./trap_class.ts";
 import { coerceStringToArray, overflow, typeError } from "./store.ts";
 import type { DecimalTypmod, ScalarType, TemporalTypmod, Type } from "./types.ts";
+import { foldConstants } from "./fold.ts";
 import { followLayer } from "./view_write.ts";
 import {
   classifyComparable,
@@ -442,7 +443,7 @@ export function resolveBooleanFilter(scope: Scope, e: Expr, params: ParamTypes):
   if (type.kind !== "bool" && type.kind !== "null") {
     throw positionedAt(typeError("argument of WHERE must be boolean"), exprLocation(e));
   }
-  return node;
+  return foldConstants(node, scope.catalog.foldEnv());
 }
 
 // resolveWholeRowRecord resolves a record whole-row reference (spec/design/grammar.md §15

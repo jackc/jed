@@ -8,7 +8,7 @@
 # incomparable pair is 42883). Each binary-search step charges one operator_eval plus the comparison's
 # size-scaled work (decimal_work / varlen_compare / collate), like GREATEST/LEAST (cost.md §3).
 # PostgreSQL-oracle-verified (postgres:18).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.array, types.array_multidim, types.i32, types.i64, types.decimal, types.f64, types.text, types.date, types.timestamp, types.interval, types.boolean, types.range, types.jsonb, types.jsonb_compare, func.array, func.array_quantified, cast.explicit, resource.cost_metering
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.array, types.array_multidim, types.i32, types.i64, types.decimal, types.f64, types.text, types.date, types.timestamp, types.interval, types.boolean, types.range, types.jsonb, types.jsonb_compare, func.array, func.array_quantified, cast.explicit, resource.cost_metering
 
 # --- the PostgreSQL documentation example ----------------------------------------------------
 query I nosort
@@ -211,23 +211,23 @@ SELECT width_bucket(5, ARRAY['a', 'c'])
 statement error 42883
 SELECT width_bucket('a'::text, ARRAY[1, 2])
 
-# --- cost: 1 (the ARRAY[…] constructor) + 1 (the width_bucket node) + 3 (one operator_eval per search
-# step over 5 thresholds: mid 2, 4, 3) + 1 (the produced row) = 6 --------------------------------
-# cost: 6
+# --- cost: 1 (the width_bucket node) + 3 (one operator_eval per search step over 5 thresholds: mid 2,
+# 4, 3) + 1 (the produced row) = 5; the constant ARRAY[…] folds at plan time (planner.md §3.7) -----
+# cost: 5
 query I nosort
 SELECT width_bucket(5, ARRAY[1, 3, 4, 6, 7])
 ----
 3
 
 # a long decimal pair adds its size-scaled decimal_work per search step (cost.md §3)
-# cost: 19
+# cost: 18
 query I nosort
 SELECT width_bucket(0.123456789012345678901234567890, ARRAY[0.1234567890123456789012345678, 0.12345678901234567890123456789012])
 ----
 1
 
 # a text pair adds varlen_compare per search step (the shorter operand's code points − 1, cost.md §3)
-# cost: 19
+# cost: 18
 query I nosort
 SELECT width_bucket('abcdefgh', ARRAY['abcdefga', 'abcdefgz'])
 ----

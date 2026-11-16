@@ -15,7 +15,7 @@
 #   - A cast operand is not a key source, so `f32col = f64value` (or the reverse) never bounds an
 #     index or an index-nested-loop inner: it scans, and the comparison is the residual filter.
 # Oracle-checked against PostgreSQL 18 (rows only — cost is jed's). Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, query.qualified_column, query.join_inner, query.join_left, query.join_using, query.hash_join, query.index_nested_loop, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, query.subquery_quantified, query.aggregates, query.aggregate_filter, query.group_by, query.group_by_expr, query.union, query.is_distinct_from, types.composite_bare_row, expr.in_list, expr.between, expr.case, expr.nullif, expr.arithmetic, expr.unary_minus, cast.operator, cast.string_literal, types.i32, types.f32, types.f64, types.array, null.three_valued, resource.cost_metering
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, query.qualified_column, query.join_inner, query.join_left, query.join_using, query.hash_join, query.index_nested_loop, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, query.subquery_quantified, query.aggregates, query.aggregate_filter, query.group_by, query.group_by_expr, query.union, query.is_distinct_from, types.composite_bare_row, expr.in_list, expr.between, expr.case, expr.nullif, expr.arithmetic, expr.unary_minus, cast.operator, cast.string_literal, types.i32, types.f32, types.f64, types.array, null.three_valued, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a f32, b f64)
@@ -88,7 +88,7 @@ SELECT id FROM t WHERE a = b ORDER BY id
 5
 
 # 0.1::f32 widens to 0.100000001490116…, which is greater than 0.1::f64.
-# cost: 13
+# cost: 1
 query BBB nosort
 SELECT 0.1::f32 = 0.1::f64, 0.1::f32 < 0.1::f64, 0.1::f32 > 0.1::f64
 ----
@@ -97,7 +97,7 @@ false
 true
 
 # Same-width f32 operands (a literal adapts to the f32 column) take no cast.
-# cost: 50
+# cost: 43
 query BBBB nosort
 SELECT a = a, a < a, a = 1.5, a > 0.5::f32 FROM t ORDER BY id
 ----
@@ -155,7 +155,7 @@ false
 false
 
 # IN (list), NOT IN, BETWEEN and simple CASE desugar to comparisons, each casting its f32 operand.
-# cost: 45
+# cost: 42
 query B nosort
 SELECT a IN (b, 2.0::f64) FROM t ORDER BY id
 ----
@@ -167,7 +167,7 @@ true
 false
 NULL
 
-# cost: 52
+# cost: 49
 query B nosort
 SELECT a NOT IN (b, 2.0::f64) FROM t ORDER BY id
 ----
@@ -179,7 +179,7 @@ false
 true
 NULL
 
-# cost: 54
+# cost: 48
 query B nosort
 SELECT a BETWEEN b AND 2.0::f64 FROM t ORDER BY id
 ----
@@ -241,7 +241,7 @@ NaN
 Infinity
 NULL
 
-# cost: 8
+# cost: 1
 query RR nosort
 SELECT 0.1::f32 * 3::f32, 0.1::f32 * 3::f64
 ----
@@ -272,14 +272,14 @@ SELECT sqrt(abs(a)), round(a) FROM t WHERE id IN (1, 2, 4) ORDER BY id
 0
 -0
 
-# cost: 7
+# cost: 3
 query RR nosort
 SELECT sqrt(2::f32), sqrt(0.1::f32)
 ----
 1.4142135623730951
 0.3162277683729184
 
-# cost: 10
+# cost: 3
 query RR nosort
 SELECT power(2::f32, 0.5::f32), power(0.1::f32, 2::f64)
 ----
@@ -323,7 +323,7 @@ NULL
 -Infinity
 NULL
 
-# cost: 606
+# cost: 599
 query B nosort
 SELECT a = ANY(ARRAY[b, 2.0::f64]) FROM t ORDER BY id
 ----
@@ -399,7 +399,7 @@ false
 false
 false
 
-# cost: 15
+# cost: 10
 query BBB nosort
 SELECT ROW(-0::f64) IS NOT DISTINCT FROM ROW(0::f64), ROW('NaN'::f64) IS NOT DISTINCT FROM ROW('NaN'::f64), ROW(NULL::i32, 1) IS NOT DISTINCT FROM ROW(NULL::i32, 1)
 ----
@@ -407,7 +407,7 @@ true
 true
 true
 
-# cost: 68
+# cost: 55
 query I nosort
 SELECT id FROM t WHERE (a, id) IN ((1.5::f64, 1), (4::f64, 3)) ORDER BY id
 ----
@@ -464,28 +464,30 @@ Infinity
 NULL
 NaN
 
-# --- access paths: a cast operand never bounds a key ----------------------------------------------
+# --- access paths: a widened key never bounds; a cast literal folds -------------------------------
 
 # u_a holds f32 keys; the f64 probe is compared after widening, so it scans (16777217 as f32 is
 # 16777216, which equals no f64 16777217).
-# cost: 22
+# cost: 17
 query I nosort
 SELECT id FROM u WHERE a = 1.5::f64 ORDER BY id
 ----
 1
 
-# cost: 21
+# cost: 16
 query I nosort
 SELECT id FROM u WHERE a = 16777217::f64 ORDER BY id
 ----
 
-# cost: 22
+# An f32 literal against the f64 key folds at plan time (planner.md §3.7) to a constant the u_b
+# index probes, like a plain literal.
+# cost: 5
 query I nosort
 SELECT id FROM u WHERE b = 1.5::f32 ORDER BY id
 ----
 1
 
-# cost: 25
+# cost: 20
 query I nosort
 SELECT id FROM u WHERE a > 0.1::f64 ORDER BY id
 ----
@@ -494,14 +496,14 @@ SELECT id FROM u WHERE a > 0.1::f64 ORDER BY id
 3
 5
 
-# cost: 23
+# cost: 9
 query I nosort
 SELECT id FROM u WHERE b < 0.1::f32 ORDER BY id
 ----
 2
 4
 
-# cost: 56
+# cost: 43
 query I nosort
 SELECT id FROM u WHERE a IN (1.5::f64, 0.1::f64, 16777217::f64) ORDER BY id
 ----

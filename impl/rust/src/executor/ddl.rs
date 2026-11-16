@@ -4868,8 +4868,9 @@ impl Engine {
             IndexKey::Column(ord) => Ok(ResolvedKey::Column(*ord)),
             IndexKey::Expr(e) => {
                 let scope = Scope::index(self, table);
-                let (rexpr, rtype) =
+                let (mut rexpr, rtype) =
                     resolve(&scope, &e.expr, None, &mut AggCtx::Forbidden, params)?;
+                fold::fold_constants(self, &mut rexpr);
                 let ty = resolved_to_key_type(&rtype)
                     .expect("index expression result type validated indexable at CREATE INDEX");
                 let coll = resolve_deriv(scope.catalog, derive_collation(&scope, &e.expr)?)?;

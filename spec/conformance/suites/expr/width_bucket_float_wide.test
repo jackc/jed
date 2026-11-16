@@ -4,42 +4,42 @@
 # operand inside [-1e308, 1e308) lands in its true bucket instead of bucket 1 (or 0). Reversed
 # bounds use the same halving; the outside-the-range answers (0 / count + 1) are unchanged, and a
 # fraction that rounds up to 1.0 is clamped to count.
-# requires: query.select, query.select_no_from, cast.operator, types.i32, types.f64, resource.cost_metering
+# requires: query.constant_folding, query.select, query.select_no_from, cast.operator, types.i32, types.f64, resource.cost_metering
 
-# cost: 6
+# cost: 2
 query I nosort
 SELECT width_bucket(0::float8, -1e308::float8, 1e308::float8, 10)
 ----
 6
 
-# cost: 6
+# cost: 2
 query I nosort
 SELECT width_bucket(5e307::float8, -1e308::float8, 1e308::float8, 10)
 ----
 8
 
 # reversed bounds
-# cost: 6
+# cost: 2
 query I nosort
 SELECT width_bucket(0::float8, 1e308::float8, -1e308::float8, 10)
 ----
 6
 
 # a large count: the halved fraction scales exactly like the direct one
-# cost: 6
+# cost: 2
 query I nosort
 SELECT width_bucket(1e307::float8, -1e308::float8, 1e308::float8, 2147483647)
 ----
 1181116006
 
-# cost: 6
+# cost: 2
 query I nosort
 SELECT width_bucket(5e307::float8, -1e308::float8, 1e308::float8, 2147483647)
 ----
 1610612736
 
 # the bounds themselves and the outside answers are unchanged
-# cost: 23
+# cost: 5
 query IIII nosort
 SELECT width_bucket(-1e308::float8, -1e308::float8, 1e308::float8, 10), width_bucket(1e308::float8, -1e308::float8, 1e308::float8, 10), width_bucket(1.7e308::float8, -1e308::float8, 1e308::float8, 10), width_bucket(-1.7e308::float8, -1e308::float8, 1e308::float8, 10)
 ----
@@ -48,7 +48,7 @@ SELECT width_bucket(-1e308::float8, -1e308::float8, 1e308::float8, 10), width_bu
 11
 0
 
-# cost: 12
+# cost: 3
 query II nosort
 SELECT width_bucket(1e308::float8, -1e308::float8, 1.5e308::float8, 3), width_bucket(-1e308::float8, 1e308::float8, -1.5e308::float8, 3)
 ----

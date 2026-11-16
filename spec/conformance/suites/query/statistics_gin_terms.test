@@ -3,7 +3,7 @@
 # predicate with a literal operand from them — the predicate's logical rows and the GIN candidate's
 # scan rows, gin_entry reads, and index pages. These deterministic integer estimates, plan choices,
 # and ANALYZE costs are jed-owned and cross-core checked; NoREC relation gin_stats checks the rows.
-# requires: maintenance.analyze, maintenance.analyze_gin_terms, introspect.statistics, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, query.gin_scan, query.gin_any_eq, query.gin_jsonb_ops, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.set_returning, query.explain, query.order_by, query.aggregates, func.array_containment, func.array_quantified, func.array, func.jsonb_contains, func.json_builders, func.jsonb_mutate, expr.arithmetic, expr.case, cast.operator, types.i32, types.i64, types.text, types.array, types.jsonb, resource.cost_metering
+# requires: query.constant_folding, maintenance.analyze, maintenance.analyze_gin_terms, introspect.statistics, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, query.gin_scan, query.gin_any_eq, query.gin_jsonb_ops, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.set_returning, query.explain, query.order_by, query.aggregates, func.array_containment, func.array_quantified, func.array, func.jsonb_contains, func.json_builders, func.jsonb_mutate, expr.arithmetic, expr.case, cast.operator, types.i32, types.i64, types.text, types.array, types.jsonb, resource.cost_metering
 
 # --- a skewed array and document column beside an ordered index ------------------------------
 
@@ -238,7 +238,7 @@ EXPLAIN SELECT id FROM gt WHERE doc ?| ARRAY['rare', 'nokey']
 Filter
 conjuncts=1
 20
-142
+122
 1
 Scan gt
 GIN bound: using gt_doc; touched=2

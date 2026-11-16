@@ -7,7 +7,7 @@
 # index engagement (strictly below the full scan) and is identical to the equivalent ASC index's;
 # the post-REINDEX costs equal the pre-REINDEX ones, so the rebuilt indexes keep their order.
 # Rows agree with the PostgreSQL oracle.
-# requires: ddl.index_key_order, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_partial, ddl.reindex, dml.insert, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.index_range, query.index_prefix, query.index_variable_width_tail, query.index_mutation, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.index_partial_full_scan, query.index_partial_access_paths, query.order_by, query.order_by_keys, query.order_by_index_scan, query.limit, query.set_returning, expr.in_list, func.array_quantified, types.array, types.i32, types.text, resource.cost_metering
+# requires: query.constant_folding, ddl.index_key_order, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_partial, ddl.reindex, dml.insert, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.index_range, query.index_prefix, query.index_variable_width_tail, query.index_mutation, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.index_partial_full_scan, query.index_partial_access_paths, query.order_by, query.order_by_keys, query.order_by_index_scan, query.limit, query.set_returning, expr.in_list, func.array_quantified, types.array, types.i32, types.text, resource.cost_metering
 
 statement ok
 CREATE TABLE k (id i32 PRIMARY KEY, g i32, name text, score i32)
@@ -128,7 +128,7 @@ n74
 75
 n75
 
-# cost: 24
+# cost: 21
 query IT rowsort
 SELECT id, name FROM k WHERE name = ANY (ARRAY['n5', 'n50', 'n9', NULL])
 ----

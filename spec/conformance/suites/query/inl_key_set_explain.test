@@ -3,7 +3,7 @@
 # set on the inner Scan. Rows and costs are pinned in inl_key_set.test. The plans are jed-owned, so
 # this file is cross-core checked, not oracle-checked.
 # Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.where_eq, query.point_lookup, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.join_inner, query.join_left, query.index_nested_loop, query.logical_connectives, query.explain, query.set_returning, func.array_quantified, types.array, cast.array, types.i32, types.i64
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.where_eq, query.point_lookup, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.join_inner, query.join_left, query.index_nested_loop, query.logical_connectives, query.explain, query.set_returning, func.array_quantified, types.array, cast.array, types.i32, types.i64
 
 statement ok
 CREATE TABLE orders (id i64 PRIMARY KEY, v i64)
@@ -221,7 +221,7 @@ EXPLAIN SELECT t.name, ti.id FROM tenants t JOIN ti ON ti.tenant = t.tenant AND 
 Nested Loop
 inner; on:conjuncts=2
 4
-47
+43
 1
 Scan tenants
 Full scan; touched=2

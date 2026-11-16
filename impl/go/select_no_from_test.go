@@ -49,9 +49,9 @@ func TestNoFromExpressionCost(t *testing.T) {
 	if len(rows) != 1 || rows[0][0].Int != 3 {
 		t.Errorf("rows: %v", rows)
 	}
-	// 1 operator_eval (the `+` node) + 1 row_produced.
-	if c := costOf(t, db, "SELECT 1 + 2"); c != 2 {
-		t.Errorf("SELECT 1 + 2 cost = %d, want 2", c)
+	// Only the 1 row_produced: the `+` of two constants folds at plan time.
+	if c := costOf(t, db, "SELECT 1 + 2"); c != 1 { // planner.md §3.7
+		t.Errorf("SELECT 1 + 2 cost = %d, want 1", c)
 	}
 }
 
@@ -68,8 +68,8 @@ func TestNoFromWhereFiltersTheVirtualRow(t *testing.T) {
 	if rows := query(t, db, "SELECT 1 WHERE 1 = 1"); len(rows) != 1 || rows[0][0].Int != 1 {
 		t.Errorf("WHERE 1 = 1 rows: %v", rows)
 	}
-	if c := costOf(t, db, "SELECT 1 WHERE 1 = 1"); c != 2 { // the `=` + the produced row
-		t.Errorf("SELECT 1 WHERE 1 = 1 cost = %d, want 2", c)
+	if c := costOf(t, db, "SELECT 1 WHERE 1 = 1"); c != 1 { // the `=` folds; the produced row
+		t.Errorf("SELECT 1 WHERE 1 = 1 cost = %d, want 1", c)
 	}
 }
 

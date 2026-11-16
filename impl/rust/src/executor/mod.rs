@@ -86,6 +86,7 @@ mod eval;
 mod exec_emit;
 pub(crate) use exec_emit::FkKeyedTarget;
 mod exec_scan;
+mod fold;
 mod hash_join;
 pub(crate) use hash_join::*;
 mod estimate_plan;

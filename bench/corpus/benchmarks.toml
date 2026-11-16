@@ -858,6 +858,68 @@ setup_sql = [
   "INSERT INTO contradiction_orders SELECT g, g % 1000 FROM generate_series(1, 100000) AS g"
 ]
 
+# Plan-time constant folding (query.constant_folding): the folded `v = 3 * 7 + 1 AND 1 = 1` evaluates
+# one comparison per row; the `_bound` twin binds the same literals, which are never folded, so its
+# arithmetic and the extra conjunct run on every row.
+[[bench]]
+name = "constant_folding_scan"
+description = "Full scan of 100k rows filtered by a constant expression that folds at plan time"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT count(*) FROM folding_orders WHERE v = 3 * 7 + 1 AND 1 = 1"
+warmup = 5
+iterations = 200
+seed = 4274
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS folding_orders",
+  "CREATE TABLE folding_orders (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO folding_orders SELECT g, g % 1000 FROM generate_series(1, 100000) AS g"
+]
+
+[[bench]]
+name = "constant_folding_scan_bound"
+description = "The same scan with every literal bound as a parameter, so the expression runs per row"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT count(*) FROM folding_orders WHERE v = $1 * $2 + $3 AND $4 = $5"
+warmup = 5
+iterations = 200
+seed = 4275
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS folding_orders",
+  "CREATE TABLE folding_orders (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO folding_orders SELECT g, g % 1000 FROM generate_series(1, 100000) AS g"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 3
+max = 3
+
+[[bench.param]]
+gen = "int_uniform"
+min = 7
+max = 7
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1
+
 # Stage-2 pushdown into a derived body (query.derived_pushdown) and its results-identical outer-filter
 # reference. Moved into the body, `d.id = 50000` seeks the PK of the 100k-row table; spelled
 # `d.id + 0`, the conjunct stays outside and the whole body runs.

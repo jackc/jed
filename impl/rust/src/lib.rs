@@ -519,6 +519,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // Stage-2 predicate rewrites (spec/design/planner.md §3): contradiction detection, WHERE pushdown
     // through joins, pushdown into derived bodies and onto computed relations, and ON pushdown.
     "query.where_pushdown",
+    "query.constant_folding",
     "query.where_contradiction",
     "dml.where_contradiction",
     "query.derived_pushdown",

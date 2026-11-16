@@ -5,7 +5,7 @@
 # cross-family 42804; all-NULL → text). The simple form `CASE x WHEN v …` is `x = v` per branch.
 # Verified against PostgreSQL 18.
 # Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, expr.case, expr.comparison_value, expr.arithmetic, error.division_by_zero, types.i32, types.text, types.decimal, null.three_valued, resource.cost_metering
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, expr.case, expr.comparison_value, expr.arithmetic, error.division_by_zero, types.i32, types.text, types.decimal, null.three_valued, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32)
@@ -112,9 +112,10 @@ SELECT CASE WHEN true THEN 100 WHEN 1 / 0 = 0 THEN 200 ELSE 300 END FROM one
 
 # G19 — simple-form CASE with a NULL scrutinee: `CASE NULL WHEN NULL THEN …` tests `NULL = NULL`,
 # which is UNKNOWN, NOT a match — so the scrutinee never matches any WHEN and the ELSE wins.
-# 1 case node + 1 condition (NULL = NULL) + 1 scan + 1 produced + 1 page = 5.
+# Every operand is a constant, so the CASE folds at plan time to 'fellthrough' (planner.md §3.7)
+# and charges nothing per row: 1 scan + 1 produced + 1 page = 3.
 # names: ?column?
-# cost: 5
+# cost: 3
 query T nosort
 SELECT CASE NULL WHEN NULL THEN 'matched' ELSE 'fellthrough' END FROM one
 ----

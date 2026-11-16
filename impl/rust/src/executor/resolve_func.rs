@@ -1891,9 +1891,12 @@ pub(crate) fn resolve_boolean_filter(
 ) -> Result<RExpr> {
     // WHERE / ON filters run before any grouping, so an aggregate here is 42803 (Forbidden).
     let mut agg = AggCtx::Forbidden;
-    let (node, ty) = resolve(scope, e, None, &mut agg, params)?;
+    let (mut node, ty) = resolve(scope, e, None, &mut agg, params)?;
     match ty {
-        ResolvedType::Bool | ResolvedType::Null => Ok(node),
+        ResolvedType::Bool | ResolvedType::Null => {
+            fold::fold_constants(scope.catalog, &mut node);
+            Ok(node)
+        }
         ResolvedType::Int(_)
         | ResolvedType::Text
         | ResolvedType::Decimal

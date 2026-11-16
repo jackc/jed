@@ -5,7 +5,7 @@
 # their exact output before building it, even over constants. payload is memory.md §3's measure: UTF-8
 # bytes for text, the byte length for bytea, 16 per dimension plus 32 + payload per element for an array.
 # jed-SPECIFIC resource contract (PostgreSQL has no cost meter or scalar allowance).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.cte, query.cte_recursive, query.aggregates, func.array, func.regexp_replace, func.array_to_string, func.string_to_array, types.array, types.bytea, types.i32, types.text, expr.text_concat, resource.cost_metering, resource.cost_limit, resource.scalar_memory
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.cte, query.cte_recursive, query.aggregates, func.array, func.regexp_replace, func.array_to_string, func.string_to_array, types.array, types.bytea, types.i32, types.text, expr.text_concat, resource.cost_metering, resource.cost_limit, resource.scalar_memory
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32[], s text)
@@ -16,7 +16,7 @@ INSERT INTO t VALUES (1, ARRAY[1, 2], 'banana')
 # === Growth kernels ===
 
 # Constant operands are free: no scalar_byte for the constructors or the ||.
-# cost: 5
+# cost: 3
 query I nosort
 SELECT cardinality(ARRAY[1, 2] || ARRAY[3])
 ----
@@ -349,7 +349,7 @@ SELECT regexp_replace(repeat('x', 100), 'x', repeat('\9', 100), 'g')
 # === array_replace ===
 
 # Charged even over constants: input payload 16 + 3 × 32 = 112, output 112.
-# cost: 227
+# cost: 226
 query T nosort
 SELECT array_replace(ARRAY[1, 1, 1], 1, 2)
 ----
@@ -376,7 +376,7 @@ NULL
 # === array_to_string ===
 
 # Charged even over constants: input payload 16 + 3 × 32 = 112, output '1,2,3' = 5.
-# cost: 120
+# cost: 119
 query T nosort
 SELECT array_to_string(ARRAY[1, 2, 3], ',')
 ----

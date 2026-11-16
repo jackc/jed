@@ -1775,7 +1775,7 @@ func (db *engine) resolveIndexWithParams(table *catTable, def indexDef, ptypes *
 		if err != nil {
 			return resolvedIndex{}, err
 		}
-		keys = append(keys, resolvedKey{Expr: node, Ty: ty, Coll: coll})
+		keys = append(keys, resolvedKey{Expr: foldConstants(s, node), Ty: ty, Coll: coll})
 	}
 	// A partial index's predicate (indexes.md §9), re-resolved against the table's columns — it was
 	// validated boolean + immutable at CREATE INDEX, so this cannot newly fail.

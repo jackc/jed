@@ -14,7 +14,7 @@
 # the costs are jed-owned, so the `# cost:` lines are the cross-core pin. The plans are pinned by
 # EXPLAIN in any_array_point_lookup_explain.test.
 # Format + `requires`: ../../../design/conformance.md.
-# requires: harness.params, ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.delete, dml.update, query.select, query.where_eq, query.point_lookup, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.bounded_limit_streaming, query.limit, query.logical_connectives, query.order_by, query.subquery_scalar, query.subquery_correlated, query.aggregates, func.array_quantified, func.array, types.array, types.array_multidim, cast.array, types.i16, types.i32, types.i64, types.decimal, types.text, null.three_valued, resource.cost_metering
+# requires: query.constant_folding, harness.params, ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.delete, dml.update, query.select, query.where_eq, query.point_lookup, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.bounded_limit_streaming, query.limit, query.logical_connectives, query.order_by, query.subquery_scalar, query.subquery_correlated, query.aggregates, func.array_quantified, func.array, types.array, types.array_multidim, cast.array, types.i16, types.i32, types.i64, types.decimal, types.text, null.three_valued, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32)
@@ -28,7 +28,7 @@ INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)
 # residual (the ANY node, the ARRAY[...] constructor it evaluates per row, and elements up to the
 # match: 3 for id 1, 4 for id 3, 5 for id 5 = 12) + 3 row_produced = 21. A full scan would read all
 # six rows and compare every element of the misses.
-# cost: 21
+# cost: 18
 query I rowsort
 SELECT a FROM t WHERE id = ANY(ARRAY[1, 3, 5])
 ----
@@ -74,14 +74,14 @@ SELECT a FROM t WHERE id = ANY(ARRAY[$1, 4])
 # --- elements --------------------------------------------------------------------------------------
 
 # Duplicate elements merge to one probe.
-# cost: 6
+# cost: 5
 query I rowsort
 SELECT a FROM t WHERE id = ANY(ARRAY[3, 3, 3])
 ----
 30
 
 # A NULL element contributes no point; the residual still sees it (unknown, never true).
-# cost: 14
+# cost: 12
 query I rowsort
 SELECT id FROM t WHERE id = ANY(ARRAY[2, NULL, 4])
 ----
@@ -89,7 +89,7 @@ SELECT id FROM t WHERE id = ANY(ARRAY[2, NULL, 4])
 4
 
 # A missing key still visits the leaf it would live in.
-# cost: 7
+# cost: 6
 query I rowsort
 SELECT a FROM t WHERE id = ANY(ARRAY[2, 99])
 ----
@@ -128,7 +128,7 @@ SELECT a FROM t WHERE id = ANY($1)
 # --- composing with the rest of the set ------------------------------------------------------------
 
 # A same-key range clips the points: {1,3,5} ∩ (2, ∞) probes only {3,5}.
-# cost: 19
+# cost: 17
 query I rowsort
 SELECT a FROM t WHERE id = ANY(ARRAY[1, 3, 5]) AND id > 2
 ----
@@ -136,7 +136,7 @@ SELECT a FROM t WHERE id = ANY(ARRAY[1, 3, 5]) AND id > 2
 50
 
 # The ANY may be one disjunct of a same-key OR.
-# cost: 23
+# cost: 20
 query I rowsort
 SELECT a FROM t WHERE id = ANY(ARRAY[1, 2]) OR id = 6
 ----
@@ -146,7 +146,7 @@ SELECT a FROM t WHERE id = ANY(ARRAY[1, 2]) OR id = 6
 
 # An ANY under an AND leaf of a same-key OR: the leaf's comparisons clip the array's points, so the
 # set probes {3, 5} from the first leaf and {1} from the second.
-# cost: 31
+# cost: 28
 query I rowsort
 SELECT a FROM t WHERE (id = ANY(ARRAY[1, 3, 5]) AND id > 2) OR id = 1
 ----
@@ -155,14 +155,14 @@ SELECT a FROM t WHERE (id = ANY(ARRAY[1, 3, 5]) AND id > 2) OR id = 1
 50
 
 # A leaf range that excludes every element leaves only the other disjunct's point.
-# cost: 10
+# cost: 9
 query I rowsort
 SELECT a FROM t WHERE (id = ANY(ARRAY[1, 2]) AND id BETWEEN 4 AND 6) OR id = 6
 ----
 60
 
 # Two ANY arrays in one leaf: the second is not a bound, so the leaf does not reduce: full scan.
-# cost: 64
+# cost: 55
 query I rowsort
 SELECT a FROM t WHERE (id = ANY(ARRAY[1, 2, 3]) AND id = ANY(ARRAY[2, 3])) OR id = 6
 ----
@@ -171,7 +171,7 @@ SELECT a FROM t WHERE (id = ANY(ARRAY[1, 2, 3]) AND id = ANY(ARRAY[2, 3])) OR id
 60
 
 # A disjunction with a non-key leaf does not bound the key: full scan.
-# cost: 43
+# cost: 37
 query I rowsort
 SELECT id FROM t WHERE id = ANY(ARRAY[1, 2]) OR a = 60
 ----
@@ -180,14 +180,14 @@ SELECT id FROM t WHERE id = ANY(ARRAY[1, 2]) OR a = 60
 6
 
 # ALL, and an ANY under another operator, do not lower.
-# cost: 39
+# cost: 33
 query I rowsort
 SELECT id FROM t WHERE id <> ALL(ARRAY[1, 2, 3, 4])
 ----
 5
 6
 
-# cost: 27
+# cost: 21
 query I rowsort
 SELECT id FROM t WHERE id < ANY(ARRAY[3])
 ----
@@ -195,7 +195,7 @@ SELECT id FROM t WHERE id < ANY(ARRAY[3])
 2
 
 # A LIMIT stops at the first survivors, so an interval it never reaches charges nothing.
-# cost: 7
+# cost: 6
 query I nosort
 SELECT a FROM t WHERE id = ANY(ARRAY[5, 1, 3]) ORDER BY id LIMIT 1
 ----
@@ -218,9 +218,9 @@ SELECT a FROM big WHERE id = ANY('{1,3}'::i32[])
 10
 30
 
-# An ARRAY[...] of explicitly typed elements is promoted but not readable as a value, so it does not
-# bound: full scan.
-# cost: 23
+# An ARRAY[...] of explicitly typed elements folds to a constant array at plan time (planner.md §3.7),
+# so its elements bound the i64 key as points like any constant array.
+# cost: 11
 query I rowsort
 SELECT a FROM big WHERE id = ANY(ARRAY[1::i32, 3::i32])
 ----
@@ -296,7 +296,7 @@ statement ok
 INSERT INTO w VALUES ('alice', 1), ('bob', 2), ('carol', 3), ('dave', 4)
 
 # A text key's points are its C-collation keys.
-# cost: 14
+# cost: 12
 query T rowsort
 SELECT name FROM w WHERE name = ANY(ARRAY['carol', 'alice', 'erin'])
 ----
@@ -316,7 +316,7 @@ CREATE INDEX sx ON s (x)
 
 # Each distinct value is an index point probe plus a row lookup per entry: 10 → rows 1 and 5, 30 →
 # row 3.
-# cost: 22
+# cost: 19
 query I rowsort
 SELECT id FROM s WHERE x = ANY(ARRAY[30, 10])
 ----
@@ -417,7 +417,7 @@ SELECT id FROM t
 5
 6
 
-# cost: 11
+# cost: 9
 statement ok
 UPDATE t SET a = 0 WHERE id = ANY(ARRAY[1, 6])
 

@@ -10,8 +10,9 @@ package jed
 
 import "testing"
 
-// cost5 — "SELECT 1 + 1 + 1 + 1 + 1" — five 1s, four +, costs 5 (4 operator_eval + 1 row_produced).
-const cost5 = "SELECT 1 + 1 + 1 + 1 + 1"
+// cost5 costs 5: the uncorrelated subquery's 1 row_produced, 3 operator_eval for the `+`s, and 1
+// row_produced. The subquery keeps the chain from folding to a constant at plan time (planner.md §3.7).
+const cost5 = "SELECT (SELECT 1) + 1 + 1 + 1"
 
 func lifeCode(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()

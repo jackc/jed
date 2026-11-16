@@ -1,18 +1,18 @@
 # Scalar-only foundation slice, shared by every core. It isolates existing SQL
 # behavior without requiring table storage or aggregates. The C# experiment uses
 # this complete file as an initial slice; it does not claim every capability below.
-# requires: query.select, query.select_no_from, query.column_alias, query.where_eq, query.limit, query.offset, query.logical_connectives, expr.arithmetic, expr.comparison_value, expr.parens, expr.precedence, cast.explicit, types.i16, types.i32, types.i64, types.boolean, types.text, null.three_valued, resource.cost_metering, error.overflow_trap, error.division_by_zero
+# requires: query.constant_folding, query.select, query.select_no_from, query.column_alias, query.where_eq, query.limit, query.offset, query.logical_connectives, expr.arithmetic, expr.comparison_value, expr.parens, expr.precedence, cast.explicit, types.i16, types.i32, types.i64, types.boolean, types.text, null.three_valued, resource.cost_metering, error.overflow_trap, error.division_by_zero
 
 # names: ?column?, answer
 # types: i64, i64
-# cost: 2
+# cost: 1
 query II nosort
 SELECT 1, 6 * 7 AS answer
 ----
 1
 42
 
-# cost: 3
+# cost: 1
 query II nosort
 SELECT 6 + 4 * 2, -7
 ----
@@ -106,7 +106,7 @@ NULL
 NULL
 true
 
-# cost: 3
+# cost: 1
 query BB nosort
 SELECT false AND (1 / 0 = 0), true OR (1 / 0 = 0)
 ----
@@ -149,7 +149,7 @@ query I nosort
 SELECT 1 WHERE NULL
 ----
 
-# cost: 2
+# cost: 1
 query I nosort
 SELECT 1 WHERE 1 = 1
 ----
@@ -172,7 +172,7 @@ SELECT 9 LIMIT 1 OFFSET 0
 9
 
 # WHERE is evaluated before OFFSET skips the virtual row.
-# cost: 1
+# cost: 0
 query I nosort
 SELECT 1 WHERE 2 = 2 OFFSET 1
 ----
@@ -189,8 +189,9 @@ query I nosort
 SELECT 1 WHERE NULL AND (1 / 0 = 0)
 ----
 
-# Runtime NULL still short-circuits a filter's AND, without a literal rewrite.
-# cost: 2
+# A NULL cast folds to the NULL constant at plan time (planner.md §3.7), so it proves the relation
+# empty exactly as the literal NULL does, and the division is never reached.
+# cost: 0
 query I nosort
 SELECT 1 WHERE CAST(NULL AS boolean) AND (1 / 0 = 0)
 ----
@@ -202,7 +203,7 @@ SELECT '😀' > '', 'é' <> 'é'
 true
 true
 
-# cost: 4
+# cost: 1
 query B nosort
 SELECT 'abc' = 'abd'
 ----

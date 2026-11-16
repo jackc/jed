@@ -184,9 +184,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ subqueries in a top-level plain `INSERT ... VALUES` slot still plan unbound
     by the custom-plan pass (the fast path opens no boundary); custom-plan them if a workload needs
     it. ([estimator.md §6.1](spec/design/estimator.md))
-  - [ ] _follow-on (`key = ANY(array)` point sets):_ the shapes that still full-scan — a promoted
-    `ARRAY[...]` constructor (`ARRAY[1::i32, 3::i32]` against an `i64` key) and promoted floats
-    (`f32[]` against an `f64` key). _(size: S)_
+  - [ ] _follow-on (`key = ANY(array)` point sets):_ the shape that still full-scans — promoted
+    floats (`f32[]` against an `f64` key). (A constant promoted `ARRAY[1::i32, 3::i32]` against an
+    `i64` key now folds to a constant array and bounds.) _(size: S)_
   - [ ] _follow-on:_ an uncorrelated subquery inside a derived-table body is evaluated with the
     body (per row) instead of folded before its scan opens, so its `IN` point set widens to every
     key there. _(size: S)_
@@ -216,9 +216,19 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     non-trapping built-ins (numeric `trunc`/`sign`/`scale`, the range accessors, the SHA-2 digests),
     the datetime renders; and widening the hash join's own residual gate
     ([cost.md §3](spec/design/cost.md)), which still admits only bare-column comparisons.
-  - [ ] _follow-on:_ plan-time **constant folding** / CSE / eliding a pushed recheck that its own
-    access bound already guarantees — each removes `operator_eval` charges, so each needs its own
-    explicit cost decision (the framing above), not a silent apply.
+  - [x] **Plan-time constant folding** — admitted operators over literals (casts, arithmetic,
+    comparisons, AND/OR/NOT, IS [NOT] NULL / DISTINCT, CASE, COALESCE, GREATEST/LEAST, `ARRAY[…]`) of
+    the non-datetime scalar types fold as filters, HAVING, select lists, and index keys resolve;
+    AND/OR drop non-deciding constants. Folded work charges nothing. → [planner.md §3.7](spec/design/planner.md)
+    - [ ] _follow-on (each its own cost decision + NoREC growth):_ immutable functions and LIKE/regex
+      by catalog `volatility` (with an output-size bound for the amplifiers); the datetime/interval/
+      json/range/composite types (needs the session/zone dependencies index-dependencies.md tracks);
+      the remaining clauses (UPDATE assignments, `INSERT … VALUES`, RETURNING, CHECK, DEFAULT, ORDER BY / GROUP
+      BY / window keys); folding bound parameters in a custom plan (makes a statement
+      parameter-sensitive); CASE/COALESCE arm pruning around an unfoldable arm.
+  - [ ] _follow-on:_ CSE, and eliding a pushed recheck that its own access bound already guarantees
+    — each removes `operator_eval` charges, so each needs its own explicit cost decision (the
+    framing above), not a silent apply.
 
 ---
 

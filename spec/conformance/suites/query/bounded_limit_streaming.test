@@ -1,7 +1,7 @@
 # LIMIT streaming over bounded access paths (cost.md §3): the access gather/order remains exact, but
 # table fetch/filter/project work stops once OFFSET+LIMIT survivors are known. Cost pins distinguish
 # this from eager bounded materialization; result rows remain PostgreSQL-comparable.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, ddl.gist_index, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.limit, query.offset, query.point_lookup, query.index_range, query.or_in_point_lookup, query.interval_set, query.gin_scan, query.gist_scan, query.limit_short_circuit, query.order_by_pk_scan, query.order_by_index_scan, query.bounded_limit_streaming, types.i32, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators, resource.cost_metering
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, ddl.gist_index, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.limit, query.offset, query.point_lookup, query.index_range, query.or_in_point_lookup, query.interval_set, query.gin_scan, query.gist_scan, query.limit_short_circuit, query.order_by_pk_scan, query.order_by_index_scan, query.bounded_limit_streaming, types.i32, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, x i32, keep i32)
@@ -135,7 +135,7 @@ SELECT id FROM g WHERE tags && ARRAY[1] AND keep = 1 ORDER BY id LIMIT 1
 ----
 2
 
-# cost: 28
+# cost: 26
 query I nosort
 SELECT id FROM g WHERE tags && ARRAY[1] AND keep = 1 ORDER BY keep LIMIT 1
 ----

@@ -112,7 +112,9 @@ hard-fenced inputs retain their staged policies ([estimator.md §9–§10](estim
   `not`, `arith`, `compare`, `and`, `or`, `is_null`, `distinct`. **Leaf nodes — `column`
   and the constants (`int`/`bool`/`null`) — charge nothing.** Charging leaves would make
   cost track how many literals the parser happened to fold, an accidental property; cost
-  must track genuine evaluation work. A **decimal** arithmetic/comparison node additionally
+  must track genuine evaluation work. A subtree of constants that plan-time constant folding
+  ([planner.md](planner.md) §3.7) evaluates once becomes such a leaf, so it charges nothing at
+  run time either. A **decimal** arithmetic/comparison node additionally
   charges size-scaled `decimal_work` — the dedicated subsection below.
 - **Mixed-width floats.** The `f32 → f64` widening ([float.md](float.md) §2) is an implicit
   **`cast` node** wherever the resolver builds an expression node over an `f32` operand that must

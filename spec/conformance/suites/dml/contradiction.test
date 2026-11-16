@@ -5,7 +5,7 @@
 # reads no page or row of its target, evaluates no WHERE, SET, CHECK, or RETURNING item, and affects
 # nothing; uncorrelated subqueries still fold once and are charged. Results are ordinary PostgreSQL
 # semantics; the `# cost:` pins are jed's cross-core contract. `t` is one leaf.
-# requires: ddl.create_table, ddl.primary_key, ddl.sequence, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.returning, dml.where_contradiction, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.aggregates, query.qualified_column, query.subquery_scalar, query.subquery_correlated, query.subquery_exists, query.cte, query.cte_data_modifying, query.where_contradiction, func.sequence, expr.arithmetic, cast.explicit, error.division_by_zero, types.i32, types.i64, types.text, types.boolean, null.three_valued, resource.cost_metering
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, ddl.sequence, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.returning, dml.where_contradiction, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.aggregates, query.qualified_column, query.subquery_scalar, query.subquery_correlated, query.subquery_exists, query.cte, query.cte_data_modifying, query.where_contradiction, func.sequence, expr.arithmetic, cast.explicit, error.division_by_zero, types.i32, types.i64, types.text, types.boolean, null.three_valued, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, x i32, s text)
@@ -114,15 +114,16 @@ SELECT nextval('sq')
 ----
 1
 
-# An uncorrelated WHERE subquery still folds once and is charged (the 10 units of `SELECT max(x)
-# FROM t`), while the target is not read.
-# cost: 10
+# A constant FALSE left conjunct decides the AND at plan time (planner.md §3.7): the WHERE folds to
+# FALSE, so the subquery it would never reach is dropped and the target is not read.
+# cost: 0
 statement ok
 DELETE FROM t WHERE false AND x = (SELECT max(x) FROM t)
 
-# The proof reads the WHERE before folding, so a subquery that folds to NULL is not proven: the
-# subquery's 2 units plus the target scan (1 page + 4 rows + 1 comparison x 4), matching nothing.
-# cost: 11
+# The proof reads the WHERE before the subquery folds, so a subquery that folds to NULL is not proven:
+# the subquery's 1 unit (its `CAST(NULL AS i32)` folds at plan time) plus the target scan (1 page +
+# 4 rows + 1 comparison x 4), matching nothing.
+# cost: 10
 statement ok
 DELETE FROM t WHERE x = (SELECT CAST(NULL AS i32))
 
@@ -139,8 +140,9 @@ WITH d AS (DELETE FROM t WHERE x = 1 AND x = 2 RETURNING id) SELECT count(*) FRO
 statement ok
 DELETE FROM t WHERE s > 'b' AND s < 'a'
 
-# A TRUE literal comparison is not folded away: it is still evaluated per row.
-# cost: 17
+# A TRUE literal comparison folds to TRUE at plan time and drops out of the AND (planner.md §3.7), so
+# only `x = 77` is evaluated per row.
+# cost: 9
 statement ok
 UPDATE t SET x = x WHERE 1 = 1 AND x = 77
 

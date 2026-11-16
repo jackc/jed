@@ -67,6 +67,7 @@ JOIN region r ON r.id = c.region;`;
 FROM city c JOIN trip t ON c.zone = t.city_id
 WHERE c.zone < 8 AND t.id > 2;`;
 	const contradiction = `EXPLAIN SELECT name FROM city WHERE zone > 5 AND zone < 3;`;
+	const constantFolding = `EXPLAIN (VERBOSE) SELECT name, 2 * 50 FROM city WHERE id = 1 + 2 AND 1 = 1;`;
 	const derivedPushdown = `EXPLAIN SELECT v.name
 FROM (SELECT id, name, region FROM city) v
 WHERE v.id = 3;`;
@@ -291,6 +292,16 @@ its one row. `UPDATE` and `DELETE` get the same check: a contradictory mutation 
 none of its `SET` or `RETURNING` expressions, and changes nothing.
 
 <LiveSql demo="contradiction" seed={seed} query={contradiction} rows={4} />
+
+An expression built only from literals is computed once, while the query is planned, and replaced by
+its value: arithmetic, comparisons, casts, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `CASE`, `COALESCE`,
+`GREATEST`/`LEAST`, and `ARRAY[…]` over numbers, booleans, text, `bytea`, and `uuid`. The folded value
+costs nothing per row, and it counts as a literal for everything above: `id = 1 + 2` bounds the
+primary key, and a `1 = 1` beside another condition drops out of the filter. `VERBOSE` shows the
+folded expressions. An expression that would fail (`1 / 0`) is left as written, so it still fails
+only if a row reaches it. Parameters, columns, function calls, and date/time values are not folded.
+
+<LiveSql demo="constantFolding" seed={seed} query={constantFolding} rows={4} />
 
 A **bound parameter** counts as a literal here and in every estimate: each execution is planned with
 its values (its *custom plan* — see [prepared statements](../../api/queries/)), so `zone > $1 AND zone

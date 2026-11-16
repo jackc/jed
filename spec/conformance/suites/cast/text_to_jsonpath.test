@@ -5,7 +5,7 @@
 # is the identity. Any other source type is 42846 (cannot_coerce), as in PostgreSQL. Cost: the
 # cast's operator_eval plus jsonpath_compile per UTF-8 byte of the text (§7). Results verified
 # against PostgreSQL 18.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, cast.explicit, cast.scalar_text, expr.text_concat, types.text, types.jsonb, types.jsonpath, func.jsonb_path, expr.jsonpath_filter, resource.cost_metering
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, cast.explicit, cast.scalar_text, expr.text_concat, types.text, types.jsonb, types.jsonpath, func.jsonb_path, expr.jsonpath_filter, resource.cost_metering
 
 # 1 concat + 1 cast + 4 bytes compiled = 6.
 # cost: 6
@@ -40,7 +40,7 @@ SELECT ('$' || '.a')::jsonpath::text
 $."a"
 
 # A NULL adapts.
-# cost: 2
+# cost: 1
 query T nosort
 SELECT (NULL::text)::jsonpath
 ----

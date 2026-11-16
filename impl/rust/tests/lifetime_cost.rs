@@ -17,8 +17,9 @@ fn code(db: &mut Session, sql: &str) -> String {
         .to_string()
 }
 
-/// `SELECT 1 + 1 + 1 + 1 + 1` — five `1`s, four `+` — costs 5 (4 operator_eval + 1 row_produced).
-const COST5: &str = "SELECT 1 + 1 + 1 + 1 + 1";
+/// Costs 5: the uncorrelated subquery's 1 row_produced, 3 operator_eval for the `+`s, and 1
+/// row_produced. The subquery keeps the chain from folding to a constant at plan time (planner.md §3.7).
+const COST5: &str = "SELECT (SELECT 1) + 1 + 1 + 1";
 
 #[test]
 fn default_session_has_no_budget_but_tracks_the_cumulative() {

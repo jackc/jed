@@ -5,7 +5,7 @@
 # stays a full scan; and that a single accelerable conjunct beside the `OR` is the bound instead.
 # The rows are oracle-checked in query/gin_disjunction.test.
 # Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, query.gin_scan, query.gin_any_eq, query.gin_array_eq, query.gin_mutation, query.gin_jsonb_ops, query.gin_disjunction, query.logical_connectives, query.explain, dml.explain, expr.in_list, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, types.i32, types.text, types.array, types.jsonb, func.array_containment, func.array_quantified, func.jsonb_contains, func.json_builders, query.set_returning, cast.operator, expr.text_concat, expr.arithmetic, dml.insert_select, maintenance.analyze, maintenance.analyze_gin_terms
+# requires: query.constant_folding, ddl.create_table, ddl.primary_key, ddl.gin_index, query.gin_scan, query.gin_any_eq, query.gin_array_eq, query.gin_mutation, query.gin_jsonb_ops, query.gin_disjunction, query.logical_connectives, query.explain, dml.explain, expr.in_list, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, types.i32, types.text, types.array, types.jsonb, func.array_containment, func.array_quantified, func.jsonb_contains, func.json_builders, query.set_returning, cast.operator, expr.text_concat, expr.arithmetic, dml.insert_select, maintenance.analyze, maintenance.analyze_gin_terms
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, tags i32[], n i32)
@@ -133,7 +133,7 @@ EXPLAIN SELECT id FROM t WHERE tags IN (ARRAY[1,2], ARRAY[3,4])
 Filter
 conjuncts=1
 2
-35
+27
 1
 Scan t
 GIN bound: using t_tags_gin; touched=2
@@ -150,7 +150,7 @@ EXPLAIN SELECT id FROM t WHERE tags IN (ARRAY[1,2], ARRAY[3,4])
 Filter
 conjuncts=1
 2
-341
+297
 1
 Scan t
 GIN bound: using t_tags_gin; touched=2
@@ -164,7 +164,7 @@ EXPLAIN SELECT id FROM t WHERE tags @> ARRAY[3] OR tags && ARRAY[5,7] OR 8 = ANY
 Filter
 conjuncts=1
 131
-1442
+1180
 1
 Scan t
 GIN bound: using t_tags_gin; touched=2
