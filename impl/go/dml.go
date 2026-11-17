@@ -581,7 +581,7 @@ func ginOpclassFor(ty dataType) (ginOpclass, bool) {
 // extraction.
 func ginValueTerms(opclass ginOpclass, v Value) [][]byte {
 	if opclass.jsonb {
-		if v.Kind != ValJsonb {
+		if v.Kind != ValJSONB {
 			return nil
 		}
 		return ginJsonbIndexTerms(v.jsonb())

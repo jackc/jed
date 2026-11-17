@@ -573,5 +573,5 @@ func (db *engine) encrypted() bool {
 }
 
 func ioError(err error) error {
-	return newError(IoError, fmt.Sprintf("I/O error: %v", err))
+	return newError(IOError, fmt.Sprintf("I/O error: %v", err))
 }

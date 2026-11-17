@@ -73,7 +73,7 @@ func TestStorageLimitOptionsAndGauge(t *testing.T) {
 	storageExec(t, s, storageBatch(200, 200))
 
 	// The create option limits from the first commit.
-	db, err := CreateDatabase(CreateOptions{MaxStorageBytes: 8 * storagePage})
+	db, err := Create(CreateOptions{MaxStorageBytes: 8 * storagePage})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func storageFileDB(t *testing.T, maxStorageBytes int64) (*Database, string) {
 	setVerifyLivePages(true)
 	t.Cleanup(func() { setVerifyLivePages(false) })
 	path := filepath.Join(t.TempDir(), "storage.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true, MaxStorageBytes: maxStorageBytes})
+	db, err := Create(CreateOptions{Path: path, SkipFsync: true, MaxStorageBytes: maxStorageBytes})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func TestFileStorageLimitMeasuresLivePages(t *testing.T) {
 
 	// The count is persisted: a reopen reports it without walking the file, and the open option sets
 	// the limit.
-	db, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true, MaxStorageBytes: measured})
+	db, err := Open(path, OpenOptions{SkipFsync: true, MaxStorageBytes: measured})
 	if err != nil {
 		t.Fatal(err)
 	}

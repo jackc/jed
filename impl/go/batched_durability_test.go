@@ -29,7 +29,7 @@ func relaxedDB(t *testing.T, path string, pageSize uint32, inline bool) *Databas
 func relaxedDBTimed(t *testing.T, path string, pageSize uint32, inline bool, intervalMs uint64, env *Environment) *Database {
 	t.Helper()
 	interval := millisDuration(intervalMs)
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: pageSize, Synchronous: SynchronousOff, FlushInterval: &interval, Environment: env})
+	db, err := Create(CreateOptions{Path: path, PageSize: pageSize, Synchronous: SynchronousOff, FlushInterval: &interval, Environment: env})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestRelaxedCommitsDeferTheBarrier(t *testing.T) {
 	if count.syncs != 1 {
 		t.Fatalf("close issued %d barriers, want the one flush", count.syncs)
 	}
-	reopened, err := OpenDatabase(path)
+	reopened, err := Open(path, OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +197,7 @@ func TestRelaxedNewestMetaVouchesForTheWholeBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	zero := time.Duration(0)
-	reopened, err := OpenDatabaseWithOptions(path, OpenOptions{Synchronous: SynchronousOff, FlushInterval: &zero})
+	reopened, err := Open(path, OpenOptions{Synchronous: SynchronousOff, FlushInterval: &zero})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +295,7 @@ func TestRelaxedBackgroundFlushWithConcurrentReaders(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenDatabase(path)
+	reopened, err := Open(path, OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +308,7 @@ func TestRelaxedBackgroundFlushWithConcurrentReaders(t *testing.T) {
 // failingSyncStore fails every barrier, as a dying device would.
 type failingSyncStore struct{ blockStore }
 
-func (s failingSyncStore) sync() error { return newError(IoError, "injected sync failure") }
+func (s failingSyncStore) sync() error { return newError(IOError, "injected sync failure") }
 
 func TestRelaxedCloseReportsAFailedFlush(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "flushfail.jed")
@@ -328,7 +328,7 @@ func TestRelaxedCloseReportsAFailedFlush(t *testing.T) {
 
 func TestSynchronousOnKeepsTxidParitySlots(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "on.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -519,7 +519,7 @@ func TestRelaxedDeadlineIsPerDatabase(t *testing.T) {
 	db := relaxedDBTimed(t, path, 0, true, 1000, env)
 	defer db.Close()
 	other := filepath.Join(dir, "other.jed")
-	created, err := CreateDatabase(CreateOptions{Path: other, Environment: env})
+	created, err := Create(CreateOptions{Path: other, Environment: env})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -569,7 +569,7 @@ func TestRelaxedStoragePrecheckIgnoresTheDeadline(t *testing.T) {
 		var db *Database
 		if mode == "on" {
 			var err error
-			db, err = CreateDatabase(CreateOptions{Path: path, PageSize: 512, Environment: env})
+			db, err = Create(CreateOptions{Path: path, PageSize: 512, Environment: env})
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -1427,7 +1427,7 @@ func renderRExpr(e *rExpr) string {
 	case reConstBytea:
 		return quoteExplainText(ByteaValue(e.cBytea).Render())
 	case reConstUuid:
-		return quoteExplainText(UuidValue(e.cBytea).Render())
+		return quoteExplainText(UUIDValue(e.cBytea).Render())
 	case reConstTimestamp:
 		return quoteExplainText(TimestampValue(e.cInt).Render())
 	case reConstTimestamptz:
@@ -1444,7 +1444,7 @@ func renderRExpr(e *rExpr) string {
 		return quoteExplainText(e.cText)
 	case reConstJsonb:
 		if e.cJsonb != nil {
-			return quoteExplainText(JsonbValue(*e.cJsonb).Render())
+			return quoteExplainText(JSONBValue(*e.cJsonb).Render())
 		}
 		return "NULL"
 	case reConstNull:

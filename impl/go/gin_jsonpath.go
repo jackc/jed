@@ -184,7 +184,7 @@ func jpGinBool(lax bool, path []jpGinItem, pred *jpPred, not bool) *jpGinNode {
 
 // jpGinScalar is a comparison operand PostgreSQL's jspIsScalar accepts: a step-less null / boolean /
 // number / string literal.
-func jpGinScalar(e *jpPathExpr) (*JsonNode, bool) {
+func jpGinScalar(e *jpPathExpr) (*JSONNode, bool) {
 	if e.primary == jpLiteral && len(e.steps) == 0 {
 		return &e.lit, true
 	}
@@ -192,7 +192,7 @@ func jpGinScalar(e *jpPathExpr) (*JsonNode, bool) {
 }
 
 // jpGinPathExpr is PostgreSQL's extract_jsp_path_expr: the nodes of expr AND-ed, or nil when none.
-func jpGinPathExpr(lax bool, path []jpGinItem, expr *jpPathExpr, scalar *JsonNode) *jpGinNode {
+func jpGinPathExpr(lax bool, path []jpGinItem, expr *jpPathExpr, scalar *JSONNode) *jpGinNode {
 	nodes := jpGinPathNodes(lax, path, expr, scalar)
 	switch len(nodes) {
 	case 0:
@@ -207,7 +207,7 @@ func jpGinPathExpr(lax bool, path []jpGinItem, expr *jpPathExpr, scalar *JsonNod
 // accessors, extracting each filter; an accessor the opclass cannot follow ends the walk with only the
 // filter nodes found so far. A complete walk with a scalar adds a KEY entry per .key accessor (last to
 // first) and the scalar's entry.
-func jpGinPathNodes(lax bool, outer []jpGinItem, expr *jpPathExpr, scalar *JsonNode) []*jpGinNode {
+func jpGinPathNodes(lax bool, outer []jpGinItem, expr *jpPathExpr, scalar *JSONNode) []*jpGinNode {
 	var nodes []*jpGinNode
 	var path []jpGinItem
 	switch expr.primary {

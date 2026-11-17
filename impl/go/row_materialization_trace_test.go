@@ -22,7 +22,7 @@ func TestRowMaterializationTrace(t *testing.T) {
 		if file {
 			opts.Path = filepath.Join(t.TempDir(), "trace.jed")
 		}
-		db, err := CreateDatabase(opts)
+		db, err := Create(opts)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -36,7 +36,7 @@ func TestRowMaterializationTrace(t *testing.T) {
 		}
 		if file {
 			_ = db.Close()
-			db, err = OpenDatabaseWithOptions(opts.Path, OpenOptions{SkipFsync: true})
+			db, err = Open(opts.Path, OpenOptions{SkipFsync: true})
 			if err != nil {
 				t.Fatal(err)
 			}

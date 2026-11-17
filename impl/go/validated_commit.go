@@ -80,7 +80,7 @@ func manifestOverflowCapacity(ps int) int { return (ps - 32) / manifestEntrySize
 // must not do more storage work; a serialization error does not start a commit.
 func (p *pager) checkValidatedCommit() error {
 	if p.commitRequiresReopen() {
-		return newError(IoError, "database writer requires reopen after failed commit")
+		return newError(IOError, "database writer requires reopen after failed commit")
 	}
 	return nil
 }

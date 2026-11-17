@@ -111,7 +111,7 @@ func TestQueryMemoryBudgetStaysWithCursor(t *testing.T) {
 // behavior and host-observed peaks, so it lives here rather than in the corpus.
 func TestQueryMemorySpillingOperatorStateReleasesItsCharge(t *testing.T) {
 	dir := t.TempDir()
-	db, err := CreateDatabase(CreateOptions{Path: filepath.Join(dir, "query_memory_spill.jed"), SkipFsync: true})
+	db, err := Create(CreateOptions{Path: filepath.Join(dir, "query_memory_spill.jed"), SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

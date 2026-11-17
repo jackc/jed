@@ -16,7 +16,7 @@ func TestGistCommittedLoadHasNoPendingWrites(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			path := filepath.Join(t.TempDir(), "source.jed")
-			source, err := jed.CreateDatabase(jed.CreateOptions{Path: path, SkipFsync: true, Locking: jed.LockingNone})
+			source, err := jed.Create(jed.CreateOptions{Path: path, SkipFsync: true, Locking: jed.LockingNone})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -40,9 +40,9 @@ func TestGistCommittedLoadHasNoPendingWrites(t *testing.T) {
 			var db *jed.Database
 			name := "t"
 			if mode == "deserialize" {
-				db, err = jed.DeserializeDatabase(image, jed.DeserializeOptions{})
+				db, err = jed.Deserialize(image, jed.DeserializeOptions{})
 			} else {
-				db, err = jed.CreateDatabase(jed.CreateOptions{})
+				db, err = jed.Create(jed.CreateOptions{})
 				if err == nil {
 					err = db.Attach("aux", jed.AttachFileWithOptions(path, jed.AttachFileOptions{Locking: jed.LockingNone}), false)
 				}

@@ -2774,7 +2774,7 @@ func valueToRExpr(v Value) *rExpr {
 		return &rExpr{kind: reConstDecimal, cDec: *v.decimal()}
 	case ValBytea:
 		return &rExpr{kind: reConstBytea, cBytea: []byte(v.str())}
-	case ValUuid:
+	case ValUUID:
 		return &rExpr{kind: reConstUuid, cBytea: []byte(v.str())}
 	case ValTimestamp:
 		return &rExpr{kind: reConstTimestamp, cInt: v.Int}
@@ -2798,11 +2798,11 @@ func valueToRExpr(v Value) *rExpr {
 	case ValRange:
 		// A folded range constant (already canonical).
 		return &rExpr{kind: reConstRange, cRange: v.rangeVal()}
-	case ValJson:
+	case ValJSON:
 		return &rExpr{kind: reConstJson, cText: v.str()}
-	case ValJsonPath:
+	case ValJSONPath:
 		return &rExpr{kind: reConstJsonPath, cText: v.str()}
-	case ValJsonb:
+	case ValJSONB:
 		return &rExpr{kind: reConstJsonb, cJsonb: v.jsonb()}
 	default: // ValNull
 		return &rExpr{kind: reConstNull}
@@ -2989,7 +2989,7 @@ func writeRowKey(b *rowKeyBuilder, row []Value) {
 			b.WriteString(strconv.Itoa(len(v.str())))
 			b.WriteByte(':')
 			b.writeBody(v.str())
-		case ValUuid:
+		case ValUUID:
 			// The 16 raw bytes (held in Str), under a distinct 'u' tag so a uuid never collides
 			// with a bytea/text of the same bytes. Fixed-width, but length-prefixed for symmetry.
 			b.WriteByte('u')
@@ -3066,7 +3066,7 @@ func writeRowKey(b *rowKeyBuilder, row []Value) {
 			b.WriteByte('n') // non-empty marker
 			writeRangeBoundKey(b, rv.Lower, rv.LowerInc)
 			writeRangeBoundKey(b, rv.Upper, rv.UpperInc)
-		case ValJson:
+		case ValJSON:
 			// json keys on its verbatim text under a distinct 'J' tag (the value-level equality,
 			// consistent with the structural derive). Length-prefixed (arbitrary UTF-8 content).
 			// Never reached through SQL in J0 (json is non-comparable — 42883).
@@ -3074,7 +3074,7 @@ func writeRowKey(b *rowKeyBuilder, row []Value) {
 			b.WriteString(strconv.Itoa(len(v.str())))
 			b.WriteByte(':')
 			b.writeBody(v.str())
-		case ValJsonb:
+		case ValJSONB:
 			// jsonb keys STRUCTURALLY under a distinct 'B' tag (json.go writeJsonbDistinctKey): the
 			// walk emits each number's value-canonical decimal string, so Cmp-equal documents share
 			// one DISTINCT/GROUP BY bucket (`{"a":1}` and `{"a":1.0}` are equal — json.md §5; the

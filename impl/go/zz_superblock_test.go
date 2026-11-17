@@ -183,7 +183,7 @@ func TestSuperBlockExperiment(t *testing.T) {
 		if err := db.Compact("main"); err != nil {
 			t.Fatal(err)
 		}
-	} else if db, err = OpenDatabase(path); err != nil {
+	} else if db, err = Open(path, OpenOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
@@ -575,7 +575,7 @@ func TestSuperBlockPoolBound(t *testing.T) {
 	fmt.Printf("\n== live heap under the buffer pool (Go core) ==\n%-10s %12s %12s %12s %8s\n", "budget", "heap MB", "charged MB", "leaves", "heap/bgt")
 	for _, budget := range []int{1, 16 << 20, 64 << 20, 1 << 30} {
 		h0 := sbHeap()
-		bdb, err := OpenDatabaseWithOptions(path, OpenOptions{CacheBytes: budget, ReadOnly: true})
+		bdb, err := Open(path, OpenOptions{CacheBytes: budget, ReadOnly: true})
 		if err != nil {
 			t.Fatal(err)
 		}

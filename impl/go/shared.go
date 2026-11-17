@@ -47,7 +47,7 @@ package jed
 //
 // The host-facing single handle is *Database (the back-compat bridge — §2.1): the shared core PLUS
 // one long-lived default *Session, whose delegators (Execute/Query/Begin/.../ExecuteScript) drive
-// that default session. CreateDatabase / OpenDatabase return it; it is also the
+// that default session. Create / OpenDatabase return it; it is also the
 // goroutine-safe core itself (Go needs no Rust-style !Send split), so the same *Database both
 // drives the single-handle path and mints additional concurrent sessions.
 
@@ -445,7 +445,7 @@ func (st *storage) startCapFlush() {
 func capFlush(paging *sharedPaging) error {
 	err := paging.withPager(func(p *pager) error { return p.flushPending(true) })
 	if err != nil {
-		paging.revoke(newError(IoError, "a deferred durability flush failed; reopen the database: "+err.Error()))
+		paging.revoke(newError(IOError, "a deferred durability flush failed; reopen the database: "+err.Error()))
 	}
 	return err
 }
@@ -1747,7 +1747,7 @@ func sharedCoreFromEngineCoordinated(e *engine, coordinator *fileCoordinator) *s
 // a Session, never on the *Database. It also offers bare convenience methods
 // (Execute/Query/ExecuteScript/View/Update) that mint a FRESH autocommit session per call and discard
 // it: committed data persists through the shared core, but no session-local state carries to the next
-// call. CreateDatabase / OpenDatabase return it.
+// call. Create / OpenDatabase return it.
 type Database struct {
 	core *sharedCore
 }
@@ -1820,7 +1820,7 @@ func errNotEncrypted() error {
 // CreateOptions are the settings for creating a fresh database (spec/design/api.md §2.1). Path
 // selects the backing: the zero value "" builds an in-memory database (never touches the
 // filesystem); a non-empty path builds a single-file database on disk (58P02 if it already exists).
-// "" is the documented "unset" — there is no positional CreateDatabase("") to be hit by an
+// "" is the documented "unset" — there is no positional Create("") to be hit by an
 // uninitialized argument (api.md §2.1). PageSize (0 → DefaultPageSize) is locked into a file's meta
 // at creation and fixes an in-memory database's tree fan-out, so it is meaningful for both backings.
 type CreateOptions struct {
@@ -1873,11 +1873,11 @@ type CreateOptions struct {
 	ScratchEncryption ScratchEncryption
 }
 
-// CreateDatabase makes a fresh database — in-memory (opts.Path == "") or file-backed (opts.Path set)
+// Create makes a fresh database — in-memory (opts.Path == "") or file-backed (opts.Path set)
 // — and returns the host handle with its default session (spec/design/api.md §2.1). A file that
 // already exists is 58P02; the page size is locked into a file. Invalid duration
 // options return 22023 before creating storage, including for an in-memory database.
-func CreateDatabase(opts CreateOptions) (*Database, error) {
+func Create(opts CreateOptions) (*Database, error) {
 	if err := validateDurationOptions(opts.FlushInterval, opts.FileLockTimeout, opts.IdleInTransactionTimeout, opts.IdleSessionTimeout, opts.YieldGrace, opts.ShutdownGrace); err != nil {
 		return nil, err
 	}
@@ -1939,7 +1939,7 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 }
 
 // newInMemoryWithPageSize builds a fresh, empty in-memory database that serializes/splits at
-// pageSize (unexported — CreateDatabase and the test helpers are its callers). The page-backed
+// pageSize (unexported — Create and the test helpers are its callers). The page-backed
 // B-tree's fan-out tracks the page size (spec/fileformat/format.md), so an in-memory tree must be
 // built at the size it will serialize to; that is why PageSize is a CreateOptions field for the
 // in-memory backing too.
@@ -1960,16 +1960,9 @@ func newInMemoryWithPageSize(pageSize uint32, env *Environment) *Database {
 	return databaseOver(sharedCoreFromEngine(e))
 }
 
-// OpenDatabase opens an existing file-backed database at path with default open settings. Use
-// OpenDatabaseWithOptions to set the buffer-pool budget, read-only mode, or work-memory budget
-// (the mirror of Rust's Database::open / open_with_options — spec/design/api.md §2.1).
-func OpenDatabase(path string) (*Database, error) {
-	return OpenDatabaseWithOptions(path, OpenOptions{})
-}
-
-// OpenDatabaseWithOptions opens an existing file-backed database at path with explicit open settings
-// (buffer-pool budget, read-only mode, work-mem) and returns the host handle with its default session.
-func OpenDatabaseWithOptions(path string, opts OpenOptions) (*Database, error) {
+// Open opens the existing database file at path. The zero OpenOptions selects the defaults.
+// A missing file fails with SQLSTATE 58P01; use [Create] to make a new database.
+func Open(path string, opts OpenOptions) (*Database, error) {
 	if err := opts.validateDurations(); err != nil {
 		return nil, err
 	}
@@ -2384,7 +2377,7 @@ func (db *Database) ChangeCredential(name string, cred *Credential, kdf Argon2Pa
 		readOnly = att.mode == attachReadOnly
 	}
 	if readOnly {
-		return newError(ReadOnlySqlTransaction, `cannot change the credential of read-only database "`+name+`"`)
+		return newError(ReadOnlySQLTransaction, `cannot change the credential of read-only database "`+name+`"`)
 	}
 	// A file attachment under the page service changes its credential through its own handle.
 	if service != nil {
@@ -2453,7 +2446,7 @@ func (db *Database) compact(lname, name string, rekey *rekeyTarget) error {
 		}
 	}
 	if readOnly {
-		return newError(ReadOnlySqlTransaction, `cannot compact read-only database "`+name+`"`)
+		return newError(ReadOnlySQLTransaction, `cannot compact read-only database "`+name+`"`)
 	}
 	if service != nil {
 		// A service attachment is compacted by its inner handle, under its own gate and watermark
@@ -3399,7 +3392,7 @@ func (s *Session) withBlock(ctx context.Context, writable bool, fn func(tx *Tran
 		// ROLLBACK (transactions.md §6). A closure API reports that — its writes are never discarded
 		// behind a nil return.
 		_, _ = s.endBlock(false)
-		return newError(InFailedSqlTransaction,
+		return newError(InFailedSQLTransaction,
 			"current transaction is aborted, commands ignored until end of transaction block")
 	}
 	_, err := s.endBlock(true)
@@ -3520,7 +3513,7 @@ func (s *Session) LoadedTimeZones() []TimeZoneInfo { return s.engine.LoadedTimeZ
 // write). A read-only session rejects it (25006).
 func (s *Session) SetDefaultCollation(name string) error {
 	if s.access == accessReadOnly {
-		return newError(ReadOnlySqlTransaction, "cannot set the default collation on a read-only session")
+		return newError(ReadOnlySQLTransaction, "cannot set the default collation on a read-only session")
 	}
 	if s.engine.session.tx != nil {
 		return s.engine.SetDefaultCollation(name) // part of the open block; publishes on its commit
@@ -3643,7 +3636,7 @@ func (s *Session) ResetVars() { s.engine.session.ResetVars() }
 // write op — it routes through the lazy writer gate and publishes through the shared core on change.
 func (s *Session) UpgradeCollations() (int, error) {
 	if s.access == accessReadOnly {
-		return 0, newError(ReadOnlySqlTransaction, "cannot upgrade collations on a read-only snapshot")
+		return 0, newError(ReadOnlySQLTransaction, "cannot upgrade collations on a read-only snapshot")
 	}
 	if s.engine.session.tx != nil {
 		// Inside an open block: run on the working set (the gate is already held for a writable block).

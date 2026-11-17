@@ -363,7 +363,7 @@ func blockingFold(a *acc, v Value, m *costMeter, unique *stateMap, prefix []Valu
 			return err
 		}
 		if !inserted {
-			return newError(DuplicateJsonObjectKeyValue, "duplicate JSON object key value")
+			return newError(DuplicateJSONObjectKeyValue, "duplicate JSON object key value")
 		}
 	}
 	if err := blockingRetain(a, owner, collections); err != nil {
@@ -561,18 +561,18 @@ func (db *engine) finalizeSpilledAcc(a *acc, spec aggSpec, srow storedRow, colle
 			if err := checkJSONTextDepth(out.String()); err != nil {
 				return NullValue(), err
 			}
-			return JsonValue(out.String()), nil
+			return JSONValue(out.String()), nil
 		}
-		var nodes []JsonNode
+		var nodes []JSONNode
 		err := collections.each(owner, func(row storedRow) error { nodes = append(nodes, *row[0].jsonb()); return nil })
 		if err != nil {
 			return NullValue(), err
 		}
-		arr := JsonNode{Kind: JArray, Arr: nodes}
+		arr := JSONNode{Kind: JArray, Arr: nodes}
 		if err := checkJSONDepth(&arr); err != nil {
 			return NullValue(), err
 		}
-		return JsonbValue(arr), nil
+		return JSONBValue(arr), nil
 	case planJsonbObjectAgg, planJsonObjectAgg, planJsonbObjectAggUnique, planJsonObjectAggUnique:
 		if !a.seen {
 			return NullValue(), nil
@@ -593,7 +593,7 @@ func (db *engine) finalizeSpilledAcc(a *acc, spec aggSpec, srow storedRow, colle
 			if err := checkJSONTextDepth(out.String()); err != nil {
 				return NullValue(), err
 			}
-			return JsonValue(out.String()), nil
+			return JSONValue(out.String()), nil
 		}
 		// The values were converted as they were folded, in input order. The sort orders keys
 		// canonically (length, then bytes); within a key it is stable, so the last value wins.
@@ -611,7 +611,7 @@ func (db *engine) finalizeSpilledAcc(a *acc, spec aggSpec, srow storedRow, colle
 			return NullValue(), err
 		}
 		defer sorted.close()
-		var members []JsonMember
+		var members []JSONMember
 		for {
 			row, ok, err := sorted.next()
 			if err != nil {
@@ -625,13 +625,13 @@ func (db *engine) finalizeSpilledAcc(a *acc, spec aggSpec, srow storedRow, colle
 				members[len(members)-1].Val = *row[2].jsonb()
 				continue
 			}
-			members = append(members, JsonMember{Key: key, Val: *row[2].jsonb()})
+			members = append(members, JSONMember{Key: key, Val: *row[2].jsonb()})
 		}
 		out := makeObject(members)
 		if err := checkJSONDepth(&out); err != nil {
 			return NullValue(), err
 		}
-		return JsonbValue(out), nil
+		return JSONBValue(out), nil
 	}
 	return a.finalize()
 }

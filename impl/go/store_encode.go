@@ -139,7 +139,7 @@ func storeValue(v Value, colTy scalarType, tm typmod, notNull bool, colName stri
 			if err != nil {
 				return Value{}, err
 			}
-			return UuidValue(b), nil
+			return UUIDValue(b), nil
 		}
 		if colTy.IsTimestamp() {
 			// A string literal adapts to a timestamp column (spec/design/timestamp.md);
@@ -204,7 +204,7 @@ func storeValue(v Value, colTy scalarType, tm typmod, notNull bool, colName stri
 			if err := validateJSON(v.str()); err != nil {
 				return Value{}, err
 			}
-			return JsonValue(v.str()), nil
+			return JSONValue(v.str()), nil
 		}
 		if colTy.IsJsonb() {
 			// A string literal adapts to a jsonb column (§2): parse + canonicalize; → 22P02.
@@ -212,7 +212,7 @@ func storeValue(v Value, colTy scalarType, tm typmod, notNull bool, colName stri
 			if err != nil {
 				return Value{}, err
 			}
-			return JsonbValue(node), nil
+			return JSONBValue(node), nil
 		}
 		return Value{}, typeError("cannot store a text value in " + colTy.CanonicalName() + " column " + colName)
 	case ValBytea:
@@ -220,7 +220,7 @@ func storeValue(v Value, colTy scalarType, tm typmod, notNull bool, colName stri
 			return v, nil
 		}
 		return Value{}, typeError("cannot store a bytea value in " + colTy.CanonicalName() + " column " + colName)
-	case ValUuid:
+	case ValUUID:
 		if colTy.IsUuid() {
 			return v, nil
 		}
@@ -280,19 +280,19 @@ func storeValue(v Value, colTy scalarType, tm typmod, notNull bool, colName stri
 			return v, nil
 		}
 		return Value{}, typeError("cannot store a f64 value in " + colTy.CanonicalName() + " column " + colName)
-	case ValJson:
+	case ValJSON:
 		// A json value stores into a json column verbatim. json → jsonb remains explicit-only.
 		if colTy.IsJson() {
 			return v, nil
 		}
 		return Value{}, typeError("cannot store a json value in " + colTy.CanonicalName() + " column " + colName)
-	case ValJsonb:
+	case ValJSONB:
 		if colTy.IsJsonb() {
 			return v, nil
 		}
 		if colTy.IsJson() {
 			// jsonb → json is an assignment cast (json.md §6.1): store jsonbOut's canonical text.
-			return JsonValue(jsonbOut(v.jsonb())), nil
+			return JSONValue(jsonbOut(v.jsonb())), nil
 		}
 		return Value{}, typeError("cannot store a jsonb value in " + colTy.CanonicalName() + " column " + colName)
 	default: // ValBool
@@ -774,7 +774,7 @@ func rExprConstToValue(e *rExpr) (Value, error) {
 	case reConstBytea:
 		return ByteaValue(e.cBytea), nil
 	case reConstUuid:
-		return UuidValue(e.cBytea), nil
+		return UUIDValue(e.cBytea), nil
 	case reConstTimestamp:
 		return TimestampValue(e.cInt), nil
 	case reConstTimestamptz:
@@ -790,11 +790,11 @@ func rExprConstToValue(e *rExpr) (Value, error) {
 	case reConstRange:
 		return RangeValue(e.cRange), nil
 	case reConstJson:
-		return JsonValue(e.cText), nil
+		return JSONValue(e.cText), nil
 	case reConstJsonPath:
-		return JsonPathValue(e.cText), nil
+		return JSONPathValue(e.cText), nil
 	case reConstJsonb:
-		return JsonbValue(*e.cJsonb), nil
+		return JSONBValue(*e.cJsonb), nil
 	default:
 		return Value{}, typeError("non-constant array element literal")
 	}
@@ -951,7 +951,7 @@ func encodeKeyValue(ty scalarType, value Value, coll *compiledCollation) ([]byte
 		return encodeInt(ty, value.Int), nil
 	case ValBool:
 		return encodeBool(value.boolVal()), nil
-	case ValUuid:
+	case ValUUID:
 		return []byte(value.str()), nil
 	case ValTimestamp, ValTimestamptz, ValDate:
 		return encodeInt(ty, value.Int), nil

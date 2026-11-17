@@ -51,7 +51,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	db, err := jed.CreateDatabase(jed.CreateOptions{Environment: builder.Build()})
+	db, err := jed.Create(jed.CreateOptions{Environment: builder.Build()})
 	if err != nil {
 		log.Fatal(err)
 	}

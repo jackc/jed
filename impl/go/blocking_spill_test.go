@@ -186,7 +186,7 @@ func TestBlockingVariableAggregatesSpill(t *testing.T) {
 
 func TestBlockingSpillFailuresAndEarlyCursorClose(t *testing.T) {
 	dir := t.TempDir()
-	db, err := CreateDatabase(CreateOptions{Path: filepath.Join(dir, "cleanup.jed"), SkipFsync: true})
+	db, err := Create(CreateOptions{Path: filepath.Join(dir, "cleanup.jed"), SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -39,7 +39,7 @@ func ginJsonbKeyTerm(key string) []byte { return ginJsonbFramed(ginJsonbFlagKey,
 
 // ginJsonbScalarTerm is the term of a scalar node; asKey marks a string that is an array element (or
 // the top-level scalar), which PostgreSQL indexes as a KEY rather than a string value.
-func ginJsonbScalarTerm(n *JsonNode, asKey bool) []byte {
+func ginJsonbScalarTerm(n *JSONNode, asKey bool) []byte {
 	switch n.Kind {
 	case JNull:
 		return []byte{ginJsonbFlagNull}
@@ -64,7 +64,7 @@ func ginJsonbScalarTerm(n *JsonNode, asKey bool) []byte {
 // ginJsonbWalk appends the terms of a container's contents, at every nesting level: a KEY term per
 // object key, a KEY term per string array element, and a value term per other scalar. Containers
 // themselves produce no term.
-func ginJsonbWalk(n *JsonNode, out [][]byte) [][]byte {
+func ginJsonbWalk(n *JSONNode, out [][]byte) [][]byte {
 	switch n.Kind {
 	case JObject:
 		for i := range n.Obj {
@@ -93,7 +93,7 @@ func ginJsonbWalk(n *JsonNode, out [][]byte) [][]byte {
 // DISTINCT terms, in ascending byte order. A top-level scalar is PostgreSQL's one-element raw-scalar
 // array (so a top-level string is a KEY term). `{}`, `[]`, and a document of only empty containers
 // yield none. Also the `@>` query terms of a containment query Q (mode ALL).
-func ginJsonbIndexTerms(doc *JsonNode) [][]byte {
+func ginJsonbIndexTerms(doc *JSONNode) [][]byte {
 	var terms [][]byte
 	if jsonIsContainer(doc) {
 		terms = ginJsonbWalk(doc, nil)

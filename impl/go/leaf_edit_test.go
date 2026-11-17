@@ -115,7 +115,7 @@ var leafEditWorkloads = []leafEditWorkload{
 func runLeafEditWorkload(t *testing.T, w leafEditWorkload) []byte {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), w.name+".jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func TestLeafShapes(t *testing.T) {
 	}
 	for table, setup := range setups {
 		path := filepath.Join(t.TempDir(), table+".jed")
-		db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+		db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -269,7 +269,7 @@ func TestLeafWidenGrowth(t *testing.T) {
 		for _, m := range modes {
 			leafSlack, leafPFOR, leafRuns, leafBlocks, leafBlocksExc = m.slack, m.pfor, m.runs, m.blocks, m.bexc
 			path := filepath.Join(t.TempDir(), c.name+".jed")
-			db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+			db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 			if err != nil {
 				t.Fatal(err)
 			}

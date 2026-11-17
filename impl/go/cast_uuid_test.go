@@ -29,7 +29,7 @@ func TestByteaToUuidIsThe16Bytes(t *testing.T) {
 	t.Parallel()
 	db := mustSession(memDB(), SessionOptions{})
 	v := castOne(t, db, "SELECT '\\x550e8400e29b41d4a716446655440000'::bytea::uuid")
-	if v.Kind != ValUuid || v.str() != uuid16 {
+	if v.Kind != ValUUID || v.str() != uuid16 {
 		t.Fatalf("bytea::uuid = %v, want the 16 bytes", v)
 	}
 }
@@ -62,7 +62,7 @@ func TestUuidByteaRoundTripThroughColumns(t *testing.T) {
 	if v := castOne(t, db, "SELECT u::bytea FROM t WHERE id = 1"); v.Kind != ValBytea || v.str() != uuid16 {
 		t.Fatalf("u::bytea = %v, want the 16 bytes", v)
 	}
-	if v := castOne(t, db, "SELECT b::uuid FROM t WHERE id = 1"); v.Kind != ValUuid || v.str() != uuid16 {
+	if v := castOne(t, db, "SELECT b::uuid FROM t WHERE id = 1"); v.Kind != ValUUID || v.str() != uuid16 {
 		t.Fatalf("b::uuid = %v, want the 16 bytes", v)
 	}
 	if v := castOne(t, db, "SELECT u::bytea FROM t WHERE id = 2"); v.Kind != ValNull {
@@ -84,7 +84,7 @@ func TestTextUuidSmoke(t *testing.T) {
 		"INSERT INTO t VALUES (2, 'not-a-uuid', NULL)",
 	)
 	// an UPPERCASE text value casts to the same 16 bytes (renders lowercase)
-	if v := castOne(t, db, "SELECT s::uuid FROM t WHERE id = 1"); v.Kind != ValUuid || v.str() != uuid16 {
+	if v := castOne(t, db, "SELECT s::uuid FROM t WHERE id = 1"); v.Kind != ValUUID || v.str() != uuid16 {
 		t.Fatalf("s::uuid = %v, want the 16 bytes", v)
 	}
 	if v := castOne(t, db, "SELECT u::text FROM t WHERE id = 1"); v.Kind != ValText ||

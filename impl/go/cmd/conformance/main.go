@@ -397,7 +397,7 @@ func openFixture(rel string, env *jed.Environment) (*jed.Database, func(), error
 		os.Remove(tmpPath)
 		return nil, nil, fmt.Errorf("fixture: write temp: %w", cmp.Or(werr, cerr))
 	}
-	db, err := jed.OpenDatabaseWithOptions(tmpPath, jed.OpenOptions{Environment: env})
+	db, err := jed.Open(tmpPath, jed.OpenOptions{Environment: env})
 	if err != nil {
 		removeTempDB(tmpPath)
 		return nil, nil, fmt.Errorf("fixture: open %s: %w", rel, err)
@@ -1068,18 +1068,18 @@ func runFile(text string, disk bool) error {
 		}
 		tmpPath = f.Name()
 		f.Close()
-		os.Remove(tmpPath) // CreateDatabase writes the initial image at this path
+		os.Remove(tmpPath) // Create writes the initial image at this path
 		// fsync=off (api.md §2.1): the disk pass reopens a throwaway temp image before every record to
 		// exercise the on-disk faulted read path — durability across an OS crash is irrelevant, so skip
 		// the per-commit fdatasync (the ~20x cost) while keeping the identical on-disk bytes + read path.
-		db, err = jed.CreateDatabase(jed.CreateOptions{Path: tmpPath, SkipFsync: true, Environment: env, Locking: serviceLocking(), Credential: modeCredential()})
+		db, err = jed.Create(jed.CreateOptions{Path: tmpPath, SkipFsync: true, Environment: env, Locking: serviceLocking(), Credential: modeCredential()})
 		if err != nil {
 			removeTempDB(tmpPath)
 			return fmt.Errorf("disk mode: create %s: %w", tmpPath, err)
 		}
 	} else {
 		var err error
-		db, err = jed.CreateDatabase(jed.CreateOptions{Environment: env}) // in-memory: no path
+		db, err = jed.Create(jed.CreateOptions{Environment: env}) // in-memory: no path
 		if err != nil {
 			return fmt.Errorf("in-memory create: %w", err)
 		}
@@ -1130,7 +1130,7 @@ func runFile(text string, disk bool) error {
 			}
 			actorOwns = client
 		}
-		reDB, err := jed.OpenDatabaseWithOptions(tmpPath, jed.OpenOptions{SkipFsync: true, Environment: env, Locking: serviceLocking(), Credential: modeCredential()}) // fsync=off (throwaway image)
+		reDB, err := jed.Open(tmpPath, jed.OpenOptions{SkipFsync: true, Environment: env, Locking: serviceLocking(), Credential: modeCredential()}) // fsync=off (throwaway image)
 		if err != nil {
 			return fmt.Errorf("disk reopen: open %s: %w", tmpPath, err)
 		}

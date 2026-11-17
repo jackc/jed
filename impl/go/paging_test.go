@@ -389,7 +389,7 @@ func TestInSessionTableJoinsResidencyFlip(t *testing.T) {
 		}
 	}
 	t.Run("in-memory", func(t *testing.T) {
-		db, err := CreateDatabase(CreateOptions{PageSize: 256})
+		db, err := Create(CreateOptions{PageSize: 256})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -397,7 +397,7 @@ func TestInSessionTableJoinsResidencyFlip(t *testing.T) {
 		run(t, db)
 	})
 	t.Run("file-create-session", func(t *testing.T) {
-		db, err := CreateDatabase(CreateOptions{Path: filepath.Join(t.TempDir(), "flip.jed"), PageSize: 256, SkipFsync: true})
+		db, err := Create(CreateOptions{Path: filepath.Join(t.TempDir(), "flip.jed"), PageSize: 256, SkipFsync: true})
 		if err != nil {
 			t.Fatal(err)
 		}

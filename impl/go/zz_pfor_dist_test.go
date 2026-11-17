@@ -306,7 +306,7 @@ func TestPFORDistributions(t *testing.T) {
 		for _, m := range distModesFrom() {
 			leafPFOR, leafBlocks, leafBlocksExc = m.pfor, m.blocks, m.bexc
 			path := filepath.Join(t.TempDir(), tb.name+".jed")
-			db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+			db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 			if err != nil {
 				t.Fatal(err)
 			}

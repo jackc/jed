@@ -49,7 +49,7 @@ func run() error {
 	}
 	ctx := context.Background()
 
-	db, err := jed.CreateDatabase(jed.CreateOptions{Path: path, SkipFsync: true, Locking: jed.LockingNone, Credential: credential})
+	db, err := jed.Create(jed.CreateOptions{Path: path, SkipFsync: true, Locking: jed.LockingNone, Credential: credential})
 	if err != nil {
 		return err
 	}
@@ -79,7 +79,7 @@ func run() error {
 		name  string
 		cache int
 	}{{"cold", 1 << 20}, {"hot", 1 << 30}} {
-		db, err := jed.OpenDatabaseWithOptions(path, jed.OpenOptions{SkipFsync: true, Locking: jed.LockingNone, CacheBytes: phase.cache, Credential: credential})
+		db, err := jed.Open(path, jed.OpenOptions{SkipFsync: true, Locking: jed.LockingNone, CacheBytes: phase.cache, Credential: credential})
 		if err != nil {
 			return err
 		}

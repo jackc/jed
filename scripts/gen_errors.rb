@@ -47,6 +47,11 @@ end
 # generated variant names match the hand-written ones byte-for-byte.
 def pascal(name) = name.split("_").map(&:capitalize).join
 
+# Go spells initialisms in one case (Effective Go; staticcheck ST1003): io_error -> IOError,
+# active_sql_transaction -> ActiveSQLTransaction. Rust and TypeScript keep pascal.
+GO_INITIALISMS = %w[sql json io uuid id].freeze
+def go_pascal(name) = name.split("_").map { |w| GO_INITIALISMS.include?(w) ? w.upcase : w.capitalize }.join
+
 # --- Rust --------------------------------------------------------------------
 
 def rust_variant(e)
@@ -120,12 +125,12 @@ end
 def go_str(s) = %("#{s}")
 
 def go_const(e, first)
-  decl = first ? "#{pascal(e['name'])} SqlState = iota" : pascal(e["name"])
-  ["\t// #{pascal(e['name'])} is #{e['code']} — #{e['template']}.", "\t#{decl}"].join("\n")
+  decl = first ? "#{go_pascal(e['name'])} SQLState = iota" : go_pascal(e["name"])
+  ["\t// #{go_pascal(e['name'])} is #{e['code']} — #{e['template']}.", "\t#{decl}"].join("\n")
 end
 
 def go_arm(e)
-  ["\tcase #{pascal(e['name'])}:", "\t\treturn #{go_str(e['code'])}"].join("\n")
+  ["\tcase #{go_pascal(e['name'])}:", "\t\treturn #{go_str(e['code'])}"].join("\n")
 end
 
 def go_desc(e)
@@ -148,17 +153,19 @@ def go_file(es)
 
     package jed
 
-    // SqlState is a structured engine error's SQLSTATE. Its Code() string is the canonical 5-char
-    // code from spec/errors/registry.toml (cross-checked in tests). Declaration order is registry
-    // order and carries no meaning — the iota value is never serialized.
-    type SqlState int
+    // SQLState identifies the SQLSTATE of an [EngineError]. Code returns its five-character code.
+    // The numeric value carries no meaning: compare SQLState constants, or compare Code strings.
+    type SQLState int
 
     const (
     #{consts}
     )
 
-    // Code returns the canonical SQLSTATE string.
-    func (s SqlState) Code() string {
+    // String returns the five-character SQLSTATE code, as Code does.
+    func (s SQLState) String() string { return s.Code() }
+
+    // Code returns the five-character SQLSTATE code, such as "23505".
+    func (s SQLState) Code() string {
     \tswitch s {
     #{arms}
     \tdefault:

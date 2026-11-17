@@ -1308,7 +1308,7 @@ func TestRegionEngineExperiment(t *testing.T) {
 		db.Close()
 		fmt.Printf("\npage %d: load %.1fs + %.1fs, loaded %.1f MB, compacted %.1f MB\n", ps, core.Seconds(), extra.Seconds(),
 			float64(loaded)/(1<<20), float64(st.Size())/(1<<20))
-		db, err := OpenDatabase(path)
+		db, err := Open(path, OpenOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1659,7 +1659,7 @@ func TestColumnSymbolTablesSurviveChange(t *testing.T) {
 	setVerifyLivePages(true)
 	t.Cleanup(func() { setVerifyLivePages(false) })
 	path := filepath.Join(t.TempDir(), "coltab.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1739,7 +1739,7 @@ func TestColumnSymbolTablesSurviveChange(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = OpenDatabase(path)
+	db, err = Open(path, OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1775,7 +1775,7 @@ func TestSymDriftExperiment(t *testing.T) {
 	path := filepath.Join(dir, "drift.jed")
 	os.Remove(path)
 	os.RemoveAll(path + ".lock")
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

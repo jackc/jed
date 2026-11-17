@@ -342,7 +342,7 @@ func (e *Environment) fill(buf []byte) error {
 		if _, ok := err.(*EngineError); ok {
 			return err
 		}
-		return newError(IoError, "random source failed: "+err.Error())
+		return newError(IOError, "random source failed: "+err.Error())
 	}
 	return nil
 }

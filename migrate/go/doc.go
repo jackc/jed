@@ -20,7 +20,7 @@
 //
 // Typical use:
 //
-//	db, _ := jed.OpenDatabase("app.jed")
+//	db, _ := jed.Open("app.jed", jed.OpenOptions{})
 //	migrations, _ := migrate.LoadMigrations("migrations")
 //	m, _ := migrate.NewMigrator(db, migrations, migrate.Options{})
 //	defer m.Close()

@@ -17,7 +17,7 @@ func memPayloadBytes(v Value) int64 {
 // memValueBytes is value_bytes(v) = VALUE + payload(v).
 func memValueBytes(v Value) int64 {
 	switch v.Kind {
-	case ValText, ValJson, ValJsonPath, ValBytea:
+	case ValText, ValJSON, ValJSONPath, ValBytea:
 		return memoryValue + int64(len(v.str()))
 	case ValDecimal:
 		return memoryValue + memoryDecimalGroup*int64(v.decimal().codecGroupCount())
@@ -44,7 +44,7 @@ func memValueBytes(v Value) int64 {
 			n += memValueBytes(*r.Upper)
 		}
 		return n
-	case ValJsonb:
+	case ValJSONB:
 		return memJsonbBytes(v.jsonb())
 	case ValUnfetched:
 		// A buffered touched value counts as the string it resolves to; any other reference is an
@@ -60,7 +60,7 @@ func memValueBytes(v Value) int64 {
 }
 
 // memJsonbBytes is one VALUE per jsonb node plus its string/key bytes and number groups.
-func memJsonbBytes(n *JsonNode) int64 {
+func memJsonbBytes(n *JSONNode) int64 {
 	b := memoryValue
 	switch n.Kind {
 	case JString:

@@ -150,7 +150,7 @@ func TestPageIdenticalBackupCopiesReachablePagesAtTheirIndices(t *testing.T) {
 	}
 
 	// The copy opens as the same database at the same version, with the same rows and costs.
-	copyDB, err := OpenDatabaseWithOptions(dest, OpenOptions{SkipFsync: true})
+	copyDB, err := Open(dest, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +193,7 @@ func TestBackupDoesNotWaitForTheWriterOrReaders(t *testing.T) {
 		if err := backupForTesting(db, dest, pageIdentical); err != nil {
 			t.Fatalf("backup (page-identical %v) under an open writer: %v", pageIdentical, err)
 		}
-		copyDB, err := OpenDatabaseWithOptions(dest, OpenOptions{SkipFsync: true})
+		copyDB, err := Open(dest, OpenOptions{SkipFsync: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -224,7 +224,7 @@ func TestBackupPreconditions(t *testing.T) {
 		t.Fatalf("a refused backup overwrote its destination")
 	}
 
-	mem, _ := CreateDatabase(CreateOptions{PageSize: compactPage})
+	mem, _ := Create(CreateOptions{PageSize: compactPage})
 	defer mem.Close()
 	if _, err := mem.Exec(t.Context(), "CREATE TABLE m (id i64 PRIMARY KEY, v text)"); err != nil {
 		t.Fatal(err)
@@ -240,7 +240,7 @@ func TestBackupPreconditions(t *testing.T) {
 	if err := backupForTesting(mem, memDest, false); err != nil {
 		t.Fatal(err)
 	}
-	copyDB, err := OpenDatabaseWithOptions(memDest, OpenOptions{SkipFsync: true})
+	copyDB, err := Open(memDest, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

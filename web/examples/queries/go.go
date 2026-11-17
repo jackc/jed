@@ -15,7 +15,7 @@ type Account struct {
 }
 
 func main() {
-	db, err := jed.OpenDatabase("app.jed")
+	db, err := jed.Open("app.jed", jed.OpenOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}

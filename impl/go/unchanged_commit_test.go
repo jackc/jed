@@ -38,7 +38,7 @@ func countCommitIO(t *testing.T, st *storage) *commitCountingStore {
 
 func TestUnchangedCommits(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "noop.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path})
+	db, err := Create(CreateOptions{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestUnchangedCommits(t *testing.T) {
 func BenchmarkWritableNoopCommit(b *testing.B) {
 	for _, sql := range []string{"", "SELECT 1", "UPDATE t SET v = v WHERE id = 1"} {
 		b.Run(sql, func(b *testing.B) {
-			db, err := CreateDatabase(CreateOptions{Path: filepath.Join(b.TempDir(), "bench.jed")})
+			db, err := Create(CreateOptions{Path: filepath.Join(b.TempDir(), "bench.jed")})
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -171,12 +171,12 @@ func TestAttachmentCommitLeavesMainUntouched(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "main.jed")
 	attached := filepath.Join(dir, "attached.jed")
-	seed, err := CreateDatabase(CreateOptions{Path: attached})
+	seed, err := Create(CreateOptions{Path: attached})
 	if err != nil {
 		t.Fatal(err)
 	}
 	seed.Close()
-	db, err := CreateDatabase(CreateOptions{Path: path})
+	db, err := Create(CreateOptions{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestAttachmentCommitLeavesMainUntouched(t *testing.T) {
 	if err := db.Detach("a"); err != nil {
 		t.Fatal(err)
 	}
-	re, err := OpenDatabase(attached)
+	re, err := Open(attached, OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -143,7 +143,7 @@ func TestChainSharingReadButUnassignedValuesKeepTheirChains(t *testing.T) {
 		t.Fatal("a chain page was written")
 	}
 
-	host, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true})
+	host, err := Open(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +248,7 @@ func TestChainSharingKeptChainsStayExclusive(t *testing.T) {
 	originals := renderedRows(t, mem, "SELECT body FROM t WHERE id IN (1, 2) ORDER BY id")
 	const q = "SELECT id, body, n FROM t ORDER BY id"
 	for i, phase := range chainOwnershipPhases {
-		host, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true})
+		host, err := Open(path, OpenOptions{SkipFsync: true})
 		if err != nil {
 			t.Fatal(err)
 		}

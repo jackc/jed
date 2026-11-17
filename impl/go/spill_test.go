@@ -75,7 +75,7 @@ func valueEqual(a, b Value) bool {
 		return a.Int == b.Int
 	case ValBool:
 		return a.boolVal() == b.boolVal()
-	case ValText, ValBytea, ValUuid:
+	case ValText, ValBytea, ValUUID:
 		return a.str() == b.str()
 	case ValDecimal:
 		return a.decimal().CmpValue(*b.decimal()) == 0
@@ -186,7 +186,7 @@ func TestReadOnlyDatabaseDirectorySpillsToHostTemp(t *testing.T) {
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "read_only_spill.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +206,7 @@ func TestReadOnlyDatabaseDirectorySpillsToHostTemp(t *testing.T) {
 	}
 	defer func() { _ = os.Chmod(dir, 0o755) }()
 
-	ro, err := OpenDatabaseWithOptions(path, OpenOptions{ReadOnly: true, WorkMem: 64, SkipFsync: true})
+	ro, err := Open(path, OpenOptions{ReadOnly: true, WorkMem: 64, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

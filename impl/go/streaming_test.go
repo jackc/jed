@@ -328,7 +328,7 @@ func TestDatabaseQueryConvenienceStreams(t *testing.T) {
 func TestBareHandleQueryPinsWatermarkUnderReclamation(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "barehandle.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -646,7 +646,7 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 		return n
 	}
 
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: DefaultPageSize, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, PageSize: DefaultPageSize, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -205,7 +205,7 @@ func mustType(t *testing.T, name string) scalarType {
 
 func TestErrorCodesAreRegistered(t *testing.T) {
 	t.Parallel()
-	// The generated SqlState table (codegen middle path, CLAUDE.md §5) must match the canonical
+	// The generated SQLState table (codegen middle path, CLAUDE.md §5) must match the canonical
 	// registry. The drift gate (`mise run verify`) pins the generated file; this test additionally
 	// compiles the generated Errors slice in and asserts it matches registry.toml row-for-row
 	// (the enum is not iterable, so the cross-check walks Errors).

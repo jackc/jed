@@ -3480,8 +3480,8 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		return resolveJSONSqlFn(s, jsExists, e.JsonExists.Ctx, e.JsonExists.Path, e.JsonExists.Passing, nil,
 			jWWithout, true, nil, jsonExistsBehavior(e.JsonExists.OnError), ag, params)
 	case exprJsonValue:
-		return resolveJSONSqlFn(s, jsValue, e.JsonValue.Ctx, e.JsonValue.Path, e.JsonValue.Passing, e.JsonValue.Returning,
-			jWWithout, true, e.JsonValue.OnEmpty, e.JsonValue.OnError, ag, params)
+		return resolveJSONSqlFn(s, jsValue, e.JSONValue.Ctx, e.JSONValue.Path, e.JSONValue.Passing, e.JSONValue.Returning,
+			jWWithout, true, e.JSONValue.OnEmpty, e.JSONValue.OnError, ag, params)
 	case exprJsonQuery:
 		return resolveJSONSqlFn(s, jsQuery, e.JsonQuery.Ctx, e.JsonQuery.Path, e.JsonQuery.Passing, e.JsonQuery.Returning,
 			e.JsonQuery.Wrapper, e.JsonQuery.KeepQuotes, e.JsonQuery.OnEmpty, e.JsonQuery.OnError, ag, params)

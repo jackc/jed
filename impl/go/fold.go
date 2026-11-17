@@ -142,7 +142,7 @@ func foldConstant(e *rExpr) bool {
 // f32/f64, boolean, text, bytea, uuid, and arrays of those.
 func foldValueInDomain(v Value) bool {
 	switch v.Kind {
-	case ValNull, ValInt, ValBool, ValText, ValDecimal, ValBytea, ValUuid, ValFloat32, ValFloat64:
+	case ValNull, ValInt, ValBool, ValText, ValDecimal, ValBytea, ValUUID, ValFloat32, ValFloat64:
 		return true
 	case ValArray:
 		return foldArrayInDomain(v.arrayVal())

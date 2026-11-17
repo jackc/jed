@@ -148,7 +148,7 @@ type syncSkipper interface {
 type closedBlockStore struct{}
 
 func errStorageReplaced() error {
-	return newError(IoError, "database storage was replaced by compaction; close and reopen the handle")
+	return newError(IOError, "database storage was replaced by compaction; close and reopen the handle")
 }
 
 func (closedBlockStore) readAt(off int64, length int) ([]byte, error) {

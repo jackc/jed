@@ -22,7 +22,7 @@ func BenchmarkRowMaterialization(b *testing.B) {
 			if host == "file" {
 				opts.Path = filepath.Join(b.TempDir(), "kernels.jed")
 			}
-			db, err := CreateDatabase(opts)
+			db, err := Create(opts)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -47,7 +47,7 @@ func BenchmarkRowMaterialization(b *testing.B) {
 			exec("INSERT INTO v SELECT id, CASE WHEN id%7=0 THEN NULL ELSE a END, CASE WHEN id%11=0 THEN NULL ELSE 'payload-' || id::text END, decode('abcdef','hex') FROM t")
 			if host == "file" {
 				db.Close()
-				db, err = OpenDatabaseWithOptions(opts.Path, OpenOptions{SkipFsync: true})
+				db, err = Open(opts.Path, OpenOptions{SkipFsync: true})
 				if err != nil {
 					b.Fatal(err)
 				}

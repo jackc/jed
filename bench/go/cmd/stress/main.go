@@ -95,12 +95,12 @@ type result struct {
 
 // parseOp splits a writer's `op` into the executable statements: bare BEGIN/COMMIT/ROLLBACK are
 // transaction MARKERS, mapped onto the handle's open/commit (§6), so they are dropped here.
-// memDB builds a fresh in-memory database, unwrapping the infallible in-memory CreateDatabase
+// memDB builds a fresh in-memory database, unwrapping the infallible in-memory Create
 // (spec/design/api.md §2.1.1 — the in-memory create cannot fail).
 func memDB() *jed.Database {
-	db, err := jed.CreateDatabase(jed.CreateOptions{})
+	db, err := jed.Create(jed.CreateOptions{})
 	if err != nil {
-		panic("in-memory CreateDatabase is infallible: " + err.Error())
+		panic("in-memory Create is infallible: " + err.Error())
 	}
 	return db
 }

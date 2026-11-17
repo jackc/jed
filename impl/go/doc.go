@@ -4,9 +4,9 @@
 //
 // # Opening a database
 //
-// CreateDatabase creates a new database. Set CreateOptions.Path for a durable
+// Create creates a new database. Set CreateOptions.Path for a durable
 // file, or leave it empty for an in-memory database. OpenDatabase opens an
-// existing file; OpenDatabaseWithOptions configures its cache, durability,
+// existing file; Open configures its cache, durability,
 // locking, and environment. Close the Database when it is no longer needed,
 // checking the returned error: closing can flush pending durable writes.
 //

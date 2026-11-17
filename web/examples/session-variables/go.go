@@ -9,7 +9,7 @@ import (
 )
 
 func main() {
-	db, err := jed.CreateDatabase(jed.CreateOptions{Path: "app.jed"})
+	db, err := jed.Create(jed.CreateOptions{Path: "app.jed"})
 	if err != nil {
 		log.Fatal(err)
 	}

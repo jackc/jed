@@ -31,7 +31,7 @@ func encSeededEnv() *Environment {
 
 func encCreate(t *testing.T, path string, cred *Credential) *Database {
 	t.Helper()
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: encPage, SkipFsync: true, Environment: encSeededEnv(), Credential: cred})
+	db, err := Create(CreateOptions{Path: path, PageSize: encPage, SkipFsync: true, Environment: encSeededEnv(), Credential: cred})
 	if err != nil {
 		t.Fatalf("create encrypted db: %v", err)
 	}
@@ -39,7 +39,7 @@ func encCreate(t *testing.T, path string, cred *Credential) *Database {
 }
 
 func encOpen(path string, cred *Credential) (*Database, error) {
-	return OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true, Credential: cred})
+	return Open(path, OpenOptions{SkipFsync: true, Credential: cred})
 }
 
 func encTryRows(db *Database, sql string) ([][]string, error) {
@@ -156,7 +156,7 @@ func TestEncryptedCredentialsFailClosed(t *testing.T) {
 	}
 
 	plain := filepath.Join(dir, "enc_plain.jed")
-	pdb, err := CreateDatabase(CreateOptions{Path: plain, PageSize: encPage, SkipFsync: true})
+	pdb, err := Create(CreateOptions{Path: plain, PageSize: encPage, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,16 +165,16 @@ func TestEncryptedCredentialsFailClosed(t *testing.T) {
 		t.Fatalf("plaintext file: %s", c)
 	}
 
-	if c := code(CreateDatabase(CreateOptions{Credential: encKey()})); c != "55000" {
+	if c := code(Create(CreateOptions{Credential: encKey()})); c != "55000" {
 		t.Fatalf("in-memory: %s", c)
 	}
-	if c := code(CreateDatabase(CreateOptions{Path: filepath.Join(dir, "enc_small.jed"), PageSize: 512, SkipFsync: true, Credential: encKey()})); c != "0A000" {
+	if c := code(Create(CreateOptions{Path: filepath.Join(dir, "enc_small.jed"), PageSize: 512, SkipFsync: true, Credential: encKey()})); c != "0A000" {
 		t.Fatalf("small page: %s", c)
 	}
 
 	// An in-memory attachment has nothing at rest; an encrypted one may not join a handle whose
 	// scratch files are plaintext (spec/design/encryption.md §6).
-	host, err := CreateDatabase(CreateOptions{Path: filepath.Join(dir, "enc_host.jed"), PageSize: encPage, SkipFsync: true})
+	host, err := Create(CreateOptions{Path: filepath.Join(dir, "enc_host.jed"), PageSize: encPage, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +193,7 @@ func TestEncryptedCredentialsFailClosed(t *testing.T) {
 func TestEncryptedPassphraseUnlocksAndTheKeyIsRedacted(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "enc_passphrase.jed")
-	db, err := CreateDatabase(CreateOptions{
+	db, err := Create(CreateOptions{
 		Path: path, PageSize: encPage, SkipFsync: true,
 		Credential: PassphraseCredential("correct horse"),
 		KDF:        Argon2Params{MemoryKiB: 64, Iterations: 1, Parallelism: 1},
@@ -587,7 +587,7 @@ func TestEncryptedCredentialChangeErrors(t *testing.T) {
 	writer.Close()
 	_ = db.Close()
 
-	ro, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true, ReadOnly: true, Credential: encKey()})
+	ro, err := Open(path, OpenOptions{SkipFsync: true, ReadOnly: true, Credential: encKey()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -596,7 +596,7 @@ func TestEncryptedCredentialChangeErrors(t *testing.T) {
 	}
 	_ = ro.Close()
 
-	memory, err := CreateDatabase(CreateOptions{})
+	memory, err := Create(CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -604,7 +604,7 @@ func TestEncryptedCredentialChangeErrors(t *testing.T) {
 	if got := encCode(memory.ChangeCredential("main", newCred, Argon2Params{})); got != "55000" {
 		t.Fatalf("in-memory: %q", got)
 	}
-	plain, err := CreateDatabase(CreateOptions{Path: filepath.Join(dir, "enc_change_plain.jed"), PageSize: encPage, SkipFsync: true})
+	plain, err := Create(CreateOptions{Path: filepath.Join(dir, "enc_change_plain.jed"), PageSize: encPage, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -689,7 +689,7 @@ func TestEncryptedInterruptedCredentialChangeLeavesExactlyOneCredential(t *testi
 	if c := encOpenCode(path, encKey()); c != "28P01" {
 		t.Fatalf("first write landed, old credential: %q", c)
 	}
-	ro, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true, ReadOnly: true, Credential: newKey})
+	ro, err := Open(path, OpenOptions{SkipFsync: true, ReadOnly: true, Credential: newKey})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -820,7 +820,7 @@ func TestScratchEncryptionGatesEncryptedAttachments(t *testing.T) {
 	_ = encCreate(t, enc, encKey()).Close()
 	plain := func(name string, scratch ScratchEncryption) *Database {
 		t.Helper()
-		db, err := CreateDatabase(CreateOptions{Path: filepath.Join(dir, name), PageSize: encPage, SkipFsync: true, ScratchEncryption: scratch})
+		db, err := Create(CreateOptions{Path: filepath.Join(dir, name), PageSize: encPage, SkipFsync: true, ScratchEncryption: scratch})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -838,7 +838,7 @@ func TestScratchEncryptionGatesEncryptedAttachments(t *testing.T) {
 	}
 	_ = sealed.Close()
 	// The open option seals as well.
-	opened, err := OpenDatabaseWithOptions(filepath.Join(dir, "enc_scratch_p1.jed"), OpenOptions{SkipFsync: true, ScratchEncryption: ScratchEncryptionOn})
+	opened, err := Open(filepath.Join(dir, "enc_scratch_p1.jed"), OpenOptions{SkipFsync: true, ScratchEncryption: ScratchEncryptionOn})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -852,7 +852,7 @@ func TestScratchEncryptionGatesEncryptedAttachments(t *testing.T) {
 // stream, exclusively locked (so it can be rekeyed); cred nil creates it plaintext.
 func encSealedHandle(t *testing.T, path string, cred *Credential, pageSize uint32) *Database {
 	t.Helper()
-	db, err := CreateDatabase(CreateOptions{
+	db, err := Create(CreateOptions{
 		Path: path, PageSize: pageSize, SkipFsync: true, Environment: encSeededEnv(), Credential: cred,
 		ScratchEncryption: ScratchEncryptionOn, Locking: LockingExclusive,
 	})
@@ -945,7 +945,7 @@ func TestEncryptedRekeyErrors(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	// A handle whose scratch files are plaintext cannot encrypt.
-	plain, err := CreateDatabase(CreateOptions{Path: filepath.Join(dir, "enc_rekey_plain.jed"), PageSize: encPage, SkipFsync: true, Locking: LockingExclusive})
+	plain, err := Create(CreateOptions{Path: filepath.Join(dir, "enc_rekey_plain.jed"), PageSize: encPage, SkipFsync: true, Locking: LockingExclusive})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -954,7 +954,7 @@ func TestEncryptedRekeyErrors(t *testing.T) {
 	}
 	_ = plain.Close()
 	// The owner of a database the page service shares rekeys it (encrypted.md §14).
-	served, err := CreateDatabase(CreateOptions{Path: filepath.Join(dir, "enc_rekey_served.jed"), PageSize: encPage, SkipFsync: true, ScratchEncryption: ScratchEncryptionOn})
+	served, err := Create(CreateOptions{Path: filepath.Join(dir, "enc_rekey_served.jed"), PageSize: encPage, SkipFsync: true, ScratchEncryption: ScratchEncryptionOn})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -967,7 +967,7 @@ func TestEncryptedRekeyErrors(t *testing.T) {
 		t.Fatalf("small page: %q", got)
 	}
 	_ = small.Close()
-	memory, err := CreateDatabase(CreateOptions{})
+	memory, err := Create(CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1068,7 +1068,7 @@ func TestEncryptedLargeRekeySpillsItsScratchDomain(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = encSealedHandle(t, path, encKey(), encPage).Close()
-	db, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true, CacheBytes: 64 * 1024, Credential: encKey(), Locking: LockingExclusive})
+	db, err := Open(path, OpenOptions{SkipFsync: true, CacheBytes: 64 * 1024, Credential: encKey(), Locking: LockingExclusive})
 	if err != nil {
 		t.Fatal(err)
 	}

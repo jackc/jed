@@ -91,7 +91,7 @@ func openIntegrityCopy(t *testing.T, src string, cred *Credential) (*Database, e
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	return OpenDatabaseWithOptions(path, OpenOptions{ReadOnly: true, Environment: goldenEnv(), Credential: cred, Locking: LockingExclusive})
+	return Open(path, OpenOptions{ReadOnly: true, Environment: goldenEnv(), Credential: cred, Locking: LockingExclusive})
 }
 
 func TestIntegrityFixtures(t *testing.T) {
@@ -305,7 +305,7 @@ func TestIntegrityKindsRegistered(t *testing.T) {
 func integrityTestDB(t *testing.T) (*Database, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "check.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 512, SkipFsync: true, Locking: LockingExclusive})
+	db, err := Create(CreateOptions{Path: path, PageSize: 512, SkipFsync: true, Locking: LockingExclusive})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -588,7 +588,7 @@ func TestIntegrityEnvironmentSkips(t *testing.T) {
 		if err := os.WriteFile(path, data, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		db, err := OpenDatabaseWithOptions(path, OpenOptions{ReadOnly: true, Environment: env, Locking: LockingExclusive})
+		db, err := Open(path, OpenOptions{ReadOnly: true, Environment: env, Locking: LockingExclusive})
 		if err != nil {
 			t.Fatalf("open %s: %v", file, err)
 		}
@@ -625,7 +625,7 @@ func TestIntegrityEnvironmentSkips(t *testing.T) {
 // clean under full: each row's write-path entries are found through each index's own lookup.
 func TestIntegrityEveryIndexKindClean(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "kinds.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 512, SkipFsync: true, Locking: LockingExclusive})
+	db, err := Create(CreateOptions{Path: path, PageSize: 512, SkipFsync: true, Locking: LockingExclusive})
 	if err != nil {
 		t.Fatal(err)
 	}

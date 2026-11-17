@@ -19,12 +19,12 @@ import (
 	"unicode/utf8"
 )
 
-// JsonNodeKind tags a jsonb node (spec/design/json.md §2).
-type JsonNodeKind int
+// JSONNodeKind tags a jsonb node (spec/design/json.md §2).
+type JSONNodeKind int
 
 const (
 	// JNull is JSON `null` — a concrete node, wholly distinct from a SQL NULL `jsonb` value.
-	JNull JsonNodeKind = iota
+	JNull JSONNodeKind = iota
 	// JBool is a JSON boolean (B holds the value).
 	JBool
 	// JNumber is a JSON number, held EXACTLY as a Decimal (PG numeric); no binary float ever appears.
@@ -38,30 +38,30 @@ const (
 	JObject
 )
 
-// JsonNode is a jsonb node — the in-memory canonical tree (spec/design/json.md §2). Object members
+// JSONNode is a jsonb node — the in-memory canonical tree (spec/design/json.md §2). Object members
 // are kept in canonical key order (shorter key first, ties bytewise) with duplicates removed
 // (last-wins), so structural equality (via the value key / Cmp == 0) IS the correct value-level
 // equality (§5). JSON `null` is the concrete JNull node, wholly distinct from a SQL NULL `jsonb`
 // value. Go has no sum types, so the kind discriminant selects which field is meaningful (the same
-// idiom Value uses). A JsonNode is held by pointer in Value so the flat struct stays comparable.
-type JsonNode struct {
-	Kind JsonNodeKind
+// idiom Value uses). A JSONNode is held by pointer in Value so the flat struct stays comparable.
+type JSONNode struct {
+	Kind JSONNodeKind
 	B    bool         // JBool
 	Num  Decimal      // JNumber
 	S    string       // JString
-	Arr  []JsonNode   // JArray
-	Obj  []JsonMember // JObject
+	Arr  []JSONNode   // JArray
+	Obj  []JSONMember // JObject
 }
 
-// JsonMember is one object member: a key string and its value node.
-type JsonMember struct {
+// JSONMember is one object member: a key string and its value node.
+type JSONMember struct {
 	Key string
-	Val JsonNode
+	Val JSONNode
 }
 
 // jsonTypeRank is the PG jsonb type-rank discriminator (spec/design/json.md §5): the outermost
 // ordering key. Object > Array > Boolean > Number > String > Null.
-func jsonTypeRank(n *JsonNode) int {
+func jsonTypeRank(n *JSONNode) int {
 	switch n.Kind {
 	case JNull:
 		return 0
@@ -85,7 +85,7 @@ func jsonTypeRank(n *JsonNode) int {
 // the element count AFTER the raw-scalar flag, so a scalar sorts after the empty array and before
 // every non-empty array (`[]` < null < "a" < 1 < true < [1] < {}). Inside a container the ordinary
 // type rank applies (`[null]` < `[[]]`).
-func (n *JsonNode) Cmp(other *JsonNode) int {
+func (n *JSONNode) Cmp(other *JSONNode) int {
 	ns, os := jsonIsScalar(n), jsonIsScalar(other)
 	if ns && other.Kind == JArray {
 		if len(other.Arr) == 0 {
@@ -103,14 +103,14 @@ func (n *JsonNode) Cmp(other *JsonNode) int {
 }
 
 // jsonIsScalar reports whether a node is a JSON scalar (null, boolean, number, string).
-func jsonIsScalar(n *JsonNode) bool { return n.Kind != JArray && n.Kind != JObject }
+func jsonIsScalar(n *JSONNode) bool { return n.Kind != JArray && n.Kind != JObject }
 
 // cmpNested is the PG jsonb order of two nodes BELOW the document root (json.md §5). Type rank
 // first; within a type: booleans false<true, numbers by Decimal value, strings by collation-`C`
 // UTF-8 byte order, arrays/objects by element/member COUNT first (PG compares container length
 // before contents) then element-wise — an object's members pairwise in stored canonical key order,
 // each key compared BYTEWISE (PG compares the key strings under the collation, not length-first).
-func (n *JsonNode) cmpNested(other *JsonNode) int {
+func (n *JSONNode) cmpNested(other *JSONNode) int {
 	ra, rb := jsonTypeRank(n), jsonTypeRank(other)
 	if ra != rb {
 		return cmpInt(ra, rb)
@@ -160,7 +160,7 @@ func (n *JsonNode) cmpNested(other *JsonNode) int {
 // (spec/design/decimal.md §5), so `1`, `1.0`, `1.00` and `1e0` share one bucket — the canonical
 // render (jsonbOut) preserves scale and would split them. Strings are length-prefixed; containers
 // frame their count and recurse; keys are length-prefixed in canonical order (json.md §2.3).
-func writeJsonbDistinctKey(b *strings.Builder, n *JsonNode) {
+func writeJsonbDistinctKey(b *strings.Builder, n *JSONNode) {
 	switch n.Kind {
 	case JNull:
 		b.WriteByte('n')
@@ -219,7 +219,7 @@ func jsonKeyCmp(a, b string) int {
 // jsonbValueEqual reports whether two jsonb nodes are value-equal (Cmp == 0). Because the canonical
 // form makes structural equality the value equality (§5), this drives `=` (always definite — no SQL
 // NULLs inside a document, PG btree not 3VL).
-func jsonbValueEqual(a, b *JsonNode) bool { return a.Cmp(b) == 0 }
+func jsonbValueEqual(a, b *JSONNode) bool { return a.Cmp(b) == 0 }
 
 // ---------------------------------------------------------------------------------------------
 // Parsing (RFC 8259). `jsonbIn` canonicalizes; `validateJSON` validates and the caller stores
@@ -243,7 +243,7 @@ func jsonTooDeep() error {
 // checkJSONDepth enforces maxJSONDepth on a constructed `jsonb` node — the constructor gate
 // (json.md §6.4): an operation that nests existing values inside a new container checks its result.
 // The walk stops one level past the limit, so it never recurses deeper than maxJSONDepth + 1.
-func checkJSONDepth(node *JsonNode) error {
+func checkJSONDepth(node *JSONNode) error {
 	if jsonExceedsDepth(node, maxJSONDepth) {
 		return jsonTooDeep()
 	}
@@ -251,7 +251,7 @@ func checkJSONDepth(node *JsonNode) error {
 }
 
 // jsonExceedsDepth reports whether node nests more than budget containers deep.
-func jsonExceedsDepth(node *JsonNode, budget int) bool {
+func jsonExceedsDepth(node *JSONNode, budget int) bool {
 	switch node.Kind {
 	case JArray:
 		if budget == 0 {
@@ -344,7 +344,7 @@ func jsonUnicodeZeroError() error {
 // jsonbIn parses + canonicalizes JSON text into a jsonb node tree (`jsonb_in` — spec/design/json.md
 // §6.2): numbers → Decimal, object keys deduped last-wins then sorted length-then-bytewise.
 // Malformed input → 22P02; a `\u0000` escape → 22P05.
-func jsonbIn(input string) (JsonNode, error) {
+func jsonbIn(input string) (JSONNode, error) {
 	p := &jsonParser{buf: []byte(input), canonicalize: true, needEscapes: true}
 	return p.parseDocument()
 }
@@ -363,7 +363,7 @@ func validateJSON(input string) error {
 // duplicates preserved) — the on-demand structural parse a `json` operator needs
 // (spec/design/json.md §4). Strings are de-escaped, so a `\u0000` (22P05) or an unpaired surrogate
 // (22P02) anywhere in the document raises (PG's need_escapes parse, json.md §4.2).
-func parsePreservingJSON(input string) (JsonNode, error) {
+func parsePreservingJSON(input string) (JSONNode, error) {
 	p := &jsonParser{buf: []byte(input), needEscapes: true}
 	return p.parseDocument()
 }
@@ -372,7 +372,7 @@ func parsePreservingJSON(input string) (JsonNode, error) {
 // (json_typeof, json_array_length, IS JSON without UNIQUE KEYS — PG lexes these without
 // need_escapes): every string (member names included) is left EMPTY, and `\u` escapes are only
 // lexed, never decoded or checked (json.md §4.2).
-func parseShapeJSON(input string) (JsonNode, error) {
+func parseShapeJSON(input string) (JSONNode, error) {
 	p := &jsonParser{buf: []byte(input)}
 	return p.parseDocument()
 }
@@ -382,7 +382,7 @@ func parseShapeJSON(input string) (JsonNode, error) {
 // raises that error at the root's opening bracket, before lexing anything inside it, so such a root
 // is returned as its parseShapeJSON (the caller raises the kind error and reads no string); any other
 // root is parsePreservingJSON'd, its escapes checked first (json.md §4.2).
-func parsePreservingJSONUnlessRoot(input string, wrongRoot byte) (JsonNode, error) {
+func parsePreservingJSONUnlessRoot(input string, wrongRoot byte) (JSONNode, error) {
 	if start := skipJSONWS(input, 0); start < len(input) && input[start] == wrongRoot {
 		return parseShapeJSON(input)
 	}
@@ -440,15 +440,15 @@ func (p *jsonParser) descend() error {
 
 // parseDocument parses a full JSON document: one value, surrounded by optional whitespace, nothing
 // trailing.
-func (p *jsonParser) parseDocument() (JsonNode, error) {
+func (p *jsonParser) parseDocument() (JSONNode, error) {
 	p.skipWS()
 	node, err := p.parseValue()
 	if err != nil {
-		return JsonNode{}, err
+		return JSONNode{}, err
 	}
 	p.skipWS()
 	if p.pos != len(p.buf) {
-		return JsonNode{}, jsonMalformed("trailing characters after JSON value")
+		return JSONNode{}, jsonMalformed("trailing characters after JSON value")
 	}
 	return node, nil
 }
@@ -472,22 +472,22 @@ func (p *jsonParser) peek() (byte, bool) {
 	return 0, false
 }
 
-func (p *jsonParser) parseValue() (JsonNode, error) {
+func (p *jsonParser) parseValue() (JSONNode, error) {
 	c, ok := p.peek()
 	if !ok {
-		return JsonNode{}, jsonMalformed("unexpected end of input")
+		return JSONNode{}, jsonMalformed("unexpected end of input")
 	}
 	switch {
 	case c == '{':
 		if err := p.descend(); err != nil {
-			return JsonNode{}, err
+			return JSONNode{}, err
 		}
 		node, err := p.parseObject()
 		p.depth--
 		return node, err
 	case c == '[':
 		if err := p.descend(); err != nil {
-			return JsonNode{}, err
+			return JSONNode{}, err
 		}
 		node, err := p.parseArray()
 		p.depth--
@@ -495,28 +495,28 @@ func (p *jsonParser) parseValue() (JsonNode, error) {
 	case c == '"':
 		s, err := p.parseString()
 		if err != nil {
-			return JsonNode{}, err
+			return JSONNode{}, err
 		}
-		return JsonNode{Kind: JString, S: s}, nil
+		return JSONNode{Kind: JString, S: s}, nil
 	case c == 't':
 		if err := p.expectKeyword("true"); err != nil {
-			return JsonNode{}, err
+			return JSONNode{}, err
 		}
-		return JsonNode{Kind: JBool, B: true}, nil
+		return JSONNode{Kind: JBool, B: true}, nil
 	case c == 'f':
 		if err := p.expectKeyword("false"); err != nil {
-			return JsonNode{}, err
+			return JSONNode{}, err
 		}
-		return JsonNode{Kind: JBool, B: false}, nil
+		return JSONNode{Kind: JBool, B: false}, nil
 	case c == 'n':
 		if err := p.expectKeyword("null"); err != nil {
-			return JsonNode{}, err
+			return JSONNode{}, err
 		}
-		return JsonNode{Kind: JNull}, nil
+		return JSONNode{Kind: JNull}, nil
 	case c == '-' || (c >= '0' && c <= '9'):
 		return p.parseNumber()
 	default:
-		return JsonNode{}, jsonMalformed("unexpected character '" + string(rune(c)) + "'")
+		return JSONNode{}, jsonMalformed("unexpected character '" + string(rune(c)) + "'")
 	}
 }
 
@@ -529,34 +529,34 @@ func (p *jsonParser) expectKeyword(kw string) error {
 	return jsonMalformed("expected '" + kw + "'")
 }
 
-func (p *jsonParser) parseObject() (JsonNode, error) {
+func (p *jsonParser) parseObject() (JSONNode, error) {
 	p.pos++ // consume '{'
-	var members []JsonMember
+	var members []JSONMember
 	p.skipWS()
 	if c, ok := p.peek(); ok && c == '}' {
 		p.pos++
-		return JsonNode{Kind: JObject, Obj: members}, nil
+		return JSONNode{Kind: JObject, Obj: members}, nil
 	}
 	for {
 		p.skipWS()
 		if c, ok := p.peek(); !ok || c != '"' {
-			return JsonNode{}, jsonMalformed("expected string key in object")
+			return JSONNode{}, jsonMalformed("expected string key in object")
 		}
 		key, err := p.parseString()
 		if err != nil {
-			return JsonNode{}, err
+			return JSONNode{}, err
 		}
 		p.skipWS()
 		if c, ok := p.peek(); !ok || c != ':' {
-			return JsonNode{}, jsonMalformed("expected ':' after object key")
+			return JSONNode{}, jsonMalformed("expected ':' after object key")
 		}
 		p.pos++
 		p.skipWS()
 		val, err := p.parseValue()
 		if err != nil {
-			return JsonNode{}, err
+			return JSONNode{}, err
 		}
-		members = append(members, JsonMember{Key: key, Val: val})
+		members = append(members, JSONMember{Key: key, Val: val})
 		p.skipWS()
 		c, ok := p.peek()
 		switch {
@@ -566,29 +566,29 @@ func (p *jsonParser) parseObject() (JsonNode, error) {
 			p.pos++
 			goto done
 		default:
-			return JsonNode{}, jsonMalformed("expected ',' or '}' in object")
+			return JSONNode{}, jsonMalformed("expected ',' or '}' in object")
 		}
 	}
 done:
 	if p.canonicalize {
 		members = canonicalizeObject(members)
 	}
-	return JsonNode{Kind: JObject, Obj: members}, nil
+	return JSONNode{Kind: JObject, Obj: members}, nil
 }
 
-func (p *jsonParser) parseArray() (JsonNode, error) {
+func (p *jsonParser) parseArray() (JSONNode, error) {
 	p.pos++ // consume '['
-	var elems []JsonNode
+	var elems []JSONNode
 	p.skipWS()
 	if c, ok := p.peek(); ok && c == ']' {
 		p.pos++
-		return JsonNode{Kind: JArray, Arr: elems}, nil
+		return JSONNode{Kind: JArray, Arr: elems}, nil
 	}
 	for {
 		p.skipWS()
 		val, err := p.parseValue()
 		if err != nil {
-			return JsonNode{}, err
+			return JSONNode{}, err
 		}
 		elems = append(elems, val)
 		p.skipWS()
@@ -598,9 +598,9 @@ func (p *jsonParser) parseArray() (JsonNode, error) {
 			p.pos++
 		case ok && c == ']':
 			p.pos++
-			return JsonNode{Kind: JArray, Arr: elems}, nil
+			return JSONNode{Kind: JArray, Arr: elems}, nil
 		default:
-			return JsonNode{}, jsonMalformed("expected ',' or ']' in array")
+			return JSONNode{}, jsonMalformed("expected ',' or ']' in array")
 		}
 	}
 }
@@ -743,7 +743,7 @@ func (p *jsonParser) parseHex4() (int, error) {
 // (`01` is malformed), a `.` requires fractional digits, `e`/`E` an exponent. The value is built via
 // the shared decimal-from-parts path so a jsonb number reads identically to a numeric literal (`1e2`
 // → `100`, `1.50` keeps scale 2). An out-of-cap magnitude → 22003.
-func (p *jsonParser) parseNumber() (JsonNode, error) {
+func (p *jsonParser) parseNumber() (JSONNode, error) {
 	start := p.pos
 	neg := false
 	if c, ok := p.peek(); ok && c == '-' {
@@ -764,7 +764,7 @@ func (p *jsonParser) parseNumber() (JsonNode, error) {
 			p.pos++
 		}
 	default:
-		return JsonNode{}, jsonMalformed("invalid number")
+		return JSONNode{}, jsonMalformed("invalid number")
 	}
 	intEnd := p.pos
 	negLen := 0
@@ -786,7 +786,7 @@ func (p *jsonParser) parseNumber() (JsonNode, error) {
 			p.pos++
 		}
 		if p.pos == fs {
-			return JsonNode{}, jsonMalformed("expected digits after decimal point")
+			return JSONNode{}, jsonMalformed("expected digits after decimal point")
 		}
 		frac = string(p.buf[fs:p.pos])
 	}
@@ -816,7 +816,7 @@ func (p *jsonParser) parseNumber() (JsonNode, error) {
 			p.pos++
 		}
 		if p.pos == es {
-			return JsonNode{}, jsonMalformed("expected digits in exponent")
+			return JSONNode{}, jsonMalformed("expected digits in exponent")
 		}
 		hasExp = true
 		exp = esign * mag
@@ -825,9 +825,9 @@ func (p *jsonParser) parseNumber() (JsonNode, error) {
 	digits, scale := decimalFromParts(intPart, frac, hasExp, exp)
 	d, err := decimalFromDigitsScale(neg, digits, scale).CheckCap()
 	if err != nil {
-		return JsonNode{}, err
+		return JSONNode{}, err
 	}
-	return JsonNode{Kind: JNumber, Num: d}, nil
+	return JSONNode{Kind: JNumber, Num: d}, nil
 }
 
 // saturatingClamp clamps v to [0, limit] (the exponent magnitude scan keeps the accumulation bounded
@@ -860,13 +860,13 @@ func utf8Len(lead byte) int {
 // keeping the LAST occurrence (PG jsonb last-wins), then sort the survivors length-then-bytewise.
 // Done before sorting so the stored object has unique keys in canonical order — a pure function of
 // input.
-func canonicalizeObject(members []JsonMember) []JsonMember {
+func canonicalizeObject(members []JSONMember) []JSONMember {
 	// The sort is stable, so occurrences of one key stay in input order and the last of each run is
 	// the last-wins survivor. Sorting first keeps this O(n log n) in the member count, which a caller
 	// (an aggregate, a cast of long text) can make arbitrarily large.
-	sorted := append([]JsonMember(nil), members...)
-	slices.SortStableFunc(sorted, func(a, b JsonMember) int { return jsonKeyCmp(a.Key, b.Key) })
-	out := make([]JsonMember, 0, len(sorted))
+	sorted := append([]JSONMember(nil), members...)
+	slices.SortStableFunc(sorted, func(a, b JSONMember) int { return jsonKeyCmp(a.Key, b.Key) })
+	out := make([]JSONMember, 0, len(sorted))
 	for _, m := range sorted {
 		if n := len(out); n > 0 && out[n-1].Key == m.Key {
 			out[n-1] = m
@@ -879,14 +879,14 @@ func canonicalizeObject(members []JsonMember) []JsonMember {
 
 // makeObject builds a canonical `jsonb` object node from (key, value) members — last-wins dedup then
 // the canonical key sort (json.md §2.3). The constructor for jsonb_build_object (the Rust json::make_object).
-func makeObject(members []JsonMember) JsonNode {
-	return JsonNode{Kind: JObject, Obj: canonicalizeObject(members)}
+func makeObject(members []JSONMember) JSONNode {
+	return JSONNode{Kind: JObject, Obj: canonicalizeObject(members)}
 }
 
 // hasDuplicateKeys detects a duplicate object key anywhere in the tree — for `IS JSON WITH UNIQUE
 // KEYS` (json-sql-functions.md §5). The node must be parsed with parsePreservingJSON (which keeps
 // duplicate keys); this walks every object (and recurses into member values and array elements).
-func hasDuplicateKeys(node *JsonNode) bool {
+func hasDuplicateKeys(node *JSONNode) bool {
 	switch node.Kind {
 	case JObject:
 		// Membership only: the set is never iterated, so no map order leaks.
@@ -917,7 +917,7 @@ func hasDuplicateKeys(node *JsonNode) bool {
 
 // jsonPredKindMatches reports whether a parsed JSON node matches an `IS JSON [kind]` predicate's
 // kind (json-sql-functions.md §5).
-func jsonPredKindMatches(node *JsonNode, kind jsonPredicateKind) bool {
+func jsonPredKindMatches(node *JSONNode, kind jsonPredicateKind) bool {
 	switch kind {
 	case jPKScalar:
 		return node.Kind != JObject && node.Kind != JArray
@@ -937,13 +937,13 @@ func jsonPredKindMatches(node *JsonNode, kind jsonPredicateKind) bool {
 // jsonbOut renders a jsonb node to the canonical PG text (spec/design/json.md §6.2): one space after
 // each `:` and `,`, keys in canonical order, numbers via the Decimal renderer (scale preserved),
 // strings JSON-escaped, `true`/`false`/`null` lowercase.
-func jsonbOut(node *JsonNode) string {
+func jsonbOut(node *JSONNode) string {
 	var b strings.Builder
 	writeJSONNode(node, &b)
 	return b.String()
 }
 
-func writeJSONNode(node *JsonNode, out *strings.Builder) {
+func writeJSONNode(node *JSONNode, out *strings.Builder) {
 	switch node.Kind {
 	case JNull:
 		out.WriteString("null")
@@ -984,13 +984,13 @@ func writeJSONNode(node *JsonNode, out *strings.Builder) {
 // PG's `json` processing functions (`json_strip_nulls`, `to_json`, the json builders) emit (a `json`
 // value's output style, distinct from `jsonb`'s spaced canonical form). Members render in their node
 // order (the caller controls canonicalization; a `json`-on-demand parse keeps input order).
-func jsonCompactOut(node *JsonNode) string {
+func jsonCompactOut(node *JSONNode) string {
 	var b strings.Builder
 	writeCompactJSON(node, &b)
 	return b.String()
 }
 
-func writeCompactJSON(node *JsonNode, out *strings.Builder) {
+func writeCompactJSON(node *JSONNode, out *strings.Builder) {
 	switch node.Kind {
 	case JNull:
 		out.WriteString("null")
@@ -1073,7 +1073,7 @@ func writeJSONString(s string, out *strings.Builder) {
 
 // jsonGetField is `jsonb -> text`: an object field by key. nil (→ SQL NULL) if the node is not an
 // object or the key is absent. A duplicate-key object cannot occur (jsonb is canonical, unique keys).
-func jsonGetField(node *JsonNode, key string) *JsonNode {
+func jsonGetField(node *JSONNode, key string) *JSONNode {
 	if node.Kind != JObject {
 		return nil
 	}
@@ -1087,7 +1087,7 @@ func jsonGetField(node *JsonNode, key string) *JsonNode {
 
 // jsonGetIndex is `jsonb -> int`: an array element by index (a negative index counts from the end).
 // nil (→ SQL NULL) if the node is not an array or the index is out of range.
-func jsonGetIndex(node *JsonNode, idx int64) *JsonNode {
+func jsonGetIndex(node *JSONNode, idx int64) *JSONNode {
 	if node.Kind != JArray {
 		return nil
 	}
@@ -1107,7 +1107,7 @@ func jsonGetIndex(node *JsonNode, idx int64) *JsonNode {
 // top-level scalar and the index names its single pseudo-array element (0 or -1): `'"x"'::jsonb -> 0`
 // is `"x"`. An object, or any other index, → nil (SQL NULL). Only the operator's root sees the
 // pseudo-array; a `#>` path step over a nested scalar is a miss (jsonGetIndex).
-func jsonGetRootIndex(node *JsonNode, idx int64) *JsonNode {
+func jsonGetRootIndex(node *JSONNode, idx int64) *JSONNode {
 	if jsonIsScalar(node) {
 		if idx == 0 || idx == -1 {
 			return node
@@ -1120,7 +1120,7 @@ func jsonGetRootIndex(node *JsonNode, idx int64) *JsonNode {
 // jsonGetPath is `jsonb #> text[]`: navigate a path of text steps. At each step an object uses the
 // step as a key; an array parses the step as an integer index (a non-integer or out-of-range step →
 // nil). An empty path returns the whole node (PG). nil (→ SQL NULL) if any step fails.
-func jsonGetPath(node *JsonNode, path []string) *JsonNode {
+func jsonGetPath(node *JSONNode, path []string) *JSONNode {
 	cur := node
 	for _, step := range path {
 		switch cur.Kind {
@@ -1150,7 +1150,7 @@ func jsonGetPath(node *JsonNode, path []string) *JsonNode {
 // jsonNodeToText is the `->>` / `#>>` text rendering of an accessed node: a STRING node yields its
 // raw content (unescaped); a JSON `null` node yields SQL NULL (ok=false); every other node yields its
 // canonical jsonb_out text.
-func jsonNodeToText(node *JsonNode) (string, bool) {
+func jsonNodeToText(node *JSONNode) (string, bool) {
 	switch node.Kind {
 	case JNull:
 		return "", false
@@ -1504,7 +1504,7 @@ func verbatimObjectMembers(text string) ([]verbatimMember, error) {
 //     pairing (object vs non-object, scalar vs array) is false.
 //   - below the top level a contained value must be the SAME kind (jsonContainsSameKind): the
 //     bare-scalar-in-array rule is top-level only, so `{"x":["a"]} @> {"x":"a"}` is false.
-func jsonContains(a, b *JsonNode) bool {
+func jsonContains(a, b *JSONNode) bool {
 	if a.Kind == JArray && !jsonIsContainer(b) {
 		// array @> a bare scalar (top level only): the scalar is a direct element of the array.
 		for i := range a.Arr {
@@ -1521,7 +1521,7 @@ func jsonContains(a, b *JsonNode) bool {
 // top level): object ⊇ object (every member of `b` has a member of `a` with the same key whose value
 // contains it, same kind), array ⊇ array (every element of `b` is matched by an element of `a`), or two
 // equal scalars. Any kind mismatch is false.
-func jsonContainsSameKind(a, b *JsonNode) bool {
+func jsonContainsSameKind(a, b *JSONNode) bool {
 	switch {
 	case a.Kind == JObject && b.Kind == JObject:
 		for i := range b.Obj {
@@ -1549,7 +1549,7 @@ func jsonContainsSameKind(a, b *JsonNode) bool {
 // jsonElementInArray reports whether `e` (an element of the right array) is "contained in" the left
 // array `arr`: a scalar element must EQUAL a direct element of `arr`; an object/array element must be
 // contained in some same-kind direct element of `arr`.
-func jsonElementInArray(arr []JsonNode, e *JsonNode) bool {
+func jsonElementInArray(arr []JSONNode, e *JSONNode) bool {
 	switch e.Kind {
 	case JObject:
 		for i := range arr {
@@ -1577,14 +1577,14 @@ func jsonElementInArray(arr []JsonNode, e *JsonNode) bool {
 
 // jsonIsContainer reports whether a node is a container (object or array) vs a scalar
 // (null/bool/number/string).
-func jsonIsContainer(n *JsonNode) bool {
+func jsonIsContainer(n *JSONNode) bool {
 	return n.Kind == JObject || n.Kind == JArray
 }
 
 // jsonHasKey is `jsonb ? text` — does the document have this top-level key? An object: the key is
 // present; an array: the key is a string element; a string scalar: it equals the key; otherwise
 // false (PG semantics, oracle-pinned).
-func jsonHasKey(node *JsonNode, key string) bool {
+func jsonHasKey(node *JSONNode, key string) bool {
 	switch node.Kind {
 	case JObject:
 		for i := range node.Obj {
@@ -1633,9 +1633,9 @@ func cannotDelete(msg string) *EngineError {
 // jsonConcat is `a || b` — concatenate / shallow-merge (PG): two objects merge with the RIGHT side
 // winning on a key conflict (result re-canonicalized); otherwise each operand is treated as an array
 // (an array stays, a non-array becomes a one-element array) and the two are concatenated.
-func jsonConcat(a, b *JsonNode) JsonNode {
+func jsonConcat(a, b *JSONNode) JSONNode {
 	if a.Kind == JObject && b.Kind == JObject {
-		out := make([]JsonMember, len(a.Obj))
+		out := make([]JSONMember, len(a.Obj))
 		copy(out, a.Obj)
 		for _, m := range b.Obj {
 			found := false
@@ -1656,54 +1656,54 @@ func jsonConcat(a, b *JsonNode) JsonNode {
 				out[j], out[j-1] = out[j-1], out[j]
 			}
 		}
-		return JsonNode{Kind: JObject, Obj: out}
+		return JSONNode{Kind: JObject, Obj: out}
 	}
 	elems := jsonToArrayElems(a)
 	elems = append(elems, jsonToArrayElems(b)...)
-	return JsonNode{Kind: JArray, Arr: elems}
+	return JSONNode{Kind: JArray, Arr: elems}
 }
 
 // jsonToArrayElems treats a node as an array for `||`: an array contributes its elements, any other
 // node becomes a single one-element list.
-func jsonToArrayElems(n *JsonNode) []JsonNode {
+func jsonToArrayElems(n *JSONNode) []JSONNode {
 	if n.Kind == JArray {
-		out := make([]JsonNode, len(n.Arr))
+		out := make([]JSONNode, len(n.Arr))
 		copy(out, n.Arr)
 		return out
 	}
-	return []JsonNode{*n}
+	return []JSONNode{*n}
 }
 
 // jsonDeleteKey is `jsonb - text` — delete a key from an object, or delete every matching string
 // element from an array; a scalar is `22023` ("cannot delete from scalar").
-func jsonDeleteKey(node *JsonNode, key string) (JsonNode, error) {
+func jsonDeleteKey(node *JSONNode, key string) (JSONNode, error) {
 	switch node.Kind {
 	case JObject:
-		out := make([]JsonMember, 0, len(node.Obj))
+		out := make([]JSONMember, 0, len(node.Obj))
 		for _, m := range node.Obj {
 			if m.Key != key {
 				out = append(out, m)
 			}
 		}
-		return JsonNode{Kind: JObject, Obj: out}, nil
+		return JSONNode{Kind: JObject, Obj: out}, nil
 	case JArray:
-		out := make([]JsonNode, 0, len(node.Arr))
+		out := make([]JSONNode, 0, len(node.Arr))
 		for i := range node.Arr {
 			if node.Arr[i].Kind == JString && node.Arr[i].S == key {
 				continue
 			}
 			out = append(out, node.Arr[i])
 		}
-		return JsonNode{Kind: JArray, Arr: out}, nil
+		return JSONNode{Kind: JArray, Arr: out}, nil
 	default:
-		return JsonNode{}, cannotDelete("cannot delete from scalar")
+		return JSONNode{}, cannotDelete("cannot delete from scalar")
 	}
 }
 
 // jsonDeleteIndex is `jsonb - int` — delete the array element at an index (negative from the end;
 // out of range is a no-op). An object is `22023` ("cannot delete from object using integer index");
 // a scalar is `22023` ("cannot delete from scalar").
-func jsonDeleteIndex(node *JsonNode, idx int64) (JsonNode, error) {
+func jsonDeleteIndex(node *JSONNode, idx int64) (JSONNode, error) {
 	switch node.Kind {
 	case JArray:
 		length := int64(len(node.Arr))
@@ -1714,19 +1714,19 @@ func jsonDeleteIndex(node *JsonNode, idx int64) (JsonNode, error) {
 		if i < 0 || i >= length {
 			return *node, nil
 		}
-		out := make([]JsonNode, 0, len(node.Arr)-1)
+		out := make([]JSONNode, 0, len(node.Arr)-1)
 		out = append(out, node.Arr[:i]...)
 		out = append(out, node.Arr[i+1:]...)
-		return JsonNode{Kind: JArray, Arr: out}, nil
+		return JSONNode{Kind: JArray, Arr: out}, nil
 	case JObject:
-		return JsonNode{}, cannotDelete("cannot delete from object using integer index")
+		return JSONNode{}, cannotDelete("cannot delete from object using integer index")
 	default:
-		return JsonNode{}, cannotDelete("cannot delete from scalar")
+		return JSONNode{}, cannotDelete("cannot delete from scalar")
 	}
 }
 
 // jsonRootCount is the element count of a container root (`JB_ROOT_COUNT`); a scalar counts as one.
-func jsonRootCount(node *JsonNode) int {
+func jsonRootCount(node *JSONNode) int {
 	switch node.Kind {
 	case JObject:
 		return len(node.Obj)
@@ -1761,9 +1761,9 @@ func jsonTextPathArg(v Value) ([]*string, error) {
 // string element (array) named by a non-NULL element of `keys`; a NULL (nil) element is skipped. A
 // scalar root is 22023 ("cannot delete from scalar") even for empty `keys`; an empty container is
 // returned unchanged.
-func jsonDeleteKeys(node *JsonNode, keys []*string) (JsonNode, error) {
+func jsonDeleteKeys(node *JSONNode, keys []*string) (JSONNode, error) {
 	if !jsonIsContainer(node) {
-		return JsonNode{}, cannotDelete("cannot delete from scalar")
+		return JSONNode{}, cannotDelete("cannot delete from scalar")
 	}
 	cur := *node
 	for _, k := range keys {
@@ -1772,7 +1772,7 @@ func jsonDeleteKeys(node *JsonNode, keys []*string) (JsonNode, error) {
 		}
 		next, err := jsonDeleteKey(&cur, *k)
 		if err != nil {
-			return JsonNode{}, err
+			return JSONNode{}, err
 		}
 		cur = next
 	}
@@ -1812,14 +1812,14 @@ const (
 // or an empty path returns the target unchanged; otherwise the setPathWalk rules apply (a NULL path
 // element reached → 22004, a non-integer step into an array → 22P02, a missing / out-of-range /
 // scalar step → no-op).
-func jsonDeletePath(node *JsonNode, path []*string) (JsonNode, error) {
+func jsonDeletePath(node *JSONNode, path []*string) (JSONNode, error) {
 	if !jsonIsContainer(node) {
-		return JsonNode{}, cannotDelete("cannot delete path in scalar")
+		return JSONNode{}, cannotDelete("cannot delete path in scalar")
 	}
 	if jsonRootCount(node) == 0 || len(path) == 0 {
 		return *node, nil
 	}
-	return setPathWalk(node, path, 0, &JsonNode{Kind: JNull}, poDelete)
+	return setPathWalk(node, path, 0, &JSONNode{Kind: JNull}, poDelete)
 }
 
 // setPath is `jsonb_set(target, path, value[, create_if_missing])` (json-sql-functions.md §2, PG
@@ -1828,9 +1828,9 @@ func jsonDeletePath(node *JsonNode, path []*string) (JsonNode, error) {
 // or an empty path, returns the target unchanged. At the final step an existing element is REPLACED
 // and a missing one is added only when `create` (an out-of-range index appends; one before the start
 // prepends). See setPathWalk for the per-step rules.
-func setPath(node *JsonNode, path []*string, value *JsonNode, create bool) (JsonNode, error) {
+func setPath(node *JSONNode, path []*string, value *JSONNode, create bool) (JSONNode, error) {
 	if !jsonIsContainer(node) {
-		return JsonNode{}, cannotDelete("cannot set path in scalar")
+		return JSONNode{}, cannotDelete("cannot set path in scalar")
 	}
 	if (jsonRootCount(node) == 0 && !create) || len(path) == 0 {
 		return *node, nil
@@ -1847,9 +1847,9 @@ func setPath(node *JsonNode, path []*string, value *JsonNode, create bool) (Json
 // replace existing key"); an array index inserts before it (or after, when `insert_after`). A scalar
 // root is 22023 ("cannot set path in scalar"); an empty path returns the target unchanged (an empty
 // container does NOT short-circuit).
-func insertPath(node *JsonNode, path []*string, value *JsonNode, insertAfter bool) (JsonNode, error) {
+func insertPath(node *JSONNode, path []*string, value *JSONNode, insertAfter bool) (JSONNode, error) {
 	if !jsonIsContainer(node) {
-		return JsonNode{}, cannotDelete("cannot set path in scalar")
+		return JSONNode{}, cannotDelete("cannot set path in scalar")
 	}
 	if len(path) == 0 {
 		return *node, nil
@@ -1905,34 +1905,34 @@ func pathStepInt32(step string) (int32, bool) {
 // position N is not an integer"); a negative index counts from the end, one before the start becomes
 // a prepend for the adding ops, one past the end clamps to the length (an append); a non-final
 // missing index is a no-op.
-func setPathWalk(node *JsonNode, path []*string, level int, value *JsonNode, op pathOp) (JsonNode, error) {
+func setPathWalk(node *JSONNode, path []*string, level int, value *JSONNode, op pathOp) (JSONNode, error) {
 	if path[level] == nil {
-		return JsonNode{}, newError(NullValueNotAllowed,
+		return JSONNode{}, newError(NullValueNotAllowed,
 			"path element at position "+strconv.Itoa(level+1)+" is null")
 	}
 	step := *path[level]
 	isFinal := level+1 == len(path)
 	switch node.Kind {
 	case JObject:
-		out := make([]JsonMember, 0, len(node.Obj)+1)
+		out := make([]JSONMember, 0, len(node.Obj)+1)
 		done := false
 		for _, mem := range node.Obj {
 			if !done && mem.Key == step {
 				done = true
 				if isFinal {
 					if op == poInsertBefore || op == poInsertAfter {
-						return JsonNode{}, cannotDelete("cannot replace existing key").
+						return JSONNode{}, cannotDelete("cannot replace existing key").
 							withHint("Try using the function jsonb_set to replace key value.")
 					}
 					if op != poDelete {
-						out = append(out, JsonMember{Key: mem.Key, Val: *value})
+						out = append(out, JSONMember{Key: mem.Key, Val: *value})
 					}
 				} else {
 					child, err := setPathWalk(&mem.Val, path, level+1, value, op)
 					if err != nil {
-						return JsonNode{}, err
+						return JSONNode{}, err
 					}
-					out = append(out, JsonMember{Key: mem.Key, Val: child})
+					out = append(out, JSONMember{Key: mem.Key, Val: child})
 				}
 			} else {
 				out = append(out, mem)
@@ -1940,13 +1940,13 @@ func setPathWalk(node *JsonNode, path []*string, level int, value *JsonNode, op 
 		}
 		if !done && isFinal && op.addsMissing() {
 			// A missing final key is added, sorted into canonical place.
-			out = canonicalizeObject(append(out, JsonMember{Key: step, Val: *value}))
+			out = canonicalizeObject(append(out, JSONMember{Key: step, Val: *value}))
 		}
-		return JsonNode{Kind: JObject, Obj: out}, nil
+		return JSONNode{Kind: JObject, Obj: out}, nil
 	case JArray:
 		parsed, ok := pathStepInt32(step)
 		if !ok {
-			return JsonNode{}, newError(InvalidTextRepresentation,
+			return JSONNode{}, newError(InvalidTextRepresentation,
 				"path element at position "+strconv.Itoa(level+1)+" is not an integer: \""+step+"\"")
 		}
 		nelems := int64(len(node.Arr))
@@ -1964,7 +1964,7 @@ func setPathWalk(node *JsonNode, path []*string, level int, value *JsonNode, op 
 		if !before && idx > nelems {
 			idx = nelems
 		}
-		out := make([]JsonNode, 0, len(node.Arr)+1)
+		out := make([]JSONNode, 0, len(node.Arr)+1)
 		done := false
 		if (before || nelems == 0) && isFinal && op.addsMissing() {
 			out = append(out, *value)
@@ -1987,7 +1987,7 @@ func setPathWalk(node *JsonNode, path []*string, level int, value *JsonNode, op 
 				} else {
 					child, err := setPathWalk(el, path, level+1, value, op)
 					if err != nil {
-						return JsonNode{}, err
+						return JSONNode{}, err
 					}
 					out = append(out, child)
 				}
@@ -1998,7 +1998,7 @@ func setPathWalk(node *JsonNode, path []*string, level int, value *JsonNode, op 
 		if !done && isFinal && op.addsMissing() {
 			out = append(out, *value)
 		}
-		return JsonNode{Kind: JArray, Arr: out}, nil
+		return JSONNode{Kind: JArray, Arr: out}, nil
 	default:
 		// A scalar below the root: the path cannot continue, so the value stays (PG).
 		return *node, nil
@@ -2011,7 +2011,7 @@ func setPathWalk(node *JsonNode, path []*string, level int, value *JsonNode, op 
 
 // jsonTypeofName is `json[b]_typeof` — the JSON type name of a node (PG): `object`/`array`/`string`/
 // `number`/`boolean`/`null`.
-func jsonTypeofName(node *JsonNode) string {
+func jsonTypeofName(node *JSONNode) string {
 	switch node.Kind {
 	case JNull:
 		return "null"
@@ -2030,7 +2030,7 @@ func jsonTypeofName(node *JsonNode) string {
 
 // jsonArrayLength is `json[b]_array_length` — the element count of an array node; a non-array is
 // `22023`.
-func jsonArrayLength(node *JsonNode) (int64, error) {
+func jsonArrayLength(node *JSONNode) (int64, error) {
 	if node.Kind != JArray {
 		return 0, newError(InvalidParameterValue, "cannot get array length of a scalar")
 	}
@@ -2040,23 +2040,23 @@ func jsonArrayLength(node *JsonNode) (int64, error) {
 // jsonStripNulls is `json[b]_strip_nulls` — recursively remove object members whose value is JSON
 // `null` (array nulls are kept, PG). Objects re-canonicalize (the surviving members stay in canonical
 // order; the input is already canonical for jsonb, and for json the on-demand parse order is kept).
-func jsonStripNulls(node *JsonNode) JsonNode {
+func jsonStripNulls(node *JSONNode) JSONNode {
 	switch node.Kind {
 	case JObject:
-		out := make([]JsonMember, 0, len(node.Obj))
+		out := make([]JSONMember, 0, len(node.Obj))
 		for i := range node.Obj {
 			if node.Obj[i].Val.Kind == JNull {
 				continue
 			}
-			out = append(out, JsonMember{Key: node.Obj[i].Key, Val: jsonStripNulls(&node.Obj[i].Val)})
+			out = append(out, JSONMember{Key: node.Obj[i].Key, Val: jsonStripNulls(&node.Obj[i].Val)})
 		}
-		return JsonNode{Kind: JObject, Obj: out}
+		return JSONNode{Kind: JObject, Obj: out}
 	case JArray:
-		out := make([]JsonNode, len(node.Arr))
+		out := make([]JSONNode, len(node.Arr))
 		for i := range node.Arr {
 			out[i] = jsonStripNulls(&node.Arr[i])
 		}
-		return JsonNode{Kind: JArray, Arr: out}
+		return JSONNode{Kind: JArray, Arr: out}
 	default:
 		return *node
 	}
@@ -2065,7 +2065,7 @@ func jsonStripNulls(node *JsonNode) JsonNode {
 // jsonPretty is `jsonb_pretty` — an indented multi-line render (PG: 4-space indent, one space after
 // `:`). A container ALWAYS multi-lines (even an empty one: `{` newline, then the close at the
 // container's own indent → `{\n}` / `{\n    }`); scalars render inline.
-func jsonPretty(node *JsonNode) string {
+func jsonPretty(node *JSONNode) string {
 	var b strings.Builder
 	writePrettyJSON(node, 0, &b)
 	return b.String()
@@ -2076,11 +2076,11 @@ func jsonPretty(node *JsonNode) string {
 // Mirrors writePrettyJSON: brackets, a newline plus four spaces per level before each member and the
 // close, commas, and ": " plus the escaped key per object member. Each scalar and key is rendered on
 // its own to measure it; that scratch is bounded by the input.
-func jsonPrettySize(node *JsonNode) int64 {
+func jsonPrettySize(node *JSONNode) int64 {
 	return jsonPrettySizeAt(node, 0)
 }
 
-func jsonPrettySizeAt(node *JsonNode, indent int64) int64 {
+func jsonPrettySizeAt(node *JSONNode, indent int64) int64 {
 	// The open bracket, then the close on its own line at this container's indent.
 	shell := 1 + 1 + 4*indent + 1
 	// Before each member: a comma after the first, then a newline and the member's indent.
@@ -2113,7 +2113,7 @@ func jsonPrettySizeAt(node *JsonNode, indent int64) int64 {
 	}
 }
 
-func writePrettyJSON(node *JsonNode, indent int, out *strings.Builder) {
+func writePrettyJSON(node *JSONNode, indent int, out *strings.Builder) {
 	switch node.Kind {
 	case JObject:
 		out.WriteByte('{')

@@ -25,7 +25,7 @@ func TestRowKeyMatchesDistinctRowKey(t *testing.T) {
 		{TextValue(long), IntValue(7)},
 		{IntValue(7), TextValue(long)},
 		{ByteaValue([]byte(long))},
-		{JsonValue(long)},
+		{JSONValue(long)},
 		{TextValue(strings.Repeat("x", rowKeySegmentMin-1))},
 		{TextValue(strings.Repeat("x", rowKeySegmentMin))},
 		{CompositeValue([]Value{TextValue(long), NullValue()})},

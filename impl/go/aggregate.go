@@ -344,7 +344,7 @@ type acc struct {
 	// collation is a text MIN/MAX's comparison collation (spec/design/collation.md §1); nil is C.
 	collation *compiledCollation
 	// json_agg / jsonb_agg accumulator (B4): the inputs' JSON images in row order — a json text
-	// (JsonValue; a NULL input NullValue) for json_agg, a JsonbValue node for jsonb_agg. jsonAsJSON
+	// (JSONValue; a NULL input NullValue) for json_agg, a JSONBValue node for jsonb_agg. jsonAsJSON
 	// selects the `json` result type (vs jsonb); jsonStrict skips a NULL-valued row. `seen` is reused
 	// to mark the group non-empty even when the strict filter drops every row (empty group → NULL,
 	// all-skipped group → `[]`). jsonTypes/jsonZone convert each input as it is folded: the
@@ -679,7 +679,7 @@ func (a *acc) fold(v Value, m *costMeter) error {
 		if a.objUnique {
 			for i := range a.objPairs {
 				if a.objPairs[i].key == key {
-					return newError(DuplicateJsonObjectKeyValue, "duplicate JSON object key value")
+					return newError(DuplicateJSONObjectKeyValue, "duplicate JSON object key value")
 				}
 			}
 		}
@@ -898,17 +898,17 @@ func (a *acc) finalize() (Value, error) {
 			if err := checkJSONTextDepth(out); err != nil {
 				return NullValue(), err
 			}
-			return JsonValue(out), nil
+			return JSONValue(out), nil
 		}
-		nodes := make([]JsonNode, len(a.jsonElems))
+		nodes := make([]JSONNode, len(a.jsonElems))
 		for i, e := range a.jsonElems {
 			nodes[i] = *e.jsonb()
 		}
-		arr := JsonNode{Kind: JArray, Arr: nodes}
+		arr := JSONNode{Kind: JArray, Arr: nodes}
 		if err := checkJSONDepth(&arr); err != nil {
 			return NullValue(), err
 		}
-		return JsonbValue(arr), nil
+		return JSONBValue(arr), nil
 	case planJsonbObjectAgg, planJsonObjectAgg, planJsonbObjectAggUnique, planJsonObjectAggUnique:
 		// json[b]_object_agg: NULL over an empty (zero-row) group; else the JSON object. json keeps
 		// the group's row order + duplicate keys and PG's '{ … }' brace-padded ', ' / ' : ' spacing;
@@ -929,17 +929,17 @@ func (a *acc) finalize() (Value, error) {
 			if err := checkJSONTextDepth(out); err != nil {
 				return NullValue(), err
 			}
-			return JsonValue(out), nil
+			return JSONValue(out), nil
 		}
-		members := make([]JsonMember, 0, len(a.objPairs))
+		members := make([]JSONMember, 0, len(a.objPairs))
 		for _, p := range a.objPairs {
-			members = append(members, JsonMember{Key: p.key, Val: *p.val.jsonb()})
+			members = append(members, JSONMember{Key: p.key, Val: *p.val.jsonb()})
 		}
 		out := makeObject(members)
 		if err := checkJSONDepth(&out); err != nil {
 			return NullValue(), err
 		}
-		return JsonbValue(out), nil
+		return JSONBValue(out), nil
 	case planArrayAgg, planArrayAggArray:
 		if !a.seen {
 			return NullValue(), nil
@@ -1716,8 +1716,8 @@ func exprHasAggregate(e exprNode) bool {
 		return exprHasAggregate(e.JsonExists.Ctx) || exprHasAggregate(e.JsonExists.Path) ||
 			passingAny(e.JsonExists.Passing, func(p *exprNode) bool { return exprHasAggregate(*p) })
 	case exprJsonValue:
-		return exprHasAggregate(e.JsonValue.Ctx) || exprHasAggregate(e.JsonValue.Path) ||
-			passingAny(e.JsonValue.Passing, func(p *exprNode) bool { return exprHasAggregate(*p) })
+		return exprHasAggregate(e.JSONValue.Ctx) || exprHasAggregate(e.JSONValue.Path) ||
+			passingAny(e.JSONValue.Passing, func(p *exprNode) bool { return exprHasAggregate(*p) })
 	case exprJsonQuery:
 		return exprHasAggregate(e.JsonQuery.Ctx) || exprHasAggregate(e.JsonQuery.Path) ||
 			passingAny(e.JsonQuery.Passing, func(p *exprNode) bool { return exprHasAggregate(*p) })
@@ -1867,8 +1867,8 @@ func exprHasWindow(e exprNode) bool {
 		return exprHasWindow(e.JsonExists.Ctx) || exprHasWindow(e.JsonExists.Path) ||
 			passingAny(e.JsonExists.Passing, func(p *exprNode) bool { return exprHasWindow(*p) })
 	case exprJsonValue:
-		return exprHasWindow(e.JsonValue.Ctx) || exprHasWindow(e.JsonValue.Path) ||
-			passingAny(e.JsonValue.Passing, func(p *exprNode) bool { return exprHasWindow(*p) })
+		return exprHasWindow(e.JSONValue.Ctx) || exprHasWindow(e.JSONValue.Path) ||
+			passingAny(e.JSONValue.Passing, func(p *exprNode) bool { return exprHasWindow(*p) })
 	case exprJsonQuery:
 		return exprHasWindow(e.JsonQuery.Ctx) || exprHasWindow(e.JsonQuery.Path) ||
 			passingAny(e.JsonQuery.Passing, func(p *exprNode) bool { return exprHasWindow(*p) })
@@ -2178,24 +2178,24 @@ func desugarNamedWindows(e exprNode, windows []namedWindow) (exprNode, error) {
 		ne.JsonExists = &nj
 		return ne, nil
 	case exprJsonValue:
-		ctx, err := desugarNamedWindows(e.JsonValue.Ctx, windows)
+		ctx, err := desugarNamedWindows(e.JSONValue.Ctx, windows)
 		if err != nil {
 			return exprNode{}, err
 		}
-		path, err := desugarNamedWindows(e.JsonValue.Path, windows)
+		path, err := desugarNamedWindows(e.JSONValue.Path, windows)
 		if err != nil {
 			return exprNode{}, err
 		}
-		passing, err := desugarPassing(e.JsonValue.Passing, func(p exprNode) (exprNode, error) { return desugarNamedWindows(p, windows) })
+		passing, err := desugarPassing(e.JSONValue.Passing, func(p exprNode) (exprNode, error) { return desugarNamedWindows(p, windows) })
 		if err != nil {
 			return exprNode{}, err
 		}
-		nj := *e.JsonValue
+		nj := *e.JSONValue
 		nj.Ctx = ctx
 		nj.Path = path
 		nj.Passing = passing
 		ne := e
-		ne.JsonValue = &nj
+		ne.JSONValue = &nj
 		return ne, nil
 	case exprJsonQuery:
 		ctx, err := desugarNamedWindows(e.JsonQuery.Ctx, windows)
@@ -2448,7 +2448,7 @@ func surfaceMatches(surface, name string) bool {
 }
 
 // jsonAggImage is a JSON aggregate input's image (json-sql-functions.md §4): for the json aggregates
-// its json text (NullValue for a NULL input, rendered null), for the jsonb aggregates a JsonbValue.
+// its json text (NullValue for a NULL input, rendered null), for the jsonb aggregates a JSONBValue.
 func jsonAggImage(v Value, asJSON bool, ty resolvedType, zone zoneRef) (Value, error) {
 	if asJSON {
 		if v.IsNull() {
@@ -2458,13 +2458,13 @@ func jsonAggImage(v Value, asJSON bool, ty resolvedType, zone zoneRef) (Value, e
 		if err := datumToJSON(v, ty, zone, &b); err != nil {
 			return NullValue(), err
 		}
-		return JsonValue(b.String()), nil
+		return JSONValue(b.String()), nil
 	}
 	node, err := datumToJSONB(v, ty, zone)
 	if err != nil {
 		return NullValue(), err
 	}
-	return JsonbValue(node), nil
+	return JSONBValue(node), nil
 }
 
 // writeJSONAggElem appends the i-th json_agg element image onto b (PostgreSQL's json_agg_transfn):

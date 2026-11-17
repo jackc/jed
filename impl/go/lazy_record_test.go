@@ -22,14 +22,14 @@ func TestInlineBodySpanMatchesDecode(t *testing.T) {
 
 	// A jsonb document touching every node kind: object, nested array, number, string, bool, null,
 	// and an empty string.
-	doc := JsonNode{Kind: JObject, Obj: []JsonMember{
-		{Key: "a", Val: JsonNode{Kind: JNumber, Num: decimalFromDigitsScale(false, "1234", 2)}},
-		{Key: "b", Val: JsonNode{Kind: JArray, Arr: []JsonNode{
+	doc := JSONNode{Kind: JObject, Obj: []JSONMember{
+		{Key: "a", Val: JSONNode{Kind: JNumber, Num: decimalFromDigitsScale(false, "1234", 2)}},
+		{Key: "b", Val: JSONNode{Kind: JArray, Arr: []JSONNode{
 			{Kind: JBool, B: true},
 			{Kind: JNull},
 			{Kind: JString, S: "x"},
 		}}},
-		{Key: "c", Val: JsonNode{Kind: JString, S: ""}},
+		{Key: "c", Val: JSONNode{Kind: JString, S: ""}},
 	}}
 
 	compTy := colType{Composite: true, Name: "pair", Fields: []colField{
@@ -53,15 +53,15 @@ func TestInlineBodySpanMatchesDecode(t *testing.T) {
 		{scalarColType(scalarBool), BoolValue(false)},
 		{scalarColType(scalarDecimal), DecimalValue(decimalFromDigitsScale(true, "9876543210", 4))},
 		{scalarColType(scalarBytea), ByteaValue([]byte{0, 1, 2, 255, 254})},
-		{scalarColType(scalarUuid), UuidValue(bytes.Repeat([]byte{7}, 16))},
+		{scalarColType(scalarUuid), UUIDValue(bytes.Repeat([]byte{7}, 16))},
 		{scalarColType(scalarTimestamp), TimestampValue(1700000000000000)},
 		{scalarColType(scalarTimestamptz), TimestamptzValue(-42)},
 		{scalarColType(scalarDate), DateValue(-19000)},
 		{scalarColType(scalarInterval), IntervalValue(Interval{Months: 14, Days: -3, Micros: 123456})},
 		{scalarColType(scalarFloat64), Float64Value(3.141592653589793)},
 		{scalarColType(scalarFloat32), Float32Value(-2.5)},
-		{scalarColType(scalarJson), JsonValue(`{"k": 1}`)},
-		{scalarColType(scalarJsonb), JsonbValue(doc)},
+		{scalarColType(scalarJson), JSONValue(`{"k": 1}`)},
+		{scalarColType(scalarJsonb), JSONBValue(doc)},
 		// Array of i32 with a NULL element (exercises the has-nulls bitmap branch).
 		{arrI32, arrayValueOf(oneDimArray([]Value{IntValue(1), NullValue(), IntValue(3)}))},
 		// Array of text (variable-length elements recurse through readInlineBody).

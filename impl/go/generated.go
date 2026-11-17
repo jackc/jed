@@ -103,9 +103,9 @@ func generatedExprChildren(e *exprNode) []*exprNode {
 			add(&e.JsonExists.Passing[i].Expr)
 		}
 	case exprJsonValue:
-		add(&e.JsonValue.Ctx, &e.JsonValue.Path)
-		for i := range e.JsonValue.Passing {
-			add(&e.JsonValue.Passing[i].Expr)
+		add(&e.JSONValue.Ctx, &e.JSONValue.Path)
+		for i := range e.JSONValue.Passing {
+			add(&e.JSONValue.Passing[i].Expr)
 		}
 	case exprJsonQuery:
 		add(&e.JsonQuery.Ctx, &e.JsonQuery.Path)

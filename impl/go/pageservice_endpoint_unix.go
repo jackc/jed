@@ -99,11 +99,11 @@ func writeOwnerRecord(dbPath string, r ownerRecord) error {
 	final := ownerRecordPath(dbPath)
 	tmp := final + ".tmp-" + hex.EncodeToString(r.incarnation[:])
 	if err := os.WriteFile(tmp, encodeOwnerRecord(r), 0o644); err != nil {
-		return newError(IoError, "write owner record: "+err.Error())
+		return newError(IOError, "write owner record: "+err.Error())
 	}
 	if err := os.Rename(tmp, final); err != nil {
 		_ = os.Remove(tmp)
-		return newError(IoError, "publish owner record: "+err.Error())
+		return newError(IOError, "publish owner record: "+err.Error())
 	}
 	return nil
 }

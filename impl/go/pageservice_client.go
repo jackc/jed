@@ -434,7 +434,7 @@ func (s *serviceBlockStore) readAt(off int64, length int) ([]byte, error) {
 	index := off / ps
 	within := off - index*ps
 	if length < 0 || within+int64(length) > ps {
-		return nil, newError(IoError, "page-service read must stay within one page")
+		return nil, newError(IOError, "page-service read must stay within one page")
 	}
 	var page []byte
 	if index < 2 {
@@ -490,7 +490,7 @@ func (s *serviceBlockStore) readPages(indices []uint32) ([][]byte, error) {
 }
 
 func errClientReadOnly() error {
-	return newError(ReadOnlySqlTransaction, "cannot write through a read-only page-service connection")
+	return newError(ReadOnlySQLTransaction, "cannot write through a read-only page-service connection")
 }
 
 func (s *serviceBlockStore) writeAt(off int64, data []byte) error {
@@ -499,7 +499,7 @@ func (s *serviceBlockStore) writeAt(off int64, data []byte) error {
 		return errClientReadOnly()
 	}
 	if off%ps != 0 || int64(len(data)) != ps {
-		return newError(IoError, "page-service write must be one whole page")
+		return newError(IOError, "page-service write must be one whole page")
 	}
 	index := uint32(off / ps)
 	page := append([]byte(nil), data...)
@@ -995,7 +995,7 @@ func (cl *psClient) releasePin(v uint64) {
 // owner) is reported as a protocol violation naming it.
 func errorFromCode(code, message string) error {
 	for i := 0; i <= len(errorDescs); i++ {
-		if state := SqlState(i); state.Code() == code {
+		if state := SQLState(i); state.Code() == code {
 			return newError(state, message)
 		}
 	}

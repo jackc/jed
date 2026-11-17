@@ -154,7 +154,7 @@ func TestFixedDecimalRejectsUncoercedValues(t *testing.T) {
 // holds slots.
 func TestFixedDecimalStatisticsStaySingleValue(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "stats.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func TestFixedDecimalStatisticsStaySingleValue(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = OpenDatabase(path)
+	db, err = Open(path, OpenOptions{})
 	if err != nil {
 		t.Fatalf("reopen after ANALYZE: %v", err)
 	}

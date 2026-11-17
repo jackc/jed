@@ -403,7 +403,7 @@ func (r *Rows) Bytes(col int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if v.Kind != ValBytea && v.Kind != ValUuid {
+	if v.Kind != ValBytea && v.Kind != ValUUID {
 		return nil, typeErr(v, "bytea")
 	}
 	return []byte(v.str()), nil
@@ -742,7 +742,7 @@ func assignValue(v Value, dest any) error {
 		}
 		*d = v.str()
 	case *[]byte:
-		if v.Kind != ValBytea && v.Kind != ValUuid {
+		if v.Kind != ValBytea && v.Kind != ValUUID {
 			return typeErr(v, "[]byte")
 		}
 		*d = []byte(v.str())
@@ -792,7 +792,7 @@ func valueToAny(v Value) any {
 		return v.str()
 	case ValBytea:
 		return []byte(v.str())
-	case ValUuid:
+	case ValUUID:
 		return renderUUID([]byte(v.str()))
 	case ValDecimal:
 		return *v.decimal()
@@ -933,7 +933,7 @@ func kindName(k ValueKind) string {
 		return "decimal"
 	case ValBytea:
 		return "bytea"
-	case ValUuid:
+	case ValUUID:
 		return "uuid"
 	case ValTimestamp:
 		return "timestamp"
@@ -953,11 +953,11 @@ func kindName(k ValueKind) string {
 		return "array"
 	case ValRange:
 		return "range"
-	case ValJson:
+	case ValJSON:
 		return "json"
-	case ValJsonb:
+	case ValJSONB:
 		return "jsonb"
-	case ValJsonPath:
+	case ValJSONPath:
 		return "jsonpath"
 	default:
 		return fmt.Sprintf("kind#%d", int(k))

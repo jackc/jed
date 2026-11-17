@@ -92,7 +92,7 @@ func rowReuseDB(t *testing.T, file bool) *Database {
 	if file {
 		opts.Path = filepath.Join(t.TempDir(), "rows.jed")
 	}
-	db, err := CreateDatabase(opts)
+	db, err := Create(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func rowReuseDB(t *testing.T, file bool) *Database {
 		if err := db.Close(); err != nil {
 			t.Fatal(err)
 		}
-		db, err = OpenDatabaseWithOptions(opts.Path, OpenOptions{SkipFsync: true})
+		db, err = Open(opts.Path, OpenOptions{SkipFsync: true})
 		if err != nil {
 			t.Fatal(err)
 		}

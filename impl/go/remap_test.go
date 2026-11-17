@@ -140,7 +140,7 @@ func TestRemapResolve(t *testing.T) {
 func TestRemapEndToEnd(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "remap.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 512, SkipFsync: true, Locking: LockingExclusive})
+	db, err := Create(CreateOptions{Path: path, PageSize: 512, SkipFsync: true, Locking: LockingExclusive})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,7 @@ func TestRemapEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true, Locking: LockingExclusive})
+	db, err = Open(path, OpenOptions{SkipFsync: true, Locking: LockingExclusive})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -131,14 +131,14 @@ func resolveServicePath(path string) (string, error) {
 		if os.IsNotExist(err) {
 			return "", newError(UndefinedFile, "database file does not exist: "+path)
 		}
-		return "", newError(IoError, "resolve database path: "+err.Error())
+		return "", newError(IOError, "resolve database path: "+err.Error())
 	}
 	if real, err = filepath.Abs(real); err != nil {
-		return "", newError(IoError, "resolve database path: "+err.Error())
+		return "", newError(IOError, "resolve database path: "+err.Error())
 	}
 	multiple, err := hasMultipleLinks(real)
 	if err != nil {
-		return "", newError(IoError, "inspect database identity: "+err.Error())
+		return "", newError(IOError, "inspect database identity: "+err.Error())
 	}
 	if multiple {
 		return "", newError(ObjectInUse, "hard-linked database paths cannot use jed locking: "+real)

@@ -111,13 +111,13 @@ func run() error {
 		}
 		db, err = jed.OpenRemote(transport, "remote:"+os.Args[2], jed.OpenOptions{FileLockTimeout: &timeout, Credential: credential})
 	} else if os.Args[1] == "create" {
-		db, err = jed.CreateDatabase(jed.CreateOptions{
+		db, err = jed.Create(jed.CreateOptions{
 			Path: os.Args[2], Locking: locking, FileLockTimeout: &timeout, IdleInTransactionTimeout: idle,
 			IdleSessionTimeout: millis("idle_session"), YieldGrace: millis("yield_grace"), ShutdownGrace: millis("shutdown_grace"), MaxConnections: maxConnections, Ownership: ownership,
 			Credential: credential, Synchronous: synchronous,
 		})
 	} else {
-		db, err = jed.OpenDatabaseWithOptions(os.Args[2], jed.OpenOptions{
+		db, err = jed.Open(os.Args[2], jed.OpenOptions{
 			Locking: locking, FileLockTimeout: &timeout, IdleInTransactionTimeout: idle, ReadOnly: readOnly,
 			IdleSessionTimeout: millis("idle_session"), YieldGrace: millis("yield_grace"), ShutdownGrace: millis("shutdown_grace"), MaxConnections: maxConnections, Ownership: ownership,
 			Credential: credential, Synchronous: synchronous,
@@ -311,7 +311,7 @@ func ownerIdle(root string) error {
 		switch command {
 		case "OWNER_OPEN":
 			timeout := 5 * time.Second
-			db, err = jed.OpenDatabaseWithOptions(sql(argument), jed.OpenOptions{Locking: jed.LockingAuto, SkipFsync: true, FileLockTimeout: &timeout, Environment: env})
+			db, err = jed.Open(sql(argument), jed.OpenOptions{Locking: jed.LockingAuto, SkipFsync: true, FileLockTimeout: &timeout, Environment: env})
 		case "OWNER_CLOSE":
 			if db != nil {
 				err = db.Close()

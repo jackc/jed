@@ -42,7 +42,7 @@ func OSRandomSource() RandomSource { return osRandomSource{} }
 
 func (osRandomSource) Fill(buf []byte) error {
 	if _, err := rand.Read(buf); err != nil {
-		return newError(IoError, "OS entropy source unavailable")
+		return newError(IOError, "OS entropy source unavailable")
 	}
 	return nil
 }

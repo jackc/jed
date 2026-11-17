@@ -9,9 +9,9 @@ import (
 	jed "github.com/jackc/jed/impl/go"
 )
 
-func ExampleCreateDatabase() {
+func ExampleCreate() {
 	// Set Path: "app.jed" to create a durable file instead.
-	db, err := jed.CreateDatabase(jed.CreateOptions{})
+	db, err := jed.Create(jed.CreateOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -27,7 +27,7 @@ func ExampleCreateDatabase() {
 }
 
 func ExampleDatabase_Query() {
-	db, err := jed.CreateDatabase(jed.CreateOptions{})
+	db, err := jed.Create(jed.CreateOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func ExampleDatabase_Query() {
 }
 
 func ExampleDatabase_Session() {
-	db, err := jed.CreateDatabase(jed.CreateOptions{})
+	db, err := jed.Create(jed.CreateOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func ExampleDatabase_Session() {
 
 func ExampleDatabase_Update() {
 	ctx := context.Background()
-	db, err := jed.CreateDatabase(jed.CreateOptions{})
+	db, err := jed.Create(jed.CreateOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func ExampleDatabase_Update() {
 }
 
 func ExampleDatabase_QueryRowPrepared() {
-	db, err := jed.CreateDatabase(jed.CreateOptions{})
+	db, err := jed.Create(jed.CreateOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func ExampleMapRows() {
 		ID   int64
 		Name string
 	}
-	db, err := jed.CreateDatabase(jed.CreateOptions{})
+	db, err := jed.Create(jed.CreateOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -157,7 +157,7 @@ func exampleInsert(ctx context.Context, q exampleExecer, id int64) error {
 
 func ExampleQueryer() {
 	ctx := context.Background()
-	db, err := jed.CreateDatabase(jed.CreateOptions{})
+	db, err := jed.Create(jed.CreateOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}

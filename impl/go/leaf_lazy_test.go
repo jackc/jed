@@ -18,7 +18,7 @@ func lazyWorkload(t *testing.T, lazy bool) (string, []byte) {
 		t.Skip("lazy leaves are off while a symbol-table switch is on")
 	}
 	path := filepath.Join(t.TempDir(), "lazy.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 4096, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, PageSize: 4096, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +41,7 @@ func lazyWorkload(t *testing.T, lazy bool) (string, []byte) {
 		if err := db.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if db, err = OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true}); err != nil {
+		if db, err = Open(path, OpenOptions{SkipFsync: true}); err != nil {
 			t.Fatal(err)
 		}
 		sess = mustSession(db, SessionOptions{})
@@ -292,7 +292,7 @@ func rootWorkload(t *testing.T, lazy bool) (string, []byte) {
 		t.Skip("lazy leaves are off while a symbol-table switch is on")
 	}
 	path := filepath.Join(t.TempDir(), "root.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 512, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, PageSize: 512, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +315,7 @@ func rootWorkload(t *testing.T, lazy bool) (string, []byte) {
 		if err := db.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if db, err = OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true}); err != nil {
+		if db, err = Open(path, OpenOptions{SkipFsync: true}); err != nil {
 			t.Fatal(err)
 		}
 		sess = mustSession(db, SessionOptions{})

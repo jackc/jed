@@ -67,15 +67,15 @@ func prepareOpenCoordinator(path string, mode Locking, timeout *uint64) (*fileCo
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, "", newError(UndefinedFile, "database file does not exist: "+path)
 		}
-		return nil, "", newError(IoError, "resolve database path: "+err.Error())
+		return nil, "", newError(IOError, "resolve database path: "+err.Error())
 	}
 	real, err = filepath.Abs(real)
 	if err != nil {
-		return nil, "", newError(IoError, "resolve database path: "+err.Error())
+		return nil, "", newError(IOError, "resolve database path: "+err.Error())
 	}
 	multiple, err := hasMultipleLinks(real)
 	if err != nil {
-		return nil, "", newError(IoError, "inspect database identity: "+err.Error())
+		return nil, "", newError(IOError, "inspect database identity: "+err.Error())
 	}
 	if multiple {
 		return nil, "", newError(ObjectInUse, "hard-linked database paths cannot use jed locking: "+real)
@@ -94,11 +94,11 @@ func prepareCreateCoordinator(path string, mode Locking, timeout *uint64) (*file
 	}
 	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
 	if err != nil {
-		return nil, "", newError(IoError, "resolve database parent: "+err.Error())
+		return nil, "", newError(IOError, "resolve database parent: "+err.Error())
 	}
 	parent, err = filepath.Abs(parent)
 	if err != nil {
-		return nil, "", newError(IoError, "resolve database parent: "+err.Error())
+		return nil, "", newError(IOError, "resolve database parent: "+err.Error())
 	}
 	real := filepath.Join(parent, filepath.Base(path))
 	c, err := acquireCoordinator(osLocks, real, mode, timeout)
@@ -186,11 +186,11 @@ func (c *fileCoordinator) close() {
 func openLockBundle(path string) (lockFiles, error) {
 	bundle := path + ".lock"
 	if err := os.Mkdir(bundle, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
-		return lockFiles{}, newError(IoError, "create coordination directory: "+err.Error())
+		return lockFiles{}, newError(IOError, "create coordination directory: "+err.Error())
 	}
 	info, err := os.Lstat(bundle)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return lockFiles{}, newError(IoError, "coordination path is not a directory: "+bundle)
+		return lockFiles{}, newError(IOError, "coordination path is not a directory: "+bundle)
 	}
 	if err := validateProtocolMarker(path); err != nil {
 		return lockFiles{}, err
@@ -205,11 +205,11 @@ func openLockBundle(path string) (lockFiles, error) {
 		return os.Open(filepath.Join(bundle, name))
 	}
 	if opened.presence, err = open("presence"); err != nil {
-		return lockFiles{}, newError(IoError, err.Error())
+		return lockFiles{}, newError(IOError, err.Error())
 	}
 	if opened.arrival, err = open("arrival"); err != nil {
 		closeOSLockFiles(opened)
-		return lockFiles{}, newError(IoError, err.Error())
+		return lockFiles{}, newError(IOError, err.Error())
 	}
 	return opened, nil
 }
@@ -221,7 +221,7 @@ func validateProtocolMarker(path string) error {
 	bundle := path + ".lock"
 	entries, err := os.ReadDir(bundle)
 	if err != nil {
-		return newError(IoError, "read coordination directory: "+err.Error())
+		return newError(IOError, "read coordination directory: "+err.Error())
 	}
 	for _, entry := range entries {
 		if name := entry.Name(); strings.HasPrefix(name, "protocol-v") && name != protocolMarker && name != legacyProtocolMarker {
@@ -236,11 +236,11 @@ func ensureRegularLockFile(path string) error {
 	if err == nil {
 		_ = f.Close()
 	} else if !errors.Is(err, os.ErrExist) {
-		return newError(IoError, "create coordination entry: "+err.Error())
+		return newError(IOError, "create coordination entry: "+err.Error())
 	}
 	info, err := os.Lstat(path)
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return newError(IoError, "coordination entry is not a regular file: "+path)
+		return newError(IOError, "coordination entry is not a regular file: "+path)
 	}
 	return nil
 }
@@ -314,5 +314,5 @@ func classifyLockError(err error) error {
 	if errors.Is(err, errLockUnsupported) {
 		return newError(FeatureNotSupported, "OS file locks are unavailable")
 	}
-	return newError(IoError, fmt.Sprintf("file lock failed: %v", err))
+	return newError(IOError, fmt.Sprintf("file lock failed: %v", err))
 }

@@ -24,10 +24,10 @@ const (
 	// ValBytea is a byte string (the bytea column type); Str holds its raw bytes (a Go
 	// string is an immutable byte sequence — any byte, incl 0x00; keeps Value ==-comparable).
 	ValBytea
-	// ValUuid is a fixed 16-byte UUID (the uuid column type); Str holds the 16 raw bytes (like
+	// ValUUID is a fixed 16-byte UUID (the uuid column type); Str holds the 16 raw bytes (like
 	// ValBytea, but a distinct kind: a uuid renders 8-4-4-4-12 and is its own comparison family,
 	// so a uuid never equals a bytea even with identical bytes — spec/design/types.md §14).
-	ValUuid
+	ValUUID
 	// ValTimestamp is a zoneless timestamp; Int holds the i64 microsecond instant (the
 	// sentinels NegInfinity/PosInfinity are -infinity/+infinity — spec/design/timestamp.md).
 	ValTimestamp
@@ -73,22 +73,22 @@ const (
 	// struct stays ==-comparable (like Comp/Array); range equality/hashing/comparison go through
 	// Eq3 / the structural value-key path, never raw ==. Discrete ranges are stored canonical (`[)`).
 	ValRange
-	// ValJson is a json value (spec/design/json.md §4) — JSON text stored VERBATIM (the original
+	// ValJSON is a json value (spec/design/json.md §4) — JSON text stored VERBATIM (the original
 	// UTF-8 text, preserving whitespace, key order, and duplicate keys), held in Str. NOT comparable
 	// (PG ships no btree/hash opclass — §5); the resolver maps any comparison attempt to 42883.
 	// Rendered verbatim (json_out).
-	ValJson
-	// ValJsonb is a jsonb value (spec/design/json.md §2) — the canonical tagged-node tree, held in
-	// Json (a *JsonNode POINTER so the flat Value struct stays ==-comparable, like Comp/Array;
+	ValJSON
+	// ValJSONB is a jsonb value (spec/design/json.md §2) — the canonical tagged-node tree, held in
+	// Json (a *JSONNode POINTER so the flat Value struct stays ==-comparable, like Comp/Array;
 	// equality/hashing/comparison go through Eq3 / the value-key, never raw ==). Numbers exact
 	// Decimal, object keys deduped + sorted. Comparable by PG's total btree order (§5). Rendered
 	// canonically (jsonb_out).
-	ValJsonb
-	// ValJsonPath is a jsonpath value (spec/design/jsonpath.md, P1a) — the canonical normalized source
-	// text, held in Str (like ValJson's verbatim text). NOT comparable (the resolver maps any
+	ValJSONB
+	// ValJSONPath is a jsonpath value (spec/design/jsonpath.md, P1a) — the canonical normalized source
+	// text, held in Str (like ValJSON's verbatim text). NOT comparable (the resolver maps any
 	// comparison to 42883); rendered as its text. Literal-only this slice (non-storable), so it never
 	// reaches the value/spill codec — those paths panic.
-	ValJsonPath
+	ValJSONPath
 )
 
 // unfetchedValue is the on-disk form of a lazily-loaded value (spec/design/large-values.md §14,
@@ -179,20 +179,20 @@ type Value struct {
 	// inline Iv (interval) and Str (text/bytea/uuid/json/jsonpath) box into it — a small header
 	// allocation for the string kinds, but the underlying bytes stay shared/zero-copy. The concrete
 	// dynamic type per Kind:
-	//   ValText/ValBytea/ValUuid/ValJson/ValJsonPath → string    (accessor str())
+	//   ValText/ValBytea/ValUUID/ValJSON/ValJSONPath → string    (accessor str())
 	//   ValDecimal                                    → *Decimal  (accessor decimal())
 	//   ValInterval                                   → Interval  (accessor interval())
 	//   ValComposite                                  → *[]Value  (accessor composite())
 	//   ValArray                                      → *ArrayVal (accessor arrayVal())
 	//   ValRange                                      → *RangeVal (accessor rangeVal())
-	//   ValJsonb                                      → *JsonNode (accessor jsonb())
+	//   ValJSONB                                      → *JSONNode (accessor jsonb())
 	//   ValUnfetched                                  → *unfetchedValue (accessor unfetched())
 	// Value stays ==-comparable: an interface holding a pointer (or a comparable value like
 	// Interval/string) compares by that, exactly as the old pointer/inline fields did — but VALUE
 	// equality for decimal/interval/composite/array/range/jsonb is scale-/span-/structure-sensitive
 	// and MUST route through Eq3 / CmpValue / the DISTINCT value-canonical key, never raw `==` on
 	// ref (that compares pointers/headers). See spec/design/{decimal,interval,composite,array,
-	// ranges,json}.md. (A ValJson value's verbatim text lives in ref as a string, like text/bytea.)
+	// ranges,json}.md. (A ValJSON value's verbatim text lives in ref as a string, like text/bytea.)
 	ref any
 	// Kind tags which of the above the value is. A zero Value is ValNull. Kept a full ValueKind
 	// (its 8 bytes are free padding — narrowing to uint8 would not shrink the 32-byte struct), so no
@@ -229,8 +229,8 @@ func (v Value) arrayVal() *ArrayVal { return v.ref.(*ArrayVal) }
 // rangeVal returns the *RangeVal of a ValRange value.
 func (v Value) rangeVal() *RangeVal { return v.ref.(*RangeVal) }
 
-// jsonb returns the *JsonNode of a ValJsonb value.
-func (v Value) jsonb() *JsonNode { return v.ref.(*JsonNode) }
+// jsonb returns the *JSONNode of a ValJSONB value.
+func (v Value) jsonb() *JSONNode { return v.ref.(*JSONNode) }
 
 // RangeVal is a range value (spec/design/ranges.md §4). Either the distinguished Empty range
 // (Empty == true, both bounds nil) or a non-empty range with optional Lower/Upper bound values — a
@@ -328,9 +328,9 @@ func DecimalValue(d Decimal) Value { return Value{Kind: ValDecimal, ref: &d} }
 // ByteaValue builds a non-null bytea value from raw bytes (stored as a byte-holding string).
 func ByteaValue(b []byte) Value { return Value{Kind: ValBytea, ref: string(b)} }
 
-// UuidValue builds a non-null uuid value from its 16 raw bytes (stored as a byte-holding string,
-// like bytea, but tagged ValUuid). The caller must pass exactly 16 bytes (ParseUUID guarantees).
-func UuidValue(b []byte) Value { return Value{Kind: ValUuid, ref: string(b)} }
+// UUIDValue builds a non-null uuid value from its 16 raw bytes (stored as a byte-holding string,
+// like bytea, but tagged ValUUID). The caller must pass exactly 16 bytes (ParseUUID guarantees).
+func UUIDValue(b []byte) Value { return Value{Kind: ValUUID, ref: string(b)} }
 
 // TimestampValue builds a non-null timestamp from its i64 microsecond instant.
 func TimestampValue(m int64) Value { return Value{Kind: ValTimestamp, Int: m} }
@@ -344,16 +344,16 @@ func IntervalValue(iv Interval) Value { return Value{Kind: ValInterval, ref: iv}
 // DateValue builds a non-null date from its i32 day count since 1970-01-01.
 func DateValue(d int32) Value { return Value{Kind: ValDate, Int: int64(d)} }
 
-// JsonValue builds a non-null json value from its verbatim UTF-8 text (spec/design/json.md §4).
-func JsonValue(s string) Value { return Value{Kind: ValJson, ref: s} }
+// JSONValue builds a non-null json value from its verbatim UTF-8 text (spec/design/json.md §4).
+func JSONValue(s string) Value { return Value{Kind: ValJSON, ref: s} }
 
-// JsonbValue builds a non-null jsonb value from its canonical node tree (spec/design/json.md §2).
+// JSONBValue builds a non-null jsonb value from its canonical node tree (spec/design/json.md §2).
 // The node is held by pointer so Value stays ==-comparable; equality/ordering go through Eq3/Cmp.
-func JsonbValue(n JsonNode) Value { return Value{Kind: ValJsonb, ref: &n} }
+func JSONBValue(n JSONNode) Value { return Value{Kind: ValJSONB, ref: &n} }
 
-// JsonPathValue builds a non-null jsonpath value from its canonical normalized text
+// JSONPathValue builds a non-null jsonpath value from its canonical normalized text
 // (spec/design/jsonpath.md, P1a). The text lives in Str, like a verbatim json value.
-func JsonPathValue(s string) Value { return Value{Kind: ValJsonPath, ref: s} }
+func JSONPathValue(s string) Value { return Value{Kind: ValJSONPath, ref: s} }
 
 // CompositeValue builds a non-null composite (row) value from its field values
 // (spec/design/composite.md §2). The slice is held by pointer so Value stays ==-comparable;
@@ -629,7 +629,7 @@ func (v Value) Render() string {
 		return v.decimal().Render()
 	case ValBytea:
 		return "\\x" + hex.EncodeToString([]byte(v.str()))
-	case ValUuid:
+	case ValUUID:
 		// Canonical 8-4-4-4-12 lowercase-hex form (PG uuid_out).
 		return renderUUID([]byte(v.str()))
 	case ValTimestamp:
@@ -661,13 +661,13 @@ func (v Value) Render() string {
 		// omitted bound for infinite, and per-bound quoting where the element text has special
 		// chars (e.g. a tsrange bound's space — spec/design/ranges.md §5).
 		return rangeOut(v.rangeVal())
-	case ValJson:
+	case ValJSON:
 		// json renders its stored bytes verbatim (json_out — the identity, §4).
 		return v.str()
-	case ValJsonb:
+	case ValJSONB:
 		// jsonb renders the canonical PG text (jsonb_out — §6.2).
 		return jsonbOut(v.jsonb())
-	case ValJsonPath:
+	case ValJSONPath:
 		// jsonpath renders its canonical normalized text (the stored Str).
 		return v.str()
 	case ValUnfetched:
@@ -805,7 +805,7 @@ func (v Value) Eq3(o Value) ThreeValued {
 	if v.Kind == ValBytea || o.Kind == ValBytea {
 		return bool3(v.str() == o.str())
 	}
-	if v.Kind == ValUuid || o.Kind == ValUuid {
+	if v.Kind == ValUUID || o.Kind == ValUUID {
 		return bool3(v.str() == o.str())
 	}
 	// Timestamps compare by the i64 instant (infinity is just an extreme value).
@@ -857,9 +857,9 @@ func (v Value) Eq3(o Value) ThreeValued {
 		return bool3(rangeTotalCmp(v.rangeVal(), o.rangeVal()) == 0)
 	}
 	// jsonb `=` is structural over the canonical tree — always definite (PG btree, not 3VL; no SQL
-	// NULLs inside a document, §5). Consistent with JsonNode.Cmp == 0. (json never reaches here — the
+	// NULLs inside a document, §5). Consistent with JSONNode.Cmp == 0. (json never reaches here — the
 	// resolver maps any json comparison to 42883; jsonb comparison resolves in J2.)
-	if v.Kind == ValJsonb && o.Kind == ValJsonb {
+	if v.Kind == ValJSONB && o.Kind == ValJSONB {
 		return bool3(jsonbValueEqual(v.jsonb(), o.jsonb()))
 	}
 	return Unknown
@@ -934,7 +934,7 @@ func (v Value) Lt3(o Value) ThreeValued {
 	if v.Kind == ValBytea || o.Kind == ValBytea {
 		return bool3(v.str() < o.str())
 	}
-	if v.Kind == ValUuid || o.Kind == ValUuid {
+	if v.Kind == ValUUID || o.Kind == ValUUID {
 		return bool3(v.str() < o.str())
 	}
 	if v.Kind == ValTimestamp && o.Kind == ValTimestamp {
@@ -969,7 +969,7 @@ func (v Value) Lt3(o Value) ThreeValued {
 	}
 	// jsonb `<` uses PG's total btree order (spec/design/json.md §5): type rank, then per-kind
 	// ordering (containers by count first). Always definite, never UNKNOWN.
-	if v.Kind == ValJsonb && o.Kind == ValJsonb {
+	if v.Kind == ValJSONB && o.Kind == ValJSONB {
 		return bool3(v.jsonb().Cmp(o.jsonb()) < 0)
 	}
 	return Unknown
@@ -1001,7 +1001,7 @@ func (v Value) Gt3(o Value) ThreeValued {
 	if v.Kind == ValBytea || o.Kind == ValBytea {
 		return bool3(v.str() > o.str())
 	}
-	if v.Kind == ValUuid || o.Kind == ValUuid {
+	if v.Kind == ValUUID || o.Kind == ValUUID {
 		return bool3(v.str() > o.str())
 	}
 	if v.Kind == ValTimestamp && o.Kind == ValTimestamp {
@@ -1029,7 +1029,7 @@ func (v Value) Gt3(o Value) ThreeValued {
 		return bool3(rangeTotalCmp(v.rangeVal(), o.rangeVal()) > 0)
 	}
 	// jsonb `>` — the total-order mirror of `<` (spec/design/json.md §5).
-	if v.Kind == ValJsonb && o.Kind == ValJsonb {
+	if v.Kind == ValJSONB && o.Kind == ValJSONB {
 		return bool3(v.jsonb().Cmp(o.jsonb()) > 0)
 	}
 	return Unknown

@@ -1408,7 +1408,7 @@ func valueCmp(a, b Value) int {
 	case a.Kind == ValBytea && b.Kind == ValBytea:
 		// bytea is held in Str (raw bytes); strings.Compare is unsigned byte order.
 		return strings.Compare(a.str(), b.str())
-	case a.Kind == ValUuid && b.Kind == ValUuid:
+	case a.Kind == ValUUID && b.Kind == ValUUID:
 		// uuid's 16 raw bytes are held in Str; strings.Compare is unsigned byte order.
 		return strings.Compare(a.str(), b.str())
 	case a.Kind == ValBool && b.Kind == ValBool:
@@ -1469,7 +1469,7 @@ func valueCmp(a, b Value) int {
 		// non-empty, then lower bound, then upper bound (accounting for infinity/inclusivity). Kept
 		// identical to value.Lt3/Gt3's range arm so `<` and ORDER BY never disagree.
 		return rangeTotalCmp(a.rangeVal(), b.rangeVal())
-	case a.Kind == ValJsonb && b.Kind == ValJsonb:
+	case a.Kind == ValJSONB && b.Kind == ValJSONB:
 		// jsonb sorts by PG's total btree order (spec/design/json.md §5); kept identical to
 		// value.Lt3/Gt3's jsonb arm so `<` and ORDER BY never disagree. (json never sorts — the
 		// resolver rejects it 42883.)
@@ -1518,7 +1518,7 @@ func familyRank(v Value) int {
 		return 4
 	case ValBytea:
 		return 5
-	case ValUuid:
+	case ValUUID:
 		return 6
 	case ValTimestamp:
 		return 7
@@ -1532,13 +1532,13 @@ func familyRank(v Value) int {
 		return 11
 	case ValDate:
 		return 13
-	case ValJson:
+	case ValJSON:
 		// json never sorts (42883 at resolve); jsonb sorts only against jsonb. Cross-family ranks for
 		// totality only — they sit after the scalar/container families.
 		return 15
-	case ValJsonb:
+	case ValJSONB:
 		return 16
-	case ValJsonPath:
+	case ValJSONPath:
 		// jsonpath never sorts (42883 at resolve); a cross-family rank for totality only.
 		return 17
 	default:

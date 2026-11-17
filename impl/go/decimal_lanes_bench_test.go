@@ -12,7 +12,7 @@ import (
 //	go test -run '^$' -bench 'DecimalLanes/sum_scan' -cpuprofile cpu.out
 func BenchmarkDecimalLanes(b *testing.B) {
 	path := filepath.Join(b.TempDir(), "ledger.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
 		b.Fatal(err)
 	}

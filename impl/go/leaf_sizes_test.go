@@ -8,7 +8,7 @@ import "testing"
 func TestLeafSizeFactsFollowDeletesAndUpdates(t *testing.T) {
 	leafSizesCheck.Store(true)
 	defer leafSizesCheck.Store(false)
-	db, err := CreateDatabase(CreateOptions{})
+	db, err := Create(CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestLeafSizeFactsFollowDeletesAndUpdates(t *testing.T) {
 func TestLeafMergeAndSplitFacts(t *testing.T) {
 	leafSizesCheck.Store(true)
 	defer leafSizesCheck.Store(false)
-	db, err := CreateDatabase(CreateOptions{})
+	db, err := Create(CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -556,16 +556,16 @@ func statisticsKeyValue(value Value, ty dataType) (Value, bool) {
 		(ty.Scalar == scalarText && value.Kind == ValText) ||
 		(ty.Scalar == scalarDecimal && value.Kind == ValDecimal) ||
 		(ty.Scalar == scalarBytea && value.Kind == ValBytea) ||
-		(ty.Scalar == scalarUuid && value.Kind == ValUuid) ||
+		(ty.Scalar == scalarUuid && value.Kind == ValUUID) ||
 		(ty.Scalar == scalarTimestamp && value.Kind == ValTimestamp) ||
 		(ty.Scalar == scalarTimestamptz && value.Kind == ValTimestamptz) ||
 		(ty.Scalar == scalarDate && value.Kind == ValDate) ||
 		(ty.Scalar == scalarInterval && value.Kind == ValInterval) ||
 		(ty.Scalar == scalarFloat32 && value.Kind == ValFloat32) ||
 		(ty.Scalar == scalarFloat64 && value.Kind == ValFloat64) ||
-		(ty.Scalar == scalarJson && value.Kind == ValJson) ||
-		(ty.Scalar == scalarJsonb && value.Kind == ValJsonb) ||
-		(ty.Scalar == scalarJsonPath && value.Kind == ValJsonPath)
+		(ty.Scalar == scalarJson && value.Kind == ValJSON) ||
+		(ty.Scalar == scalarJsonb && value.Kind == ValJSONB) ||
+		(ty.Scalar == scalarJsonPath && value.Kind == ValJSONPath)
 	return value, ok
 }
 

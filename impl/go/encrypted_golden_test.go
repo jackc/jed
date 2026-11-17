@@ -75,7 +75,7 @@ func encFillerBytesHex(n int) string {
 func checkEncryptedGolden(t *testing.T, name string, sql []string, probe string) {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := CreateDatabase(CreateOptions{Path: filepath.Join(dir, "golden.jed"), PageSize: encGoldenPage, SkipFsync: true, Credential: encGoldenKey()})
+	db, err := Create(CreateOptions{Path: filepath.Join(dir, "golden.jed"), PageSize: encGoldenPage, SkipFsync: true, Credential: encGoldenKey()})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -105,7 +105,7 @@ func checkEncryptedGolden(t *testing.T, name string, sql []string, probe string)
 	if err := os.WriteFile(copyPath, golden, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	rdb, err := OpenDatabaseWithOptions(copyPath, OpenOptions{Credential: encGoldenKey()})
+	rdb, err := Open(copyPath, OpenOptions{Credential: encGoldenKey()})
 	if err != nil {
 		t.Fatalf("open %s: %v", name, err)
 	}
@@ -176,7 +176,7 @@ func TestEncryptedGoldenRekeyIndexTable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "golden_rekey_index_table.jed")
 	env := NewEnvironmentBuilder()
 	env.SetInsecureSeededKeyEntropy(encGoldenSeed)
-	db, err := CreateDatabase(CreateOptions{
+	db, err := Create(CreateOptions{
 		Path: path, PageSize: encGoldenPage, SkipFsync: true, Environment: env.Build(),
 		ScratchEncryption: ScratchEncryptionOn, Locking: LockingExclusive,
 	})

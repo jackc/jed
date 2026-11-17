@@ -138,7 +138,7 @@ func proverConstFromValue(v Value) (proverConst, bool) {
 			b = 1
 		}
 		return proverConst{kind: pcBool, i: b}, true
-	case ValUuid:
+	case ValUUID:
 		return proverConst{kind: pcUuid, s: v.str()}, true
 	}
 	return proverConst{}, false

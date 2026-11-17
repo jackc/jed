@@ -231,7 +231,7 @@ func (o *pageServiceOwner) start() error {
 	if err != nil {
 		o.endpoint = ""
 		_ = o.host.writeOwnerRecord(o.dbPath, ownerRecord{uid: uid, incarnation: o.incarnation, pid: uint32(os.Getpid())})
-		return newError(IoError, "bind page-service endpoint: "+err.Error())
+		return newError(IOError, "bind page-service endpoint: "+err.Error())
 	}
 	o.listener = listener
 	o.wg.Add(1)
@@ -1365,7 +1365,7 @@ func (o *pageServiceOwner) capFlushClientCommit() bool {
 	st.mu.Lock()
 	err := st.paging.withPager(func(p *pager) error { return p.flushPending(false) })
 	if err != nil {
-		st.paging.revoke(newError(IoError, "a deferred durability flush failed; reopen the database: "+err.Error()))
+		st.paging.revoke(newError(IOError, "a deferred durability flush failed; reopen the database: "+err.Error()))
 	}
 	st.mu.Unlock()
 	if err != nil {

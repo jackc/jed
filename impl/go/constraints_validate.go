@@ -62,13 +62,13 @@ func rejectCheckStructure(e exprNode) error {
 		}
 		return nil
 	case exprJsonValue:
-		if err := rejectCheckStructure(e.JsonValue.Ctx); err != nil {
+		if err := rejectCheckStructure(e.JSONValue.Ctx); err != nil {
 			return err
 		}
-		if err := rejectCheckStructure(e.JsonValue.Path); err != nil {
+		if err := rejectCheckStructure(e.JSONValue.Path); err != nil {
 			return err
 		}
-		for _, p := range e.JsonValue.Passing {
+		for _, p := range e.JSONValue.Passing {
 			if err := rejectCheckStructure(p.Expr); err != nil {
 				return err
 			}
@@ -246,13 +246,13 @@ func rejectDefaultStructure(e exprNode) error {
 		}
 		return nil
 	case exprJsonValue:
-		if err := rejectDefaultStructure(e.JsonValue.Ctx); err != nil {
+		if err := rejectDefaultStructure(e.JSONValue.Ctx); err != nil {
 			return err
 		}
-		if err := rejectDefaultStructure(e.JsonValue.Path); err != nil {
+		if err := rejectDefaultStructure(e.JSONValue.Path); err != nil {
 			return err
 		}
-		for _, p := range e.JsonValue.Passing {
+		for _, p := range e.JSONValue.Passing {
 			if err := rejectDefaultStructure(p.Expr); err != nil {
 				return err
 			}
@@ -428,9 +428,9 @@ func checkReferencedColumns(e exprNode, columns []catColumn) []int {
 				walk(p.Expr)
 			}
 		case exprJsonValue:
-			walk(e.JsonValue.Ctx)
-			walk(e.JsonValue.Path)
-			for _, p := range e.JsonValue.Passing {
+			walk(e.JSONValue.Ctx)
+			walk(e.JSONValue.Path)
+			for _, p := range e.JSONValue.Passing {
 				walk(p.Expr)
 			}
 		case exprJsonQuery:
@@ -538,8 +538,8 @@ func indexExprHasSubquery(e exprNode) bool {
 			return walk(e.JsonExists.Ctx) || walk(e.JsonExists.Path) ||
 				passingAny(e.JsonExists.Passing, func(p *exprNode) bool { return walk(*p) })
 		case exprJsonValue:
-			return walk(e.JsonValue.Ctx) || walk(e.JsonValue.Path) ||
-				passingAny(e.JsonValue.Passing, func(p *exprNode) bool { return walk(*p) })
+			return walk(e.JSONValue.Ctx) || walk(e.JSONValue.Path) ||
+				passingAny(e.JSONValue.Passing, func(p *exprNode) bool { return walk(*p) })
 		case exprJsonQuery:
 			return walk(e.JsonQuery.Ctx) || walk(e.JsonQuery.Path) ||
 				passingAny(e.JsonQuery.Passing, func(p *exprNode) bool { return walk(*p) })
@@ -686,13 +686,13 @@ func indexExprFirstParam(e exprNode) (uint64, bool) {
 			}
 			return 0, false
 		case exprJsonValue:
-			if n, ok := walk(e.JsonValue.Ctx); ok {
+			if n, ok := walk(e.JSONValue.Ctx); ok {
 				return n, true
 			}
-			if n, ok := walk(e.JsonValue.Path); ok {
+			if n, ok := walk(e.JSONValue.Path); ok {
 				return n, true
 			}
-			for _, p := range e.JsonValue.Passing {
+			for _, p := range e.JSONValue.Passing {
 				if n, ok := walk(p.Expr); ok {
 					return n, true
 				}

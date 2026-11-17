@@ -828,7 +828,7 @@ func (r *simRunner) attach(name string) error {
 }
 
 // openProc starts process pid. A service trace elects it through the simulated lock host and
-// network, exactly as OpenDatabaseWithOptions does through the OS host.
+// network, exactly as Open does through the OS host.
 func (r *simRunner) openProc(pid int) error {
 	var db *Database
 	var err error
@@ -947,7 +947,7 @@ func (r *simRunner) procBusy(pid int) bool {
 func (r *simRunner) openDatabase(env *Environment, coord *fileCoordinator) (*Database, error) {
 	main := r.fs.main()
 	if main == nil {
-		return nil, newError(IoError, "the database file is gone")
+		return nil, newError(IOError, "the database file is gone")
 	}
 	p, err := pagerFromStore(main)
 	if err != nil {

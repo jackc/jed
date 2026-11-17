@@ -33,7 +33,7 @@ func openScratch(dataDir string, synchronous jed.Synchronous) (bench.Engine, err
 		return nil, err
 	}
 	e.scratch = dir
-	db, err := jed.CreateDatabase(jed.CreateOptions{Path: filepath.Join(dir, "scratch.jed"), Environment: env, Synchronous: synchronous})
+	db, err := jed.Create(jed.CreateOptions{Path: filepath.Join(dir, "scratch.jed"), Environment: env, Synchronous: synchronous})
 	if err != nil {
 		os.RemoveAll(dir)
 		return nil, err
@@ -64,7 +64,7 @@ func open(dataDir, dataset string) (bench.Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	db, err := jed.OpenDatabaseWithOptions(filepath.Join(dataDir, dataset+".jed"), jed.OpenOptions{Environment: env})
+	db, err := jed.Open(filepath.Join(dataDir, dataset+".jed"), jed.OpenOptions{Environment: env})
 	if err != nil {
 		return nil, err
 	}

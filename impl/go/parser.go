@@ -7689,7 +7689,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 			if err != nil {
 				return exprNode{}, err
 			}
-			expr = exprNode{Kind: exprJsonValue, JsonValue: &jsonValueExpr{Ctx: ctx, Path: path, Passing: passing, Returning: returning, OnEmpty: onEmpty, OnError: onError}}
+			expr = exprNode{Kind: exprJsonValue, JSONValue: &jsonValueExpr{Ctx: ctx, Path: path, Passing: passing, Returning: returning, OnEmpty: onEmpty, OnError: onError}}
 		default: // json_query
 			returning, err := p.parseJSONReturning()
 			if err != nil {

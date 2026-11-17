@@ -65,7 +65,7 @@ func (db *engine) executeStmtParamsCached(stmt statement, params []Value, ic *in
 	// Inside an explicit block?
 	if db.session.tx != nil {
 		if db.session.tx.failed {
-			return outcome{}, newError(InFailedSqlTransaction,
+			return outcome{}, newError(InFailedSQLTransaction,
 				"current transaction is aborted, commands ignored until end of transaction block")
 		}
 		// Run the statement; ANY error aborts the block (it enters the failed state — §6).
@@ -74,9 +74,9 @@ func (db *engine) executeStmtParamsCached(stmt statement, params []Value, ic *in
 		if kind := reindexOutsideBlock(stmt); kind != "" {
 			// REINDEX CONCURRENTLY / DATABASE / SYSTEM cannot run inside a transaction block
 			// (PostgreSQL's PreventInTransactionBlock — spec/design/indexes.md §10).
-			err = newError(ActiveSqlTransaction, kind+" cannot run inside a transaction block")
+			err = newError(ActiveSQLTransaction, kind+" cannot run inside a transaction block")
 		} else if db.stmtIsWriteWithViews(stmt) && !db.session.tx.writable {
-			err = newError(ReadOnlySqlTransaction,
+			err = newError(ReadOnlySQLTransaction,
 				"cannot execute "+stmtKind(stmt)+" in a read-only transaction")
 		} else {
 			out, err = db.dispatchStmtCached(stmt, params, ic, true)
@@ -107,7 +107,7 @@ func (db *engine) executeStmtParamsCached(stmt statement, params []Value, ic *in
 	// behavior — api.md §2.1), so an autocommit write fails exactly like a write inside a
 	// READ ONLY block.
 	if db.readOnly {
-		return outcome{}, newError(ReadOnlySqlTransaction,
+		return outcome{}, newError(ReadOnlySQLTransaction,
 			"cannot execute "+stmtKind(stmt)+" in a read-only transaction")
 	}
 	db.session.tx = db.newTx(true)
@@ -146,13 +146,13 @@ func (db *engine) beginTx(writable, modeSet bool) (outcome, error) {
 		if tx.failed {
 			// In a failed block even BEGIN is refused with the block's 25P02 (PostgreSQL — only
 			// ROLLBACK/COMMIT/ROLLBACK TO are accepted there, transactions.md §6).
-			return outcome{}, newError(InFailedSqlTransaction,
+			return outcome{}, newError(InFailedSQLTransaction,
 				"current transaction is aborted, commands ignored until end of transaction block")
 		}
-		return outcome{}, newError(ActiveSqlTransaction, "there is already a transaction in progress")
+		return outcome{}, newError(ActiveSQLTransaction, "there is already a transaction in progress")
 	}
 	if modeSet && writable && db.readOnly {
-		return outcome{}, newError(ReadOnlySqlTransaction,
+		return outcome{}, newError(ReadOnlySQLTransaction,
 			"cannot set transaction read-write mode on a read-only database")
 	}
 	if !modeSet {
@@ -466,10 +466,10 @@ func (db *engine) savepointStmt(sp *savepointStmt) (outcome, error) {
 		case savepointRollbackTo:
 			what = "ROLLBACK TO SAVEPOINT"
 		}
-		return outcome{}, newError(NoActiveSqlTransaction, what+" can only be used in transaction blocks")
+		return outcome{}, newError(NoActiveSQLTransaction, what+" can only be used in transaction blocks")
 	}
 	if tx.failed && sp.Op != savepointRollbackTo {
-		return outcome{}, newError(InFailedSqlTransaction,
+		return outcome{}, newError(InFailedSQLTransaction,
 			"current transaction is aborted, commands ignored until end of transaction block")
 	}
 	at := -1

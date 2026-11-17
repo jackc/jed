@@ -1288,8 +1288,8 @@ func cteRefsExpr(e exprNode, visit cteRefVisitor) int {
 		}
 		return n
 	case exprJsonValue:
-		n := cteRefsExpr(e.JsonValue.Ctx, visit) + cteRefsExpr(e.JsonValue.Path, visit)
-		for _, p := range e.JsonValue.Passing {
+		n := cteRefsExpr(e.JSONValue.Ctx, visit) + cteRefsExpr(e.JSONValue.Path, visit)
+		for _, p := range e.JSONValue.Passing {
 			n += cteRefsExpr(p.Expr, visit)
 		}
 		return n

@@ -218,7 +218,7 @@ func timezoneIndexTableDB(t *testing.T) *Session {
 
 func hostfuncIndexTableDB(t *testing.T) *Session {
 	env := envWith(t, geoHash("com.example/geo_hash", 1))
-	db, err := CreateDatabase(CreateOptions{PageSize: goldenPageSize, Environment: env})
+	db, err := Create(CreateOptions{PageSize: goldenPageSize, Environment: env})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -234,7 +234,7 @@ func hostfuncIndexTableDB(t *testing.T) *Session {
 // catalog change. Must match verify.rb's HOSTFUNC_CHECK_TABLE.
 func hostfuncCheckTableDB(t *testing.T) *Session {
 	env := envWith(t, geoHash("com.example/geo_hash", 1))
-	db, err := CreateDatabase(CreateOptions{PageSize: goldenPageSize, Environment: env})
+	db, err := Create(CreateOptions{PageSize: goldenPageSize, Environment: env})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -2027,7 +2027,7 @@ func goldenComparableRows(rows []storedRow) [][]any {
 	for i, row := range rows {
 		out[i] = make([]any, len(row))
 		for j, v := range row {
-			if v.Kind == ValJsonb {
+			if v.Kind == ValJSONB {
 				out[i][j] = "jsonb:" + jsonbOut(v.jsonb())
 			} else {
 				out[i][j] = v

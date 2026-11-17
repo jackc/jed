@@ -227,7 +227,7 @@ func appendMemoValue(b []byte, v Value) []byte {
 			b = append(b, byte(u>>(8*i)))
 		}
 		return b
-	case ValText, ValBytea, ValUuid, ValJson, ValJsonPath:
+	case ValText, ValBytea, ValUUID, ValJSON, ValJSONPath:
 		return appendMemoString(b, v.str())
 	case ValDecimal:
 		return appendMemoString(b, v.decimal().Render())

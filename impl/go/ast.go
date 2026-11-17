@@ -1744,7 +1744,7 @@ type exprNode struct {
 	IsJsonOf    *isJsonExpr     // ExprIsJson
 	JsonCtorOf  *jsonCtorExpr   // ExprJsonCtor
 	JsonExists  *jsonExistsExpr // ExprJsonExists
-	JsonValue   *jsonValueExpr  // ExprJsonValue
+	JSONValue   *jsonValueExpr  // ExprJsonValue
 	JsonQuery   *jsonQueryExpr  // ExprJsonQuery
 	IsDistinct  *isDistinctExpr // ExprIsDistinct
 	FuncCall    *funcCallExpr   // ExprFuncCall

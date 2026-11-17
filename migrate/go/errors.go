@@ -35,9 +35,9 @@ func (e *MigrationError) Error() string {
 
 func (e *MigrationError) Unwrap() error { return e.Err }
 
-// SqlState returns the underlying engine SQLSTATE when the wrapped error is a
+// SQLState returns the underlying engine SQLSTATE when the wrapped error is a
 // *jed.EngineError, or "" otherwise — a convenience so callers need not unwrap by hand.
-func (e *MigrationError) SqlState() string {
+func (e *MigrationError) SQLState() string {
 	var ee *jed.EngineError
 	if errors.As(e.Err, &ee) {
 		return ee.Code()

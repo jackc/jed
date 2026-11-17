@@ -187,7 +187,7 @@ func TestViewBodyFunctionsNeedTheReadersExecute(t *testing.T) {
 // api.md §2.6).
 func TestViewsSurviveCommitReopenAndCompaction(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "views.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func TestViewsSurviveCommitReopenAndCompaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = OpenDatabase(path)
+	db, err = Open(path, OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestViewsSurviveCommitReopenAndCompaction(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = OpenDatabase(path)
+	db, err = Open(path, OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

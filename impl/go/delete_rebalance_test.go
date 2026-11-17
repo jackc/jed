@@ -29,7 +29,7 @@ func TestDeleteRebalanceNeverOverflowsTheParent(t *testing.T) {
 			t.Parallel()
 			rng := rand.New(rand.NewSource(seed))
 			path := filepath.Join(t.TempDir(), "rebalance.jed")
-			db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})
+			db, err := Create(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})
 			if err != nil {
 				t.Fatal(err)
 			}

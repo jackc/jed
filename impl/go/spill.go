@@ -522,7 +522,7 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 	case ValBytea:
 		_ = w.WriteByte(5)
 		spillWriteBytes(w, []byte(v.str()))
-	case ValUuid:
+	case ValUUID:
 		_ = w.WriteByte(6)
 		_, _ = w.Write([]byte(v.str())) // exactly 16 bytes
 	case ValFloat32:
@@ -601,18 +601,18 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 				spillWriteValue(w, *rv.Upper)
 			}
 		}
-	case ValJson:
+	case ValJSON:
 		// json — tag 19: the verbatim text (spec/design/json.md). Internal merge-sort scratch format
 		// only; a json/jsonb column can ride a spilling sort as a carried column, so it must spill
 		// faithfully.
 		_ = w.WriteByte(19)
 		spillWriteBytes(w, []byte(v.str()))
-	case ValJsonb:
+	case ValJSONB:
 		// jsonb — tag 20: the canonical text (jsonbOut → jsonbIn round-trips exactly, since the
 		// output is canonical), spec/design/json.md.
 		_ = w.WriteByte(20)
 		spillWriteBytes(w, []byte(jsonbOut(v.jsonb())))
-	case ValJsonPath:
+	case ValJSONPath:
 		// Derived/CTE rows may carry a non-storable jsonpath through a blocking operator.
 		_ = w.WriteByte(22)
 		spillWriteBytes(w, []byte(v.str()))
@@ -749,7 +749,7 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 		if _, err := io.ReadFull(r, u[:]); err != nil {
 			return Value{}, err
 		}
-		return UuidValue(u[:]), nil
+		return UUIDValue(u[:]), nil
 	case 13, 14, 17:
 		n, err := spillReadU64(r)
 		kind := ValFloat32
@@ -805,7 +805,7 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: tagExternalComp, FirstPage: first, firstTag: tag, StoredLen: stored, RawLen: raw}}, err
 	case 22:
 		body, err := spillReadBytes(r)
-		return JsonPathValue(string(body)), err
+		return JSONPathValue(string(body)), err
 	case 21:
 		body, err := spillReadBytes(r)
 		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: 0x00, Comp: body}}, err
@@ -904,7 +904,7 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		return JsonValue(string(b)), nil
+		return JSONValue(string(b)), nil
 	case 20:
 		b, err := spillReadBytes(r)
 		if err != nil {
@@ -914,7 +914,7 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 		if err != nil {
 			return Value{}, io.ErrUnexpectedEOF
 		}
-		return JsonbValue(node), nil
+		return JSONBValue(node), nil
 	default:
 		return Value{}, io.ErrUnexpectedEOF
 	}

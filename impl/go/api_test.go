@@ -25,7 +25,7 @@ func mustExec(t *testing.T, db dbHandle, sql string) {
 func TestCreateCommitReopenRoundTrips(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "round_trip.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestCreateCommitReopenRoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true})
+	db, err = Open(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestCreateCommitReopenRoundTrips(t *testing.T) {
 func TestOpenMissingFileIs58P01(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "nope.jed")
-	if _, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true}); err == nil {
+	if _, err := Open(path, OpenOptions{SkipFsync: true}); err == nil {
 		t.Fatal("expected error")
 	} else if ee, ok := err.(*EngineError); !ok || ee.Code() != "58P01" {
 		t.Fatalf("code = %v want 58P01", err)
@@ -66,14 +66,14 @@ func TestOpenMissingFileIs58P01(t *testing.T) {
 func TestCreateOverExistingFileIs58P02(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "here.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true}); err == nil {
+	if _, err := Create(CreateOptions{Path: path, SkipFsync: true}); err == nil {
 		t.Fatal("expected error")
 	} else if ee, ok := err.(*EngineError); !ok || ee.Code() != "58P02" {
 		t.Fatalf("code = %v want 58P02", err)
@@ -83,7 +83,7 @@ func TestCreateOverExistingFileIs58P02(t *testing.T) {
 func TestCreateWithCustomPageSizeRoundTrips(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "page256.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestCreateWithCustomPageSizeRoundTrips(t *testing.T) {
 		t.Fatalf("page size = %d want 256", db.PageSize())
 	}
 	db.Close()
-	db, err = OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true})
+	db, err = Open(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestAutocommitPersistsEachWriteAcrossClose(t *testing.T) {
 	// succeeds, so it survives a Close with no explicit Commit — the opposite of the original
 	// "no autocommit" model this test used to assert.
 	path := filepath.Join(t.TempDir(), "autocommit.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestAutocommitPersistsEachWriteAcrossClose(t *testing.T) {
 	mustExec(t, db, "INSERT INTO t VALUES (1)") // autocommitted, no explicit commit
 	db.Close()
 
-	db, err = OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true})
+	db, err = Open(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +403,7 @@ func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
 	// transaction defaults to READ ONLY, an explicit READ WRITE request and any write are
 	// 25006, and the file bytes are never touched.
 	path := filepath.Join(t.TempDir(), "readonly.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +417,7 @@ func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rodb, err := OpenDatabaseWithOptions(path, OpenOptions{ReadOnly: true, SkipFsync: true})
+	rodb, err := Open(path, OpenOptions{ReadOnly: true, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,7 +479,7 @@ func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
 	}
 
 	// A normal reopen is writable again.
-	wdb, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true})
+	wdb, err := Open(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

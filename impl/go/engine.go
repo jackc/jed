@@ -836,7 +836,7 @@ func (db *engine) checkAttachmentWritable(scope *string) error {
 		return nil
 	}
 	if att := db.core.attachment(name); att != nil && att.mode == attachReadOnly {
-		return newError(ReadOnlySqlTransaction,
+		return newError(ReadOnlySQLTransaction,
 			`cannot write to read-only database "`+*scope+`"`)
 	}
 	return nil
@@ -1667,11 +1667,11 @@ func (db *engine) hostWriteBase() (*snapshot, error) {
 		return db.committed, nil
 	}
 	if tx.failed {
-		return nil, newError(InFailedSqlTransaction,
+		return nil, newError(InFailedSQLTransaction,
 			"current transaction is aborted, commands ignored until end of transaction block")
 	}
 	if !tx.writable {
-		return nil, newError(ReadOnlySqlTransaction, "cannot change collations in a read-only transaction")
+		return nil, newError(ReadOnlySQLTransaction, "cannot change collations in a read-only transaction")
 	}
 	return tx.working, nil
 }

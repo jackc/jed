@@ -1,6 +1,6 @@
 package jed
 
-// Database ↔ bytes — Database.Serialize / DeserializeDatabase (spec/design/api.md §2.8). Both are
+// Database ↔ bytes — Database.Serialize / Deserialize (spec/design/api.md §2.8). Both are
 // host-API acts the SQL corpus cannot reach, so their contract lives here (CLAUDE.md §10): an export
 // is the from-scratch image of the committed snapshot at its version, it round-trips rows and costs, a
 // raw file's bytes load, the loaded copy is independent of the bytes and of the source, and the error
@@ -18,7 +18,7 @@ import (
 
 func serializeMemory(t *testing.T) *Database {
 	t.Helper()
-	db, err := CreateDatabase(CreateOptions{PageSize: compactPage})
+	db, err := Create(CreateOptions{PageSize: compactPage})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,7 @@ func mustSerialize(t *testing.T, db *Database, name string) []byte {
 
 func mustDeserialize(t *testing.T, data []byte, opts DeserializeOptions) *Database {
 	t.Helper()
-	db, err := DeserializeDatabase(data, opts)
+	db, err := Deserialize(data, opts)
 	if err != nil {
 		t.Fatalf("deserialize: %v", err)
 	}
@@ -187,12 +187,12 @@ func TestSerializeEncryptedAndMalformedInputsFail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = DeserializeDatabase(raw, DeserializeOptions{})
+	_, err = Deserialize(raw, DeserializeOptions{})
 	if c := compactCode(t, err); c != "55000" {
 		t.Fatalf("deserialize encrypted: %s, want 55000", c)
 	}
 	for _, data := range [][]byte{[]byte("not a database"), nil} {
-		_, err = DeserializeDatabase(data, DeserializeOptions{})
+		_, err = Deserialize(data, DeserializeOptions{})
 		if c := compactCode(t, err); c != "XX001" {
 			t.Fatalf("deserialize %q: %s, want XX001", data, c)
 		}

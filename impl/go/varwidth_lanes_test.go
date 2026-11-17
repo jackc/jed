@@ -144,7 +144,7 @@ func varwidthCheckAll(t *testing.T, s *Session) {
 func TestVarwidthLanesMatchRowPath(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "varwidth_lanes.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +174,7 @@ func TestVarwidthLanesMatchRowPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	paged, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true})
+	paged, err := Open(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +282,7 @@ func TestArrayElementSpans(t *testing.T) {
 func laneSession(t *testing.T, file string, seed []string) *Session {
 	t.Helper()
 	if file == "" {
-		db, err := CreateDatabase(CreateOptions{})
+		db, err := Create(CreateOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -294,7 +294,7 @@ func laneSession(t *testing.T, file string, seed []string) *Session {
 		return s
 	}
 	path := filepath.Join(t.TempDir(), file)
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +305,7 @@ func laneSession(t *testing.T, file string, seed []string) *Session {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	paged, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true})
+	paged, err := Open(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

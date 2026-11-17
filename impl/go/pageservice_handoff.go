@@ -351,7 +351,7 @@ func canOpenReadWrite(files fileHost, path string) bool {
 func (c *sharedCore) requestWriteOwnership(r *serviceRole, deadline time.Time, done <-chan struct{}) error {
 	h := c.handoff
 	if h.ownership == OwnershipNever || !canOpenReadWrite(h.fileHost(), h.path) {
-		return newError(ReadOnlySqlTransaction, "the database owner opened the file read-only")
+		return newError(ReadOnlySQLTransaction, "the database owner opened the file read-only")
 	}
 	cl := r.client
 	_, _ = cl.roundTrip(psRequestOwnership{})

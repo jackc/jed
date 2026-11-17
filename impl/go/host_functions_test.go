@@ -46,7 +46,7 @@ func envWith(t *testing.T, funcs ...*HostFunction) *Environment {
 
 func dbExt(t *testing.T, env *Environment, stmts ...string) *Session {
 	t.Helper()
-	db, err := CreateDatabase(CreateOptions{Environment: env})
+	db, err := Create(CreateOptions{Environment: env})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -216,7 +216,7 @@ func TestDeclaredCostGatesMaxCostCeiling(t *testing.T) {
 	// A declared weight above the ceiling aborts 54P01 before the kernel runs (guard after charge).
 	heavy := NewHostFunction("host_heavy", nil, "i64",
 		func(args []Value) (Value, error) { return IntValue(0), nil }).WithCost(1_000_000)
-	db, _ := CreateDatabase(CreateOptions{Environment: envWith(t, heavy)})
+	db, _ := Create(CreateOptions{Environment: envWith(t, heavy)})
 	s := mustSession(db, SessionOptions{})
 	s.SetMaxCost(1000)
 	_, err := queryOutcome(s, "SELECT host_heavy()", nil)
@@ -318,7 +318,7 @@ func geoIDs(t *testing.T, q valueQuerier, sql string) []int64 {
 // (each autocommits durably), then closes it.
 func createGeoFile(t *testing.T, path string, env *Environment, stmts ...string) {
 	t.Helper()
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true, Environment: env})
+	db, err := Create(CreateOptions{Path: path, SkipFsync: true, Environment: env})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -333,7 +333,7 @@ func createGeoFile(t *testing.T, path string, env *Environment, stmts ...string)
 // openGeoFile reopens a file-backed database (v31 deserialize) with env's host functions.
 func openGeoFile(t *testing.T, path string, env *Environment) *Database {
 	t.Helper()
-	db, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true, Environment: env})
+	db, err := Open(path, OpenOptions{SkipFsync: true, Environment: env})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -1182,7 +1182,7 @@ func TestHostBatchStreamingScanStorageErrorsMatchRowKernel(t *testing.T) {
 		if err := os.WriteFile(p, bytes, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		d, err := OpenDatabaseWithOptions(p, OpenOptions{SkipFsync: true, Environment: envWith(t, f)})
+		d, err := Open(p, OpenOptions{SkipFsync: true, Environment: envWith(t, f)})
 		if err != nil {
 			return nil // a corrupted routing/catalog page fails at open, before any scan
 		}

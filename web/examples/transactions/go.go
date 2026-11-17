@@ -8,7 +8,7 @@ import (
 )
 
 func main() {
-	db, err := jed.OpenDatabase("bank.jed")
+	db, err := jed.Open("bank.jed", jed.OpenOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}

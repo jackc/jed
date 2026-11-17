@@ -209,7 +209,7 @@ func (p *pager) refreshAllocatedPages() error {
 // preallocated slot past the old high-water). bytes is one page wide.
 func (p *pager) writeBlock(index uint32, bytes []byte) (err error) {
 	if p.poisoned {
-		return newError(IoError, "database writer requires reopen after failed commit")
+		return newError(IOError, "database writer requires reopen after failed commit")
 	}
 	defer func() {
 		if err != nil {
@@ -271,7 +271,7 @@ func (p *pager) faultOnWrite(index uint32, bytes []byte) error {
 // real zero blocks + a full fsync — is the host's setSize, the metadata barrier (hosts.md §2.1/§3).
 func (p *pager) reserve(minPages uint32) (err error) {
 	if p.poisoned {
-		return newError(IoError, "database writer requires reopen after failed commit")
+		return newError(IOError, "database writer requires reopen after failed commit")
 	}
 	defer func() {
 		if err != nil {
@@ -356,7 +356,7 @@ func growthStep(pages, pageSize uint32) uint32 {
 // before the first new writer, since readable OS-cache bytes may not be durable.
 func (p *pager) sync() (err error) {
 	if p.poisoned {
-		return newError(IoError, "database writer requires reopen after failed commit")
+		return newError(IOError, "database writer requires reopen after failed commit")
 	}
 	defer func() {
 		if err != nil {
@@ -377,7 +377,7 @@ func (p *pager) sync() (err error) {
 // reported as an ordinary I/O failure so the commit path rolls back exactly as a real write error
 // would (spec/design/storage.md §7). Testing only.
 func injectedCrash() error {
-	return newError(IoError, "injected commit crash (fault injection)")
+	return newError(IOError, "injected commit crash (fault injection)")
 }
 
 // swapStore replaces the byte backing, returning the old one (compaction, spec/design/api.md §2.6):

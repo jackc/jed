@@ -35,9 +35,9 @@ func run() error {
 	}
 	var db *jed.Database
 	if os.Args[1] == "create" {
-		db, err = jed.CreateDatabase(jed.CreateOptions{Path: os.Args[2], SkipFsync: true, Locking: jed.LockingNone})
+		db, err = jed.Create(jed.CreateOptions{Path: os.Args[2], SkipFsync: true, Locking: jed.LockingNone})
 	} else {
-		db, err = jed.OpenDatabaseWithOptions(os.Args[2], jed.OpenOptions{CacheBytes: cache, Locking: jed.LockingNone})
+		db, err = jed.Open(os.Args[2], jed.OpenOptions{CacheBytes: cache, Locking: jed.LockingNone})
 	}
 	if err != nil {
 		return err

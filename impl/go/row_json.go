@@ -56,10 +56,10 @@ func datumToJSON(v Value, ty resolvedType, zone zoneRef, out *strings.Builder) e
 		out.WriteString(v.decimal().Render())
 	case ValText:
 		writeJSONString(v.str(), out)
-	case ValJson:
+	case ValJSON:
 		// json embeds its text verbatim; jsonb its canonical (spaced) output.
 		out.WriteString(v.str())
-	case ValJsonb:
+	case ValJSONB:
 		out.WriteString(jsonbOut(v.jsonb()))
 	case ValComposite:
 		return compositeToJSON(*v.composite(), ty.comp, false, zone, out)
@@ -84,7 +84,7 @@ func datumToJSON(v Value, ty resolvedType, zone zoneRef, out *strings.Builder) e
 		} else {
 			out.WriteString(renderFloatPG(f, bits))
 		}
-	case ValInterval, ValUuid, ValBytea, ValRange, ValJsonPath:
+	case ValInterval, ValUUID, ValBytea, ValRange, ValJSONPath:
 		// Every other type is the JSON string of its text output (a range's timestamptz bounds in
 		// the session zone).
 		text, err := v.renderIn(zone)
@@ -138,73 +138,73 @@ func arrayDimToJSON(a *ArrayVal, dim int, elem resolvedType, pretty bool, zone z
 // datumToJSONB is one value's jsonb image (PostgreSQL's datum_to_jsonb_internal, never a key): as
 // datumToJSON, except that a json value is parsed (duplicate keys collapse, last wins), a composite
 // is an object in canonical key order, and the result is a node, not text.
-func datumToJSONB(v Value, ty resolvedType, zone zoneRef) (JsonNode, error) {
+func datumToJSONB(v Value, ty resolvedType, zone zoneRef) (JSONNode, error) {
 	switch v.Kind {
 	case ValNull:
-		return JsonNode{Kind: JNull}, nil
+		return JSONNode{Kind: JNull}, nil
 	case ValBool:
-		return JsonNode{Kind: JBool, B: v.boolVal()}, nil
+		return JSONNode{Kind: JBool, B: v.boolVal()}, nil
 	case ValInt:
-		return JsonNode{Kind: JNumber, Num: decimalFromInt64(v.Int)}, nil
+		return JSONNode{Kind: JNumber, Num: decimalFromInt64(v.Int)}, nil
 	case ValDecimal:
-		return JsonNode{Kind: JNumber, Num: *v.decimal()}, nil
+		return JSONNode{Kind: JNumber, Num: *v.decimal()}, nil
 	case ValText:
-		return JsonNode{Kind: JString, S: v.str()}, nil
-	case ValJson:
+		return JSONNode{Kind: JString, S: v.str()}, nil
+	case ValJSON:
 		return jsonbIn(v.str())
-	case ValJsonb:
+	case ValJSONB:
 		return *v.jsonb(), nil
 	case ValComposite:
 		fields := *v.composite()
-		members := make([]JsonMember, 0, len(fields))
+		members := make([]JSONMember, 0, len(fields))
 		for i, f := range ty.comp.fields {
 			node, err := datumToJSONB(fields[i], f.ty, zone)
 			if err != nil {
-				return JsonNode{}, err
+				return JSONNode{}, err
 			}
-			members = append(members, JsonMember{Key: f.name, Val: node})
+			members = append(members, JSONMember{Key: f.name, Val: node})
 		}
 		return makeObject(members), nil
 	case ValArray:
 		a := v.arrayVal()
 		if len(a.Elements) == 0 {
-			return JsonNode{Kind: JArray, Arr: []JsonNode{}}, nil
+			return JSONNode{Kind: JArray, Arr: []JSONNode{}}, nil
 		}
 		next := 0
 		return arrayDimToJSONB(a, 0, *ty.elem, zone, &next)
 	case ValDate:
-		return JsonNode{Kind: JString, S: renderDate(int32(v.Int))}, nil
+		return JSONNode{Kind: JString, S: renderDate(int32(v.Int))}, nil
 	case ValTimestamp:
-		return JsonNode{Kind: JString, S: renderTimestampXSD(v.Int)}, nil
+		return JSONNode{Kind: JString, S: renderTimestampXSD(v.Int)}, nil
 	case ValTimestamptz:
 		text, err := renderTimestamptzXSDIn(v.Int, zone)
 		if err != nil {
-			return JsonNode{}, err
+			return JSONNode{}, err
 		}
-		return JsonNode{Kind: JString, S: text}, nil
+		return JSONNode{Kind: JString, S: text}, nil
 	case ValFloat32, ValFloat64:
 		// The number numeric_in reads from the float8out/float4out text; NaN/±Infinity are strings.
 		f, bits := floatOf(v)
 		if math.IsNaN(f) || math.IsInf(f, 0) {
-			return JsonNode{Kind: JString, S: renderFloatPG(f, bits)}, nil
+			return JSONNode{Kind: JString, S: renderFloatPG(f, bits)}, nil
 		}
-		return JsonNode{Kind: JNumber, Num: floatJSONNumber(f, bits)}, nil
-	case ValInterval, ValUuid, ValBytea, ValRange, ValJsonPath:
+		return JSONNode{Kind: JNumber, Num: floatJSONNumber(f, bits)}, nil
+	case ValInterval, ValUUID, ValBytea, ValRange, ValJSONPath:
 		text, err := v.renderIn(zone)
 		if err != nil {
-			return JsonNode{}, err
+			return JSONNode{}, err
 		}
-		return JsonNode{Kind: JString, S: text}, nil
+		return JSONNode{Kind: JString, S: text}, nil
 	default:
 		panic("BUG: unfetched large value escaped the storage layer")
 	}
 }
 
 // arrayDimToJSONB is one dimension of an array's jsonb image (PostgreSQL's array_dim_to_jsonb).
-func arrayDimToJSONB(a *ArrayVal, dim int, elem resolvedType, zone zoneRef, next *int) (JsonNode, error) {
-	items := make([]JsonNode, 0, a.Dims[dim])
+func arrayDimToJSONB(a *ArrayVal, dim int, elem resolvedType, zone zoneRef, next *int) (JSONNode, error) {
+	items := make([]JSONNode, 0, a.Dims[dim])
 	for i := 0; i < a.Dims[dim]; i++ {
-		var node JsonNode
+		var node JSONNode
 		var err error
 		if dim+1 == a.Ndim() {
 			node, err = datumToJSONB(a.Elements[*next], elem, zone)
@@ -213,11 +213,11 @@ func arrayDimToJSONB(a *ArrayVal, dim int, elem resolvedType, zone zoneRef, next
 			node, err = arrayDimToJSONB(a, dim+1, elem, zone, next)
 		}
 		if err != nil {
-			return JsonNode{}, err
+			return JSONNode{}, err
 		}
 		items = append(items, node)
 	}
-	return JsonNode{Kind: JArray, Arr: items}, nil
+	return JSONNode{Kind: JArray, Arr: items}, nil
 }
 
 // jsonKeyText is the text of an object KEY (PostgreSQL's datum_to_json[b]_internal with key_scalar):
@@ -226,7 +226,7 @@ func arrayDimToJSONB(a *ArrayVal, dim int, elem resolvedType, zone zoneRef, next
 // a NULL key first.
 func jsonKeyText(v Value, zone zoneRef) (string, error) {
 	switch v.Kind {
-	case ValArray, ValComposite, ValJson, ValJsonb:
+	case ValArray, ValComposite, ValJSON, ValJSONB:
 		return "", newError(InvalidParameterValue, "key value must be scalar, not array, composite, or json")
 	case ValBool:
 		if v.boolVal() {
@@ -248,7 +248,7 @@ func jsonKeyText(v Value, zone zoneRef) (string, error) {
 	case ValFloat32, ValFloat64:
 		f, bits := floatOf(v)
 		return renderFloatPG(f, bits), nil
-	case ValInterval, ValUuid, ValBytea, ValRange, ValJsonPath:
+	case ValInterval, ValUUID, ValBytea, ValRange, ValJSONPath:
 		return v.renderIn(zone)
 	case ValNull:
 		panic("jsonKeyText: the caller rejects a NULL key")

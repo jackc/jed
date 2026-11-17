@@ -24,14 +24,14 @@ func TestSessionConfigurationValidation(t *testing.T) {
 			var db *Database
 			if readOnly {
 				path := filepath.Join(t.TempDir(), "db.jed")
-				created, err := CreateDatabase(CreateOptions{Path: path, Locking: LockingNone})
+				created, err := Create(CreateOptions{Path: path, Locking: LockingNone})
 				if err != nil {
 					t.Fatal(err)
 				}
 				if err := created.Close(); err != nil {
 					t.Fatal(err)
 				}
-				db, err = OpenDatabaseWithOptions(path, OpenOptions{ReadOnly: true, Locking: LockingNone})
+				db, err = Open(path, OpenOptions{ReadOnly: true, Locking: LockingNone})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -113,7 +113,7 @@ func TestDurationOptionsRejectNegativeBeforeIO(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			db, err := CreateDatabase(tc.create)
+			db, err := Create(tc.create)
 			requireInvalidOption(t, err)
 			if db != nil {
 				db.Close()
@@ -121,7 +121,7 @@ func TestDurationOptionsRejectNegativeBeforeIO(t *testing.T) {
 			}
 			path := filepath.Join(t.TempDir(), "new.jed")
 			tc.create.Path = path
-			db, err = CreateDatabase(tc.create)
+			db, err = Create(tc.create)
 			requireInvalidOption(t, err)
 			if db != nil {
 				db.Close()
@@ -130,7 +130,7 @@ func TestDurationOptionsRejectNegativeBeforeIO(t *testing.T) {
 			if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("create touched path: %v", err)
 			}
-			db, err = OpenDatabaseWithOptions(path, tc.open)
+			db, err = Open(path, tc.open)
 			requireInvalidOption(t, err)
 			if db != nil {
 				db.Close()
@@ -197,7 +197,7 @@ func TestDurationOptionDefaultsAndZero(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "db.jed")
-			db, err := CreateDatabase(CreateOptions{Path: path, Locking: LockingNone, FlushInterval: tc.value})
+			db, err := Create(CreateOptions{Path: path, Locking: LockingNone, FlushInterval: tc.value})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -207,7 +207,7 @@ func TestDurationOptionDefaultsAndZero(t *testing.T) {
 			if err := db.Close(); err != nil {
 				t.Fatal(err)
 			}
-			db, err = OpenDatabaseWithOptions(path, OpenOptions{Locking: LockingNone, FlushInterval: tc.value})
+			db, err = Open(path, OpenOptions{Locking: LockingNone, FlushInterval: tc.value})
 			if err != nil {
 				t.Fatal(err)
 			}

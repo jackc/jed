@@ -1464,7 +1464,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 	case reConstBytea:
 		return ByteaValue(e.cBytea), nil
 	case reConstUuid:
-		return UuidValue(e.cBytea), nil
+		return UUIDValue(e.cBytea), nil
 	case reConstTimestamp:
 		return TimestampValue(e.cInt), nil
 	case reConstTimestamptz:
@@ -1479,13 +1479,13 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		return Float64Value(e.cFloat), nil
 	case reConstJson:
 		// A json constant — its verbatim text (validated at resolve).
-		return JsonValue(e.cText), nil
+		return JSONValue(e.cText), nil
 	case reConstJsonPath:
 		// A jsonpath constant — its canonical normalized text (compiled + rendered at resolve).
-		return JsonPathValue(e.cText), nil
+		return JSONPathValue(e.cText), nil
 	case reConstJsonb:
 		// A jsonb constant — its canonical node tree (parsed + canonicalized at resolve).
-		return JsonbValue(*e.cJsonb), nil
+		return JSONBValue(*e.cJsonb), nil
 	case reConstNull:
 		return NullValue(), nil
 	case reCast:
@@ -1505,7 +1505,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
-			return JsonPathValue(jp.Render()), nil
+			return JSONPathValue(jp.Render()), nil
 		}
 		var out Value
 		if e.result.IsText() {
@@ -1524,7 +1524,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		}
 		// Rendering bytea (hex) or jsonb (escapes) to text, and jsonb to json, is a growth kernel
 		// (cost.md §8.1). The full render is charged, before any varchar(n) truncation below.
-		if (v.Kind == ValJsonb || v.Kind == ValBytea) && (out.Kind == ValText || out.Kind == ValJson) && !rexprIsConstant(e.operand) {
+		if (v.Kind == ValJSONB || v.Kind == ValBytea) && (out.Kind == ValText || out.Kind == ValJSON) && !rexprIsConstant(e.operand) {
 			if err := chargeOutput(m, out); err != nil {
 				return Value{}, err
 			}
@@ -1916,13 +1916,13 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if bv.Kind == ValNull || av.Kind == ValNull {
 			return NullValue(), nil
 		}
-		if bv.Kind == ValJson {
+		if bv.Kind == ValJSON {
 			return jsonGetVerbatim(e.jgop, bv.str(), av)
 		}
 		node := bv.jsonb() // resolver guarantees a json/jsonb base for an accessor operator
 		// Locate the accessed node: a key (text) / index (int) for `-> ->>`, or a text[] path for
 		// `#> #>>`. A NULL element inside the path array misses (PG).
-		var accessed *JsonNode
+		var accessed *JSONNode
 		switch e.jgop {
 		case jgArrow, jgArrowText:
 			if av.Kind == ValText {
@@ -1954,7 +1954,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		}
 		switch e.jgop {
 		case jgArrow, jgHashArrow:
-			return JsonbValue(*accessed), nil
+			return JSONBValue(*accessed), nil
 		default: // jgArrowText, jgHashArrowText
 			out := NullValue()
 			if s, ok := jsonNodeToText(accessed); ok {
@@ -2064,7 +2064,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err := checkJSONDepth(&out); err != nil {
 			return Value{}, err
 		}
-		return growthResult(m, []*rExpr{e.lhs, e.rhs}, JsonbValue(out))
+		return growthResult(m, []*rExpr{e.lhs, e.rhs}, JSONBValue(out))
 	case reJsonDelete:
 		// `jsonb - text|int|text[]` / `jsonb #- text[]` mutation deletes (json-sql-functions.md §1,
 		// J6). One operator_eval; STRICT — a NULL base or argument yields SQL NULL.
@@ -2084,7 +2084,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return NullValue(), nil
 		}
 		node := bv.jsonb() // resolver guarantees a jsonb base for - / #-
-		var result JsonNode
+		var result JSONNode
 		switch e.delKind {
 		case dkKey:
 			result, err = jsonDeleteKey(node, av.str()) // resolver guarantees a text arg for - key
@@ -2106,7 +2106,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		return JsonbValue(result), nil
+		return JSONBValue(result), nil
 	// AND / OR short-circuit left to right (cost.md §3): a FALSE left operand decides AND, a TRUE one
 	// decides OR, and the right operand is then never evaluated or charged.
 	case reAnd:
@@ -2159,10 +2159,10 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		switch v.Kind {
 		case ValNull:
 			return NullValue(), nil // a NULL operand → NULL (never raises)
-		case ValJsonb:
+		case ValJSONB:
 			// jsonb is always well-formed with unique keys; only the kind can fail.
 			ok = jsonPredKindMatches(v.jsonb(), e.jpKind)
-		case ValJson, ValText:
+		case ValJSON, ValText:
 			// A string / json operand: parse (preserving duplicate keys); malformed → false. Only the
 			// UNIQUE KEYS check reads string contents, so only it de-escapes (PG's need_escapes =
 			// check_unique_keys): a `\u0000` or unpaired surrogate is then a parse failure → false
@@ -2198,17 +2198,17 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				if _, perr := parseShapeJSON(v.str()); perr != nil {
 					return Value{}, perr
 				}
-				return JsonValue(v.str()), nil
+				return JSONValue(v.str()), nil
 			}
 			node, perr := parsePreservingJSON(v.str())
 			if perr != nil {
 				return Value{}, perr
 			}
 			if hasDuplicateKeys(&node) {
-				return Value{}, newError(DuplicateJsonObjectKeyValue, "duplicate JSON object key value")
+				return Value{}, newError(DuplicateJSONObjectKeyValue, "duplicate JSON object key value")
 			}
 			// The result is the verbatim input text as a `json` value (PG).
-			return JsonValue(v.str()), nil
+			return JSONValue(v.str()), nil
 		default:
 			panic("BUG: resolver restricts JSON() to a text operand")
 		}
@@ -3215,7 +3215,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
-			return UuidValue(b), nil
+			return UUIDValue(b), nil
 		case sfUuidv7:
 			clock := env.rng.statementClockMicros(env.exec.session.env)
 			shifted := clock
@@ -3240,7 +3240,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
-			return UuidValue(b), nil
+			return UUIDValue(b), nil
 		case sfNow:
 			// current-time functions (spec/design/entropy.md §5): now() reads the statement clock
 			// ONCE and reuses it (STABLE); clock_timestamp() reads the seam on every call
@@ -3337,7 +3337,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
-			return JsonbValue(jsonStripNulls(&node)), nil
+			return JSONBValue(jsonStripNulls(&node)), nil
 		case sfJsonStripNulls:
 			// json_strip_nulls returns json — render the stripped tree COMPACTLY (PG's json output
 			// style), preserving the on-demand parse's key order.
@@ -3346,7 +3346,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return Value{}, err
 			}
 			stripped := jsonStripNulls(&node)
-			return JsonValue(jsonCompactOut(&stripped)), nil
+			return JSONValue(jsonCompactOut(&stripped)), nil
 		case sfJsonbPretty:
 			r, err := jsonbPrettyText(vals[0], m)
 			if err != nil {
@@ -3358,9 +3358,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// is its verbatim text, a jsonb input its canonical render (jsonbOut). STRICT: the NULL-input
 			// case is handled by the blanket propagation above.
 			switch vals[0].Kind {
-			case ValJson:
+			case ValJSON:
 				return growthResult(m, e.sargs, TextValue(vals[0].str()))
-			case ValJsonb:
+			case ValJSONB:
 				return growthResult(m, e.sargs, TextValue(jsonbOut(vals[0].jsonb())))
 			default:
 				panic("BUG: resolver restricts JSON_SERIALIZE to json/jsonb")
@@ -4107,9 +4107,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				if err := checkJSONTextDepth(out); err != nil {
 					return Value{}, err
 				}
-				return growthResult(m, e.sargs, JsonValue(out))
+				return growthResult(m, e.sargs, JSONValue(out))
 			}
-			nodes := make([]JsonNode, len(vals))
+			nodes := make([]JSONNode, len(vals))
 			for i := range vals {
 				node, err := datumToJSONB(vals[i], elemTy(i), zone)
 				if err != nil {
@@ -4117,11 +4117,11 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				}
 				nodes[i] = node
 			}
-			out := JsonNode{Kind: JArray, Arr: nodes}
+			out := JSONNode{Kind: JArray, Arr: nodes}
 			if err := checkJSONDepth(&out); err != nil {
 				return Value{}, err
 			}
-			return growthResult(m, e.sargs, JsonbValue(out))
+			return growthResult(m, e.sargs, JSONBValue(out))
 		default: // jbObject
 			if len(vals)%2 != 0 {
 				return Value{}, newError(InvalidParameterValue,
@@ -4154,9 +4154,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				if err := checkJSONTextDepth(out); err != nil {
 					return Value{}, err
 				}
-				return growthResult(m, e.sargs, JsonValue(out))
+				return growthResult(m, e.sargs, JSONValue(out))
 			}
-			members := make([]JsonMember, 0, len(vals)/2)
+			members := make([]JSONMember, 0, len(vals)/2)
 			for i := 0; i < len(vals); i += 2 {
 				if vals[i].IsNull() {
 					return Value{}, newError(InvalidParameterValue,
@@ -4170,13 +4170,13 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				if err != nil {
 					return Value{}, err
 				}
-				members = append(members, JsonMember{Key: key, Val: node})
+				members = append(members, JSONMember{Key: key, Val: node})
 			}
 			out := makeObject(members)
 			if err := checkJSONDepth(&out); err != nil {
 				return Value{}, err
 			}
-			return growthResult(m, e.sargs, JsonbValue(out))
+			return growthResult(m, e.sargs, JSONBValue(out))
 		}
 	case reJsonObject:
 		// json_object / jsonb_object (json-sql-functions.md §2): build an object from text array(s).
@@ -4247,24 +4247,24 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				}
 				val := "null"
 				if p.val != nil {
-					val = jsonCompactOut(&JsonNode{Kind: JString, S: *p.val})
+					val = jsonCompactOut(&JSONNode{Kind: JString, S: *p.val})
 				}
-				parts = append(parts, jsonCompactOut(&JsonNode{Kind: JString, S: *p.key})+" : "+val)
+				parts = append(parts, jsonCompactOut(&JSONNode{Kind: JString, S: *p.key})+" : "+val)
 			}
-			return growthResult(m, e.sargs, JsonValue("{"+strings.Join(parts, ", ")+"}"))
+			return growthResult(m, e.sargs, JSONValue("{"+strings.Join(parts, ", ")+"}"))
 		}
-		members := make([]JsonMember, 0, len(pairs))
+		members := make([]JSONMember, 0, len(pairs))
 		for _, p := range pairs {
 			if p.key == nil {
 				return Value{}, objectKeyNull()
 			}
-			node := JsonNode{Kind: JNull}
+			node := JSONNode{Kind: JNull}
 			if p.val != nil {
-				node = JsonNode{Kind: JString, S: *p.val}
+				node = JSONNode{Kind: JString, S: *p.val}
 			}
-			members = append(members, JsonMember{Key: *p.key, Val: node})
+			members = append(members, JSONMember{Key: *p.key, Val: node})
 		}
-		return growthResult(m, e.sargs, JsonbValue(makeObject(members)))
+		return growthResult(m, e.sargs, JSONBValue(makeObject(members)))
 	case reJsonImage:
 		// A JSON-image function (json-sql-functions.md §2.2): to_json / to_jsonb / array_to_json /
 		// row_to_json / JSON_SCALAR. STRICT. A finite timestamptz at any depth charges one timezone unit, charged and
@@ -4300,7 +4300,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err := checkJSONDepth(&node); err != nil {
 				return Value{}, err
 			}
-			return growthResult(m, e.sargs, JsonbValue(node))
+			return growthResult(m, e.sargs, JSONBValue(node))
 		}
 		var b strings.Builder
 		var err error
@@ -4320,7 +4320,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err := checkJSONTextDepth(text); err != nil {
 			return Value{}, err
 		}
-		return growthResult(m, e.sargs, JsonValue(text))
+		return growthResult(m, e.sargs, JSONValue(text))
 	case reJsonSetInsert:
 		// jsonb_set / jsonb_insert (json-sql-functions.md §2): STRICT path mutation. Any NULL argument
 		// → SQL NULL (a NULL path element is the kernel's 22004). One operator_eval; the args charge their own.
@@ -4339,7 +4339,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return Value{}, err
 		}
 		target, pathV, valueV, flagV := args[0], args[1], args[2], args[3]
-		var valueNode JsonNode
+		var valueNode JSONNode
 		if e.psLax {
 			if target.Kind == ValNull || pathV.Kind == ValNull || flagV.Kind == ValNull {
 				return NullValue(), nil
@@ -4353,7 +4353,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				case "raise_exception":
 					return Value{}, nullValueRaised()
 				case "use_json_null":
-					valueNode = JsonNode{Kind: JNull}
+					valueNode = JSONNode{Kind: JNull}
 				case "delete_key":
 					// `#-` (jsonb_delete_path): removing a member never grows the document, so no
 					// output charge and no depth check.
@@ -4365,7 +4365,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 					if err != nil {
 						return Value{}, err
 					}
-					return JsonbValue(out), nil
+					return JSONBValue(out), nil
 				case "return_target":
 					return target, nil
 				default:
@@ -4387,7 +4387,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		}
 		node := *target.jsonb() // resolver guarantees a jsonb target
 		flag := flagV.Kind == ValBool && flagV.boolVal()
-		var out JsonNode
+		var out JSONNode
 		if e.psMode == psSet {
 			out, err = setPath(&node, path, &valueNode, flag)
 		} else {
@@ -4400,7 +4400,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err := checkJSONDepth(&out); err != nil {
 			return Value{}, err
 		}
-		return growthResult(m, e.sargs, JsonbValue(out))
+		return growthResult(m, e.sargs, JSONBValue(out))
 	case reJsonPathFn:
 		// A scalar jsonpath query function (P2, jsonpath.md §5). STRICT: a NULL argument → NULL.
 		m.Charge(costs.OperatorEval)
@@ -4454,7 +4454,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if len(seq) == 0 {
 				return NullValue(), nil
 			}
-			return JsonbValue(seq[0]), nil
+			return JSONBValue(seq[0]), nil
 		case jpfMatch, jpfMatchSilent:
 			// jsonb_path_match: the path must produce EXACTLY one boolean item (or a JSON null — an
 			// unknown predicate — which is SQL NULL). Silent (@@, or silent => true) suppresses
@@ -4469,14 +4469,14 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if silent {
 				return NullValue(), nil
 			}
-			return Value{}, newError(SingletonSqlJsonItemRequired, "single boolean result is expected")
+			return Value{}, newError(SingletonSQLJSONItemRequired, "single boolean result is expected")
 		default: // jpfQueryArray
 			// Wrapping the items in an array can deepen the result (json.md §6.4).
-			out := JsonNode{Kind: JArray, Arr: seq}
+			out := JSONNode{Kind: JArray, Arr: seq}
 			if err := checkJSONDepth(&out); err != nil {
 				return Value{}, err
 			}
-			return growthResult(m, e.sargs, JsonbValue(out))
+			return growthResult(m, e.sargs, JSONBValue(out))
 		}
 	case reJsonSqlFn:
 		// A SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY (json-sql-functions.md §5,
@@ -4854,7 +4854,7 @@ func evalArith(op binaryOp, x, y int64, result scalarType) (Value, error) {
 // element-wise T[] → text[] cast.
 func scalarToText(v Value, env *evalEnv, m *costMeter) (string, error) {
 	switch v.Kind {
-	case ValText, ValJson, ValJsonPath:
+	case ValText, ValJSON, ValJSONPath:
 		return v.str(), nil
 	case ValTimestamptz:
 		if v.Int != negInfinity && v.Int != posInfinity {
@@ -4880,14 +4880,14 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod, temporal *tempo
 			if err := validateJSON(v.str()); err != nil {
 				return Value{}, err
 			}
-			return JsonValue(v.str()), nil
+			return JSONValue(v.str()), nil
 		}
 		if target.IsJsonb() {
 			n, err := jsonbIn(v.str())
 			if err != nil {
 				return Value{}, err
 			}
-			return JsonbValue(n), nil
+			return JSONBValue(n), nil
 		}
 		// text → uuid (the uuid cast slice, casts.toml/types.md §14): the PG-flexible uuid_in parser;
 		// a malformed string traps 22P02.
@@ -4896,7 +4896,7 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod, temporal *tempo
 			if err != nil {
 				return Value{}, err
 			}
-			return UuidValue(b), nil
+			return UUIDValue(b), nil
 		}
 		// text → interval / bytea (types.md §5): the literal's own input per row — parseInterval
 		// (22007/22008) and the bytea input — `\x` hex or escape format (22P02). A runtime text is
@@ -4988,7 +4988,7 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod, temporal *tempo
 	}
 	// uuid → bytea (the 16 raw bytes) — the uuid cast slice (casts.toml/types.md §14). uuid → text
 	// is scalarToText.
-	if v.Kind == ValUuid {
+	if v.Kind == ValUUID {
 		if target.IsBytea() {
 			return ByteaValue([]byte(v.str())), nil
 		}
@@ -5002,32 +5002,32 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod, temporal *tempo
 				return Value{}, newError(InvalidTextRepresentation,
 					fmt.Sprintf("invalid length for type uuid: %d bytes (expected 16)", len(v.str())))
 			}
-			return UuidValue([]byte(v.str())), nil
+			return UUIDValue([]byte(v.str())), nil
 		}
 		panic("BUG: resolver rejects this bytea cast target")
 	}
 	// json → jsonb re-parses + canonicalizes; json → json is the identity (json → text is
 	// scalarToText: the identity on the verbatim bytes).
-	if v.Kind == ValJson {
+	if v.Kind == ValJSON {
 		switch {
 		case target.IsJson():
-			return JsonValue(v.str()), nil
+			return JSONValue(v.str()), nil
 		case target.IsJsonb():
 			n, err := jsonbIn(v.str())
 			if err != nil {
 				return Value{}, err
 			}
-			return JsonbValue(n), nil
+			return JSONBValue(n), nil
 		default:
 			panic("BUG: resolver rejects this json cast target")
 		}
 	}
 	// jsonb → json renders the canonical form (jsonb_out); jsonb → jsonb is the identity (jsonb →
 	// text is scalarToText).
-	if v.Kind == ValJsonb {
+	if v.Kind == ValJSONB {
 		switch {
 		case target.IsJson():
-			return JsonValue(jsonbOut(v.jsonb())), nil
+			return JSONValue(jsonbOut(v.jsonb())), nil
 		case target.IsJsonb():
 			return v, nil
 		default:
@@ -5324,7 +5324,7 @@ func jsonGetVerbatim(op jsonGetOp, text string, arg Value) (Value, error) {
 	}
 	switch op {
 	case jgArrow, jgHashArrow:
-		return JsonValue(sub), nil
+		return JSONValue(sub), nil
 	default: // jgArrowText, jgHashArrowText
 		s, ok, err := verbatimToText(sub)
 		if err != nil {

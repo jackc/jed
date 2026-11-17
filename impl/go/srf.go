@@ -1661,11 +1661,11 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 	}
 	// A json argument is de-escaped (PG lexes it with need_escapes), but PG raises a root
 	// container's kind error at its opening bracket, before lexing inside it (json.md §4.2).
-	var node JsonNode
+	var node JSONNode
 	switch {
-	case arg.Kind == ValJson && (sp.kind == srfJsonObjectKeys || sp.kind == srfJSONRecord):
+	case arg.Kind == ValJSON && (sp.kind == srfJsonObjectKeys || sp.kind == srfJSONRecord):
 		node, err = parsePreservingJSONUnlessRoot(arg.str(), '[')
-	case arg.Kind == ValJson && sp.kind == srfJSONRecordset:
+	case arg.Kind == ValJSON && sp.kind == srfJSONRecordset:
 		text := arg.str()
 		if start := skipJSONWS(text, 0); start < len(text) && text[start] == '[' {
 			return jsonRecordsetRowsVerbatim(sp, text, base, env, m)
@@ -1703,7 +1703,7 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 					}
 				}
 			} else {
-				v = JsonbValue(e)
+				v = JSONBValue(e)
 			}
 			out = append(out, storedRow{v})
 		}
@@ -1743,7 +1743,7 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 					}
 				}
 			} else {
-				value = JsonbValue(node.Obj[i].Val)
+				value = JSONBValue(node.Obj[i].Val)
 			}
 			out = append(out, storedRow{TextValue(node.Obj[i].Key), value})
 		}
@@ -1805,7 +1805,7 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 			return nil, err
 		}
 		opts := jpEvalOpts{vars: jpObjectVars(varsNode)}
-		var seq []JsonNode
+		var seq []JSONNode
 		if silentV.boolVal() {
 			seq, _, err = compiled.EvalSilent(node, opts, m)
 		} else {
@@ -1819,7 +1819,7 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
-			out = append(out, storedRow{JsonbValue(seq[i])})
+			out = append(out, storedRow{JSONBValue(seq[i])})
 		}
 	default:
 		panic("jsonSrfRows only handles the json SRF kinds")
@@ -1833,14 +1833,14 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 // forms) or SQL NULL (`base` nil, the `_to_record` forms); a non-object node → 22023. A `json`
 // document keeps duplicate keys, and the LAST one wins, as PostgreSQL's hash of the object does
 // (json-table.md §2). The base row is never modified.
-func jsonRecordRow(node *JsonNode, cols []catColumn, base storedRow, env *evalEnv, m *costMeter) (storedRow, error) {
+func jsonRecordRow(node *JSONNode, cols []catColumn, base storedRow, env *evalEnv, m *costMeter) (storedRow, error) {
 	if node.Kind != JObject {
 		return nil, newError(InvalidParameterValue, "argument of json_to_record must be a JSON object")
 	}
 	row := make(storedRow, 0, len(cols))
 	for ci := range cols {
 		col := &cols[ci]
-		var member *JsonNode
+		var member *JSONNode
 		for mi := range node.Obj {
 			if node.Obj[mi].Key == col.Name {
 				member = &node.Obj[mi].Val // last wins
@@ -1872,7 +1872,7 @@ func jsonRecordRow(node *JsonNode, cols []catColumn, base storedRow, env *evalEn
 // path): a `jsonb` column embeds the node, a `json` column its canonical text, every other scalar
 // coerces the node's `->>`-style text through the cast machinery (so `"42"` / `42` → an `int`
 // column, etc.). A composite/array column type is a deferred 0A000.
-func coerceJSONMember(node *JsonNode, colTy dataType, tm typmod, env *evalEnv, m *costMeter) (Value, error) {
+func coerceJSONMember(node *JSONNode, colTy dataType, tm typmod, env *evalEnv, m *costMeter) (Value, error) {
 	// A composite / array / range field type is a deferred 0A000 (only scalar / json / jsonb coerce
 	// this slice). R1's col-def list rejects these at resolve; R2's composite fields can carry one.
 	if _, ok := colTy.AsScalar(); !ok {
@@ -1881,9 +1881,9 @@ func coerceJSONMember(node *JsonNode, colTy dataType, tm typmod, env *evalEnv, m
 	st := colTy.ScalarTy()
 	switch {
 	case st == scalarJsonb:
-		return JsonbValue(*node), nil
+		return JSONBValue(*node), nil
 	case st == scalarJson:
-		return JsonValue(jsonbOut(node)), nil
+		return JSONValue(jsonbOut(node)), nil
 	default:
 		text, ok := jsonNodeToText(node)
 		if !ok {
@@ -1940,7 +1940,7 @@ func applyJSONBehavior(behavior jsonOnBehavior, clause jsonClause, defaults json
 		if err != nil {
 			return Value{}, err
 		}
-		if v.Kind != ValJsonb || returning == scalarJsonb {
+		if v.Kind != ValJSONB || returning == scalarJsonb {
 			return v, nil
 		}
 		out, err := coerceJSONMember(v.jsonb(), scalarT(returning), typmod{}, env, m)
@@ -1963,15 +1963,15 @@ func applyJSONBehavior(behavior jsonOnBehavior, clause jsonClause, defaults json
 	case jOBUnknown:
 		return NullValue(), nil
 	case jOBEmptyArray:
-		return jsonNodeAsReturning(JsonNode{Kind: JArray}, returning, env, m)
+		return jsonNodeAsReturning(JSONNode{Kind: JArray}, returning, env, m)
 	default: // JOBEmptyObject
-		return jsonNodeAsReturning(JsonNode{Kind: JObject}, returning, env, m)
+		return jsonNodeAsReturning(JSONNode{Kind: JObject}, returning, env, m)
 	}
 }
 
 // jsonNodeAsReturning renders a json result node as the RETURNING type: `jsonb` embeds, `json` its
 // canonical text, any other scalar coerces the node's `->>`-style text through the cast machinery.
-func jsonNodeAsReturning(node JsonNode, returning scalarType, env *evalEnv, m *costMeter) (Value, error) {
+func jsonNodeAsReturning(node JSONNode, returning scalarType, env *evalEnv, m *costMeter) (Value, error) {
 	return coerceJSONMember(&node, scalarT(returning), typmod{}, env, m)
 }
 
@@ -1979,24 +1979,24 @@ func jsonNodeAsReturning(node JsonNode, returning scalarType, env *evalEnv, m *c
 // evaluated sequence. (JSON_EXISTS is handled inline — non-empty → true.)
 // constant reports that the context and path are both constant operands, so a wrapped JSON_QUERY
 // result is free like any constant growth kernel (cost.md §8.1).
-func evalJSONSqlResult(kind jsonSqlKind, seq []JsonNode, returning scalarType, wrapper jsonWrapper, onEmpty, onError jsonOnBehavior, defaults jsonDefaults, constant bool, env *evalEnv, m *costMeter) (Value, error) {
+func evalJSONSqlResult(kind jsonSqlKind, seq []JSONNode, returning scalarType, wrapper jsonWrapper, onEmpty, onError jsonOnBehavior, defaults jsonDefaults, constant bool, env *evalEnv, m *costMeter) (Value, error) {
 	switch kind {
 	case jsExists:
 		return BoolValue(len(seq) > 0), nil
 	case jsValue:
 		if len(seq) == 0 {
-			return applyJSONBehavior(onEmpty, jsonClauseEmpty, defaults, newError(NoSqlJsonItem, "no SQL/JSON item"), returning, env, m)
+			return applyJSONBehavior(onEmpty, jsonClauseEmpty, defaults, newError(NoSQLJSONItem, "no SQL/JSON item"), returning, env, m)
 		}
 		if len(seq) > 1 {
 			return applyJSONBehavior(onError, jsonClauseError, defaults,
-				newError(MoreThanOneSqlJsonItem, "JSON path expression in JSON_VALUE should return singleton scalar item"),
+				newError(MoreThanOneSQLJSONItem, "JSON path expression in JSON_VALUE should return singleton scalar item"),
 				returning, env, m)
 		}
 		item := seq[0]
 		// JSON_VALUE requires a SCALAR item (PG 2203F otherwise).
 		if item.Kind == JArray || item.Kind == JObject {
 			return applyJSONBehavior(onError, jsonClauseError, defaults,
-				newError(SqlJsonScalarRequired, "JSON path expression in JSON_VALUE should return singleton scalar item"),
+				newError(SQLJSONScalarRequired, "JSON path expression in JSON_VALUE should return singleton scalar item"),
 				returning, env, m)
 		}
 		// Coerce the scalar to the RETURNING type (a JSON null → SQL NULL). A coercion failure is a
@@ -2012,23 +2012,23 @@ func evalJSONSqlResult(kind jsonSqlKind, seq []JsonNode, returning scalarType, w
 	default: // jsQuery
 		// Whether a wrapper built an array: then JSON_QUERY is a growth kernel (cost.md §8.1).
 		wrapped := wrapper == jWUnconditional || (wrapper == jWConditional && len(seq) != 1)
-		var node JsonNode
+		var node JSONNode
 		switch wrapper {
 		case jWUnconditional:
-			node = JsonNode{Kind: JArray, Arr: seq}
+			node = JSONNode{Kind: JArray, Arr: seq}
 		case jWConditional:
 			if len(seq) == 1 {
 				node = seq[0]
 			} else {
-				node = JsonNode{Kind: JArray, Arr: seq}
+				node = JSONNode{Kind: JArray, Arr: seq}
 			}
 		default: // JWWithout
 			if len(seq) == 0 {
-				return applyJSONBehavior(onEmpty, jsonClauseEmpty, defaults, newError(NoSqlJsonItem, "no SQL/JSON item"), returning, env, m)
+				return applyJSONBehavior(onEmpty, jsonClauseEmpty, defaults, newError(NoSQLJSONItem, "no SQL/JSON item"), returning, env, m)
 			}
 			if len(seq) > 1 {
 				return applyJSONBehavior(onError, jsonClauseError, defaults,
-					newError(MoreThanOneSqlJsonItem, "JSON path expression in JSON_QUERY should return singleton item without wrapper"),
+					newError(MoreThanOneSQLJSONItem, "JSON path expression in JSON_QUERY should return singleton item without wrapper"),
 					returning, env, m)
 			}
 			node = seq[0]
@@ -2202,7 +2202,7 @@ func jtEvalOpts(vars jpVars) jpEvalOpts { return jpEvalOpts{vars: vars} }
 // expandJtLevel expands a JSON_TABLE COLUMNS level over a sequence of row items → the sparse rows
 // (the parent→child LEFT OUTER product with sibling NESTED paths UNIONed, json-table.md §3.3). Every
 // path reads the PASSING variables vars.
-func expandJtLevel(cols []jtCol, items []JsonNode, vars jpVars, env *evalEnv, m *costMeter) ([][]jtAssign, error) {
+func expandJtLevel(cols []jtCol, items []JSONNode, vars jpVars, env *evalEnv, m *costMeter) ([][]jtAssign, error) {
 	var rows [][]jtAssign
 	for i := range items {
 		if err := m.Step(); err != nil {
@@ -2256,7 +2256,7 @@ func expandJtLevel(cols []jtCol, items []JsonNode, vars jpVars, env *evalEnv, m 
 // expandJtNested expands the NESTED siblings of a level over one parent item — the default-plan
 // UNION of the siblings (each row fills only its own subtree), with the parent→child LEFT OUTER fill
 // (no child rows at all → one all-NULL nested row).
-func expandJtNested(children []*jtColNested, item *JsonNode, vars jpVars, env *evalEnv, m *costMeter) ([][]jtAssign, error) {
+func expandJtNested(children []*jtColNested, item *JSONNode, vars jpVars, env *evalEnv, m *costMeter) ([][]jtAssign, error) {
 	if len(children) == 0 {
 		return [][]jtAssign{nil}, nil
 	}
@@ -2288,7 +2288,7 @@ func expandJtNested(children []*jtColNested, item *JsonNode, vars jpVars, env *e
 
 // evalJtRegular evaluates a regular JSON_TABLE column over a row item — JSON_VALUE (scalar) /
 // JSON_QUERY (json/jsonb) semantics, with the column's wrapper / ON EMPTY / ON ERROR.
-func evalJtRegular(item *JsonNode, c *jtColRegular, vars jpVars, env *evalEnv, m *costMeter) (Value, error) {
+func evalJtRegular(item *JSONNode, c *jtColRegular, vars jpVars, env *evalEnv, m *costMeter) (Value, error) {
 	defaults := jsonDefaults{onEmpty: c.onEmptyDefault, onError: c.onErrorDefault}
 	p, err := compileMetered(c.path, m, env.exec.session.env.propertyTable())
 	if err != nil {
@@ -2311,7 +2311,7 @@ func evalJtRegular(item *JsonNode, c *jtColRegular, vars jpVars, env *evalEnv, m
 
 // evalJtExists evaluates an EXISTS JSON_TABLE column over a row item — JSON_EXISTS, coerced to the
 // column type (a NON-empty sequence is true; a structural error honors ON ERROR, default FALSE).
-func evalJtExists(item *JsonNode, c *jtColExists, vars jpVars, prop *propertyTable, m *costMeter) (Value, error) {
+func evalJtExists(item *JSONNode, c *jtColExists, vars jpVars, prop *propertyTable, m *costMeter) (Value, error) {
 	p, err := compileMetered(c.path, m, prop)
 	if err != nil {
 		return Value{}, err
@@ -2491,7 +2491,7 @@ func jsonRecordsetRowsVerbatim(sp *srfPlan, text string, base storedRow, env *ev
 func jsonVerbatimSrfRows(kind srfKind, text string, m *costMeter) ([]storedRow, error) {
 	render := func(sub string, asText bool) (Value, error) {
 		if !asText {
-			return JsonValue(sub), nil
+			return JSONValue(sub), nil
 		}
 		s, ok, err := verbatimToText(sub)
 		if err != nil {

@@ -38,7 +38,7 @@ func forxWorkload(t *testing.T) string {
 	leafPatchCheck.Store(true)
 
 	path := filepath.Join(t.TempDir(), "forx.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 4096, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, PageSize: 4096, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func forxWorkload(t *testing.T) string {
 		if err := db.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if db, err = OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true}); err != nil {
+		if db, err = Open(path, OpenOptions{SkipFsync: true}); err != nil {
 			t.Fatal(err)
 		}
 		sess = mustSession(db, SessionOptions{})

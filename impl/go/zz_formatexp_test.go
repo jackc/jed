@@ -96,7 +96,7 @@ func expScale(n int) int {
 }
 
 func expBuild(t testing.TB, path string, pageSize uint32) *Database {
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: pageSize, SkipFsync: true, Credential: expCredential()})
+	db, err := Create(CreateOptions{Path: path, PageSize: pageSize, SkipFsync: true, Credential: expCredential()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -910,7 +910,7 @@ func expOne(t *testing.T, dir string, pageSize uint32, detail bool) expRun {
 	// Reopen: the first run of each query faults every leaf (read + CRC + directory validation, OS
 	// cache warm); later runs are resident.
 	db.Close()
-	db, err := OpenDatabase(path)
+	db, err := Open(path, OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1121,7 +1121,7 @@ func TestCommitWriteExperiment(t *testing.T) {
 	}
 	before := countRows(t, db, "orders")
 	db.Close()
-	db, err = OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true, Credential: expCredential()})
+	db, err = Open(path, OpenOptions{SkipFsync: true, Credential: expCredential()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1226,11 +1226,11 @@ func deferInteriorStress(t *testing.T, cred *Credential) {
 	setVerifyLivePages(true)
 	defer setVerifyLivePages(false)
 	path := filepath.Join(t.TempDir(), "defer.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true, Credential: cred})
+	db, err := Create(CreateOptions{Path: path, SkipFsync: true, Credential: cred})
 	if err != nil {
 		t.Fatal(err)
 	}
-	mem, err := CreateDatabase(CreateOptions{})
+	mem, err := Create(CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1319,7 +1319,7 @@ func deferInteriorStress(t *testing.T, cred *Credential) {
 		if i%400 == 399 {
 			pendingEntries := db.core.storage.paging.remap.len()
 			db.Close()
-			if db, err = OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true, Credential: cred}); err != nil {
+			if db, err = Open(path, OpenOptions{SkipFsync: true, Credential: cred}); err != nil {
 				t.Fatalf("commit %d: reopen: %v", i, err)
 			}
 			if got := db.core.storage.paging.remap.len(); got != pendingEntries {

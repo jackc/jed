@@ -2,7 +2,7 @@ package jed
 
 // Slice 7c — file-backed sessions + the default-session bridge (spec/design/session.md §2.4/§10).
 // These per-core tests cover what the corpus cannot express (host-API surface + concurrency +
-// on-disk durability): that CreateDatabase/OpenDatabase return the shared core with a stateful
+// on-disk durability): that Create/OpenDatabase return the shared core with a stateful
 // default session whose autocommit writes persist durably and survive a reopen; that file-backed
 // read sessions fault pages concurrently with a committing writer while staying snapshot-isolated;
 // and that a read-only open rejects writes (25006). The logical transaction/visibility semantics
@@ -29,7 +29,7 @@ func TestFileBackedRoundtripAndReopen(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "file_sessions_roundtrip.jed")
 	func() {
-		db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+		db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 		if err != nil {
 			t.Fatalf("create: %v", err)
 		}
@@ -53,7 +53,7 @@ func TestFileBackedRoundtripAndReopen(t *testing.T) {
 		}
 	}()
 
-	db, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true})
+	db, err := Open(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestFileBackedExplicitTransactionPersistsThenRollsBack(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "file_sessions_explicit_tx.jed")
 	func() {
-		db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+		db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 		if err != nil {
 			t.Fatalf("create: %v", err)
 		}
@@ -113,7 +113,7 @@ func TestFileBackedExplicitTransactionPersistsThenRollsBack(t *testing.T) {
 		}
 	}()
 
-	db, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true})
+	db, err := Open(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestFileBackedExecuteScriptIsAllOrNothing(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "file_sessions_script.jed")
 	func() {
-		db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+		db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 		if err != nil {
 			t.Fatalf("create: %v", err)
 		}
@@ -146,7 +146,7 @@ func TestFileBackedExecuteScriptIsAllOrNothing(t *testing.T) {
 		}
 	}()
 
-	db, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true})
+	db, err := Open(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestFileBackedReadOnlyOpenRejectsWrites(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "file_sessions_read_only.jed")
 	func() {
-		db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+		db, err := Create(CreateOptions{Path: path, SkipFsync: true})
 		if err != nil {
 			t.Fatalf("create: %v", err)
 		}
@@ -169,7 +169,7 @@ func TestFileBackedReadOnlyOpenRejectsWrites(t *testing.T) {
 		execDB(t, db, "INSERT INTO t VALUES (1)")
 	}()
 
-	db, err := OpenDatabaseWithOptions(path, OpenOptions{ReadOnly: true, SkipFsync: true})
+	db, err := Open(path, OpenOptions{ReadOnly: true, SkipFsync: true})
 	if err != nil {
 		t.Fatalf("open read-only: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestFileBackedReadersRunConcurrentlyWithAWriter(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "file_sessions_concurrent.jed")
 	func() {
 		// Small pages so the table spans several leaves (real faults).
-		db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})
+		db, err := Create(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})
 		if err != nil {
 			t.Fatalf("create: %v", err)
 		}
@@ -208,7 +208,7 @@ func TestFileBackedReadersRunConcurrentlyWithAWriter(t *testing.T) {
 		execDB(t, db, "INSERT INTO t VALUES (1)")
 	}()
 
-	db, err := OpenDatabaseWithOptions(path, OpenOptions{CacheBytes: 4 * 256, SkipFsync: true}) // a handful of resident leaves
+	db, err := Open(path, OpenOptions{CacheBytes: 4 * 256, SkipFsync: true}) // a handful of resident leaves
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestFileBackedReadersRunConcurrentlyWithAWriter(t *testing.T) {
 
 	// Reopen from scratch: every committed row is durable on disk.
 	db.Close()
-	reopened, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true})
+	reopened, err := Open(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

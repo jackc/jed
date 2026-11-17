@@ -9,14 +9,13 @@
 
 package jed
 
-// SqlState is a structured engine error's SQLSTATE. Its Code() string is the canonical 5-char
-// code from spec/errors/registry.toml (cross-checked in tests). Declaration order is registry
-// order and carries no meaning — the iota value is never serialized.
-type SqlState int
+// SQLState identifies the SQLSTATE of an [EngineError]. Code returns its five-character code.
+// The numeric value carries no meaning: compare SQLState constants, or compare Code strings.
+type SQLState int
 
 const (
 	// ConnectionFailure is 08006 — {detail}.
-	ConnectionFailure SqlState = iota
+	ConnectionFailure SQLState = iota
 	// TransactionResolutionUnknown is 08007 — {detail}.
 	TransactionResolutionUnknown
 	// ProtocolViolation is 08P01 — {detail}.
@@ -71,30 +70,30 @@ const (
 	InvalidRegularExpression
 	// ArraySubscriptError is 2202E — {detail}.
 	ArraySubscriptError
-	// DuplicateJsonObjectKeyValue is 22030 — duplicate JSON object key value.
-	DuplicateJsonObjectKeyValue
-	// SqlJsonArrayNotFound is 22039 — {detail}.
-	SqlJsonArrayNotFound
-	// SqlJsonMemberNotFound is 2203A — {detail}.
-	SqlJsonMemberNotFound
-	// SqlJsonNumberNotFound is 2203B — {detail}.
-	SqlJsonNumberNotFound
-	// SqlJsonObjectNotFound is 2203C — {detail}.
-	SqlJsonObjectNotFound
-	// SqlJsonScalarRequired is 2203F — {detail}.
-	SqlJsonScalarRequired
-	// InvalidArgumentForSqlJsonDatetimeFunction is 22031 — {detail}.
-	InvalidArgumentForSqlJsonDatetimeFunction
-	// InvalidSqlJsonSubscript is 22033 — {detail}.
-	InvalidSqlJsonSubscript
-	// MoreThanOneSqlJsonItem is 22034 — {detail}.
-	MoreThanOneSqlJsonItem
-	// NoSqlJsonItem is 22035 — {detail}.
-	NoSqlJsonItem
-	// NonNumericSqlJsonItem is 22036 — {detail}.
-	NonNumericSqlJsonItem
-	// SingletonSqlJsonItemRequired is 22038 — {detail}.
-	SingletonSqlJsonItemRequired
+	// DuplicateJSONObjectKeyValue is 22030 — duplicate JSON object key value.
+	DuplicateJSONObjectKeyValue
+	// SQLJSONArrayNotFound is 22039 — {detail}.
+	SQLJSONArrayNotFound
+	// SQLJSONMemberNotFound is 2203A — {detail}.
+	SQLJSONMemberNotFound
+	// SQLJSONNumberNotFound is 2203B — {detail}.
+	SQLJSONNumberNotFound
+	// SQLJSONObjectNotFound is 2203C — {detail}.
+	SQLJSONObjectNotFound
+	// SQLJSONScalarRequired is 2203F — {detail}.
+	SQLJSONScalarRequired
+	// InvalidArgumentForSQLJSONDatetimeFunction is 22031 — {detail}.
+	InvalidArgumentForSQLJSONDatetimeFunction
+	// InvalidSQLJSONSubscript is 22033 — {detail}.
+	InvalidSQLJSONSubscript
+	// MoreThanOneSQLJSONItem is 22034 — {detail}.
+	MoreThanOneSQLJSONItem
+	// NoSQLJSONItem is 22035 — {detail}.
+	NoSQLJSONItem
+	// NonNumericSQLJSONItem is 22036 — {detail}.
+	NonNumericSQLJSONItem
+	// SingletonSQLJSONItemRequired is 22038 — {detail}.
+	SingletonSQLJSONItemRequired
 	// InvalidTextRepresentation is 22P02 — invalid input syntax for type {type}: {detail}.
 	InvalidTextRepresentation
 	// UntranslatableCharacter is 22P05 — unsupported Unicode escape sequence.
@@ -109,14 +108,14 @@ const (
 	ForeignKeyViolation
 	// ExclusionViolation is 23P01 — conflicting key value violates exclusion constraint: {name}.
 	ExclusionViolation
-	// ActiveSqlTransaction is 25001 — there is already a transaction in progress.
-	ActiveSqlTransaction
-	// ReadOnlySqlTransaction is 25006 — cannot execute {statement} in a read-only transaction.
-	ReadOnlySqlTransaction
-	// NoActiveSqlTransaction is 25P01 — {statement} can only be used in transaction blocks.
-	NoActiveSqlTransaction
-	// InFailedSqlTransaction is 25P02 — current transaction is aborted, commands ignored until end of transaction block.
-	InFailedSqlTransaction
+	// ActiveSQLTransaction is 25001 — there is already a transaction in progress.
+	ActiveSQLTransaction
+	// ReadOnlySQLTransaction is 25006 — cannot execute {statement} in a read-only transaction.
+	ReadOnlySQLTransaction
+	// NoActiveSQLTransaction is 25P01 — {statement} can only be used in transaction blocks.
+	NoActiveSQLTransaction
+	// InFailedSQLTransaction is 25P02 — current transaction is aborted, commands ignored until end of transaction block.
+	InFailedSQLTransaction
 	// IdleInTransactionSessionTimeout is 25P03 — {detail}.
 	IdleInTransactionSessionTimeout
 	// DependentObjectsStillExist is 2BP01 — cannot drop type {name} because other objects depend on it: {detail}.
@@ -233,8 +232,8 @@ const (
 	LockNotAvailable
 	// QueryCanceled is 57014 — canceling statement due to user request.
 	QueryCanceled
-	// IoError is 58030 — I/O error: {detail}.
-	IoError
+	// IOError is 58030 — I/O error: {detail}.
+	IOError
 	// UndefinedFile is 58P01 — database file does not exist: {path}.
 	UndefinedFile
 	// DuplicateFile is 58P02 — database file already exists: {path}.
@@ -247,8 +246,11 @@ const (
 	UnparsableStoredDefinition
 )
 
-// Code returns the canonical SQLSTATE string.
-func (s SqlState) Code() string {
+// String returns the five-character SQLSTATE code, as Code does.
+func (s SQLState) String() string { return s.Code() }
+
+// Code returns the five-character SQLSTATE code, such as "23505".
+func (s SQLState) Code() string {
 	switch s {
 	case ConnectionFailure:
 		return "08006"
@@ -306,29 +308,29 @@ func (s SqlState) Code() string {
 		return "2201B"
 	case ArraySubscriptError:
 		return "2202E"
-	case DuplicateJsonObjectKeyValue:
+	case DuplicateJSONObjectKeyValue:
 		return "22030"
-	case SqlJsonArrayNotFound:
+	case SQLJSONArrayNotFound:
 		return "22039"
-	case SqlJsonMemberNotFound:
+	case SQLJSONMemberNotFound:
 		return "2203A"
-	case SqlJsonNumberNotFound:
+	case SQLJSONNumberNotFound:
 		return "2203B"
-	case SqlJsonObjectNotFound:
+	case SQLJSONObjectNotFound:
 		return "2203C"
-	case SqlJsonScalarRequired:
+	case SQLJSONScalarRequired:
 		return "2203F"
-	case InvalidArgumentForSqlJsonDatetimeFunction:
+	case InvalidArgumentForSQLJSONDatetimeFunction:
 		return "22031"
-	case InvalidSqlJsonSubscript:
+	case InvalidSQLJSONSubscript:
 		return "22033"
-	case MoreThanOneSqlJsonItem:
+	case MoreThanOneSQLJSONItem:
 		return "22034"
-	case NoSqlJsonItem:
+	case NoSQLJSONItem:
 		return "22035"
-	case NonNumericSqlJsonItem:
+	case NonNumericSQLJSONItem:
 		return "22036"
-	case SingletonSqlJsonItemRequired:
+	case SingletonSQLJSONItemRequired:
 		return "22038"
 	case InvalidTextRepresentation:
 		return "22P02"
@@ -344,13 +346,13 @@ func (s SqlState) Code() string {
 		return "23503"
 	case ExclusionViolation:
 		return "23P01"
-	case ActiveSqlTransaction:
+	case ActiveSQLTransaction:
 		return "25001"
-	case ReadOnlySqlTransaction:
+	case ReadOnlySQLTransaction:
 		return "25006"
-	case NoActiveSqlTransaction:
+	case NoActiveSQLTransaction:
 		return "25P01"
-	case InFailedSqlTransaction:
+	case InFailedSQLTransaction:
 		return "25P02"
 	case IdleInTransactionSessionTimeout:
 		return "25P03"
@@ -468,7 +470,7 @@ func (s SqlState) Code() string {
 		return "55P03"
 	case QueryCanceled:
 		return "57014"
-	case IoError:
+	case IOError:
 		return "58030"
 	case UndefinedFile:
 		return "58P01"

@@ -417,7 +417,7 @@ func TestErrorFieldsFloatOverflowDataTypes(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			db, err := CreateDatabase(CreateOptions{})
+			db, err := Create(CreateOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}

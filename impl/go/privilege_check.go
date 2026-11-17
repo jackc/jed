@@ -265,8 +265,8 @@ func exprCallsSeqMutator(e *exprNode) bool {
 		return exprCallsSeqMutator(&e.JsonExists.Ctx) || exprCallsSeqMutator(&e.JsonExists.Path) ||
 			passingAny(e.JsonExists.Passing, exprCallsSeqMutator)
 	case exprJsonValue:
-		return exprCallsSeqMutator(&e.JsonValue.Ctx) || exprCallsSeqMutator(&e.JsonValue.Path) ||
-			passingAny(e.JsonValue.Passing, exprCallsSeqMutator)
+		return exprCallsSeqMutator(&e.JSONValue.Ctx) || exprCallsSeqMutator(&e.JSONValue.Path) ||
+			passingAny(e.JSONValue.Passing, exprCallsSeqMutator)
 	case exprJsonQuery:
 		return exprCallsSeqMutator(&e.JsonQuery.Ctx) || exprCallsSeqMutator(&e.JsonQuery.Path) ||
 			passingAny(e.JsonQuery.Passing, exprCallsSeqMutator)
@@ -851,7 +851,7 @@ func (db *engine) dropViewTargetsTemp(dv *dropView) bool {
 func (db *engine) gateReadLanes(stmt statement) error {
 	db.session.resetStatementMemory()
 	if db.session.tx != nil && db.session.tx.failed {
-		return newError(InFailedSqlTransaction,
+		return newError(InFailedSQLTransaction,
 			"current transaction is aborted, commands ignored until end of transaction block")
 	}
 	if err := db.checkLifetimeAdmission(); err != nil {
@@ -1311,10 +1311,10 @@ func collectExprPrivs(e *exprNode, req *privReq, locals map[string]bool) {
 			collectExprPrivs(&e.JsonExists.Passing[i].Expr, req, locals)
 		}
 	case exprJsonValue:
-		collectExprPrivs(&e.JsonValue.Ctx, req, locals)
-		collectExprPrivs(&e.JsonValue.Path, req, locals)
-		for i := range e.JsonValue.Passing {
-			collectExprPrivs(&e.JsonValue.Passing[i].Expr, req, locals)
+		collectExprPrivs(&e.JSONValue.Ctx, req, locals)
+		collectExprPrivs(&e.JSONValue.Path, req, locals)
+		for i := range e.JSONValue.Passing {
+			collectExprPrivs(&e.JSONValue.Passing[i].Expr, req, locals)
 		}
 	case exprJsonQuery:
 		collectExprPrivs(&e.JsonQuery.Ctx, req, locals)
@@ -1438,8 +1438,8 @@ func exprReadsColumns(e *exprNode) bool {
 		return exprReadsColumns(&e.JsonExists.Ctx) || exprReadsColumns(&e.JsonExists.Path) ||
 			passingAny(e.JsonExists.Passing, exprReadsColumns)
 	case exprJsonValue:
-		return exprReadsColumns(&e.JsonValue.Ctx) || exprReadsColumns(&e.JsonValue.Path) ||
-			passingAny(e.JsonValue.Passing, exprReadsColumns)
+		return exprReadsColumns(&e.JSONValue.Ctx) || exprReadsColumns(&e.JSONValue.Path) ||
+			passingAny(e.JSONValue.Passing, exprReadsColumns)
 	case exprJsonQuery:
 		return exprReadsColumns(&e.JsonQuery.Ctx) || exprReadsColumns(&e.JsonQuery.Path) ||
 			passingAny(e.JsonQuery.Passing, exprReadsColumns)

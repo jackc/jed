@@ -32,12 +32,12 @@ import (
 	jed "github.com/jackc/jed/impl/go"
 )
 
-// memDB builds a fresh in-memory database, unwrapping the infallible in-memory CreateDatabase
+// memDB builds a fresh in-memory database, unwrapping the infallible in-memory Create
 // (spec/design/api.md §2.1.1 — the in-memory create cannot fail, so the harness wraps it).
 func memDB() *jed.Database {
-	db, err := jed.CreateDatabase(jed.CreateOptions{})
+	db, err := jed.Create(jed.CreateOptions{})
 	if err != nil {
-		panic("in-memory CreateDatabase is infallible: " + err.Error())
+		panic("in-memory Create is infallible: " + err.Error())
 	}
 	return db
 }

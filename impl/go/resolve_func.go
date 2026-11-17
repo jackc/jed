@@ -2280,11 +2280,11 @@ func jsonOpSymbol(op binaryOp) string {
 // jsonArgNode is the node tree of a json/jsonb function argument: a jsonb value IS the canonical
 // node; a json value is parsed from its verbatim text on demand, preserving key order + duplicates
 // (json.md §4). The resolver restricts a json/jsonb function argument to json/jsonb.
-func jsonArgNode(v Value) (JsonNode, error) {
+func jsonArgNode(v Value) (JSONNode, error) {
 	switch v.Kind {
-	case ValJsonb:
+	case ValJSONB:
 		return *v.jsonb(), nil
-	case ValJson:
+	case ValJSON:
 		return parsePreservingJSON(v.str())
 	default:
 		panic("jsonArgNode: a json/jsonb function argument must be json/jsonb")
@@ -2294,11 +2294,11 @@ func jsonArgNode(v Value) (JsonNode, error) {
 // jsonArgShape is jsonArgNode for a function that never reads string contents (json_typeof,
 // json_array_length): a json value is only lexed, as PostgreSQL does without need_escapes, so a
 // `\u0000` or an unpaired surrogate inside it does not raise (json.md §4.2).
-func jsonArgShape(v Value) (JsonNode, error) {
+func jsonArgShape(v Value) (JSONNode, error) {
 	switch v.Kind {
-	case ValJsonb:
+	case ValJSONB:
 		return *v.jsonb(), nil
-	case ValJson:
+	case ValJSON:
 		return parseShapeJSON(v.str())
 	default:
 		panic("jsonArgShape: a json/jsonb function argument must be json/jsonb")
@@ -2846,29 +2846,29 @@ func passingBindings(exprs []*rExpr, names []string, row storedRow, env *evalEnv
 		if err != nil {
 			return nil, err
 		}
-		var node JsonNode
+		var node JSONNode
 		switch v.Kind {
 		case ValNull:
-			node = JsonNode{Kind: JNull}
+			node = JSONNode{Kind: JNull}
 		case ValBool:
-			node = JsonNode{Kind: JBool, B: v.boolVal()}
+			node = JSONNode{Kind: JBool, B: v.boolVal()}
 		case ValInt:
-			node = JsonNode{Kind: JNumber, Num: decimalFromInt64(v.Int)}
+			node = JSONNode{Kind: JNumber, Num: decimalFromInt64(v.Int)}
 		case ValDecimal:
-			node = JsonNode{Kind: JNumber, Num: *v.decimal()}
+			node = JSONNode{Kind: JNumber, Num: *v.decimal()}
 		case ValFloat32, ValFloat64:
 			f, bits := floatOf(v)
 			if math.IsNaN(f) || math.IsInf(f, 0) {
 				return nil, newError(FeatureNotSupported, "a NaN or infinite float PASSING value is not supported yet")
 			}
 			if bits == 32 {
-				node = JsonNode{Kind: JNumber, Num: decimalFromFloat32FltDig(v.F32())}
+				node = JSONNode{Kind: JNumber, Num: decimalFromFloat32FltDig(v.F32())}
 			} else {
-				node = JsonNode{Kind: JNumber, Num: decimalFromFloat64DblDig(f)}
+				node = JSONNode{Kind: JNumber, Num: decimalFromFloat64DblDig(f)}
 			}
 		case ValText:
-			node = JsonNode{Kind: JString, S: v.str()}
-		case ValJsonb:
+			node = JSONNode{Kind: JString, S: v.str()}
+		case ValJSONB:
 			node = *v.jsonb()
 		case ValBytea:
 			// FORMAT JSON on a bytea value: UTF-8 encoded JSON text, parsed as the text cast does.
@@ -2959,7 +2959,7 @@ func resolveJsonpathArgs(s *scope, name string, args []*exprNode, argNames []*st
 		}
 		vars = v
 	} else {
-		vars = valueToRExpr(JsonbValue(JsonNode{Kind: JObject}))
+		vars = valueToRExpr(JSONBValue(JSONNode{Kind: JObject}))
 	}
 	var silent *rExpr
 	if slots[3] != nil {
@@ -2983,8 +2983,8 @@ func resolveJsonpathArgs(s *scope, name string, args []*exprNode, argNames []*st
 // value (the SQL/JSON query functions and JSON_TABLE admit a `text` context item, with or without
 // FORMAT JSON — json-sql-functions.md §5.1) parsed as jsonb: malformed text is 22P02, raised by
 // the context's conversion, outside ON ERROR (json.md §4.2), as in PostgreSQL.
-func jsonpathContextNode(v Value) (JsonNode, error) {
-	if v.Kind == ValJson || v.Kind == ValText {
+func jsonpathContextNode(v Value) (JSONNode, error) {
+	if v.Kind == ValJSON || v.Kind == ValText {
 		return jsonbIn(v.str())
 	}
 	return jsonArgNode(v)
@@ -2995,7 +2995,7 @@ func jsonpathContextNode(v Value) (JsonNode, error) {
 // ok=false (→ SQL NULL / zero rows). Compiling and evaluating are metered (jsonpath.md §7). In silent
 // mode a SQL/JSON error ends the evaluation: the items found before it are returned with
 // errored = true.
-func evalJsonpath(ctx, path Value, opts jpEvalOpts, silent bool, m *costMeter) (seq []JsonNode, ok, errored bool, err error) {
+func evalJsonpath(ctx, path Value, opts jpEvalOpts, silent bool, m *costMeter) (seq []JSONNode, ok, errored bool, err error) {
 	if ctx.Kind == ValNull || path.Kind == ValNull {
 		return nil, false, false, nil
 	}
@@ -3013,7 +3013,7 @@ func evalJsonpath(ctx, path Value, opts jpEvalOpts, silent bool, m *costMeter) (
 // evalJsonpathOn evaluates a non-NULL jsonpath over an already-read context node: recompiling the
 // path's canonical text charges jsonpath_compile (jsonpath.md §7). In silent mode a SQL/JSON error
 // ends the evaluation: the items found before it are returned with errored = true.
-func evalJsonpathOn(node JsonNode, path Value, opts jpEvalOpts, silent bool, m *costMeter) (seq []JsonNode, errored bool, err error) {
+func evalJsonpathOn(node JSONNode, path Value, opts jpEvalOpts, silent bool, m *costMeter) (seq []JSONNode, errored bool, err error) {
 	// The resolver restricts a jsonpath argument to jsonpath (its canonical text in Str).
 	compiled, err := compileMetered(path.str(), m, opts.prop)
 	if err != nil {

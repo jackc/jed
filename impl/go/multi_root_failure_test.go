@@ -79,7 +79,7 @@ func wantCode(t *testing.T, err error, code string) {
 func TestFailedMainPersistLeavesInMemoryAttachmentIntact(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "multi_root_failure.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestFailedMainPersistLeavesInMemoryAttachmentIntact(t *testing.T) {
 
 func TestFailedLaterAttachmentLeavesEarlierAttachmentIntact(t *testing.T) {
 	t.Parallel()
-	db, err := CreateDatabase(CreateOptions{PageSize: 256})
+	db, err := Create(CreateOptions{PageSize: 256})
 	if err != nil {
 		t.Fatal(err)
 	}

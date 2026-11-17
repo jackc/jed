@@ -281,7 +281,7 @@ func (s *specializationReadStore) readAt(off int64, n int) ([]byte, error) {
 	s.offsets = append(s.offsets, off)
 	if len(s.offsets) == 2 {
 		if s.fail {
-			return nil, newError(IoError, "specialization injected read failure")
+			return nil, newError(IOError, "specialization injected read failure")
 		}
 		close(s.done)
 	}
@@ -290,7 +290,7 @@ func (s *specializationReadStore) readAt(off int64, n int) ([]byte, error) {
 
 func TestSpecializationFileFaultOrder(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "faults.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true, PageSize: 256})
+	db, err := Create(CreateOptions{Path: path, SkipFsync: true, PageSize: 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +307,7 @@ func TestSpecializationFileFaultOrder(t *testing.T) {
 			code    string
 		}
 		run := func(ordinary bool, limit string) result {
-			db, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true, CacheBytes: 512})
+			db, err := Open(path, OpenOptions{SkipFsync: true, CacheBytes: 512})
 			if err != nil {
 				t.Fatal(err)
 			}

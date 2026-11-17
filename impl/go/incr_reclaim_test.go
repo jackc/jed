@@ -15,7 +15,7 @@ func TestIncrReclaimReaderHoldsOnlyNewerGenerations(t *testing.T) {
 		t.Skip("a Go-only prototype that disables incremental reclamation is on")
 	}
 	path := filepath.Join(t.TempDir(), "incr.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -492,7 +492,7 @@ func encodeDecimalBody(d Decimal, out []byte) []byte {
 // encodeJsonbBody serializes a jsonb node tree into out (the body bytes — spec/design/json.md §2.1).
 // Object members are already in canonical key order (the canonicalizer's invariant); each member's
 // key is itself a string node (ntagString), so the dictionary door covers keys and values uniformly.
-func encodeJsonbBody(node *JsonNode, out []byte) []byte {
+func encodeJsonbBody(node *JSONNode, out []byte) []byte {
 	switch node.Kind {
 	case JNull:
 		return append(out, ntagNull)
@@ -533,116 +533,116 @@ func encodeJsonbBody(node *JsonNode, out []byte) []byte {
 // decodeJsonbBody deserializes a jsonb node from buf at pos (inverse of encodeJsonbBody). A nonzero
 // flag nibble, the reserved ntagStringDict (no dictionary slice yet), or an unknown kind is XX001
 // data_corrupted (spec/design/json.md §3.1/§6.3).
-func decodeJsonbBody(buf []byte, pos *int, mode decodeMode) (JsonNode, error) {
+func decodeJsonbBody(buf []byte, pos *int, mode decodeMode) (JSONNode, error) {
 	return decodeJsonbNode(buf, pos, mode, 0)
 }
 
 // decodeJsonbNode is decodeJsonbBody at container nesting depth. A conformant engine never writes a
 // body deeper than maxJSONDepth, so entering a deeper container is XX001 — checked BEFORE recursing,
 // which bounds this decoder's own recursion (spec/design/json.md §6.4).
-func decodeJsonbNode(buf []byte, pos *int, mode decodeMode, depth int) (JsonNode, error) {
+func decodeJsonbNode(buf []byte, pos *int, mode decodeMode, depth int) (JSONNode, error) {
 	tag, err := readU8(buf, pos)
 	if err != nil {
-		return JsonNode{}, err
+		return JSONNode{}, err
 	}
 	if tag&0xf0 != 0 {
-		return JsonNode{}, newError(DataCorrupted, "jsonb node tag has a reserved flag bit set")
+		return JSONNode{}, newError(DataCorrupted, "jsonb node tag has a reserved flag bit set")
 	}
 	switch tag & 0x0f {
 	case ntagNull:
-		return JsonNode{Kind: JNull}, nil
+		return JSONNode{Kind: JNull}, nil
 	case ntagFalse:
-		return JsonNode{Kind: JBool, B: false}, nil
+		return JSONNode{Kind: JBool, B: false}, nil
 	case ntagTrue:
-		return JsonNode{Kind: JBool, B: true}, nil
+		return JSONNode{Kind: JBool, B: true}, nil
 	case ntagNumber:
 		dv, err := decodeDecimalBody(buf, pos, mode)
 		if err != nil {
-			return JsonNode{}, err
+			return JSONNode{}, err
 		}
 		if !mode.constructs() {
-			return JsonNode{}, nil // skip-mode placeholder (decimal body advanced, not built)
+			return JSONNode{}, nil // skip-mode placeholder (decimal body advanced, not built)
 		}
-		return JsonNode{Kind: JNumber, Num: *dv.decimal()}, nil
+		return JSONNode{Kind: JNumber, Num: *dv.decimal()}, nil
 	case ntagString:
 		s, err := decodeJsonbString(buf, pos, mode)
 		if err != nil {
-			return JsonNode{}, err
+			return JSONNode{}, err
 		}
 		if !mode.constructs() {
-			return JsonNode{}, nil // skip-mode placeholder
+			return JSONNode{}, nil // skip-mode placeholder
 		}
-		return JsonNode{Kind: JString, S: s}, nil
+		return JSONNode{Kind: JString, S: s}, nil
 	case ntagStringDict:
-		return JsonNode{}, newError(DataCorrupted, "jsonb string-dictionary reference before the dictionary slice")
+		return JSONNode{}, newError(DataCorrupted, "jsonb string-dictionary reference before the dictionary slice")
 	case ntagArray:
 		depth, err := jsonbDescend(depth)
 		if err != nil {
-			return JsonNode{}, err
+			return JSONNode{}, err
 		}
 		count, err := readUvarint(buf, pos)
 		if err != nil {
-			return JsonNode{}, err
+			return JSONNode{}, err
 		}
-		var elems []JsonNode
+		var elems []JSONNode
 		if mode.constructs() {
-			elems = make([]JsonNode, 0, minCap(count))
+			elems = make([]JSONNode, 0, minCap(count))
 		}
 		for i := uint64(0); i < count; i++ {
 			child, err := decodeJsonbNode(buf, pos, mode, depth)
 			if err != nil {
-				return JsonNode{}, err
+				return JSONNode{}, err
 			}
 			if mode.constructs() {
 				elems = append(elems, child)
 			}
 		}
-		return JsonNode{Kind: JArray, Arr: elems}, nil
+		return JSONNode{Kind: JArray, Arr: elems}, nil
 	case ntagObject:
 		depth, err := jsonbDescend(depth)
 		if err != nil {
-			return JsonNode{}, err
+			return JSONNode{}, err
 		}
 		count, err := readUvarint(buf, pos)
 		if err != nil {
-			return JsonNode{}, err
+			return JSONNode{}, err
 		}
-		var members []JsonMember
+		var members []JSONMember
 		if mode.constructs() {
-			members = make([]JsonMember, 0, minCap(count))
+			members = make([]JSONMember, 0, minCap(count))
 		}
 		for i := uint64(0); i < count; i++ {
 			// Each member's key is a string node (ntagString / reserved ntagStringDict).
 			ktag, err := readU8(buf, pos)
 			if err != nil {
-				return JsonNode{}, err
+				return JSONNode{}, err
 			}
 			if ktag&0xf0 != 0 {
-				return JsonNode{}, newError(DataCorrupted, "jsonb object key tag has a reserved flag bit set")
+				return JSONNode{}, newError(DataCorrupted, "jsonb object key tag has a reserved flag bit set")
 			}
 			switch ktag & 0x0f {
 			case ntagString:
 				// fall through to read the key payload below
 			case ntagStringDict:
-				return JsonNode{}, newError(DataCorrupted, "jsonb string-dictionary reference before the dictionary slice")
+				return JSONNode{}, newError(DataCorrupted, "jsonb string-dictionary reference before the dictionary slice")
 			default:
-				return JsonNode{}, newError(DataCorrupted, "jsonb object key is not a string node")
+				return JSONNode{}, newError(DataCorrupted, "jsonb object key is not a string node")
 			}
 			key, err := decodeJsonbString(buf, pos, mode)
 			if err != nil {
-				return JsonNode{}, err
+				return JSONNode{}, err
 			}
 			val, err := decodeJsonbNode(buf, pos, mode, depth)
 			if err != nil {
-				return JsonNode{}, err
+				return JSONNode{}, err
 			}
 			if mode.constructs() {
-				members = append(members, JsonMember{Key: key, Val: val})
+				members = append(members, JSONMember{Key: key, Val: val})
 			}
 		}
-		return JsonNode{Kind: JObject, Obj: members}, nil
+		return JSONNode{Kind: JObject, Obj: members}, nil
 	default:
-		return JsonNode{}, newError(DataCorrupted, "unknown jsonb node tag")
+		return JSONNode{}, newError(DataCorrupted, "unknown jsonb node tag")
 	}
 }
 
@@ -702,16 +702,16 @@ func encodeScalar(ty scalarType, v Value) []byte {
 	case ValRange:
 		// A range value is encoded by encodeValue's range arm, never here.
 		panic("BUG: a range value reached the scalar codec")
-	case ValJsonPath:
+	case ValJSONPath:
 		// jsonpath is literal-only (non-storable), so a value never reaches the codec.
 		panic("BUG: a jsonpath value reached the scalar codec")
-	case ValJson:
+	case ValJSON:
 		// json: the verbatim text body, length-prefixed exactly like text (spec/design/json.md §4).
 		out := make([]byte, 0, 3+len(v.str()))
 		out = append(out, 0x00) // present
 		out = appendU16(out, uint16(len(v.str())))
 		return append(out, v.str()...)
-	case ValJsonb:
+	case ValJSONB:
 		// jsonb: present tag, then the self-delimiting tagged-node tree (spec/design/json.md §2).
 		out := []byte{0x00} // present
 		return encodeJsonbBody(v.jsonb(), out)
@@ -722,7 +722,7 @@ func encodeScalar(ty scalarType, v Value) []byte {
 		out = append(out, 0x00) // present
 		out = appendU16(out, uint16(len(v.str())))
 		return append(out, v.str()...)
-	case ValUuid:
+	case ValUUID:
 		// Fixed 16-byte body, NO length prefix (the first fixed-width non-integer value) —
 		// spec/fileformat/format.md. The 16 raw bytes live in Str.
 		out := make([]byte, 0, 1+16)
@@ -3661,7 +3661,7 @@ func valueFromStringPayload(ty colType, payload string) (Value, error) {
 		if !utf8.ValidString(payload) {
 			return Value{}, newError(DataCorrupted, "non-UTF-8 json value")
 		}
-		return JsonValue(payload), nil
+		return JSONValue(payload), nil
 	}
 }
 
@@ -3696,14 +3696,14 @@ func valueFromPayload(ty colType, payload []byte) (Value, error) {
 		if !utf8.Valid(payload) {
 			return Value{}, newError(DataCorrupted, "non-UTF-8 json value")
 		}
-		return JsonValue(string(payload)), nil
+		return JSONValue(string(payload)), nil
 	case ty.Scalar.IsJsonb():
 		pos := 0
 		n, err := decodeJsonbBody(payload, &pos, decodeConstruct)
 		if err != nil {
 			return Value{}, err
 		}
-		return JsonbValue(n), nil
+		return JSONBValue(n), nil
 	case ty.Scalar.IsDecimal():
 		pos := 0
 		return decodeDecimalBody(payload, &pos, decodeConstruct)
@@ -6806,7 +6806,7 @@ func (p *packedLeaf) fixedValue(c, i int) (Value, error) {
 			}
 			var u [16]byte
 			copy(u[copy(u[:], head):], tail)
-			return UuidValue(u[:]), nil // the one wider key-derivable type
+			return UUIDValue(u[:]), nil // the one wider key-derivable type
 		}
 		slot = l.keySlot(i, at, w, nil)
 	} else {
@@ -7946,7 +7946,7 @@ func readValue(ty colType, buf []byte, pos *int, fetch func(uint32) ([]byte, err
 // run the identical cursor-advancing reads (the same length / tag / count reads and the same
 // recursion), so a skip walk finds every column boundary identically to a construct decode by
 // construction: the zero-drift property the lazy-record reshape rests on. Skip omits only the
-// expensive leaf construction (the string copy + UTF-8 validation, the Decimal, the JsonNode /
+// expensive leaf construction (the string copy + UTF-8 validation, the Decimal, the JSONNode /
 // []Value tree) and the content validation bundled with it; fixed-width scalars are cheap and stay
 // eager either way (§6). A skip-mode return is an unobserved placeholder — callers use only the
 // advanced cursor (see inlineBodySpan).
@@ -8265,7 +8265,7 @@ func readInlineScalar(ty scalarType, buf []byte, pos *int, mode decodeMode) (Val
 		if !utf8.Valid(sb) {
 			return Value{}, newError(DataCorrupted, "non-UTF-8 json value")
 		}
-		return JsonValue(string(sb)), nil
+		return JSONValue(string(sb)), nil
 	case ty.IsJsonb():
 		// jsonb: the self-delimiting tagged-node tree (spec/design/json.md §2).
 		node, err := decodeJsonbBody(buf, pos, mode)
@@ -8275,7 +8275,7 @@ func readInlineScalar(ty scalarType, buf []byte, pos *int, mode decodeMode) (Val
 		if !mode.constructs() {
 			return NullValue(), nil // skip: tree walked, not built
 		}
-		return JsonbValue(node), nil
+		return JSONBValue(node), nil
 	case ty.IsUuid():
 		// Fixed 16 raw bytes, no length prefix. Must branch before the integer path —
 		// DecodeInt would sign-flip and WidthBytes is 16 there too.
@@ -8283,7 +8283,7 @@ func readInlineScalar(ty scalarType, buf []byte, pos *int, mode decodeMode) (Val
 		if err != nil {
 			return Value{}, err
 		}
-		return UuidValue(ub), nil
+		return UUIDValue(ub), nil
 	case ty.IsTimestamp() || ty.IsTimestamptz():
 		vb, err := take(buf, pos, ty.WidthBytes())
 		if err != nil {

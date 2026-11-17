@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// The SqlState type + its Code() mapping are generated from spec/errors/registry.toml
+// The SQLState type + its Code() mapping are generated from spec/errors/registry.toml
 // (the codegen "middle path", CLAUDE.md §5 — see sqlstate.go / spec/design/codegen.md).
 // The hand-written EngineError scaffolding below consumes it.
 
@@ -16,7 +16,7 @@ import (
 // host would otherwise scrape from the message text. An empty string means "not set"
 // (pgx's own convention).
 type EngineError struct {
-	State   SqlState
+	State   SQLState
 	Message string
 	// cause preserves a host cancellation's Go error identity without changing SQLSTATE.
 	cause error
@@ -60,7 +60,7 @@ type EngineError struct {
 }
 
 // newError builds an EngineError.
-func newError(state SqlState, message string) *EngineError {
+func newError(state SQLState, message string) *EngineError {
 	return &EngineError{State: state, Message: message}
 }
 

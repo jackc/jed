@@ -3002,7 +3002,7 @@ func jsonbQueryTerms(strategy ginStrategy, qv Value) ginQuery {
 		// `@?` / `@@` (gin.md §2.2): the tree PostgreSQL extracts from the path, or the full scan when
 		// nothing is extractable. The path text is a jsonpath value's canonical text, already compiled
 		// at resolve; a term never depends on the environment's casing table.
-		if qv.Kind != ValJsonPath {
+		if qv.Kind != ValJSONPath {
 			return ginQuery{kind: ginQueryEmpty}
 		}
 		path, err := compile(qv.str(), nil)
@@ -3015,7 +3015,7 @@ func jsonbQueryTerms(strategy ginStrategy, qv Value) ginQuery {
 		}
 		return ginQuery{kind: ginQueryGather, tree: tree}
 	case ginJsonbContains:
-		if qv.Kind != ValJsonb {
+		if qv.Kind != ValJSONB {
 			return ginQuery{kind: ginQueryEmpty}
 		}
 		terms = ginJsonbIndexTerms(qv.jsonb())

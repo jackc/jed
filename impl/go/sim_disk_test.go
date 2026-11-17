@@ -186,7 +186,7 @@ func (fs *simFS) newFile(name string) *simDisk {
 func (fs *simFS) main() *simDisk { return fs.files[simMainFile] }
 
 func simInjected(what string) error {
-	return newError(IoError, "I/O error: simulated "+what)
+	return newError(IOError, "I/O error: simulated "+what)
 }
 
 // beginStep resets the per-step state and arms f (nil for an unfaulted step).
@@ -278,7 +278,7 @@ func (d *simDisk) readAt(off int64, length int) ([]byte, error) {
 		return nil, simInjected("read error")
 	}
 	if off < 0 || off+int64(length) > int64(len(d.cache)) {
-		return nil, newError(IoError, "I/O error: short read past the end of the simulated disk")
+		return nil, newError(IOError, "I/O error: short read past the end of the simulated disk")
 	}
 	return append([]byte(nil), d.cache[off:off+int64(length)]...), nil
 }
@@ -640,7 +640,7 @@ func (fs *simFS) rename(from, to string) error {
 	}
 	d := fs.files[from]
 	if d == nil {
-		return newError(IoError, "I/O error: rename of a missing file "+from)
+		return newError(IOError, "I/O error: rename of a missing file "+from)
 	}
 	d.inherit(fs.files[to])
 	fs.files[to] = d

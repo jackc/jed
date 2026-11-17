@@ -1291,7 +1291,7 @@ type rExpr struct {
 	cRange *RangeVal
 	// reConstJsonb: a folded jsonb constant — the canonical node tree (parsed + canonicalized at
 	// resolve). A reConstJson holds its verbatim text in cText (no extra field).
-	cJsonb *JsonNode
+	cJsonb *JSONNode
 
 	// reIsJson: the optional kind word (json-sql-functions.md §5) and the WITH UNIQUE KEYS flag. The
 	// operand reuses `operand`; `negated` carries IS NOT JSON.

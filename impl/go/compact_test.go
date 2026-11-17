@@ -26,7 +26,7 @@ const compactProbe = "SELECT id, length(pad), n FROM t WHERE n = 3 ORDER BY id"
 // createCompactFile creates a file database at path with the test page size and fsync off.
 func createCompactFile(t *testing.T, path string) *Database {
 	t.Helper()
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: compactPage, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, PageSize: compactPage, SkipFsync: true})
 	if err != nil {
 		t.Fatalf("create %s: %v", path, err)
 	}
@@ -137,7 +137,7 @@ func TestFileCompactionReturnsDeadPagesAndKeepsRowsAndCosts(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = OpenDatabase(path)
+	db, err = Open(path, OpenOptions{})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -191,7 +191,7 @@ func unstamped(body []byte) []byte {
 
 func TestInMemoryCompactionLowersStorageBytes(t *testing.T) {
 	t.Parallel()
-	db, err := CreateDatabase(CreateOptions{PageSize: compactPage})
+	db, err := Create(CreateOptions{PageSize: compactPage})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +310,7 @@ func TestCompactionPreconditionsFailWithoutWriting(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ro, err := OpenDatabaseWithOptions(path, OpenOptions{ReadOnly: true})
+	ro, err := Open(path, OpenOptions{ReadOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +391,7 @@ func TestAStaleTempFileIsIgnoredAndReplaced(t *testing.T) {
 	if err := os.WriteFile(path+".jedtmp", []byte("partial image"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	db, err := OpenDatabase(path)
+	db, err := Open(path, OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -427,7 +427,7 @@ func TestCompactionKeepsSymlinksAndPermissionBits(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err := OpenDatabase(link)
+	db, err := Open(link, OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -451,7 +451,7 @@ func TestCompactionKeepsSymlinksAndPermissionBits(t *testing.T) {
 	if info.Mode().Perm() != 0o640 {
 		t.Fatalf("permission bits = %o, want 640", info.Mode().Perm())
 	}
-	db, err = OpenDatabase(link)
+	db, err = Open(link, OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

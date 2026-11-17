@@ -13,9 +13,9 @@ import (
 // no filesystem needed).
 func memDB(t *testing.T) *jed.Database {
 	t.Helper()
-	db, err := jed.CreateDatabase(jed.CreateOptions{})
+	db, err := jed.Create(jed.CreateOptions{})
 	if err != nil {
-		t.Fatalf("CreateDatabase: %v", err)
+		t.Fatalf("Create: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db
@@ -205,8 +205,8 @@ func TestMigrationErrorCarriesContext(t *testing.T) {
 	if me.Name != "001_bad" || me.Direction != "up" {
 		t.Errorf("MigrationError name/direction = %q/%q", me.Name, me.Direction)
 	}
-	if me.SqlState() != "42P01" { // undefined table
-		t.Errorf("SqlState = %q, want 42P01", me.SqlState())
+	if me.SQLState() != "42P01" { // undefined table
+		t.Errorf("SQLState = %q, want 42P01", me.SQLState())
 	}
 	if me.Statement == "" {
 		t.Errorf("MigrationError.Statement is empty; want the failing statement text")
@@ -239,8 +239,8 @@ func TestInScriptTransactionControlIsRejected(t *testing.T) {
 	if !errors.As(err, &me) {
 		t.Fatalf("Migrate error = %v (%T); want *MigrationError", err, err)
 	}
-	if me.SqlState() != "0A000" { // feature_not_supported — transaction control inside a script
-		t.Errorf("SqlState = %q, want 0A000", me.SqlState())
+	if me.SQLState() != "0A000" { // feature_not_supported — transaction control inside a script
+		t.Errorf("SQLState = %q, want 0A000", me.SQLState())
 	}
 	if v, _ := m.CurrentVersion(); v != 0 {
 		t.Errorf("version = %d, want 0 (rolled back)", v)

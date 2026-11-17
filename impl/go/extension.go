@@ -415,7 +415,7 @@ func valueMatchesResult(v Value, ty scalarType) bool {
 		return ty == scalarDecimal
 	case ValBytea:
 		return ty == scalarBytea
-	case ValUuid:
+	case ValUUID:
 		return ty == scalarUuid
 	case ValTimestamp:
 		return ty == scalarTimestamp
@@ -425,11 +425,11 @@ func valueMatchesResult(v Value, ty scalarType) bool {
 		return ty == scalarDate
 	case ValInterval:
 		return ty == scalarInterval
-	case ValJson:
+	case ValJSON:
 		return ty == scalarJson
-	case ValJsonb:
+	case ValJSONB:
 		return ty == scalarJsonb
-	case ValJsonPath:
+	case ValJSONPath:
 		return ty == scalarJsonPath
 	default:
 		// ValComposite / ValArray / ValRange / ValUnfetched: a host scalar function declares a

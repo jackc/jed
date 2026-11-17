@@ -52,7 +52,7 @@ func relayStdio(endpoint string) {
 func remoteFixture(t *testing.T) (owner, remote *Database) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "remote.jed")
-	owner, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	owner, err := Create(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

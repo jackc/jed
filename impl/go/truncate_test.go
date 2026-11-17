@@ -68,7 +68,7 @@ func TestTrailingTruncationShrinksAFileAfterADelete(t *testing.T) {
 	db.Close()
 
 	// The truncated file reopens to the same high-water, rows, and costs.
-	re, err := OpenDatabase(path)
+	re, err := Open(path, OpenOptions{})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestTrailingTruncationWaitsForTheFlushUnderSynchronousOff(t *testing.T) {
 	s.Close()
 	db.Close()
 	zero := time.Duration(0) // no time-based flush: wall time never moves a flush
-	db, err := OpenDatabaseWithOptions(path, OpenOptions{Synchronous: SynchronousOff, FlushInterval: &zero})
+	db, err := Open(path, OpenOptions{Synchronous: SynchronousOff, FlushInterval: &zero})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +193,7 @@ func TestTrailingTruncationWaitsForTheFlushUnderSynchronousOff(t *testing.T) {
 	if limit := int64(pc+growthStep(pc, compactPage)) * compactPage; fileLength(t, path) > limit {
 		t.Fatalf("close flushed the batch but left the file %d bytes (at most %d)", fileLength(t, path), limit)
 	}
-	re, err := OpenDatabase(path)
+	re, err := Open(path, OpenOptions{})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

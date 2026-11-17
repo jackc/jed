@@ -36,7 +36,7 @@ func main() {
 	if v := os.Getenv("JOIN_WARM_CYCLES"); v != "" {
 		warmCycles = integer(v)
 	}
-	db, err := jed.CreateDatabase(jed.CreateOptions{})
+	db, err := jed.Create(jed.CreateOptions{})
 	must(err)
 	defer db.Close()
 	session, err := db.Session(jed.SessionOptions{})

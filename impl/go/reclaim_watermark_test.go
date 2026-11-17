@@ -29,7 +29,7 @@ func countOf(db *Database, rd *Session) (int64, error) {
 
 func TestFallbackReaderSnapshotIsolationUnderReclamation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "fallback.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})
+	db, err := Create(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}

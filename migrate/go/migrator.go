@@ -268,8 +268,8 @@ func (m *Migrator) readVersion() (int, error) {
 }
 
 // errIsState reports whether err wraps a *jed.EngineError with the given SQLSTATE, compared
-// by the engine's typed SqlState constant (jed.DuplicateTable, …) rather than a raw string.
-func errIsState(err error, state jed.SqlState) bool {
+// by the engine's typed SQLState constant (jed.DuplicateTable, …) rather than a raw string.
+func errIsState(err error, state jed.SQLState) bool {
 	var ee *jed.EngineError
 	return errors.As(err, &ee) && ee.State == state
 }
