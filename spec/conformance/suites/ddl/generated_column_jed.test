@@ -1,0 +1,43 @@
+# Stored generated columns where jed deliberately differs from PostgreSQL 18
+# (spec/design/generated-columns.md §9): no VIRTUAL generated columns, and the bare form (neither
+# STORED nor VIRTUAL, which PostgreSQL 18 makes VIRTUAL) is rejected rather than read as STORED;
+# SET EXPRESSION and ALTER TYPE of a generated column, a timezone-data-dependent expression, and an
+# ADD COLUMN generation expression over a column added by the same statement are 0A000 this slice.
+# Not oracle-checked.
+# requires: ddl.generated_column, ddl.alter_table, ddl.create_table, dml.insert, query.select, types.i32, types.i64, types.text, types.timestamp, types.timestamptz
+
+statement error 0A000
+CREATE TABLE v (a i32, b i32 GENERATED ALWAYS AS (a) VIRTUAL)
+
+statement error 0A000
+CREATE TABLE v (a i32, b i32 GENERATED ALWAYS AS (a))
+
+statement ok
+CREATE TABLE v (a i32)
+
+statement error 0A000
+ALTER TABLE v ADD COLUMN b i32 GENERATED ALWAYS AS (a) VIRTUAL
+
+statement ok
+CREATE TABLE s (a i32, b i32 GENERATED ALWAYS AS (a + 1) STORED)
+
+statement error 0A000
+ALTER TABLE s ALTER COLUMN b SET EXPRESSION AS (a + 2)
+
+statement error 0A000
+ALTER TABLE s ALTER COLUMN b TYPE i64
+
+# a nonconstant zone would pin the whole loaded zone set — 0A000 this slice
+statement error 0A000
+CREATE TABLE tz (t timestamp, z text, u timestamptz GENERATED ALWAYS AS (t AT TIME ZONE z) STORED)
+
+# UTC has no timezone-data dependency and is admitted
+statement ok
+CREATE TABLE tz (t timestamp, u timestamptz GENERATED ALWAYS AS (t AT TIME ZONE 'UTC') STORED)
+
+# an ADD COLUMN generation expression may not read a column added by the same statement
+statement error 0A000
+ALTER TABLE s ADD COLUMN c i32, ADD COLUMN d i32 GENERATED ALWAYS AS (c) STORED
+
+statement ok
+ALTER TABLE s ADD COLUMN c i32, ADD COLUMN d i32 GENERATED ALWAYS AS (a * 10) STORED

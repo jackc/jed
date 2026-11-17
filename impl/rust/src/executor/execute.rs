@@ -1622,13 +1622,18 @@ fn collect_assignment_default_privs(
     }
 }
 
-/// Add the named functions of a write target's CHECK constraints, which the write evaluates on each
-/// new row.
+/// Add the named functions of a write target's CHECK constraints and stored generation expressions
+/// (spec/design/generated-columns.md), which the write may evaluate on each new row.
 fn collect_check_privs(table: &Table, req: &mut PrivReq) {
     let locals = HashSet::new();
     // An unparsed check calls nothing this binary can name; the write itself fails XX003.
     for check in table.checks.iter().filter(|c| !c.unparsed) {
         collect_expr_privs(&check.expr, req, &locals);
+    }
+    for g in table.columns.iter().filter_map(|c| c.generated.as_ref()) {
+        if !g.unparsed {
+            collect_expr_privs(&g.expr, req, &locals);
+        }
     }
 }
 

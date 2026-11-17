@@ -783,6 +783,13 @@ func collectCheckPrivs(table *catTable, req *privReq) {
 			collectExprPrivs(&table.Checks[i].Expr, req, locals)
 		}
 	}
+	// Stored generation expressions (spec/design/generated-columns.md), which the write may
+	// evaluate on each new row; an unparsed one fails the write XX003 itself.
+	for i := range table.Columns {
+		if g := table.Columns[i].Generated; g != nil && !g.Unparsed {
+			collectExprPrivs(&g.Expr, req, locals)
+		}
+	}
 }
 
 func (db *engine) collectAssignmentDefaultPrivs(table *catTable, assignments []assignment, req *privReq) {

@@ -2660,6 +2660,7 @@ fn join_group_outputs(
             collation: c.collation.clone(),
             no_collation: c.no_collation,
             collation_conflict: c.collation_conflict,
+            generated: None,
         });
     }
     for r in &scope.rels {

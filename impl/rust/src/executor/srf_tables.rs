@@ -85,6 +85,7 @@ pub(crate) fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
         collation: None,
         no_collation: false,
         collation_conflict: false,
+        generated: None,
     };
     let col = |name: &str, ty: ScalarType, not_null: bool| mk_col(name, Type::Scalar(ty), not_null);
     // A `text[]` member-list column (introspection.md §5.1 — the indexed / member column names).
@@ -131,6 +132,9 @@ pub(crate) fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
                 col("column_default", ScalarType::Text, false),
                 // 'ALWAYS' / 'BY DEFAULT' for an identity column, else NULL (introspection.md §5).
                 col("identity_generation", ScalarType::Text, false),
+                // A stored generated column's canonical expression text, else NULL
+                // (generated-columns.md §5).
+                col("generation_expression", ScalarType::Text, false),
             ],
         ),
         SrfKind::JedIndexes => table(
@@ -274,6 +278,7 @@ pub(crate) fn srf_table(func_name: &str, alias: Option<&str>, col_ty: Type) -> B
             collation: None,
             no_collation: false,
             collation_conflict: false,
+            generated: None,
         }],
         pk: Vec::new(),
         checks: Vec::new(),
@@ -363,6 +368,7 @@ pub(crate) fn srf_table_cols(
                 collation: None,
                 no_collation: false,
                 collation_conflict: false,
+                generated: None,
             })
             .collect(),
         pk: Vec::new(),

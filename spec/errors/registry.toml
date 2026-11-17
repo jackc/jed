@@ -683,6 +683,16 @@ class = "syntax error or access rule violation"
 # raises the same code at each use of such a view; jed refuses the definition.
 template = "functions in index expression must be marked IMMUTABLE"
 
+# 42611 invalid_column_definition — ALTER COLUMN … TYPE … USING on a stored generated column
+# (spec/design/generated-columns.md §4.3): "cannot specify USING when altering type of generated
+# column", with PostgreSQL's Detail naming the column as a structured field. Code and message match
+# PostgreSQL.
+[[error]]
+code = "42611"
+name = "invalid_column_definition"
+class = "syntax error or access rule violation"
+template = "cannot specify USING when altering type of generated column"
+
 [[error]]
 code = "42P20"
 name = "windowing_error"
@@ -766,7 +776,8 @@ class = "syntax error or access rule violation"
 template = "identifier exceeds the maximum length of {max} bytes"
 
 # 428C9 generated_always — a write supplying an explicit value to a GENERATED ALWAYS identity
-# column (spec/design/sequences.md §13). Two messages: an INSERT of a non-DEFAULT value without
+# column (spec/design/sequences.md §13) or to a stored generated column
+# (spec/design/generated-columns.md §3; no OVERRIDING clause lifts it there). Two messages: an INSERT of a non-DEFAULT value without
 # OVERRIDING SYSTEM VALUE — "cannot insert a non-DEFAULT value into column {name}"; an UPDATE
 # assigning the column — "column {name} can only be updated to DEFAULT". The rendered message
 # carries no DETAIL/HINT line (house style); PostgreSQL's Detail and (INSERT) Hint are the structured

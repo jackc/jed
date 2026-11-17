@@ -202,6 +202,14 @@ pub enum AlterColumnKind {
     DropIdentity {
         if_exists: bool,
     },
+    /// `DROP EXPRESSION [IF EXISTS]` (spec/design/generated-columns.md §4.2): turn a stored generated
+    /// column into an ordinary column that keeps its values (55000 on a non-generated column unless
+    /// IF EXISTS).
+    DropExpression {
+        if_exists: bool,
+    },
+    /// `SET EXPRESSION AS ( expr )` (spec/design/generated-columns.md §4.3) — `0A000` this slice.
+    SetExpression,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -704,11 +712,34 @@ pub struct ColumnDef {
     /// (spec/design/sequences.md §13). Desugars like `serial` (an owned sequence + a `nextval`
     /// default + NOT NULL) plus the persisted ALWAYS/BY DEFAULT distinction.
     pub identity: Option<IdentitySpec>,
+    /// An optional `GENERATED ALWAYS AS ( expr ) [STORED | VIRTUAL]` clause
+    /// (spec/design/generated-columns.md §1): a stored generated column. The kind gate (only
+    /// `STORED` is implemented) and the expression's admission run at execution.
+    pub generated: Option<GeneratedDef>,
     /// An optional `COLLATE "name"` column modifier (spec/design/collation.md §1) — a quoted,
     /// case-sensitive collation name. Only valid on a `text` column (else 42804); the name must be a
     /// loaded collation or `"C"` (else 42704). Absent ⇒ the column inherits the per-database default
     /// collation. The effective collation is frozen into the column at CREATE TABLE.
     pub collation: Option<String>,
+}
+
+/// A column's `GENERATED ALWAYS AS ( expr ) …` clause (spec/design/generated-columns.md §1): the
+/// parsed expression, its re-rendered token text (the persisted form, as a `CHECK` persists), and
+/// which storage keyword followed — `STORED`, `VIRTUAL`, or neither (`0A000` unless `STORED`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct GeneratedDef {
+    pub expr: Expr,
+    pub text: String,
+    pub kind: GeneratedKind,
+}
+
+/// The storage keyword after a generation expression (spec/design/generated-columns.md §1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GeneratedKind {
+    Stored,
+    Virtual,
+    /// Neither keyword — PostgreSQL 18's VIRTUAL default; jed rejects it (`0A000`).
+    Unspecified,
 }
 
 /// A parsed type modifier: a precision and an optional scale, as written

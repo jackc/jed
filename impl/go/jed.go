@@ -202,6 +202,7 @@ var SupportedCapabilities = []string{
 	"ddl.alter_sequence",
 	"ddl.alter_table",
 	"ddl.alter_identity",
+	"ddl.generated_column",
 	// NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
 	"ddl.not_null",
 	// DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).
@@ -1064,8 +1065,8 @@ var SupportedCapabilities = []string{
 	"maintenance.analyze_gin_terms",
 	"introspect.statistics",
 	// The jed_columns catalog relation (I1): one row per column of every user table — ordinal,
-	// canonical type text, not_null, pk_ordinal, column_default, identity_generation
-	// (introspection.md §5).
+	// canonical type text, not_null, pk_ordinal, column_default, identity_generation,
+	// generation_expression (introspection.md §5).
 	"introspect.columns",
 	// The jed_indexes catalog relation (I2, introspection.md §5.1): one row per secondary index —
 	// name, table_name, columns (text[]), is_unique, method (btree/gin/gist).

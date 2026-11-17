@@ -1,0 +1,45 @@
+# jed_columns.generation_expression (spec/design/generated-columns.md §5): a stored generated
+# column's canonical expression text, NULL for every other column; a generated column's
+# column_default is NULL. RENAME COLUMN rewrites the text, DROP EXPRESSION clears it. jed-specific,
+# so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# requires: introspect.columns, ddl.generated_column, ddl.alter_table, ddl.create_table, query.select, query.where_eq, query.order_by, types.i32, types.text
+
+statement ok
+CREATE TABLE g (a i32 DEFAULT 1, b i32 GENERATED ALWAYS AS (a * 2) STORED, "S" text, u text GENERATED ALWAYS AS (upper("S") || 'x') STORED)
+
+query TTTT nosort
+SELECT name, type, column_default, generation_expression FROM jed_columns WHERE table_name = 'g' ORDER BY ordinal
+----
+a
+i32
+1
+NULL
+b
+i32
+NULL
+a * 2
+S
+text
+NULL
+NULL
+u
+text
+NULL
+upper ( "S" ) || 'x'
+
+statement ok
+ALTER TABLE g RENAME COLUMN a TO "Z"
+
+query T nosort
+SELECT generation_expression FROM jed_columns WHERE table_name = 'g' AND name = 'b'
+----
+"Z" * 2
+
+statement ok
+ALTER TABLE g ALTER COLUMN u DROP EXPRESSION
+
+query TT nosort
+SELECT name, generation_expression FROM jed_columns WHERE table_name = 'g' AND generation_expression IS NOT NULL ORDER BY ordinal
+----
+b
+"Z" * 2

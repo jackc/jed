@@ -27,7 +27,7 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion    uint16 = 54    // 54 = a base-plus-offsets column region may store one value whole as an exception (region kind 6: null bitmap, base, offset width, exception row u16, exception body, N offsets with the exception's zero), taken when it saves more than kind 1 (spec/fileformat/format.md "Leaf node"; spec/design/leaf-write-cost.md §4); 53 = deferred interior pages, narrow commit-manifest entries and the page stamp (spec/fileformat/format.md "Version scope", *Remap list*, *Deferral*, *Commit manifest*, *Page header*; spec/design/deferred-interior.md §9, manifest-crc32.md): a commit writes only the nodes whose own content changed, a retained interior keeping its page with a (parent, slot) → page remap list in the meta's last third (remap_entries at offset 60), folded when it would overflow; a manifest entry is a page id and its own header CRC-32 (an encrypted page's CRC-32 of its ciphertext), the overflow chain's digest a CRC-32; page header bytes 2-3 carry the low 16 bits of the writing commit's txid, checked against the commit window in manifest validation; 52 = the compact leaf (spec/fileformat/format.md "Leaf node", spec/design/leaf-structural.md): a leaf payload leads with a flags byte and every directory entry is a u16; a table column that is a leading primary-key member with a key-recoverable value has no region; a table whose keys all have one length stores that length once and no key directory; an inline text / bytea / json value in a leaf is tag 0x05 + its bytes, without a length; a leaf may store its keys' shared prefix once; and a region may be base-plus-offsets (integer-like fixed-width columns), a dictionary (string columns) or bit-packed (integer arrays), so a leaf's size is Σ record_size + leafOverhead − the savings its keys and rows give; interior, catalog, overflow and GiST pages are unchanged; 51 = a numeric(p,s) table column with p <= 18 is a fixed-width leaf column — a null bitmap and 2/4/8-byte slots holding the value's unscaled integer — instead of the variable-width decimal codec (colType.DecSlot; spec/design/decimal.md §6a); the catalog is unchanged; 50 = the per-index index_flags byte gains bit5 is_constraint: set on the unique index that backs a UNIQUE constraint, clear on a bare CREATE UNIQUE INDEX (legal only with bit0 unique; spec/design/constraints.md §5.5); 49 = batched durability (spec/design/validated-cow.md §4): a commit writes the meta slot that does not hold the newest durable meta (txid & 1 under synchronous = on, one slot for a whole relaxed batch), and a pending commit's manifest also lists every body page written since that floor; no byte layout change; 48 = view column defaults (a per-column flags byte + u32 default text), view dep kinds 2 (sequence) / 3 (type) sorted by (name, kind), a trailing view flags byte (bit0 security_barrier, bit1 security_invoker), and catalog entries longer than a page spanning consecutive catalog pages (header byte 1 bit0 continued; spec/design/views.md §3/§6/§16); 47 = multi-column GIN indexes: a GIN index may list several key columns, and every entry of a multi-column GIN index is column_tag (u8, the 0-based key position) ‖ term ‖ storage key (spec/design/gin.md §4.4); a single-column GIN's entries are unchanged and the catalog bytes do not change; 46 = ordered index keys (spec/design/indexes.md §11, encoding.md §2.16): the per-index index_flags byte gains bit4 has_key_options, and (only when set) one option byte per key element (bit0 desc, bit1 nulls_first) after the optional timezone dependencies; a DESC / NULLS FIRST key's entry slots use the §2.16 ordered slot; an index with only default (ASC NULLS LAST) keys is byte-identical to v45; 45 = exclusion-constraint follow-ons (spec/design/gist.md §7.1/§7.2) — no byte layout change; the v27 has_predicate bit is now legal on a GiST index that backs an exclusion constraint (the partial EXCLUDE … WHERE (predicate)), and an exclusion constraint may name an ordered (btree, index_kind 0, non-unique) backing index whose every element operator is = (EXCLUDE USING btree); a v44 reader rejected both shapes as corrupt, hence the version break; 44 = a composite column may carry an expression DEFAULT — column flags bit3 (default_is_expr), with the expr-text (u16 length + UTF-8) after the type name (spec/design/composite.md §12); any other composite column flag but not_null is corrupt; no other byte layout change; 43 = timestamp(p) / interval qualifier typmods (spec/design/timestamp.md §8, interval.md §6.1): a timestamp / timestamptz column or composite field appends u8 precision (0xFF = none, else 0..6), an interval one u8 interval_fields ‖ u8 precision (fields 0 = no qualifier, else the datetime_units.toml qualifier code) in the typmod slot; no other byte layout change; 42 = GIN term statistics (spec/design/statistics.md §4.5/§7): a statistics summary's flags byte gains bit2 term_eligible, and (only when set) term_occurrences i64 ‖ untracked_term_rows i64 ‖ term_count u16 follow histogram_count; stats_kind 3 term items (ordinal u16, rows i64, term_len u16 + term bytes) follow the histogram items; no other byte layout change; 41 = a composite-type entry admits a range-typed field — field_type_code 17 + the one-byte range element descriptor, before the field flags byte (spec/design/composite.md §3); no other byte layout change; 40 = a foreign key's actions byte gains bit 6 match_full (MATCH FULL; 0 = MATCH SIMPLE — spec/design/constraints.md §6.3/§6.9); bit 7 stays reserved 0; no other byte layout change; 39 = every view entry gains a trailing u8 check_option (0 none, 1 LOCAL, 2 CASCADED; spec/design/views.md §15.6); no other byte layout change; 38 = views: entry_kind 5 view catalog entries emitted last in view-name byte order (spec/design/views.md §3); no other byte layout change; 37 = exact (folded) identifier names: no byte layout change; catalog names are byte-exact and name-ordered groups sort by exact-name bytes; persisted expression text renders bare words folded and quoted identifiers as "…" (spec/design/grammar.md §3); 36 = an array column entry's flags byte gains bit6 has_collation (legal only for a text element), the collation name (u16 len + UTF-8) following the element descriptor; a collated text[] key encodes each present element as its UCA sort key (spec/design/collation.md §1, encoding.md §2.14); 35 = every CHECK catalog entry gains a trailing check_flags byte (bit0 has_host_deps; bits 1-7 reserved 0) followed, when bit0 is set, by the v31 host-function dependency list (spec/design/extensibility.md §7.1.3); 34 = meta offset 56 carries the exact live page count (spec/design/memory.md §8.7); 33 = validated COW commit manifests; 32 = timezone index dependencies (index-dependencies.md); 31 = host-function index dependencies (spec/design/extensibility.md §8.1): the per-index index_flags byte gains bit2 has_host_deps, and (only when set) after the v27 predicate a u16 dep_count + per dependency name (u16 len + UTF-8) ‖ arg_count u16 ‖ arg type codes (u8 each) ‖ result type code (u8) ‖ component_id (u16 len + UTF-8) ‖ semantic_version u32, in ascending (name, arg-type codes) order; an index with no host-function key is byte-identical to v30, so a file with no such index moves to v31 only by its version byte + meta CRC. 30 = three-bit FOREIGN KEY action codes for CASCADE / SET NULL / SET DEFAULT; 29 = deterministic per-column statistics (kind 4; spec/design/statistics.md); 28 = exact table row count: each table catalog entry appends a nonnegative i64 row_count after root_data_page, with (root_data_page == 0) == (row_count == 0);  on-disk format version (27 = partial-index predicates (spec/design/indexes.md §9): the per-index index_flags byte gains bit1 has_predicate, and (only when set) a u16 length + the canonical predicate text (the Check-expression text form) follows index_root_page; on load a partial predicate re-parses that text (XX001 on failure, like a stored CHECK) and a non-btree index with bit1 set is data_corrupted. B-tree only. A non-partial index is byte-identical to v26, so a file with no partial index moves to v27 only by its version byte + meta CRC. 26 = expression index keys (spec/design/indexes.md §1/§6): a per-index key element is a u16 column ordinal OR the 0xFFFF sentinel + a u16 length + the canonical expression text (the Check-expression text form); on load an expression element re-parses that text (XX001 on failure, like a stored CHECK), and a GIN/GiST index with a non-column key is data_corrupted. Only the index-list changes — a plain column index is byte-identical to v6. 25 = on-disk free-list persistence (spec/fileformat/format.md; storage.md §6): meta offset 28 becomes free_list_head (0 = empty), and a page_type 7 free-list page persists the unconsumed free-list so open reads it directly instead of reconstructing it by walking every leaf; paired with continuous within-session reclamation. A from-scratch image (create/goldens) has an EMPTY free-list, so free_list_head = 0 and no page_type 7 page: every golden's only v25 change is its version byte + meta CRC. 24 = the B+tree reshape (spec/design/bplus-reshape.md, slice B1; spec/fileformat/format.md "The per-table data B+tree"): records live ONLY in leaves — an INTERIOR page (page_type 3) is a record-free routing skeleton, N+1 child pointers ‖ an N-entry end-offset separator directory ‖ the separator key blob (a separator is a COPY of a boundary key; leaf splits copy up, interior splits push up, leaf merges remove the parent separator, interior merges pull it down). A LEAF page's column regions each lead with a reserved flags byte (0 — the string-dictionary door) and take a class-determined shape: a FIXED-WIDTH column is a null bitmap (ceil(N/8), MSB-first, set = NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled); a VARIABLE-WIDTH column is an N-entry end-offset value directory + the tagged v23 codec bytes with NULL a ZERO-LENGTH SPAN (no 0x01 tag inside a leaf; the single-value codec elsewhere is unchanged). All directories become N-entry END offsets (the redundant leading 0 of the v23 N+1 prefix sums is dropped). record_size is restated as key_len + Σ value_size (fixed → its width always, variable → 0 when NULL else the tagged encoded size; the v23 phantom 2+ is dropped); RECORD_MAX keeps its v23 value (C − max(12, 12+16K))/2, re-derived leaf-only. Catalog/overflow/GiST pages are byte-identical to v23. 23 = PAX leaf layout (spec/fileformat/format.md "Leaf node"): a B-tree LEAF page (page_type 2) stores its records COLUMN-MAJOR — key directory (N+1 u32 prefix-sum) ‖ key blob ‖ column directory (K+1 u32 region offsets, colStart[K] = payload end) ‖ per column a value directory (N+1 u32 prefix-sum) then that column's N value bodies. The value codec is byte-unchanged (same 1-byte tag + body); interior pages (page_type 3) stay row-major (child pointers ‖ records). 22 = varchar(n) length limits (spec/design/types.md §15): a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints (spec/design/gist.md §7/§8, GX3): a per-table exclusion list after the foreign-key list — each entry the constraint name, its backing GiST index name, and a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes (spec/design/gist.md, GX1): a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encode_range_body(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encode_range_body(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index still moves to v20 only by its version byte. 19 = storable json/jsonb columns (spec/design/json.md, J1/J1b): a column type can be json (type_code 18) or jsonb (type_code 19) — plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column still moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicode_version + cldr_version + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: type_code 17 + an inline element-type descriptor in the catalog — one scalar code, spec/design/ranges.md §3 — and the compact range value body, a flags byte EMPTY/LB_INF/UB_INF/LB_INC/UB_INC + present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+	formatVersion    uint16 = 55    // 55 = stored generated columns — column flags bit7 is_generated, always with bit3, and the expression-text slot holds the generation expression (spec/design/generated-columns.md §6); 54 = a base-plus-offsets column region may store one value whole as an exception (region kind 6: null bitmap, base, offset width, exception row u16, exception body, N offsets with the exception's zero), taken when it saves more than kind 1 (spec/fileformat/format.md "Leaf node"; spec/design/leaf-write-cost.md §4); 53 = deferred interior pages, narrow commit-manifest entries and the page stamp (spec/fileformat/format.md "Version scope", *Remap list*, *Deferral*, *Commit manifest*, *Page header*; spec/design/deferred-interior.md §9, manifest-crc32.md): a commit writes only the nodes whose own content changed, a retained interior keeping its page with a (parent, slot) → page remap list in the meta's last third (remap_entries at offset 60), folded when it would overflow; a manifest entry is a page id and its own header CRC-32 (an encrypted page's CRC-32 of its ciphertext), the overflow chain's digest a CRC-32; page header bytes 2-3 carry the low 16 bits of the writing commit's txid, checked against the commit window in manifest validation; 52 = the compact leaf (spec/fileformat/format.md "Leaf node", spec/design/leaf-structural.md): a leaf payload leads with a flags byte and every directory entry is a u16; a table column that is a leading primary-key member with a key-recoverable value has no region; a table whose keys all have one length stores that length once and no key directory; an inline text / bytea / json value in a leaf is tag 0x05 + its bytes, without a length; a leaf may store its keys' shared prefix once; and a region may be base-plus-offsets (integer-like fixed-width columns), a dictionary (string columns) or bit-packed (integer arrays), so a leaf's size is Σ record_size + leafOverhead − the savings its keys and rows give; interior, catalog, overflow and GiST pages are unchanged; 51 = a numeric(p,s) table column with p <= 18 is a fixed-width leaf column — a null bitmap and 2/4/8-byte slots holding the value's unscaled integer — instead of the variable-width decimal codec (colType.DecSlot; spec/design/decimal.md §6a); the catalog is unchanged; 50 = the per-index index_flags byte gains bit5 is_constraint: set on the unique index that backs a UNIQUE constraint, clear on a bare CREATE UNIQUE INDEX (legal only with bit0 unique; spec/design/constraints.md §5.5); 49 = batched durability (spec/design/validated-cow.md §4): a commit writes the meta slot that does not hold the newest durable meta (txid & 1 under synchronous = on, one slot for a whole relaxed batch), and a pending commit's manifest also lists every body page written since that floor; no byte layout change; 48 = view column defaults (a per-column flags byte + u32 default text), view dep kinds 2 (sequence) / 3 (type) sorted by (name, kind), a trailing view flags byte (bit0 security_barrier, bit1 security_invoker), and catalog entries longer than a page spanning consecutive catalog pages (header byte 1 bit0 continued; spec/design/views.md §3/§6/§16); 47 = multi-column GIN indexes: a GIN index may list several key columns, and every entry of a multi-column GIN index is column_tag (u8, the 0-based key position) ‖ term ‖ storage key (spec/design/gin.md §4.4); a single-column GIN's entries are unchanged and the catalog bytes do not change; 46 = ordered index keys (spec/design/indexes.md §11, encoding.md §2.16): the per-index index_flags byte gains bit4 has_key_options, and (only when set) one option byte per key element (bit0 desc, bit1 nulls_first) after the optional timezone dependencies; a DESC / NULLS FIRST key's entry slots use the §2.16 ordered slot; an index with only default (ASC NULLS LAST) keys is byte-identical to v45; 45 = exclusion-constraint follow-ons (spec/design/gist.md §7.1/§7.2) — no byte layout change; the v27 has_predicate bit is now legal on a GiST index that backs an exclusion constraint (the partial EXCLUDE … WHERE (predicate)), and an exclusion constraint may name an ordered (btree, index_kind 0, non-unique) backing index whose every element operator is = (EXCLUDE USING btree); a v44 reader rejected both shapes as corrupt, hence the version break; 44 = a composite column may carry an expression DEFAULT — column flags bit3 (default_is_expr), with the expr-text (u16 length + UTF-8) after the type name (spec/design/composite.md §12); any other composite column flag but not_null is corrupt; no other byte layout change; 43 = timestamp(p) / interval qualifier typmods (spec/design/timestamp.md §8, interval.md §6.1): a timestamp / timestamptz column or composite field appends u8 precision (0xFF = none, else 0..6), an interval one u8 interval_fields ‖ u8 precision (fields 0 = no qualifier, else the datetime_units.toml qualifier code) in the typmod slot; no other byte layout change; 42 = GIN term statistics (spec/design/statistics.md §4.5/§7): a statistics summary's flags byte gains bit2 term_eligible, and (only when set) term_occurrences i64 ‖ untracked_term_rows i64 ‖ term_count u16 follow histogram_count; stats_kind 3 term items (ordinal u16, rows i64, term_len u16 + term bytes) follow the histogram items; no other byte layout change; 41 = a composite-type entry admits a range-typed field — field_type_code 17 + the one-byte range element descriptor, before the field flags byte (spec/design/composite.md §3); no other byte layout change; 40 = a foreign key's actions byte gains bit 6 match_full (MATCH FULL; 0 = MATCH SIMPLE — spec/design/constraints.md §6.3/§6.9); bit 7 stays reserved 0; no other byte layout change; 39 = every view entry gains a trailing u8 check_option (0 none, 1 LOCAL, 2 CASCADED; spec/design/views.md §15.6); no other byte layout change; 38 = views: entry_kind 5 view catalog entries emitted last in view-name byte order (spec/design/views.md §3); no other byte layout change; 37 = exact (folded) identifier names: no byte layout change; catalog names are byte-exact and name-ordered groups sort by exact-name bytes; persisted expression text renders bare words folded and quoted identifiers as "…" (spec/design/grammar.md §3); 36 = an array column entry's flags byte gains bit6 has_collation (legal only for a text element), the collation name (u16 len + UTF-8) following the element descriptor; a collated text[] key encodes each present element as its UCA sort key (spec/design/collation.md §1, encoding.md §2.14); 35 = every CHECK catalog entry gains a trailing check_flags byte (bit0 has_host_deps; bits 1-7 reserved 0) followed, when bit0 is set, by the v31 host-function dependency list (spec/design/extensibility.md §7.1.3); 34 = meta offset 56 carries the exact live page count (spec/design/memory.md §8.7); 33 = validated COW commit manifests; 32 = timezone index dependencies (index-dependencies.md); 31 = host-function index dependencies (spec/design/extensibility.md §8.1): the per-index index_flags byte gains bit2 has_host_deps, and (only when set) after the v27 predicate a u16 dep_count + per dependency name (u16 len + UTF-8) ‖ arg_count u16 ‖ arg type codes (u8 each) ‖ result type code (u8) ‖ component_id (u16 len + UTF-8) ‖ semantic_version u32, in ascending (name, arg-type codes) order; an index with no host-function key is byte-identical to v30, so a file with no such index moves to v31 only by its version byte + meta CRC. 30 = three-bit FOREIGN KEY action codes for CASCADE / SET NULL / SET DEFAULT; 29 = deterministic per-column statistics (kind 4; spec/design/statistics.md); 28 = exact table row count: each table catalog entry appends a nonnegative i64 row_count after root_data_page, with (root_data_page == 0) == (row_count == 0);  on-disk format version (27 = partial-index predicates (spec/design/indexes.md §9): the per-index index_flags byte gains bit1 has_predicate, and (only when set) a u16 length + the canonical predicate text (the Check-expression text form) follows index_root_page; on load a partial predicate re-parses that text (XX001 on failure, like a stored CHECK) and a non-btree index with bit1 set is data_corrupted. B-tree only. A non-partial index is byte-identical to v26, so a file with no partial index moves to v27 only by its version byte + meta CRC. 26 = expression index keys (spec/design/indexes.md §1/§6): a per-index key element is a u16 column ordinal OR the 0xFFFF sentinel + a u16 length + the canonical expression text (the Check-expression text form); on load an expression element re-parses that text (XX001 on failure, like a stored CHECK), and a GIN/GiST index with a non-column key is data_corrupted. Only the index-list changes — a plain column index is byte-identical to v6. 25 = on-disk free-list persistence (spec/fileformat/format.md; storage.md §6): meta offset 28 becomes free_list_head (0 = empty), and a page_type 7 free-list page persists the unconsumed free-list so open reads it directly instead of reconstructing it by walking every leaf; paired with continuous within-session reclamation. A from-scratch image (create/goldens) has an EMPTY free-list, so free_list_head = 0 and no page_type 7 page: every golden's only v25 change is its version byte + meta CRC. 24 = the B+tree reshape (spec/design/bplus-reshape.md, slice B1; spec/fileformat/format.md "The per-table data B+tree"): records live ONLY in leaves — an INTERIOR page (page_type 3) is a record-free routing skeleton, N+1 child pointers ‖ an N-entry end-offset separator directory ‖ the separator key blob (a separator is a COPY of a boundary key; leaf splits copy up, interior splits push up, leaf merges remove the parent separator, interior merges pull it down). A LEAF page's column regions each lead with a reserved flags byte (0 — the string-dictionary door) and take a class-determined shape: a FIXED-WIDTH column is a null bitmap (ceil(N/8), MSB-first, set = NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled); a VARIABLE-WIDTH column is an N-entry end-offset value directory + the tagged v23 codec bytes with NULL a ZERO-LENGTH SPAN (no 0x01 tag inside a leaf; the single-value codec elsewhere is unchanged). All directories become N-entry END offsets (the redundant leading 0 of the v23 N+1 prefix sums is dropped). record_size is restated as key_len + Σ value_size (fixed → its width always, variable → 0 when NULL else the tagged encoded size; the v23 phantom 2+ is dropped); RECORD_MAX keeps its v23 value (C − max(12, 12+16K))/2, re-derived leaf-only. Catalog/overflow/GiST pages are byte-identical to v23. 23 = PAX leaf layout (spec/fileformat/format.md "Leaf node"): a B-tree LEAF page (page_type 2) stores its records COLUMN-MAJOR — key directory (N+1 u32 prefix-sum) ‖ key blob ‖ column directory (K+1 u32 region offsets, colStart[K] = payload end) ‖ per column a value directory (N+1 u32 prefix-sum) then that column's N value bodies. The value codec is byte-unchanged (same 1-byte tag + body); interior pages (page_type 3) stay row-major (child pointers ‖ records). 22 = varchar(n) length limits (spec/design/types.md §15): a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints (spec/design/gist.md §7/§8, GX3): a per-table exclusion list after the foreign-key list — each entry the constraint name, its backing GiST index name, and a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes (spec/design/gist.md, GX1): a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encode_range_body(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encode_range_body(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index still moves to v20 only by its version byte. 19 = storable json/jsonb columns (spec/design/json.md, J1/J1b): a column type can be json (type_code 18) or jsonb (type_code 19) — plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column still moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicode_version + cldr_version + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: type_code 17 + an inline element-type descriptor in the catalog — one scalar code, spec/design/ranges.md §3 — and the compact range value body, a flags byte EMPTY/LB_INF/UB_INF/LB_INC/UB_INC + present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 	pageHeader              = 16    // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 	recordMaxReserve        = 12    // bytes reserved inside RECORD_MAX beyond the per-column term — independent of pageHeader (format.md "Why the record cap"). Historically the two-key interior node's 3 child pointers (4·3); since v24 the value is kept as the K = 0 floor of the leaf-only re-derivation (a two-record index leaf is exactly 2·(C−12)/2 + 4·2 + 4 = C)
 	pageCatalog      byte   = 1     // page_type for a catalog page
@@ -5319,12 +5319,16 @@ func tableEntryBytes(table *catTable, rootDataPage pageRef, indexRoots []pageRef
 			if col.DefaultExpr != nil {
 				flags |= 0b1000
 			}
+			// bit7 is_generated (v55): the generation expression takes the expr-text slot.
+			if col.Generated != nil {
+				flags |= 0b1000_1000
+			}
 			out = append(out, flags)
 			out = appendU16(out, uint16(len(col.Type.Comp.Name)))
 			out = append(out, col.Type.Comp.Name...)
-			if col.DefaultExpr != nil {
-				out = appendU16(out, uint16(len(col.DefaultExpr.ExprText)))
-				out = append(out, col.DefaultExpr.ExprText...)
+			if de := col.exprTextSlot(); de != nil {
+				out = appendU16(out, uint16(len(de.ExprText)))
+				out = append(out, de.ExprText...)
 			}
 			continue
 		}
@@ -5341,8 +5345,14 @@ func tableEntryBytes(table *catTable, rootDataPage pageRef, indexRoots []pageRef
 			if col.Collation != "" {
 				flags |= 0b100_0000
 			}
+			// bit7 is_generated + bit3 (v55): the generation expression text follows the element
+			// descriptor, before the collation name.
+			if col.Generated != nil {
+				flags |= 0b1000_1000
+			}
 			out = append(out, flags)
 			out = pushArrayElementType(out, *col.Type.Array)
+			out = pushGeneratedText(out, &col)
 			if col.Collation != "" {
 				out = appendU16(out, uint16(len(col.Collation)))
 				out = append(out, col.Collation...)
@@ -5358,8 +5368,14 @@ func tableEntryBytes(table *catTable, rootDataPage pageRef, indexRoots []pageRef
 			if col.NotNull {
 				flags |= 0b10
 			}
+			// bit7 is_generated + bit3 (v55): the generation expression text follows the element
+			// descriptor.
+			if col.Generated != nil {
+				flags |= 0b1000_1000
+			}
 			out = append(out, flags)
 			out = pushRangeElementType(out, *col.Type.Range)
+			out = pushGeneratedText(out, &col)
 			continue
 		}
 		out = append(out, typeCodeForScalar(col.Type.ScalarTy()))
@@ -5389,6 +5405,11 @@ func tableEntryBytes(table *catTable, rootDataPage pageRef, indexRoots []pageRef
 		// (spec/design/collation.md §5); the name is appended after the default.
 		if col.Collation != "" {
 			flags |= 0b100_0000
+		}
+		// bit7 is_generated (v55) — a stored generated column, always with bit3: its generation
+		// expression takes the expr-text slot (generated-columns.md §6).
+		if col.Generated != nil {
+			flags |= 0b1000_1000
 		}
 		out = append(out, flags)
 		// A decimal column appends its typmod (precision, scale) — only for type_code 6, so
@@ -5425,9 +5446,9 @@ func tableEntryBytes(table *catTable, rootDataPage pageRef, indexRoots []pageRef
 			// A column DEFAULT is always a scalar value (composite columns carry no default this
 			// slice — composite.md §12), so encode the scalar body directly.
 			out = append(out, encodeScalar(col.Type.ScalarTy(), *col.Default)...)
-		} else if col.DefaultExpr != nil {
-			out = appendU16(out, uint16(len(col.DefaultExpr.ExprText)))
-			out = append(out, col.DefaultExpr.ExprText...)
+		} else if de := col.exprTextSlot(); de != nil {
+			out = appendU16(out, uint16(len(de.ExprText)))
+			out = append(out, de.ExprText...)
 		}
 		// The effective collation name (v17, flags bit6) — last in the per-column entry, so a
 		// non-collated column is byte-unchanged (spec/design/collation.md §5).
@@ -5652,6 +5673,9 @@ func checkCatalogTextLengths(s *snapshot) error {
 		long := false
 		for _, c := range table.Columns {
 			if c.DefaultExpr != nil && tooLong(c.DefaultExpr.ExprText) {
+				long = true
+			}
+			if c.Generated != nil && tooLong(c.Generated.ExprText) {
 				long = true
 			}
 		}
@@ -6963,31 +6987,32 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64, pcap pageCap) (*
 			if flags&0b01 != 0 {
 				return nil, pageRef{}, nil, newError(DataCorrupted, "reserved column flag bit0 set")
 			}
-			if flags&^0b1010 != 0 {
+			if flags&^0b1000_1010 != 0 {
 				return nil, pageRef{}, nil, newError(DataCorrupted, "invalid composite column flags")
+			}
+			isGenerated, err := containerGeneratedFlag(flags)
+			if err != nil {
+				return nil, pageRef{}, nil, err
 			}
 			tname, err := readString(buf, pos)
 			if err != nil {
 				return nil, pageRef{}, nil, err
 			}
-			var defaultExpr *defaultExprDef
+			var defaultExpr, generated *defaultExprDef
 			if flags&0b1000 != 0 {
-				exprText, err := readString(buf, pos)
-				if err != nil {
+				if defaultExpr, err = readStoredExpr(buf, pos); err != nil {
 					return nil, pageRef{}, nil, err
 				}
-				// Text this binary cannot parse is kept, unparsed (spec/design/unparsable-definitions.md).
-				expr, perr := parseExpression(exprText)
-				if perr != nil {
-					expr = exprNode{}
-				}
-				defaultExpr = &defaultExprDef{ExprText: exprText, Expr: expr, Unparsed: perr != nil}
+			}
+			if isGenerated {
+				generated, defaultExpr = defaultExpr, nil
 			}
 			columns = append(columns, catColumn{
 				Name:        cname,
 				Type:        compositeT(tname),
 				NotNull:     flags&0b10 != 0,
 				DefaultExpr: defaultExpr,
+				Generated:   generated,
 			})
 			continue
 		}
@@ -7000,9 +7025,22 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64, pcap pageCap) (*
 			if flags&0b01 != 0 {
 				return nil, pageRef{}, nil, newError(DataCorrupted, "reserved column flag bit0 set")
 			}
+			isGenerated, err := containerGeneratedFlag(flags)
+			if err != nil {
+				return nil, pageRef{}, nil, err
+			}
+			if isGenerated != (flags&0b1000 != 0) {
+				return nil, pageRef{}, nil, newError(DataCorrupted, "default_is_expr set on an array column")
+			}
 			elem, err := readArrayElementType(buf, pos)
 			if err != nil {
 				return nil, pageRef{}, nil, err
+			}
+			var generated *defaultExprDef
+			if isGenerated {
+				if generated, err = readStoredExpr(buf, pos); err != nil {
+					return nil, pageRef{}, nil, err
+				}
 			}
 			// bit6 has_collation (v36): a text[] column's non-C collation name follows the element
 			// descriptor; the bit on any other element type is corrupt (spec/design/array.md §3).
@@ -7019,6 +7057,7 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64, pcap pageCap) (*
 				Name:      cname,
 				Type:      arrayT(elem),
 				NotNull:   flags&0b10 != 0,
+				Generated: generated,
 				Collation: collation,
 			})
 			continue
@@ -7033,14 +7072,31 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64, pcap pageCap) (*
 			if flags&0b01 != 0 {
 				return nil, pageRef{}, nil, newError(DataCorrupted, "reserved column flag bit0 set")
 			}
+			if flags&0b100_0000 != 0 {
+				return nil, pageRef{}, nil, newError(DataCorrupted, "invalid range column flags")
+			}
+			isGenerated, err := containerGeneratedFlag(flags)
+			if err != nil {
+				return nil, pageRef{}, nil, err
+			}
+			if isGenerated != (flags&0b1000 != 0) {
+				return nil, pageRef{}, nil, newError(DataCorrupted, "invalid range column flags")
+			}
 			elem, err := readRangeElementType(buf, pos)
 			if err != nil {
 				return nil, pageRef{}, nil, err
 			}
+			var generated *defaultExprDef
+			if isGenerated {
+				if generated, err = readStoredExpr(buf, pos); err != nil {
+					return nil, pageRef{}, nil, err
+				}
+			}
 			columns = append(columns, catColumn{
-				Name:    cname,
-				Type:    rangeT(elem),
-				NotNull: flags&0b10 != 0,
+				Name:      cname,
+				Type:      rangeT(elem),
+				NotNull:   flags&0b10 != 0,
+				Generated: generated,
 			})
 			continue
 		}
@@ -7053,12 +7109,14 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64, pcap pageCap) (*
 			return nil, pageRef{}, nil, err
 		}
 		// bit0 was the primary_key flag through v4; v5 retired it (the pk list below is
-		// the authority) and reserves it as must-be-zero. bit6 = has_collation (v17); bit7 reserved.
+		// the authority) and reserves it as must-be-zero. bit6 = has_collation (v17); bit7 is
+		// is_generated (v55): always with bit3, never with bit2 or bit4 (generated-columns.md §6).
 		if flags&0b01 != 0 {
 			return nil, pageRef{}, nil, newError(DataCorrupted, "reserved column flag bit0 set")
 		}
-		if flags&0b1000_0000 != 0 {
-			return nil, pageRef{}, nil, newError(DataCorrupted, "reserved column flag bit7 set")
+		isGenerated := flags&0b1000_0000 != 0
+		if isGenerated && (flags&0b1000 == 0 || flags&0b1_0100 != 0) {
+			return nil, pageRef{}, nil, newError(DataCorrupted, "invalid is_generated column flags")
 		}
 		// bit4 is_identity + bit5 identity_always (v15) — identity_always is meaningful only with
 		// is_identity (spec/design/sequences.md §13).
@@ -7127,18 +7185,15 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64, pcap pageCap) (*
 			}
 			defaultVal = &dv
 		}
-		var defaultExpr *defaultExprDef
+		// Text this binary cannot parse is kept, unparsed (spec/design/unparsable-definitions.md).
+		var defaultExpr, generated *defaultExprDef
 		if flags&0b1000 != 0 {
-			exprText, err := readString(buf, pos)
-			if err != nil {
+			if defaultExpr, err = readStoredExpr(buf, pos); err != nil {
 				return nil, pageRef{}, nil, err
 			}
-			// Text this binary cannot parse is kept, unparsed (spec/design/unparsable-definitions.md).
-			expr, perr := parseExpression(exprText)
-			if perr != nil {
-				expr = exprNode{}
-			}
-			defaultExpr = &defaultExprDef{ExprText: exprText, Expr: expr, Unparsed: perr != nil}
+		}
+		if isGenerated {
+			generated, defaultExpr = defaultExpr, nil
 		}
 		// The effective collation (v17, flags bit6) — appended last; a non-collated column has the
 		// bit clear and reads nothing (spec/design/collation.md §5).
@@ -7160,6 +7215,7 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64, pcap pageCap) (*
 			Default:     defaultVal,
 			DefaultExpr: defaultExpr,
 			Identity:    identity,
+			Generated:   generated,
 			Collation:   collation,
 		})
 	}
@@ -8563,4 +8619,51 @@ func readHostDeps(buf []byte, pos *int) ([]hostFuncDep, error) {
 		})
 	}
 	return deps, nil
+}
+
+// exprTextSlot is the expression whose text fills a column entry's expr-text slot: the expression
+// default, else the generation expression (v55, flags bit7 — the two never coexist).
+func (c *catColumn) exprTextSlot() *defaultExprDef {
+	if c.DefaultExpr != nil {
+		return c.DefaultExpr
+	}
+	return c.Generated
+}
+
+// pushGeneratedText appends a container column's generation-expression text (v55, flags bit7):
+// u16 length + UTF-8.
+func pushGeneratedText(out []byte, col *catColumn) []byte {
+	if col.Generated == nil {
+		return out
+	}
+	out = appendU16(out, uint16(len(col.Generated.ExprText)))
+	return append(out, col.Generated.ExprText...)
+}
+
+// containerGeneratedFlag applies the v55 is_generated flag rules for a container column
+// (generated-columns.md §6): bit7 requires bit3, and bits 2, 4 and 5 are never set on such a
+// column; it returns whether bit7 is set.
+func containerGeneratedFlag(flags byte) (bool, error) {
+	if flags&0b11_0100 != 0 {
+		return false, newError(DataCorrupted, "invalid container column flags")
+	}
+	g := flags&0b1000_0000 != 0
+	if g && flags&0b1000 == 0 {
+		return false, newError(DataCorrupted, "is_generated set without default_is_expr")
+	}
+	return g, nil
+}
+
+// readStoredExpr reads a stored expression's text (u16 length + UTF-8) and parses it, keeping text
+// this binary cannot parse (spec/design/unparsable-definitions.md).
+func readStoredExpr(buf []byte, pos *int) (*defaultExprDef, error) {
+	exprText, err := readString(buf, pos)
+	if err != nil {
+		return nil, err
+	}
+	expr, perr := parseExpression(exprText)
+	if perr != nil {
+		expr = exprNode{}
+	}
+	return &defaultExprDef{ExprText: exprText, Expr: expr, Unparsed: perr != nil}, nil
 }

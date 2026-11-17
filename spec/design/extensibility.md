@@ -681,9 +681,9 @@ against. Host *types* (§4.3, later) extend this to the full tuple in the persis
 > **Status: landed (all three cores, `format_version` 35).** This closes the §14 step-4 deferral.
 > The Ruby gem cannot yet declare a `component_id`, so its host functions cannot back a `CHECK` (or
 > an index); that is a gem follow-on in [TODO.md](../../TODO.md). Generated columns are **out of
-> scope**: jed has no `GENERATED ALWAYS AS (expr) STORED` (only `GENERATED … AS IDENTITY`), so
-> there is nothing to extend. A future stored generated column would take the **index** rule (§8.1),
-> not this one. Its stored value is derived from the function the way an index key is, so a changed
+> scope** here: a stored generated column ([generated-columns.md](generated-columns.md)) rejects a
+> host function with `0A000` for now, and admitting one would take the **index** rule (§8.1), not
+> this one. Its stored value is derived from the function the way an index key is, so a changed
 > implementation would leave stored values stale.
 
 **The gap this closes.** This is not a missing feature: a host function in a `DEFAULT` or `CHECK` is

@@ -17,17 +17,28 @@ pub fn dump(db: &mut jed::Session, out: &mut dyn Write) -> io::Result<()> {
     writeln!(out, "BEGIN;")?;
     let names = db.table_names();
     for name in &names {
-        let (create, order_by, n_indexes) = {
+        let (create, order_by, n_indexes, stored_cols) = {
             let table = db.table(name).expect("listed table exists");
             (
                 create_table_sql(table),
                 pk_order_by(table),
                 table.indexes.len(),
+                stored_column_list(table),
             )
         };
         writeln!(out, "{create}")?;
+        // A stored generated column takes no value on replay (it is recomputed from the row —
+        // spec/design/generated-columns.md §5), so such a table dumps and inserts the other columns
+        // by name.
+        let (select_list, insert_cols) = match &stored_cols {
+            Some(cols) => (cols.clone(), format!(" ({cols})")),
+            None => ("*".to_string(), String::new()),
+        };
         let rows = db
-            .query(&format!("SELECT * FROM {}{order_by}", q(name)), &[])
+            .query(
+                &format!("SELECT {select_list} FROM {}{order_by}", q(name)),
+                &[],
+            )
             .expect("a full-table scan of a cataloged table cannot fail");
         for row in rows {
             // A read that fails part-way must fail the dump, never shorten it.
@@ -35,7 +46,7 @@ pub fn dump(db: &mut jed::Session, out: &mut dyn Write) -> io::Result<()> {
             let values: Vec<String> = row.iter().map(Value::sql_literal).collect();
             writeln!(
                 out,
-                "INSERT INTO {} VALUES ({});",
+                "INSERT INTO {}{insert_cols} VALUES ({});",
                 q(name),
                 values.join(", ")
             )?;
@@ -147,6 +158,11 @@ fn create_table_sql(table: &Table) -> String {
         if col.not_null && !col.primary_key {
             line.push_str(" NOT NULL");
         }
+        // A stored generated column writes its persisted generation text (it re-parses on replay;
+        // spec/design/generated-columns.md §5). It has no default.
+        if let Some(g) = &col.generated {
+            line.push_str(&format!(" GENERATED ALWAYS AS ({}) STORED", g.expr_text));
+        }
         // The canonical DEFAULT text jed_columns.column_default shows (introspection.md §5): an
         // expression default's persisted expr-text (it re-parses to the same expression on replay),
         // or a constant's SQL literal. `DEFAULT NULL` is omitted — it is the same as no default. An
@@ -180,6 +196,21 @@ fn create_table_sql(table: &Table) -> String {
         q(&table.name),
         parts.join(",\n")
     )
+}
+
+/// The comma-separated names of `table`'s non-generated columns when it has a stored generated
+/// column, else `None` (the dump then selects and inserts `*`).
+fn stored_column_list(table: &Table) -> Option<String> {
+    if table.columns.iter().all(|c| c.generated.is_none()) {
+        return None;
+    }
+    let cols: Vec<String> = table
+        .columns
+        .iter()
+        .filter(|c| c.generated.is_none())
+        .map(|c| q(&c.name))
+        .collect();
+    Some(cols.join(", "))
 }
 
 /// The statements that make each identity column of `table` an identity column again once its rows
@@ -391,6 +422,49 @@ mod tests {
             .expect("in-memory create is infallible")
             .session(jed::SessionOptions::default());
         assert_eq!(dump_to_string(&mut db), "BEGIN;\nCOMMIT;\n");
+    }
+
+    // A stored generated column dumps its expression and is left out of the INSERTs, which replay
+    // recomputes (spec/design/generated-columns.md §5): dump → replay → dump is byte-identical.
+    #[test]
+    fn generated_columns_round_trip() {
+        let mut db = jed::Database::create(jed::CreateOptions::default())
+            .expect("in-memory create is infallible")
+            .session(jed::SessionOptions::default());
+        for sql in [
+            "CREATE TABLE g (id i32 PRIMARY KEY, a i32, b i32 NOT NULL GENERATED ALWAYS AS (a * 2) STORED, c text)",
+            "INSERT INTO g (id, a, c) VALUES (1, 5, 'x'), (2, 7, NULL)",
+        ] {
+            db.execute(sql, &[]).unwrap();
+        }
+        let first = dump_to_string(&mut db);
+        assert_eq!(
+            first,
+            "BEGIN;\n\
+             CREATE TABLE g (\n\
+             \x20 id i32,\n\
+             \x20 a i32,\n\
+             \x20 b i32 NOT NULL GENERATED ALWAYS AS (a * 2) STORED,\n\
+             \x20 c text,\n\
+             \x20 PRIMARY KEY (id)\n\
+             );\n\
+             INSERT INTO g (id, a, c) VALUES (1, 5, 'x');\n\
+             INSERT INTO g (id, a, c) VALUES (2, 7, NULL);\n\
+             COMMIT;\n"
+        );
+        let mut replayed = jed::Database::create(jed::CreateOptions::default())
+            .expect("in-memory create is infallible")
+            .session(jed::SessionOptions::default());
+        for stmt in crate::splitter::split(&first).unwrap() {
+            replayed.execute(&stmt.sql, &[]).unwrap();
+        }
+        assert_eq!(dump_to_string(&mut replayed), first);
+        let rows = replayed.query("SELECT b FROM g ORDER BY id", &[]).unwrap();
+        let bs: Vec<Vec<jed::Value>> = rows.collect::<Result<_, _>>().unwrap();
+        assert_eq!(
+            bs,
+            vec![vec![jed::Value::Int(10)], vec![jed::Value::Int(14)]]
+        );
     }
 
     // Identity columns dump as plain NOT NULL columns, get their rows, and then become identity

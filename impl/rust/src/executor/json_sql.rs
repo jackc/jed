@@ -687,6 +687,7 @@ pub(crate) fn jt_column(name: &str, ty: ScalarType, decimal: Option<DecimalTypmo
         collation: None,
         no_collation: false,
         collation_conflict: false,
+        generated: None,
     }
 }
 

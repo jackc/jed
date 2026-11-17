@@ -458,8 +458,11 @@ default-off + per-function `grant`"; a *deny-list* is "default-on + per-function
   It also includes functions reached indirectly through a **catalog expression** the statement makes
   the engine evaluate, as PostgreSQL checks them against the current user: the column default an
   `INSERT` fills (an omitted column, a `DEFAULT` slot, `DEFAULT VALUES`) or `SET x = DEFAULT`
-  assigns (in `UPDATE` or an `ON CONFLICT DO UPDATE` action), and the `CHECK` constraints of an
-  `INSERT`/`UPDATE`/upsert target. Through an updatable view these are the base table's
+  assigns (in `UPDATE` or an `ON CONFLICT DO UPDATE` action), and the `CHECK` constraints and stored
+  generation expressions ([generated-columns.md](generated-columns.md)) of an
+  `INSERT`/`UPDATE`/upsert target. Every generation expression of the target counts, even one the
+  statement does not recompute (an `UPDATE` that assigns none of its columns), which keeps the check
+  static. Through an updatable view these are the base table's
   ([views.md](views.md) §15.4). Privilege preflight walks those selected expressions before any row
   is evaluated, so the check is static: a write that touches no row still needs them. Index
   expressions and partial-index predicates are not checked (nor are they in PostgreSQL, whose index

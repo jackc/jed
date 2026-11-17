@@ -714,6 +714,7 @@ pub(crate) fn cte_synthetic_table_cols(
                 collation: None,
                 no_collation: false,
                 collation_conflict: false,
+                generated: None,
             };
             let d = body_derivs.map_or(&Deriv::None, |ds| &ds[i]);
             set_synthetic_collation(&mut col, d);

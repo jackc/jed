@@ -212,6 +212,7 @@ impl Engine {
                 collation,
                 no_collation: false,
                 collation_conflict: false,
+                generated: None,
             });
         }
         Ok(columns)

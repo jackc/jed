@@ -375,18 +375,19 @@ impl Engine {
         // The GENERATED ALWAYS columns still explicitly targeted (and not OVERRIDING SYSTEM VALUE):
         // supplying a non-DEFAULT value to one is `428C9`. Collected as (column ordinal, value
         // position) so the source branches can enforce it (VALUES per-row, SELECT up-front).
-        let always_targeted: Vec<(usize, usize)> = if overriding == Some(Overriding::System) {
-            Vec::new()
-        } else {
-            columns
-                .iter()
-                .enumerate()
-                .filter_map(|(i, col)| match (col.identity, provided[i]) {
-                    (Some(IdentityKind::Always), Some(p)) => Some((i, p)),
-                    _ => None,
-                })
-                .collect()
-        };
+        // A stored generated column joins them whatever the OVERRIDING clause
+        // (generated-columns.md §3.1); the list is in column order, PostgreSQL's rewrite order.
+        let always_targeted: Vec<(usize, usize)> = columns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, col)| match (col.identity, provided[i]) {
+                (_, Some(p)) if col.generated.is_some() => Some((i, p)),
+                (Some(IdentityKind::Always), Some(p)) if overriding != Some(Overriding::System) => {
+                    Some((i, p))
+                }
+                _ => None,
+            })
+            .collect();
 
         match source {
             InsertSource::Values(rows_in) => {
@@ -440,7 +441,7 @@ impl Engine {
                         .iter()
                         .any(|values| !matches!(values[p], InsertValue::Default))
                     {
-                        return Err(EngineError::generated_always_insert(&columns[i].name));
+                        return Err(insert_targeted_error(&columns[i]));
                     }
                 }
                 // Resolve the RETURNING projection after the source (PostgreSQL's analysis
@@ -650,7 +651,7 @@ impl Engine {
                 // VALUE` is `428C9` — raised up front (PG raises it at rewrite), firing even over a
                 // zero-row source.
                 if let Some(&(i, _)) = always_targeted.first() {
-                    return Err(EngineError::generated_always_insert(&columns[i].name));
+                    return Err(insert_targeted_error(&columns[i]));
                 }
                 // Plan the source query, then resolve the RETURNING projection (PostgreSQL's
                 // analysis order — both precede any execution), threading ONE ParamTypes so a
@@ -1068,22 +1069,22 @@ impl Engine {
             &mut ptypes,
         )?;
         let rindexes = self.resolve_table_indexes_with_params(&table, &mut ptypes)?;
-        let always_targeted: Vec<InsertAlwaysTarget> = if ins.overriding == Some(Overriding::System)
-        {
-            Vec::new()
-        } else {
-            table
-                .columns
-                .iter()
-                .enumerate()
-                .filter_map(|(i, col)| match (col.identity, provided[i]) {
-                    (Some(IdentityKind::Always), Some(p)) => {
-                        Some(InsertAlwaysTarget { col: i, pos: p })
-                    }
-                    _ => None,
-                })
-                .collect()
-        };
+        let always_targeted: Vec<InsertAlwaysTarget> = table
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, col)| match (col.identity, provided[i]) {
+                (_, Some(p)) if col.generated.is_some() => {
+                    Some(InsertAlwaysTarget { col: i, pos: p })
+                }
+                (Some(IdentityKind::Always), Some(p))
+                    if ins.overriding != Some(Overriding::System) =>
+                {
+                    Some(InsertAlwaysTarget { col: i, pos: p })
+                }
+                _ => None,
+            })
+            .collect();
         let mut value_exprs: ValueExprs = Vec::with_capacity(rows.len());
         for values in rows {
             if values.len() != arity {
@@ -1124,9 +1125,7 @@ impl Engine {
                 .iter()
                 .any(|values| !matches!(values[target.pos], InsertValue::Default))
             {
-                return Err(EngineError::generated_always_insert(
-                    &table.columns[target.col].name,
-                ));
+                return Err(insert_targeted_error(&table.columns[target.col]));
             }
         }
         let returning = match &ins.returning {
@@ -1918,6 +1917,7 @@ impl Engine {
                     Vec::new()
                 };
                 let mut plans: Vec<AssignPlan> = Vec::with_capacity(assignments.len());
+                let mut generated_defaults: Vec<usize> = Vec::new();
                 for a in assignments {
                     let idx = col_idx(tdef, &a.column).map_err(|e| e.with_position(a.pos.0))?;
                     // A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md
@@ -1926,13 +1926,22 @@ impl Engine {
                     if tdef.columns[idx].identity == Some(IdentityKind::Always) && !a.is_default {
                         return Err(EngineError::generated_always_update(&a.column));
                     }
+                    // A stored generated column takes only DEFAULT, which assigns nothing
+                    // (generated-columns.md §3.2).
+                    if tdef.columns[idx].generated.is_some() && !a.is_default {
+                        return Err(generated_update_error(&a.column));
+                    }
                     // Assigning a PRIMARY KEY member re-keys the existing row (upsert.md §5), the
                     // standalone UPDATE rule carried onto the conflict path.
-                    if plans.iter().any(|p| p.idx == idx) {
+                    if plans.iter().any(|p| p.idx == idx) || generated_defaults.contains(&idx) {
                         return Err(EngineError::new(
                             SqlState::DuplicateColumn,
                             format!("column {} assigned more than once", a.column),
                         ));
+                    }
+                    if tdef.columns[idx].generated.is_some() {
+                        generated_defaults.push(idx);
+                        continue;
                     }
                     let col = &tdef.columns[idx];
                     // A container (composite / range / array) column takes the standalone UPDATE
@@ -1975,9 +1984,17 @@ impl Engine {
                     Some(p) => Some(resolve_boolean_filter(&scope, p, ptypes)?),
                     None => None,
                 };
+                let set_targets: Vec<bool> = (0..tdef.columns.len())
+                    .map(|i| plans.iter().any(|p| p.idx == i))
+                    .collect();
+                let generated = match generated_recompute_set(tdef, &set_targets) {
+                    Some(need) => self.resolve_generated_exprs(tdef, Some(&need), ptypes)?,
+                    None => Vec::new(),
+                };
                 ConflictActionPlan::DoUpdate {
                     assignments: plans,
                     filter,
+                    generated,
                 }
             }
         };
@@ -2097,9 +2114,14 @@ impl Engine {
         let mut affected_arbiter: HashSet<Vec<u8>> = HashSet::new();
         let mut affected_stored: HashSet<Vec<u8>> = HashSet::new();
         let pk_assigned = match &plan.action {
-            ConflictActionPlan::DoUpdate { assignments, .. } => assignments
-                .iter()
-                .any(|a| pk.iter().any(|(o, _)| *o == a.idx)),
+            ConflictActionPlan::DoUpdate {
+                assignments,
+                generated,
+                ..
+            } => pk.iter().any(|(o, _)| {
+                assignments.iter().any(|a| a.idx == *o)
+                    || generated.get(*o).is_some_and(Option::is_some)
+            }),
             ConflictActionPlan::DoNothing => false,
         };
         // For the no-target DO NOTHING path: the planned inserts' keys/prefixes, so an in-batch
@@ -2247,6 +2269,7 @@ impl Engine {
                             ConflictActionPlan::DoUpdate {
                                 assignments,
                                 filter,
+                                generated,
                             } => {
                                 // The combined eval row [existing | proposed] the §5 scope resolves
                                 // against (bare/qualified = existing, `excluded.col` = proposed).
@@ -2269,12 +2292,12 @@ impl Engine {
                                     continue;
                                 }
                                 let mut new_row = erow.clone();
-                                let mut null_col: Option<&str> = None;
+                                let mut null_col: Option<usize> = None;
                                 for ap in assignments {
                                     let raw = ap.source.eval(&combined, &env, meter)?;
                                     // NOT NULL over the complete new row (error-fields.md §9.5).
                                     if ap.not_null && matches!(raw, Value::Null) {
-                                        null_col.get_or_insert(&ap.name);
+                                        null_col.get_or_insert(ap.idx);
                                         new_row[ap.idx] = Value::Null;
                                         continue;
                                     }
@@ -2282,10 +2305,34 @@ impl Engine {
                                         .check(raw, &self.input_zone())
                                         .map_err(|e| e.with_table(&relation))?;
                                 }
-                                if let Some(col) = null_col {
-                                    return Err(
-                                        self.not_null_row_violation(&relation, col, &new_row)
-                                    );
+                                // Recompute generated columns reading a SET target, before NOT
+                                // NULL (generated-columns.md §3.2).
+                                if !generated.is_empty() {
+                                    self.compute_generated(
+                                        columns,
+                                        &col_types,
+                                        generated,
+                                        &mut new_row,
+                                        rng,
+                                        meter,
+                                        &relation,
+                                    )?;
+                                    for (i, g) in generated.iter().enumerate() {
+                                        if g.is_some()
+                                            && columns[i].not_null
+                                            && matches!(new_row[i], Value::Null)
+                                            && null_col.is_none_or(|c| i < c)
+                                        {
+                                            null_col = Some(i);
+                                        }
+                                    }
+                                }
+                                if let Some(ci) = null_col {
+                                    return Err(self.not_null_row_violation(
+                                        &relation,
+                                        &columns[ci].name,
+                                        &new_row,
+                                    ));
                                 }
                                 self.eval_checks(checks, &new_row, rng, &relation, meter)?;
                                 view_check(&new_row, meter)?;
@@ -2401,9 +2448,15 @@ impl Engine {
         // that assigned an FK local column, must reference an existing parent key — the committed
         // parent state plus (for a self-reference) the statement's end state.
         let assigned: HashSet<usize> = match &plan.action {
-            ConflictActionPlan::DoUpdate { assignments, .. } => {
-                assignments.iter().map(|a| a.idx).collect()
-            }
+            ConflictActionPlan::DoUpdate {
+                assignments,
+                generated,
+                ..
+            } => assignments
+                .iter()
+                .map(|a| a.idx)
+                .chain((0..generated.len()).filter(|&i| generated[i].is_some()))
+                .collect(),
             ConflictActionPlan::DoNothing => HashSet::new(),
         };
         let (fks, fk_temp) = self.target_foreign_keys(db_scope, table);
@@ -2931,7 +2984,18 @@ impl Engine {
     ) -> Result<Row> {
         let mut row = Vec::with_capacity(columns.len());
         let mut null_col: Option<usize> = None;
+        let mut has_generated = false;
         for (i, col) in columns.iter().enumerate() {
+            // A stored generated column's slot is a placeholder until the base row is built
+            // (generated-columns.md §3.1); `default_exprs[i]` holds its resolved expression.
+            if col.generated.is_some() {
+                if let Some(p) = provided[i] {
+                    let _ = value(p); // an all-DEFAULT VALUES slot (anything else was 428C9)
+                }
+                has_generated = true;
+                row.push(Value::Null);
+                continue;
+            }
             let candidate = match provided[i] {
                 Some(p) => value(p),
                 None => self.eval_default(col, default_exprs[i].as_ref(), rng, meter)?,
@@ -2958,6 +3022,26 @@ impl Engine {
                     }
                 })?,
             );
+        }
+        if has_generated {
+            self.compute_generated(
+                columns,
+                col_types,
+                default_exprs,
+                &mut row,
+                rng,
+                meter,
+                relation,
+            )?;
+            for (i, col) in columns.iter().enumerate() {
+                if col.generated.is_some()
+                    && col.not_null
+                    && matches!(row[i], Value::Null)
+                    && null_col.is_none_or(|c| i < c)
+                {
+                    null_col = Some(i);
+                }
+            }
         }
         if let Some(i) = null_col {
             return Err(self.not_null_row_violation(relation, &columns[i].name, &row));
@@ -3025,6 +3109,7 @@ impl Engine {
                 ConflictActionPlan::DoUpdate {
                     assignments,
                     filter,
+                    ..
                 },
             ..
         }) = plan
@@ -4103,6 +4188,9 @@ impl Engine {
         };
         let mut ptypes = ParamTypes::default();
         let mut plans: Vec<AssignPlan> = Vec::with_capacity(upd.assignments.len());
+        // `SET g = DEFAULT` on a stored generated column assigns nothing (generated-columns.md
+        // §3.2); its ordinals are kept only for the repeated-assignment check.
+        let mut generated_defaults: Vec<usize> = Vec::new();
         for a in &upd.assignments {
             let idx = col_idx(table, &a.column).map_err(|e| e.with_position(a.pos.0))?;
             // A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4).
@@ -4111,11 +4199,19 @@ impl Engine {
             if table.columns[idx].identity == Some(IdentityKind::Always) && !a.is_default {
                 return Err(EngineError::generated_always_update(&a.column));
             }
-            if plans.iter().any(|p| p.idx == idx) {
+            // A stored generated column likewise takes only DEFAULT (generated-columns.md §3.2).
+            if table.columns[idx].generated.is_some() && !a.is_default {
+                return Err(generated_update_error(&a.column));
+            }
+            if plans.iter().any(|p| p.idx == idx) || generated_defaults.contains(&idx) {
                 return Err(EngineError::new(
                     SqlState::DuplicateColumn,
                     format!("column {} assigned more than once", a.column),
                 ));
+            }
+            if table.columns[idx].generated.is_some() {
+                generated_defaults.push(idx);
+                continue;
             }
             let col = &table.columns[idx];
             if a.is_default {
@@ -4189,11 +4285,23 @@ impl Engine {
                 }
             }
         }
+        // The stored generated columns this UPDATE recomputes — those whose expression references a
+        // SET target (generated-columns.md §3.2) — resolved once against the table's columns. A
+        // recomputed column counts as written below (key, foreign key, carried-value handling).
+        let set_targets: Vec<bool> = (0..table.columns.len())
+            .map(|i| plans.iter().any(|p| p.idx == i))
+            .collect();
+        let generated = match generated_recompute_set(table, &set_targets) {
+            Some(need) => self.resolve_generated_exprs(table, Some(&need), &mut ptypes)?,
+            None => Vec::new(),
+        };
+        let written: Vec<bool> = (0..table.columns.len())
+            .map(|i| set_targets[i] || generated.get(i).is_some_and(Option::is_some))
+            .collect();
         // A re-keying UPDATE assigns at least one key member: each matched row's storage key is
         // recomputed (phase 1) and the row is moved (phase 2). An UPDATE that touches no key
         // member keeps every storage key in place — the in-place fast path (`store.replace`).
-        let pk_changed =
-            !pk_members.is_empty() && plans.iter().any(|p| pk_members.contains(&p.idx));
+        let pk_changed = !pk_members.is_empty() && pk_members.iter().any(|&m| written[m]);
 
         let mut filter = self.resolve_write_filter(
             &scope,
@@ -4289,6 +4397,15 @@ impl Engine {
         for plan in &plans {
             collect_touched(&plan.source, 0, &mut mask);
         }
+        // A recomputed generated column reads the columns its expression references; an assigned
+        // one's value is the freshly computed one, not a storage read.
+        for g in generated.iter().flatten() {
+            let mut gmask = vec![false; ncols];
+            collect_touched(g, 0, &mut gmask);
+            for (i, m) in mask.iter_mut().enumerate() {
+                *m |= gmask[i] && !set_targets[i];
+            }
+        }
         // The columns RETURNING reads from the old side, which the retained old row keeps resolved.
         let mut old_returned: Option<Vec<bool>> = None;
         if let Some((nodes, _, _)) = &ret {
@@ -4297,7 +4414,7 @@ impl Engine {
                 collect_touched(node, 0, &mut ret_mask);
             }
             for (i, m) in mask.iter_mut().enumerate() {
-                *m |= ret_mask[i] && !plans.iter().any(|p| p.idx == i); // new side
+                *m |= ret_mask[i] && !written[i]; // new side
                 *m |= ret_mask[ncols + i]; // old side — always a storage read
             }
             old_returned = Some(ret_mask[ncols..].to_vec());
@@ -4338,9 +4455,7 @@ impl Engine {
         scan_actual += block_cost;
         let mut filter_actual = scan_actual;
         let store = self.store_scoped(upd.db.as_deref(), &upd.table);
-        let assigned: Vec<bool> = (0..ncols)
-            .map(|i| plans.iter().any(|p| p.idx == i))
-            .collect();
+        let assigned: Vec<bool> = written.clone();
         for (key, mut row) in batch.entries {
             meter.checkpoint()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
@@ -4398,7 +4513,7 @@ impl Engine {
                     _ => v.clone(),
                 })
                 .collect();
-            let mut null_col: Option<&str> = None;
+            let mut null_col: Option<usize> = None;
             for plan in &plans {
                 let mut raw = plan.source.eval(&row, &env, &mut meter)?;
                 if let (Some(mapped), Some(target)) = (mapped, &upd.fk_target) {
@@ -4413,7 +4528,7 @@ impl Engine {
                 }
                 // NOT NULL over the complete new row, after every assignment (error-fields.md §9.5).
                 if plan.not_null && matches!(raw, Value::Null) {
-                    null_col.get_or_insert(&plan.name);
+                    null_col.get_or_insert(plan.idx);
                     new_row[plan.idx] = Value::Null;
                     continue;
                 }
@@ -4421,8 +4536,34 @@ impl Engine {
                     .check(raw, &self.input_zone())
                     .map_err(|e| e.with_table(&relation))?;
             }
-            if let Some(col) = null_col {
-                return Err(self.not_null_row_violation(&relation, col, &new_row));
+            // Recompute the generated columns over the assigned row, before NOT NULL
+            // (generated-columns.md §3.1 step 2); a NULL into NOT NULL joins the row-wide check.
+            if !generated.is_empty() {
+                self.compute_generated(
+                    &table.columns,
+                    &col_types,
+                    &generated,
+                    &mut new_row,
+                    &stmt_rng,
+                    &mut meter,
+                    &relation,
+                )?;
+                for (i, g) in generated.iter().enumerate() {
+                    if g.is_some()
+                        && table.columns[i].not_null
+                        && matches!(new_row[i], Value::Null)
+                        && null_col.is_none_or(|c| i < c)
+                    {
+                        null_col = Some(i);
+                    }
+                }
+            }
+            if let Some(ci) = null_col {
+                return Err(self.not_null_row_violation(
+                    &relation,
+                    &table.columns[ci].name,
+                    &new_row,
+                ));
             }
             // An unassigned non-key column carries its stored large value over deferred, so the
             // rewrite neither re-reads nor recompresses it and the commit keeps its chain
@@ -4572,7 +4713,7 @@ impl Engine {
         // must reference an existing parent key — committed parent state, plus (for a
         // self-reference) the updated rows' new referenced values, so a row may reference a value
         // another updated row now supplies. Unmetered, phase 1, before any write.
-        let assigned: HashSet<usize> = plans.iter().map(|p| p.idx).collect();
+        let assigned: HashSet<usize> = (0..ncols).filter(|&i| written[i]).collect();
         let (fks, fk_temp) = self.target_foreign_keys(upd.db.as_deref(), &upd.table);
         for fk in &fks {
             if !fk.columns.iter().any(|c| assigned.contains(c)) {

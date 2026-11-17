@@ -944,6 +944,23 @@ function defaultExprTableDB(): Engine {
   return db;
 }
 
+// generatedTableDB exercises stored generated columns (format v55,
+// spec/design/generated-columns.md §6): column flags bit7 is_generated with bit3, the generation
+// text in the expr-text slot — scalar, NOT NULL text, array and range entries. EMPTY table — the
+// catalog encoding is the cross-core proof.
+function generatedTableDB(): Engine {
+  const db = goldenDb();
+  run(
+    db,
+    "CREATE TABLE t (id i32 PRIMARY KEY, a i32, " +
+      "g i32 GENERATED ALWAYS AS (a * 2) STORED, " +
+      "s text NOT NULL GENERATED ALWAYS AS (a::text || 'x') STORED, " +
+      "arr i32[] GENERATED ALWAYS AS (ARRAY[a, id]) STORED, " +
+      "r i32range GENERATED ALWAYS AS (i32range(a, a + 1)) STORED)",
+  );
+  return db;
+}
+
 // timestampTableDB exercises the value codec's i64-instant branch (type code 8): a positive
 // instant, a pre-1970 negative one, a BC-era one, the ±infinity sentinels, and a NULL. The
 // literals parse to the same micros the golden stores. The PK stays i32.
@@ -1385,6 +1402,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "uuid_table.jed", build: uuidTableDB },
     { name: "default_table.jed", build: defaultTableDB },
     { name: "default_expr_table.jed", build: defaultExprTableDB },
+    { name: "generated_table.jed", build: generatedTableDB },
     { name: "timestamp_table.jed", build: timestampTableDB },
     { name: "date_table.jed", build: dateTableDB },
     { name: "timestamptz_table.jed", build: timestamptzTableDB },
@@ -1478,6 +1496,7 @@ test("read goldens reproduces rows", () => {
     { name: "uuid_table.jed", build: uuidTableDB, table: "t" },
     { name: "default_table.jed", build: defaultTableDB, table: "t" },
     { name: "default_expr_table.jed", build: defaultExprTableDB, table: "t" },
+    { name: "generated_table.jed", build: generatedTableDB, table: "t" },
     { name: "timestamp_table.jed", build: timestampTableDB, table: "t" },
     { name: "date_table.jed", build: dateTableDB, table: "t" },
     { name: "timestamptz_table.jed", build: timestamptzTableDB, table: "t" },

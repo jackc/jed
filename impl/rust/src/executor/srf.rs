@@ -416,6 +416,7 @@ impl Engine {
                 collation: None,
                 no_collation: false,
                 collation_conflict: false,
+                generated: None,
             });
         }
         let table = Box::new(Table {
@@ -491,6 +492,7 @@ impl Engine {
                 collation: None,
                 no_collation: false,
                 collation_conflict: false,
+                generated: None,
             })
             .collect();
         let want = if jsonb {
@@ -986,6 +988,7 @@ impl Engine {
                 collation: None,
                 no_collation: false,
                 collation_conflict: false,
+                generated: None,
             });
         }
         let mismatch = "function return row and query-specified return row do not match";
@@ -1140,7 +1143,8 @@ impl Engine {
     /// `pk_ordinal` is the 1-based position in the PRIMARY KEY in KEY order (which may differ from
     /// declaration order — constraints.md §3), NULL for a non-member; `column_default` is the
     /// canonical DEFAULT text (`Column::default_text`); `identity_generation` is `ALWAYS` / `BY DEFAULT`
-    /// for an identity column, else NULL. The main database's views follow, in
+    /// for an identity column, else NULL; `generation_expression` is a stored generated column's
+    /// canonical expression text, else NULL. The main database's views follow, in
     /// (view name, ordinal) order (introspection.md §5): a view column's `type` is the type its
     /// planned body produces, and it is nullable, keyless, and has no default. Cost mirrors
     /// jed_tables_rows.
@@ -1178,6 +1182,9 @@ impl Engine {
                         Some(IdentityKind::ByDefault) => Value::Text("BY DEFAULT".to_string()),
                         None => Value::Null,
                     },
+                    c.generated
+                        .as_ref()
+                        .map_or(Value::Null, |g| Value::Text(g.expr_text.clone())),
                 ]);
             }
         }
@@ -1198,6 +1205,7 @@ impl Engine {
                         Value::Bool(false),
                         Value::Null,
                         default.map_or(Value::Null, |d| Value::Text(d.expr_text)),
+                        Value::Null,
                         Value::Null,
                     ]);
                 }

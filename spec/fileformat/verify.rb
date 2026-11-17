@@ -27,7 +27,8 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 54 # v54: a base-plus-offsets region may store up to 16 values whole as exceptions (region kind 6,
+VERSION = 55 # v55: stored generated columns — column flags bit7 is_generated, always with bit3, the
+# generation expression in the expr-text slot (format.md, generated-columns.md §6). v54: a base-plus-offsets region may store up to 16 values whole as exceptions (region kind 6,
 # format.md "Leaf node"; leaf-write-cost.md §8–§9). v53: deferred interior pages, narrow commit-manifest entries and the page stamp (format.md
 # "Version scope", deferred-interior.md §9, manifest-crc32.md). v52: the compact leaf (format.md "Leaf node", leaf-structural.md) — a leaf payload leads with a
 # flags byte and every leaf directory entry is a u16; a table column that is a leading key-derivable
@@ -513,10 +514,12 @@ end
 # BY DEFAULT) — the v15 column flag bits 4 (is_identity) + 5 (identity_always); an identity column
 # also carries not_null + an expression default (the nextval, spec/design/sequences.md §13).
 def col(name, type, pk: false, not_null: nil, precision: nil, scale: nil, varchar_len: nil,
-        default: :none, default_expr: nil, identity: nil, collation: nil, temporal: nil)
+        default: :none, default_expr: nil, identity: nil, collation: nil, temporal: nil,
+        generated: nil)
   { name: name, type: type, pk: pk, not_null: not_null.nil? ? pk : not_null,
     precision: precision, scale: scale, varchar_len: varchar_len, default: default,
     default_expr: default_expr, identity: identity, collation: collation, temporal: temporal }
+    .merge(generated ? { generated: generated } : {})
 end
 
 # A timestamp / interval typmod (v43, spec/design/timestamp.md §8, interval.md §6.1): `fields` is the
@@ -1022,6 +1025,23 @@ DEFAULT_EXPR_TABLE = {
     col("n", "i32", default_expr: "1 + 1"),
     col("k", "i32", default: 7),
     col("plain", "i16")
+  ],
+  rows: []
+}.freeze
+
+# Stored generated columns (v55, generated-columns.md §6): column flags bit7 is_generated with bit3,
+# the generation text in the expr-text slot — a scalar (after the typmod), a NOT NULL text column
+# (after the varchar length), an array (after the element descriptor) and a range (likewise). EMPTY
+# table: the catalog bytes are the cross-core proof; computation is covered by the corpus.
+GENERATED_TABLE = {
+  name: "t",
+  columns: [
+    col("id", "i32", pk: true),
+    col("a", "i32"),
+    col("g", "i32", generated: "a * 2"),
+    col("s", "text", not_null: true, generated: "a :: text || 'x'"),
+    col("arr", "i32[]", generated: "array [ a , id ]"),
+    col("r", "i32range", generated: "i32range ( a , a + 1 )")
   ],
   rows: []
 }.freeze
@@ -2254,7 +2274,14 @@ MALFORMED_FIXTURES = [
   { file: "malformed_fk_type.jed", page_size: 256, tables: MALFORMED_FK_TYPE_TABLES, malformed: :none },
   { file: "malformed_missing_type.jed", page_size: 256, types: [ctype("ghost", [field("x", "i32")])],
     tables: [{ name: "t", columns: [col("id", "i32", pk: true), col("home", "ghost")], rows: [] }],
-    malformed: :drop_types }
+    malformed: :drop_types },
+  # A stored generated column that is also an identity column: flags bit7 is_generated with bit4
+  # is_identity, which v55 forbids (generated-columns.md §6).
+  { file: "malformed_generated_flags.jed", page_size: 256,
+    tables: [{ name: "t", columns: [col("id", "i32", pk: true), col("a", "i32"),
+                                    col("g", "i32", not_null: true, identity: :always,
+                                                    generated: "a * 2")], rows: [] }],
+    malformed: :catalog, reject: true }
 ].freeze
 
 # --- encrypted-variant fixtures (spec/fileformat/encrypted.md), page size 1024 --------------------
@@ -2346,6 +2373,7 @@ FIXTURES = ([
   { file: "uuid_table.jed",      page_size: 256, tables: [UUID_TABLE] },
   { file: "default_table.jed",   page_size: 256, tables: [DEFAULT_TABLE] },
   { file: "default_expr_table.jed", page_size: 256, tables: [DEFAULT_EXPR_TABLE] },
+  { file: "generated_table.jed", page_size: 256, tables: [GENERATED_TABLE] },
   { file: "timestamp_table.jed",   page_size: 256, tables: [TIMESTAMP_TABLE] },
   { file: "timestamptz_table.jed", page_size: 256, tables: [TIMESTAMPTZ_TABLE] },
   { file: "interval_table.jed",    page_size: 256, tables: [INTERVAL_TABLE] },
@@ -2980,9 +3008,12 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
       out << [14].pack("C")
       cflags = c[:not_null] ? 0b10 : 0
       cflags |= 0b1000 if c[:default_expr]
+      # bit7 is_generated (v55): the generation expression takes the expr-text slot.
+      cflags |= 0b1000_1000 if c[:generated]
       out << [cflags].pack("C")
       out << u16(c[:type].bytesize) << c[:type].b
-      out << u16(c[:default_expr].bytesize) << c[:default_expr].b if c[:default_expr]
+      text = c[:default_expr] || c[:generated]
+      out << u16(text.bytesize) << text.b if text
       next
     end
     # An array column (v10): type_code 15, flags, then the element-type descriptor
@@ -2993,8 +3024,11 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
       out << [15].pack("C")
       aflags = c[:not_null] ? 0b10 : 0
       aflags |= 0b100_0000 if c[:collation]
+      # bit7 is_generated + bit3 (v55): the generation text follows the element descriptor.
+      aflags |= 0b1000_1000 if c[:generated]
       out << [aflags].pack("C")
       push_array_element_type(out, elem)
+      out << u16(c[:generated].bytesize) << c[:generated].b if c[:generated]
       out << u16(c[:collation].bytesize) << c[:collation].b if c[:collation]
       next
     end
@@ -3002,8 +3036,12 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
     # code (spec/design/ranges.md §3). Range columns carry no default this slice (bits 2/3 = 0).
     if (relem = range_elem(c[:type]))
       out << [17].pack("C")
-      out << [c[:not_null] ? 0b10 : 0].pack("C")
+      rflags = c[:not_null] ? 0b10 : 0
+      # bit7 is_generated + bit3 (v55): the generation text follows the element descriptor.
+      rflags |= 0b1000_1000 if c[:generated]
+      out << [rflags].pack("C")
       out << [TYPECODE.fetch(relem)].pack("C")
+      out << u16(c[:generated].bytesize) << c[:generated].b if c[:generated]
       next
     end
     out << [TYPECODE.fetch(c[:type])].pack("C")
@@ -3025,6 +3063,8 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
     # bit6 has_collation (v17) — a text column with a non-C effective collation (collation.md §5);
     # the name is appended last.
     flags |= 0b100_0000 if c[:collation]
+    # bit7 is_generated (v55) — a stored generated column, always with bit3 (generated-columns.md §6).
+    flags |= 0b1000_1000 if c[:generated]
     out << [flags].pack("C")
     # A decimal column appends its typmod (precision, scale) — only for type_code 6, so
     # non-decimal entries are byte-unchanged. precision 0 = unconstrained numeric.
@@ -3042,6 +3082,8 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
       out << encode_value(c[:type], c[:default])
     elsif has_default_expr
       out << u16(c[:default_expr].bytesize) << c[:default_expr].b
+    elsif c[:generated]
+      out << u16(c[:generated].bytesize) << c[:generated].b
     end
     # The effective collation name (v17, flags bit6) — last in the per-column entry (collation.md §5).
     out << u16(c[:collation].bytesize) << c[:collation].b if c[:collation]
@@ -5417,7 +5459,9 @@ end
 def malformed_fixture_image(fx)
   ps = fx[:page_size]
   image = build_image(fx[:types] || [], [], fx[:tables], ps)
-  roots = table_root_pages(image, ps)
+  # A catalog the reference decoder itself rejects has no roots to read back (the forgery is the
+  # table model).
+  roots = fx[:malformed] == :catalog ? {} : table_root_pages(image, ps)
   if %i[leaf_directory wrong_tree_leaf interior_cycle].include?(fx[:malformed])
     raise "t's root must be an interior node" unless read_page(image, ps, roots["t"])[:type] == PAGE_INTERIOR
   end
@@ -5461,7 +5505,7 @@ def malformed_fixture_image(fx)
     image[cat * ps + PAGE_HEADER, ps - PAGE_HEADER] = payload + "\x00".b * dropped
     image[cat * ps + 4, 4] = u32(page_u32(image, ps, cat, 4) - fx[:types].size)
     refresh_body_crc(image, ps, cat)
-  when :none
+  when :none, :catalog
     nil
   else
     raise "unknown malformed mutation #{fx[:malformed]}"
@@ -5508,6 +5552,13 @@ def read_host_deps(buf, pos)
               semantic_version: svb.unpack1("N") }
   end
   [deps, pos]
+end
+
+# The v55 is_generated rules for a container column entry (generated-columns.md §6): bit7 requires
+# bit3, and bits 2, 4 and 5 are never set on a composite, array or range column.
+def check_container_generated_flags(flags)
+  raise "invalid container column flags" if (flags & 0b11_0100) != 0
+  raise "is_generated set without default_is_expr" if (flags & 0b1000_0000) != 0 && (flags & 0b1000).zero?
 end
 
 def take(buf, pos, n)
@@ -5834,8 +5885,9 @@ def decode_table_entry(buf, pos)
       cflags, pos = take(buf, pos, 1)
       cf = cflags.getbyte(0)
       raise "reserved flag bit0 set (retired primary_key bit — v5)" if (cf & 0b01) != 0
-      raise "invalid composite column flags (v44)" if (cf & ~0b1010 & 0xff) != 0
+      raise "invalid composite column flags (v44)" if (cf & ~0b1000_1010 & 0xff) != 0
 
+      check_container_generated_flags(cf)
       tnl, pos = take(buf, pos, 2)
       tname, pos = take(buf, pos, tnl.unpack1("n"))
       cdefault_expr = nil
@@ -5844,9 +5896,11 @@ def decode_table_entry(buf, pos)
         de, pos = take(buf, pos, del.unpack1("n"))
         cdefault_expr = de.force_encoding("UTF-8")
       end
+      cgenerated = nil
+      cgenerated, cdefault_expr = cdefault_expr, nil if (cf & 0b1000_0000) != 0
       columns << { name: cname, type: tname, pk: false, not_null: (cf & 0b10) != 0,
                    precision: nil, scale: nil, varchar_len: nil, default: :none,
-                   default_expr: cdefault_expr, identity: nil, collation: nil, temporal: nil }
+                   default_expr: cdefault_expr, identity: nil, collation: nil, temporal: nil }.merge(cgenerated ? { generated: cgenerated } : {})
       next
     end
     # An array column (v10, type_code 15): flags, then the element-type descriptor
@@ -5856,7 +5910,12 @@ def decode_table_entry(buf, pos)
       af = aflags.getbyte(0)
       raise "reserved flag bit0 set (retired primary_key bit — v5)" if (af & 0b01) != 0
 
+      check_container_generated_flags(af)
+      raise "default_is_expr set on an array column" if (af & 0b1000) != 0 && (af & 0b1000_0000).zero?
+
       elem_type, pos = read_array_element_type(buf, pos)
+      agenerated = nil
+      agenerated, pos = take_str(buf, pos) if (af & 0b1000_0000) != 0
       # bit6 has_collation (v36): a text[] column's collation name follows the element descriptor.
       collation = nil
       if (af & 0b100_0000) != 0
@@ -5868,7 +5927,7 @@ def decode_table_entry(buf, pos)
       end
       columns << { name: cname, type: "#{elem_type}[]", pk: false, not_null: (af & 0b10) != 0,
                    precision: nil, scale: nil, varchar_len: nil, default: :none,
-                   default_expr: nil, identity: nil, collation: collation, temporal: nil }
+                   default_expr: nil, identity: nil, collation: collation, temporal: nil }.merge(agenerated ? { generated: agenerated } : {})
       next
     end
     # A range column (v15, type_code 17): flags, then the element-type descriptor — one scalar code
@@ -5878,18 +5937,27 @@ def decode_table_entry(buf, pos)
       rf = rflags.getbyte(0)
       raise "reserved flag bit0 set (retired primary_key bit — v5)" if (rf & 0b01) != 0
 
+      check_container_generated_flags(rf)
+      raise "invalid range column flags" if (rf & 0b100_0000) != 0 ||
+                                            ((rf & 0b1000) != 0 && (rf & 0b1000_0000).zero?)
+
       ecb, pos = take(buf, pos, 1)
       elem_type = CODETYPE.fetch(ecb.getbyte(0))
       rname = RANGE_ELEM.key(elem_type) or raise "type code is not a valid range element subtype"
+      rgenerated = nil
+      rgenerated, pos = take_str(buf, pos) if (rf & 0b1000_0000) != 0
       columns << { name: cname, type: rname, pk: false, not_null: (rf & 0b10) != 0,
                    precision: nil, scale: nil, varchar_len: nil, default: :none,
-                   default_expr: nil, identity: nil, collation: nil, temporal: nil }
+                   default_expr: nil, identity: nil, collation: nil, temporal: nil }.merge(rgenerated ? { generated: rgenerated } : {})
       next
     end
     flags, pos = take(buf, pos, 1)
     f = flags.getbyte(0)
     raise "reserved flag bit0 set (retired primary_key bit — v5)" if (f & 0b01) != 0
-    raise "reserved column flag bit7 set" if (f & 0b1000_0000) != 0 # bit6 = has_collation (v17)
+    # bit7 is_generated (v55): always with bit3, never with bit2 or bit4 (generated-columns.md §6).
+    if (f & 0b1000_0000) != 0 && ((f & 0b1000).zero? || (f & 0b1_0100) != 0)
+      raise "invalid is_generated column flags"
+    end
     # bit4 is_identity + bit5 identity_always (v15) — identity_always meaningful only with bit4.
     raise "identity_always set without is_identity" if (f & 0b11_0000) == 0b10_0000
     identity = if (f & 0b1_0000) != 0
@@ -5934,10 +6002,12 @@ def decode_table_entry(buf, pos)
       cb, pos = take(buf, pos, cl.unpack1("n"))
       collation = cb.force_encoding("UTF-8")
     end
+    generated = nil
+    generated, default_expr = default_expr, nil if (f & 0b1000_0000) != 0
     columns << { name: cname, type: type, pk: false, not_null: (f & 0b10) != 0,
                  precision: precision, scale: scale, varchar_len: varchar_len, default: default,
                  default_expr: default_expr, identity: identity, collation: collation,
-                 temporal: tm }
+                 temporal: tm }.merge(generated ? { generated: generated } : {})
   end
   # The primary key (v5): member ordinals in KEY order; pk membership marks the columns.
   pk = []
@@ -7048,6 +7118,7 @@ def expected_tables(fx)
           precision: c[:precision], scale: c[:scale], varchar_len: c[:varchar_len],
           default: c[:default], default_expr: c[:default_expr], identity: c[:identity],
           collation: c[:collation], temporal: c[:temporal] }
+          .merge(c[:generated] ? { generated: c[:generated] } : {})
       end,
       pk: pk_order(t),
       checks: (t[:checks] || []).map { |ck| { name: ck[:name], expr: ck[:expr], host_deps: ck[:host_deps] || [] } },

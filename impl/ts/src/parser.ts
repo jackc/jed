@@ -26,6 +26,7 @@ import type {
   Delete,
   Expr,
   GroupItem,
+  GeneratedDef,
   IdentitySpec,
   IndexKeyElem,
   ConflictColumn,
@@ -1754,6 +1755,7 @@ class Parser {
     let notNull = false;
     let def: DefaultDef | null = null;
     let identity: IdentitySpec | null = null;
+    let generated: GeneratedDef | null = null;
     let collation: string | null = null;
     for (;;) {
       if (this.atCheckConstraint()) {
@@ -1817,6 +1819,38 @@ class Parser {
           );
         }
         this.expectKeyword("as");
+        // `GENERATED ALWAYS AS ( expr ) [STORED | VIRTUAL]` — a generated column
+        // (spec/design/generated-columns.md §1), told from IDENTITY by the `(`.
+        if (this.peek().kind === "lparen") {
+          if (!always) {
+            throw engineError(
+              "syntax_error",
+              "for a generated column, GENERATED ALWAYS must be specified",
+            );
+          }
+          this.advance();
+          const start = this.pos;
+          const expr = this.parseExpr();
+          const text = renderTokens(this.tokens.slice(start, this.pos));
+          this.expect("rparen");
+          let gkind: GeneratedDef["kind"] = "unspecified";
+          const skw = this.peekKeyword();
+          if (skw === "stored") {
+            this.advance();
+            gkind = "stored";
+          } else if (skw === "virtual") {
+            this.advance();
+            gkind = "virtual";
+          }
+          if (generated !== null) {
+            throw engineError(
+              "syntax_error",
+              `multiple generation clauses specified for column "${name}" of table "${tableName}"`,
+            );
+          }
+          generated = { expr, text, kind: gkind };
+          continue;
+        }
         this.expectKeyword("identity");
         const options =
           this.peek().kind === "lparen" ? this.parseSequenceOptions(true) : emptySeqOptions();
@@ -1844,6 +1878,22 @@ class Parser {
         break;
       }
     }
+    // PostgreSQL's transformColumnDefinition checks these after the constraint loop
+    // (spec/design/generated-columns.md §1).
+    if (generated !== null) {
+      if (def !== null) {
+        throw engineError(
+          "syntax_error",
+          `both default and generation expression specified for column "${name}" of table "${tableName}"`,
+        );
+      }
+      if (identity !== null) {
+        throw engineError(
+          "syntax_error",
+          `both identity and generation expression specified for column "${name}" of table "${tableName}"`,
+        );
+      }
+    }
     return {
       name,
       typeName,
@@ -1853,6 +1903,7 @@ class Parser {
       notNull,
       default: def,
       identity,
+      generated,
       collation,
     };
   }
@@ -2554,7 +2605,8 @@ class Parser {
           (this.peekKeyword() === "set" &&
             setTarget !== "default" &&
             setTarget !== "data" &&
-            setTarget !== "not")
+            setTarget !== "not" &&
+            setTarget !== "expression")
         ) {
           // The identity option list (alter.md §2.8): `SET GENERATED …`, `SET <sequence_option>`,
           // `RESTART …`, in any order.
@@ -2585,6 +2637,14 @@ class Parser {
             this.advance();
             this.expectKeyword("type");
             edit = { column, action: this.parseAlterColumnType() };
+          } else if (this.peekKeyword() === "expression") {
+            // `SET EXPRESSION AS ( expr )` (generated-columns.md §4.3).
+            this.advance();
+            this.expectKeyword("as");
+            this.expect("lparen");
+            this.parseExpr();
+            this.expect("rparen");
+            edit = { column, action: { kind: "setExpression" } };
           } else {
             this.expectKeyword("not");
             this.expectKeyword("null");
@@ -2604,6 +2664,16 @@ class Parser {
               ifExists = true;
             }
             edit = { column, action: { kind: "dropIdentity", ifExists } };
+          } else if (this.peekKeyword() === "expression") {
+            // `DROP EXPRESSION [IF EXISTS]` (generated-columns.md §4.2).
+            this.advance();
+            let ifExists = false;
+            if (this.peekKeyword() === "if") {
+              this.advance();
+              this.expectKeyword("exists");
+              ifExists = true;
+            }
+            edit = { column, action: { kind: "dropExpression", ifExists } };
           } else {
             this.expectKeyword("not");
             this.expectKeyword("null");

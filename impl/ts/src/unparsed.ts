@@ -27,6 +27,12 @@ export function unparsableDefaultError(table: string, column: string): EngineErr
   return unparsableError('default of column "' + column + '" of table "' + table + '"');
 }
 
+export function unparsableGeneratedError(table: string, column: string): EngineError {
+  return unparsableError(
+    'generation expression of column "' + column + '" of table "' + table + '"',
+  );
+}
+
 export function unparsableIndexError(table: string, index: string): EngineError {
   return unparsableError('index "' + index + '" of table "' + table + '"');
 }
@@ -63,6 +69,10 @@ export function indexUnparsed(def: IndexDef): boolean {
 export function assertTableParsed(t: Table, defaults: boolean): void {
   for (const c of t.checks) {
     if (c.unparsed) throw unparsableCheckError(t.name, c.name);
+  }
+  // A generation expression names the columns it depends on, so every caller needs it parsed.
+  for (const col of t.columns) {
+    if (col.generated?.unparsed) throw unparsableGeneratedError(t.name, col.name);
   }
   if (defaults) {
     for (const col of t.columns) {

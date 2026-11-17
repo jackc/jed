@@ -918,6 +918,19 @@ func defaultExprTableDB(t *testing.T) *Session {
 	return db
 }
 
+// generatedTableDB covers stored generated columns (format v55, spec/design/generated-columns.md
+// §6): column flags bit7 is_generated with bit3, the generation text in the expr-text slot — scalar,
+// NOT NULL text, array and range entries. EMPTY table — the catalog encoding is the cross-core proof.
+func generatedTableDB(t *testing.T) *Session {
+	db := mustSession(newInMemoryWithPageSize(goldenPageSize, goldenEnv()), SessionOptions{})
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, "+
+		"g i32 GENERATED ALWAYS AS (a * 2) STORED, "+
+		"s text NOT NULL GENERATED ALWAYS AS (a::text || 'x') STORED, "+
+		"arr i32[] GENERATED ALWAYS AS (ARRAY[a, id]) STORED, "+
+		"r i32range GENERATED ALWAYS AS (i32range(a, a + 1)) STORED)")
+	return db
+}
+
 // timestampTableDB exercises the value codec's i64-instant branch (type code 8): a
 // positive instant, a pre-1970 negative one, a BC-era one, the ±infinity sentinels, and a
 // NULL. The literals parse to the same micros the golden stores. The PK stays i32.
@@ -1326,6 +1339,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"uuid_table.jed", uuidTableDB},
 		{"default_table.jed", defaultTableDB},
 		{"default_expr_table.jed", defaultExprTableDB},
+		{"generated_table.jed", generatedTableDB},
 		{"timestamp_table.jed", timestampTableDB},
 		{"timestamptz_table.jed", timestamptzTableDB},
 		{"interval_table.jed", intervalTableDB},

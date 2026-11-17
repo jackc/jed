@@ -865,6 +865,19 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 		var defaultVal *Value
 		var defaultExpr *defaultExprDef
 		var identityKind *identityKind
+		// A stored generated column (generated-columns.md §1): only STORED (0A000), never with a
+		// synthesized serial default (42601, like an explicit DEFAULT). Its expression is admitted
+		// once every column exists (below), so a later column is in scope.
+		if def.Generated != nil {
+			if isSerial {
+				return outcome{}, newError(SyntaxError, fmt.Sprintf(
+					"both default and generation expression specified for column %s of table %s", def.Name, ct.Name,
+				))
+			}
+			if err := requireStored(def.Generated); err != nil {
+				return outcome{}, err
+			}
+		}
 		// A serial pseudo-type OR a GENERATED … AS IDENTITY constraint both desugar to an
 		// auto-numbered column: an OWNED sequence + a synthesized DEFAULT nextval(...) + NOT NULL
 		// (sequences.md §12/§13). Identity additionally records ALWAYS/BY DEFAULT and gates the
@@ -1034,6 +1047,7 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 			Default:     defaultVal,
 			DefaultExpr: defaultExpr,
 			Identity:    identityKind,
+			Generated:   generatedExprOf(def.Generated),
 			Collation:   collation,
 		})
 	}
@@ -1131,6 +1145,16 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 	table := &catTable{Name: ct.Name, Columns: columns, PK: pk}
 	if ct.OnCommit != nil {
 		table.OnCommit = *ct.OnCommit // a temp table (42P16 above otherwise) — temp-tables.md §5.1
+	}
+	// Generation expressions (generated-columns.md §2), in column order: after the key constraints
+	// resolve and before any CHECK validates — PostgreSQL cooks column defaults and generation
+	// expressions before the table's CHECK constraints.
+	for ci := range table.Columns {
+		if table.Columns[ci].Generated != nil {
+			if err := db.admitGeneratedExpr(table, ci); err != nil {
+				return outcome{}, err
+			}
+		}
 	}
 	checkDeps := make([][]hostFuncDep, len(ct.Checks))
 	for i := range ct.Checks {
@@ -1414,6 +1438,9 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 		}
 		onUpdate, err := newFkAction(fk.OnUpdate, "UPDATE")
 		if err != nil {
+			return outcome{}, err
+		}
+		if err := checkFkGeneratedActions(table, local, onDelete, onUpdate); err != nil {
 			return outcome{}, err
 		}
 		// 7. The referenced columns must be the parent's PK or a UNIQUE set (§6.2).
@@ -1702,8 +1729,24 @@ func (db *engine) resolveDefaultExprsWithParams(table *catTable, ptypes *paramTy
 // default it never applies need not be registered (spec/design/extensibility.md §7.1.1). An unneeded
 // column's slot stays nil.
 func (db *engine) resolveDefaultExprsFor(table *catTable, need []bool, ptypes *paramTypes) ([]*rExpr, error) {
-	out := make([]*rExpr, len(table.Columns))
+	// A stored generated column's slot carries its resolved generation expression instead
+	// (generated-columns.md §3.1): the INSERT row build computes it over the base row, and
+	// evalDefault never evaluates it as a default.
+	hasGenerated := slices.ContainsFunc(table.Columns, func(c catColumn) bool { return c.Generated != nil })
+	var out []*rExpr
+	if hasGenerated {
+		g, err := db.resolveGeneratedExprs(table, need, ptypes)
+		if err != nil {
+			return nil, err
+		}
+		out = g
+	} else {
+		out = make([]*rExpr, len(table.Columns))
+	}
 	for i := range table.Columns {
+		if table.Columns[i].Generated != nil {
+			continue
+		}
 		de := table.Columns[i].DefaultExpr
 		if de == nil || (need != nil && !need[i]) {
 			continue
@@ -1869,6 +1912,11 @@ func (db *engine) arbiterProbeKey(arb *arbiter, colTypes []colType, pk []int, co
 // materialization (a DEFAULT keyword) and insertRows (an omitted column), sharing ONE StmtRng
 // so a multi-row DEFAULT uuidv7() stays monotonic. defaultRExpr is nil for a constant/no default.
 func (db *engine) evalDefault(col catColumn, defaultRExpr *rExpr, rng *stmtRng, meter *costMeter) (Value, error) {
+	// A stored generated column has no default: its slot is computed after the base row
+	// (generated-columns.md §3.1), so a DEFAULT keyword materializes a placeholder.
+	if col.Generated != nil {
+		return NullValue(), nil
+	}
 	if defaultRExpr == nil {
 		return defaultOrNull(col), nil
 	}
@@ -2376,15 +2424,39 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				}
 				captured := col
 				columnSources = append(columnSources, alterColumnSource{original: -1, added: &captured})
-				defaults, err := db.resolveDefaultExprs(&catTable{Name: table.Name, Columns: []catColumn{captured}})
-				if err != nil {
-					return outcome{}, err
+				var addedDefault *rExpr
+				if captured.Generated != nil {
+					// A generated ADD COLUMN backfills each row from its expression over the row as
+					// the earlier actions left it (generated-columns.md §4.1). A column added by this
+					// statement is not yet a stored column of that row: 0A000.
+					ci := len(table.Columns) - 1
+					for _, r := range checkReferencedColumns(captured.Generated.Expr, table.Columns) {
+						if r != ci && columnSources[r].original < 0 {
+							return outcome{}, newError(FeatureNotSupported, "a generation expression over a column added by the same ALTER TABLE is not supported yet")
+						}
+					}
+					if err := db.admitGeneratedExpr(&table, ci); err != nil {
+						return outcome{}, err
+					}
+					need := make([]bool, len(table.Columns))
+					need[ci] = true
+					g, err := db.resolveGeneratedExprs(&table, need, &paramTypes{})
+					if err != nil {
+						return outcome{}, err
+					}
+					addedDefault = g[ci]
+				} else {
+					defaults, err := db.resolveDefaultExprs(&catTable{Name: table.Name, Columns: []catColumn{captured}})
+					if err != nil {
+						return outcome{}, err
+					}
+					addedDefault = defaults[0]
 				}
 				rowSteps = append(rowSteps, alterRowStep{
 					kind:        alterRowAdd,
 					added:       captured,
 					addedType:   resolveColType(captured.Type, snap.types),
-					defaultExpr: defaults[0],
+					defaultExpr: addedDefault,
 				})
 				var inline []alterTableEdit
 				for i := range add.Checks {
@@ -2407,6 +2479,33 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			}
 			if a.DropColumn != nil {
 				ci := table.ColumnIndex(a.DropColumn.Name)
+				// A generated column reading this one is a dependent (generated-columns.md §4.4):
+				// 2BP01 under RESTRICT; under CASCADE each such column is dropped first (requeued
+				// ahead of this drop), so no stored expression is left naming the removed column.
+				if ci >= 0 && !slices.Contains(table.PK, ci) {
+					var genDeps []string
+					for j := range table.Columns {
+						if g := table.Columns[j].Generated; j != ci && g != nil && slices.Contains(checkReferencedColumns(g.Expr, table.Columns), ci) {
+							genDeps = append(genDeps, table.Columns[j].Name)
+						}
+					}
+					if len(genDeps) > 0 {
+						name := a.DropColumn.Name
+						if !a.DropColumn.Cascade {
+							return outcome{}, newError(DependentObjectsStillExist, fmt.Sprintf(
+								"cannot drop column %s of table %s because other objects depend on it", name, table.Name)).
+								withDetail(fmt.Sprintf("column %s of table %s depends on column %s of table %s", genDeps[0], table.Name, name, table.Name)).
+								hinted(hintDropCascade)
+						}
+						requeued := make([]alterTableEdit, 0, len(genDeps)+1+len(actions))
+						for _, dep := range genDeps {
+							requeued = append(requeued, alterTableEdit{DropColumn: &alterDropColumn{Name: dep}})
+						}
+						requeued = append(requeued, a)
+						actions = append(requeued, actions...)
+						continue
+					}
+				}
 				// A column a view references cannot be dropped (views.md §6): 2BP01. Under CASCADE those
 				// views are dropped, with every view depending on them.
 				if ci >= 0 && !slices.Contains(table.PK, ci) && viewPlan != nil && columnSources[ci].original >= 0 {
@@ -2553,7 +2652,28 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			if ci < 0 {
 				return outcome{}, newError(UndefinedColumn, "column does not exist: "+edit.Column)
 			}
+			// generated-columns.md §4.3: a generation expression is not a default.
+			if (edit.Kind == alterSetDefault || edit.Kind == alterDropDefault) && table.Columns[ci].Generated != nil {
+				hint := "Use ALTER TABLE ... ALTER COLUMN ... SET EXPRESSION instead."
+				if edit.Kind == alterDropDefault {
+					hint = "Use ALTER TABLE ... ALTER COLUMN ... DROP EXPRESSION instead."
+				}
+				return outcome{}, newError(SyntaxError, fmt.Sprintf(
+					"column %s of relation %s is a generated column", table.Columns[ci].Name, table.Name)).hinted(hint)
+			}
 			switch edit.Kind {
+			case alterDropExpression:
+				// generated-columns.md §4.2: the column keeps its stored values.
+				if table.Columns[ci].Generated == nil {
+					if edit.IfExists {
+						continue
+					}
+					return outcome{}, newError(ObjectNotInPrerequisiteState, fmt.Sprintf(
+						"column %s of relation %s is not a generated column", table.Columns[ci].Name, table.Name))
+				}
+				table.Columns[ci].Generated = nil
+			case alterSetExpression:
+				return outcome{}, newError(FeatureNotSupported, "ALTER COLUMN ... SET EXPRESSION is not supported yet")
 			case alterSetDefault:
 				if table.Columns[ci].Identity != nil {
 					return outcome{}, newError(SyntaxError, "identity column cannot have a default")
@@ -2611,7 +2731,9 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 					return outcome{}, newError(ObjectNotInPrerequisiteState, fmt.Sprintf(
 						"column \"%s\" of relation \"%s\" is already an identity column", col.Name, table.Name))
 				}
-				if col.Default != nil || col.DefaultExpr != nil {
+				// A stored generated column counts as having one (PostgreSQL keeps its expression as
+				// the column's default).
+				if col.Default != nil || col.DefaultExpr != nil || col.Generated != nil {
 					return outcome{}, newError(ObjectNotInPrerequisiteState, fmt.Sprintf(
 						"column \"%s\" of relation \"%s\" already has a default value", col.Name, table.Name))
 				}
@@ -2688,6 +2810,20 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				}
 				table.Columns[ci].NotNull = false
 			case alterSetType:
+				// generated-columns.md §4.3/§4.4: a generated column's own type is 0A000 this slice
+				// (42611 with USING, PostgreSQL's rule), and a column a generated column reads cannot
+				// change type (0A000).
+				if table.Columns[ci].Generated != nil {
+					if edit.Using != nil {
+						return outcome{}, newError(InvalidColumnDefinition, "cannot specify USING when altering type of generated column").
+							withDetail(fmt.Sprintf("Column \"%s\" is a generated column.", table.Columns[ci].Name))
+					}
+					return outcome{}, newError(FeatureNotSupported, "altering the type of a generated column is not supported yet")
+				}
+				if g := generatedReaderOf(&table, ci); g >= 0 {
+					return outcome{}, newError(FeatureNotSupported, "cannot alter type of a column used by a generated column").
+						withDetail(fmt.Sprintf("Column \"%s\" is used by generated column \"%s\".", table.Columns[ci].Name, table.Columns[g].Name))
+				}
 				// A column a view references cannot change type (views.md §6); checked after every
 				// action, so a view a DROP COLUMN … CASCADE drops does not block it.
 				if columnSources[ci].original >= 0 {
@@ -2939,7 +3075,15 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			for _, step := range rowSteps {
 				switch step.kind {
 				case alterRowAdd:
-					v, err := db.evalDefault(step.added, step.defaultExpr, rng, meter)
+					// A generated column's default slot is its expression over the row as built so
+					// far (generated-columns.md §4.1).
+					var v Value
+					var err error
+					if step.added.Generated != nil && step.defaultExpr != nil {
+						v, err = step.defaultExpr.eval(row, env, meter)
+					} else {
+						v, err = db.evalDefault(step.added, step.defaultExpr, rng, meter)
+					}
 					if err != nil {
 						return outcome{}, err
 					}
@@ -3366,7 +3510,15 @@ func (db *engine) buildAlterAddedColumn(table *catTable, def *columnDef, pending
 		return catColumn{}, newError(FeatureNotSupported, "this column type or collation is not supported on an attached-database table")
 	}
 
-	col := catColumn{Name: def.Name, Type: ty, Decimal: decimal, VarcharLen: varcharLen, Temporal: temporal, PrimaryKey: def.PrimaryKey, NotNull: def.PrimaryKey || def.NotNull || isSerial || def.Identity != nil, Collation: collation}
+	col := catColumn{Name: def.Name, Type: ty, Decimal: decimal, VarcharLen: varcharLen, Temporal: temporal, PrimaryKey: def.PrimaryKey, NotNull: def.PrimaryKey || def.NotNull || isSerial || def.Identity != nil, Collation: collation, Generated: generatedExprOf(def.Generated)}
+	if def.Generated != nil {
+		if isSerial {
+			return catColumn{}, newError(SyntaxError, fmt.Sprintf("both default and generation expression specified for column %s of table %s", def.Name, table.Name))
+		}
+		if err := requireStored(def.Generated); err != nil {
+			return catColumn{}, err
+		}
+	}
 	if def.PrimaryKey {
 		if len(table.PK) > 0 {
 			return catColumn{}, newError(InvalidTableDefinition, "multiple primary keys for table "+table.Name+" are not allowed")
@@ -3466,6 +3618,15 @@ func rewriteAlterTableExpressions(table *catTable, old, next string, tableRename
 		table.Checks[i].ExprText, table.Checks[i].Expr = text, expr
 	}
 	for i := range table.Columns {
+		if g := table.Columns[i].Generated; g != nil {
+			ge := *g
+			text, expr, err := rewrite(ge.ExprText)
+			if err != nil {
+				return err
+			}
+			ge.ExprText, ge.Expr = text, expr
+			table.Columns[i].Generated = &ge
+		}
 		if table.Columns[i].DefaultExpr == nil {
 			continue
 		}

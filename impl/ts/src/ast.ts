@@ -570,11 +570,25 @@ export type ColumnDef = {
   // (spec/design/sequences.md §13). Desugars like `serial` (an owned sequence + a `nextval` default
   // + NOT NULL) plus the persisted ALWAYS/BY DEFAULT distinction. null = a non-identity column.
   identity: IdentitySpec | null;
+  // An optional `GENERATED ALWAYS AS ( expr ) [STORED | VIRTUAL]` clause
+  // (spec/design/generated-columns.md §1): a stored generated column. The kind gate (only STORED is
+  // implemented) and the expression's admission run at execution. Absent/null = not generated.
+  generated?: GeneratedDef | null;
   // An optional `COLLATE "name"` column modifier (spec/design/collation.md §1) — a quoted,
   // case-sensitive collation name. Text-only (else 42804); the name must be loaded or "C" (else
   // 42704). null = no clause ⇒ inherit the per-database default. Frozen into the column at CREATE
   // TABLE.
   collation: string | null;
+};
+
+// GeneratedDef is a column's `GENERATED ALWAYS AS ( expr ) …` clause
+// (spec/design/generated-columns.md §1): the parsed expression, its re-rendered token text (the
+// persisted form, as a CHECK persists), and which storage keyword followed — STORED, VIRTUAL, or
+// neither ("unspecified", PostgreSQL 18's VIRTUAL default; 0A000 unless STORED).
+export type GeneratedDef = {
+  expr: Expr;
+  text: string;
+  kind: "stored" | "virtual" | "unspecified";
 };
 
 // Assignment is one `SET <column> = <value>` clause; value is a general expression
@@ -988,7 +1002,13 @@ export type AlterColumnAction = {
       }
     // `DROP IDENTITY [IF EXISTS]` (alter.md §2.8): drop the owned sequence and the synthesized
     // default; the column stays NOT NULL.
-    | { kind: "dropIdentity"; ifExists: boolean };
+    | { kind: "dropIdentity"; ifExists: boolean }
+    // `DROP EXPRESSION [IF EXISTS]` (spec/design/generated-columns.md §4.2): turn a stored
+    // generated column into an ordinary column that keeps its values (55000 on a non-generated
+    // column unless IF EXISTS).
+    | { kind: "dropExpression"; ifExists: boolean }
+    // `SET EXPRESSION AS ( expr )` (spec/design/generated-columns.md §4.3) — 0A000 this slice.
+    | { kind: "setExpression" };
 };
 
 // Insert is an INSERT ... [(col, ..)] whose rows come from DEFAULT VALUES, a VALUES list (each

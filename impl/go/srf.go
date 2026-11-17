@@ -879,6 +879,9 @@ func catalogRelTable(kind srfKind) *catTable {
 			{Name: "column_default", Type: scalarT(scalarText)},
 			// 'ALWAYS' / 'BY DEFAULT' for an identity column, else NULL (introspection.md §5).
 			{Name: "identity_generation", Type: scalarT(scalarText)},
+			// A stored generated column's canonical expression text, else NULL
+			// (generated-columns.md §5).
+			{Name: "generation_expression", Type: scalarT(scalarText)},
 		}}
 	case srfJedIndexes:
 		return &catTable{Name: "jed_indexes", Columns: []catColumn{
@@ -1042,7 +1045,8 @@ func (db *engine) jedTablesRows(sp *srfPlan, m *costMeter) ([]storedRow, error) 
 // position in the PRIMARY KEY in KEY order (which may differ from declaration order —
 // constraints.md §3), NULL for a non-member; column_default is the canonical DEFAULT text
 // (catColumn.defaultText); identity_generation is ALWAYS / BY DEFAULT for an identity column, else
-// NULL. The main database's views follow, in (view name, ordinal) order
+// NULL; generation_expression is a stored generated column's canonical expression text, else NULL.
+// The main database's views follow, in (view name, ordinal) order
 // (introspection.md §5): a view column's type is the type its planned body produces, and it is
 // nullable, keyless, and has no default. Cost mirrors jedTablesRows.
 func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
@@ -1076,6 +1080,10 @@ func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 					identityGeneration = TextValue("BY DEFAULT")
 				}
 			}
+			generationExpression := NullValue()
+			if c.Generated != nil {
+				generationExpression = TextValue(c.Generated.ExprText)
+			}
 			out = append(out, storedRow{
 				TextValue(t.Name),
 				TextValue(c.Name),
@@ -1085,6 +1093,7 @@ func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 				pkOrdinal,
 				columnDefault,
 				identityGeneration,
+				generationExpression,
 			})
 		}
 	}
@@ -1113,6 +1122,7 @@ func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 					BoolValue(false),
 					NullValue(),
 					def,
+					NullValue(),
 					NullValue(),
 				})
 			}

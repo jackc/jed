@@ -20,6 +20,7 @@ use crate::ast::{
 };
 use crate::ast::{CheckOption, FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::ast::{CycleClause, RowCount, SearchClause, ViewEdit, ViewOption};
+use crate::ast::{GeneratedDef, GeneratedKind};
 use crate::ast::{Merge, MergeAction, MergeClause, MergeMatch, MergeValue};
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -1712,6 +1713,7 @@ impl Parser {
         let mut not_null = false;
         let mut default = None;
         let mut identity: Option<IdentitySpec> = None;
+        let mut generated: Option<GeneratedDef> = None;
         let mut collation: Option<String> = None;
         loop {
             if self.at_check_constraint() {
@@ -1790,6 +1792,38 @@ impl Parser {
                         }
                     };
                     self.expect_keyword("as")?;
+                    // `GENERATED ALWAYS AS ( expr ) [STORED | VIRTUAL]` — a generated column
+                    // (spec/design/generated-columns.md §1), told from IDENTITY by the `(`.
+                    if matches!(self.peek(), Token::LParen) {
+                        if !always {
+                            return Err(syntax(
+                                "for a generated column, GENERATED ALWAYS must be specified",
+                            ));
+                        }
+                        self.bump();
+                        let start = self.pos;
+                        let expr = self.parse_expr()?;
+                        let text = render_tokens(&self.tokens[start..self.pos]);
+                        self.expect(&Token::RParen)?;
+                        let kind = match self.peek_keyword().as_deref() {
+                            Some("stored") => {
+                                self.bump();
+                                GeneratedKind::Stored
+                            }
+                            Some("virtual") => {
+                                self.bump();
+                                GeneratedKind::Virtual
+                            }
+                            _ => GeneratedKind::Unspecified,
+                        };
+                        if generated.is_some() {
+                            return Err(syntax(format!(
+                                "multiple generation clauses specified for column \"{name}\" of table \"{table_name}\""
+                            )));
+                        }
+                        generated = Some(GeneratedDef { expr, text, kind });
+                        continue;
+                    }
                     self.expect_keyword("identity")?;
                     let options = if matches!(self.peek(), Token::LParen) {
                         self.parse_sequence_options(true)?
@@ -1831,6 +1865,20 @@ impl Parser {
                 _ => break,
             }
         }
+        // PostgreSQL's transformColumnDefinition checks these after the constraint loop
+        // (spec/design/generated-columns.md §1).
+        if generated.is_some() {
+            if default.is_some() {
+                return Err(syntax(format!(
+                    "both default and generation expression specified for column \"{name}\" of table \"{table_name}\""
+                )));
+            }
+            if identity.is_some() {
+                return Err(syntax(format!(
+                    "both identity and generation expression specified for column \"{name}\" of table \"{table_name}\""
+                )));
+            }
+        }
         Ok(ColumnDef {
             name,
             type_name,
@@ -1840,6 +1888,7 @@ impl Parser {
             not_null,
             default,
             identity,
+            generated,
             collation,
         })
     }
@@ -2983,6 +3032,16 @@ impl Parser {
                             // The identity option list (alter.md §2.8): `SET GENERATED …`,
                             // `SET <sequence_option>`, `RESTART …`, in any order.
                             Some("restart") => self.parse_alter_identity_options()?,
+                            // `SET EXPRESSION AS ( expr )` (generated-columns.md §4.3).
+                            Some("set") if set_target.as_deref() == Some("expression") => {
+                                self.bump();
+                                self.bump();
+                                self.expect_keyword("as")?;
+                                self.expect(&Token::LParen)?;
+                                self.parse_expr()?;
+                                self.expect(&Token::RParen)?;
+                                AlterColumnKind::SetExpression
+                            }
                             Some("set")
                                 if !matches!(
                                     set_target.as_deref(),
@@ -3038,6 +3097,18 @@ impl Parser {
                                         false
                                     };
                                     AlterColumnKind::DropIdentity { if_exists }
+                                } else if self.peek_keyword().as_deref() == Some("expression") {
+                                    // `DROP EXPRESSION [IF EXISTS]` (generated-columns.md §4.2).
+                                    self.bump();
+                                    let if_exists = if self.peek_keyword().as_deref() == Some("if")
+                                    {
+                                        self.bump();
+                                        self.expect_keyword("exists")?;
+                                        true
+                                    } else {
+                                        false
+                                    };
+                                    AlterColumnKind::DropExpression { if_exists }
                                 } else {
                                     self.expect_keyword("not")?;
                                     self.expect_keyword("null")?;

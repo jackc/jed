@@ -7,6 +7,7 @@ import type { Expr, MergeMatch, Overriding, SrcLoc } from "./ast.ts";
 import type { Table } from "./catalog.ts";
 import { columnIndex } from "./catalog.ts";
 import { engineError, generatedAlwaysInsert } from "./errors.ts";
+import { generatedInsertError } from "./generated.ts";
 import type { HashJoinPlan, QueryPlan, RExpr, ScopeRel } from "./executor.ts";
 import type { Deriv, Typmod } from "./resolve.ts";
 import type { ResolvedType } from "./executor.ts";
@@ -21,7 +22,9 @@ import type { AssignPlan } from "./window.ts";
 // in place of the table's (views.md §16.1); defaults are those columns' expression defaults,
 // resolved for this action (constraints.md §2).
 export type MergeActionPlan =
-  | { kind: "update"; assigns: AssignPlan[] }
+  // generated: the stored generated columns the clause recomputes (one slot per column; empty when
+  // none — generated-columns.md §3.2).
+  | { kind: "update"; assigns: AssignPlan[]; generated: (RExpr | null)[] }
   | { kind: "delete" }
   | {
       kind: "insert";
@@ -185,6 +188,9 @@ export function mergeInsertColumns(
     slotCol[p] = i;
     if (values[p] === null) continue;
     const col = table.columns[i]!;
+    // A stored generated column takes only DEFAULT, whatever the OVERRIDING clause
+    // (generated-columns.md §3.1).
+    if (col.generated) throw generatedInsertError(col.name);
     if (col.identity !== null && overriding === "user") continue;
     if (col.identity === "always" && overriding !== "system") {
       throw generatedAlwaysInsert(col.name);

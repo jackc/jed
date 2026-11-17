@@ -229,7 +229,10 @@ its table's rows it becomes an identity column again through `ALTER TABLE … AL
 GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY (SEQUENCE NAME s START WITH … INCREMENT BY … MINVALUE
 … MAXVALUE … CACHE … [NO] CYCLE)` — pg_dump's form ([alter.md](alter.md) §2.8) — followed, unless
 the counter is untouched, by `SELECT setval('s', last_value, is_called)`, so a GENERATED ALWAYS column
-takes its dumped values and the sequence keeps its name and position. After every table, each view follows as `CREATE VIEW name
+takes its dumped values and the sequence keeps its name and position. A stored generated column
+is written with its `GENERATED ALWAYS AS (…) STORED` clause from the persisted text, and its
+table's `INSERT`s name the other columns (`INSERT INTO t (a, c) VALUES …`), so the replay
+recomputes it ([generated-columns.md](generated-columns.md) §5). After every table, each view follows as `CREATE VIEW name
 (columns) AS definition;` — its stored canonical text, followed by ` WITH LOCAL CHECK OPTION` or ` WITH
 CASCADED CHECK OPTION` when it has a check option, in dependency order (a view after every view it
 reads; ties in name byte order — [views.md](views.md) §11). The script is wrapped in one

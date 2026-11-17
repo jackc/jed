@@ -172,6 +172,13 @@ const (
 	// alterDropIdentity drops the owned sequence and the synthesized default; the column stays
 	// NOT NULL (alter.md §2.8).
 	alterDropIdentity
+	// alterDropExpression is `DROP EXPRESSION [IF EXISTS]` (spec/design/generated-columns.md §4.2):
+	// turn a stored generated column into an ordinary column that keeps its values (55000 on a
+	// non-generated column unless IF EXISTS, which rides IfExists).
+	alterDropExpression
+	// alterSetExpression is `SET EXPRESSION AS ( expr )` (generated-columns.md §4.3) — 0A000 this
+	// slice.
+	alterSetExpression
 )
 
 // explain is a parsed `EXPLAIN [ANALYZE] <statement>` (spec/design/explain.md). Inner is the wrapped
@@ -743,12 +750,37 @@ type columnDef struct {
 	// (spec/design/sequences.md §13). Desugars like serial (an owned sequence + a nextval default +
 	// NOT NULL) plus the persisted ALWAYS/BY DEFAULT distinction. nil = a non-identity column.
 	Identity *identitySpec
+	// Generated is an optional `GENERATED ALWAYS AS ( expr ) [STORED | VIRTUAL]` clause
+	// (spec/design/generated-columns.md §1): a stored generated column. The kind gate (only STORED
+	// is implemented) and the expression's admission run at execution. nil = not generated.
+	Generated *generatedDef
 	// Collation is an optional `COLLATE "name"` column modifier (spec/design/collation.md §1) — a
 	// quoted, case-sensitive collation name. Text-only (else 42804); the name must be loaded or "C"
 	// (else 42704). "" = no clause ⇒ inherit the per-database default. Frozen into the column at
 	// CREATE TABLE.
 	Collation string
 }
+
+// generatedDef is a column's `GENERATED ALWAYS AS ( expr ) …` clause
+// (spec/design/generated-columns.md §1): the parsed expression, its re-rendered token text (the
+// persisted form, as a CHECK persists), and which storage keyword followed.
+type generatedDef struct {
+	Expr exprNode
+	Text string
+	Kind generatedKind
+}
+
+// generatedKind is the storage keyword after a generation expression
+// (spec/design/generated-columns.md §1).
+type generatedKind int
+
+const (
+	generatedStored generatedKind = iota
+	generatedVirtual
+	// generatedUnspecified is neither keyword — PostgreSQL 18's VIRTUAL default; jed rejects it
+	// (0A000).
+	generatedUnspecified
+)
 
 // TypeMod is a parsed type modifier: a precision and an optional scale, as written
 // (numeric(p) → Scale nil, numeric(p,s) → Scale set). The values are the raw lexed magnitudes;

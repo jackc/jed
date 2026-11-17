@@ -181,6 +181,8 @@ const (
 	UndefinedParameter
 	// InvalidObjectDefinition is 42P17 — functions in index expression must be marked IMMUTABLE.
 	InvalidObjectDefinition
+	// InvalidColumnDefinition is 42611 — cannot specify USING when altering type of generated column.
+	InvalidColumnDefinition
 	// WindowingError is 42P20 — {detail}.
 	WindowingError
 	// CollationMismatch is 42P21 — collation mismatch between explicit collations {left} and {right}.
@@ -414,6 +416,8 @@ func (s SqlState) Code() string {
 		return "42P02"
 	case InvalidObjectDefinition:
 		return "42P17"
+	case InvalidColumnDefinition:
+		return "42611"
 	case WindowingError:
 		return "42P20"
 	case CollationMismatch:
@@ -575,6 +579,7 @@ var errorDescs = []errorDesc{
 	{Code: "42P19", Name: "invalid_recursion", Class: "syntax error or access rule violation"},
 	{Code: "42P02", Name: "undefined_parameter", Class: "syntax error or access rule violation"},
 	{Code: "42P17", Name: "invalid_object_definition", Class: "syntax error or access rule violation"},
+	{Code: "42611", Name: "invalid_column_definition", Class: "syntax error or access rule violation"},
 	{Code: "42P20", Name: "windowing_error", Class: "syntax error or access rule violation"},
 	{Code: "42P21", Name: "collation_mismatch", Class: "syntax error or access rule violation"},
 	{Code: "42P22", Name: "indeterminate_collation", Class: "syntax error or access rule violation"},

@@ -93,6 +93,7 @@ export type SqlState =
   | "invalid_recursion" // 42P19 — {detail}
   | "undefined_parameter" // 42P02 — there is no parameter ${index}
   | "invalid_object_definition" // 42P17 — functions in index expression must be marked IMMUTABLE
+  | "invalid_column_definition" // 42611 — cannot specify USING when altering type of generated column
   | "windowing_error" // 42P20 — {detail}
   | "collation_mismatch" // 42P21 — collation mismatch between explicit collations {left} and {right}
   | "indeterminate_collation" // 42P22 — could not determine which collation to use for string comparison
@@ -209,6 +210,7 @@ const CODES: Record<SqlState, string> = {
   invalid_recursion: "42P19",
   undefined_parameter: "42P02",
   invalid_object_definition: "42P17",
+  invalid_column_definition: "42611",
   windowing_error: "42P20",
   collation_mismatch: "42P21",
   indeterminate_collation: "42P22",
@@ -341,6 +343,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "42P19", name: "invalid_recursion", class: "syntax error or access rule violation" },
   { code: "42P02", name: "undefined_parameter", class: "syntax error or access rule violation" },
   { code: "42P17", name: "invalid_object_definition", class: "syntax error or access rule violation" },
+  { code: "42611", name: "invalid_column_definition", class: "syntax error or access rule violation" },
   { code: "42P20", name: "windowing_error", class: "syntax error or access rule violation" },
   { code: "42P21", name: "collation_mismatch", class: "syntax error or access rule violation" },
   { code: "42P22", name: "indeterminate_collation", class: "syntax error or access rule violation" },

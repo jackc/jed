@@ -991,8 +991,9 @@ precedence and deterministic cost, so a specialized execution path must reproduc
 1. Build each declaration-order candidate row: apply `DEFAULT`/omission and coerce and range-check each
    value, in column order. Then enforce `NOT NULL` over the complete row, in column order. A later
    column's coercion or default error therefore wins over an earlier column's NULL, as in PostgreSQL,
-   which forms the row before `ExecConstraints` ([error-fields.md](error-fields.md) §9.5). UPDATE's
-   new-row build uses the same order.
+   which forms the row before `ExecConstraints` ([error-fields.md](error-fields.md) §9.5). Stored
+   generated columns are computed between the two, in column order, over the built row
+   ([generated-columns.md](generated-columns.md) §3.1). UPDATE's new-row build uses the same order.
 2. Evaluate `CHECK` constraints in their name order.
 3. Encode and probe the primary key. For a multi-row statement, also reject a key claimed by an
    earlier candidate.

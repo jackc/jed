@@ -1169,6 +1169,21 @@ impl Engine {
             //   - any other expression is validated (structural pre-walk, then resolved against
             //     an EMPTY scope — a default may not reference a column — then its result type is
             //     checked assignable to the column, 42804) and stored as text for per-row eval.
+            // A stored generated column (generated-columns.md §1): only STORED (0A000), never with
+            // a synthesized `serial` default (42601, like an explicit DEFAULT). Its expression is
+            // admitted once every column exists (below), so a later column is in scope.
+            if let Some(g) = &def.generated {
+                if serial_kind.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::SyntaxError,
+                        format!(
+                            "both default and generation expression specified for column {} of table {}",
+                            def.name, ct.name
+                        ),
+                    ));
+                }
+                require_stored(g)?;
+            }
             // A `serial` pseudo-type OR a `GENERATED … AS IDENTITY` constraint both desugar to an
             // auto-numbered column: an OWNED sequence + a synthesized `DEFAULT nextval(...)` + NOT
             // NULL (sequences.md §12/§13). Identity additionally records ALWAYS/BY DEFAULT and gates
@@ -1417,6 +1432,7 @@ impl Engine {
                 collation,
                 no_collation: false,
                 collation_conflict: false,
+                generated: def.generated.as_ref().map(generated_expr_of),
             });
         }
 
@@ -1530,6 +1546,14 @@ impl Engine {
             on_commit: ct.on_commit.unwrap_or_default(),
             scalar_func: false,
         };
+        // Generation expressions (generated-columns.md §2), in column order: after the key
+        // constraints resolve and before any CHECK validates — PostgreSQL cooks column defaults
+        // and generation expressions before the table's CHECK constraints.
+        for ci in 0..table.columns.len() {
+            if table.columns[ci].generated.is_some() {
+                self.admit_generated_expr(&table, ci)?;
+            }
+        }
         let mut check_deps: Vec<Vec<HostFuncDep>> = Vec::with_capacity(ct.checks.len());
         for def in &ct.checks {
             // Structural rejections first (a single pre-walk — a documented micro-order
@@ -1827,6 +1851,7 @@ impl Engine {
             // 6. Resolve and store the selected referential actions (§6.6).
             let on_delete = fk_action(fk.on_delete, "DELETE")?;
             let on_update = fk_action(fk.on_update, "UPDATE")?;
+            check_fk_generated_actions(&table, &local, on_delete, on_update)?;
             // 7. The referenced columns must be the parent's PK or a UNIQUE set (§6.2).
             let ref_set = sorted_unique(&refs);
             let matches_unique = (!parent.pk.is_empty() && sorted_unique(&parent.pk) == ref_set)
@@ -2464,25 +2489,60 @@ impl Engine {
                         column_sources.push(ColumnSource::Added);
                         type_changed_columns.push(false);
                         let added = table.columns.last().unwrap().clone();
-                        let default = self
-                            .resolve_default_exprs(&Table {
-                                name: table.name.clone(),
-                                columns: vec![added.clone()],
-                                pk: Vec::new(),
-                                checks: Vec::new(),
-                                indexes: Vec::new(),
-                                foreign_keys: Vec::new(),
-                                exclusions: Vec::new(),
-                                on_commit: crate::catalog::OnCommit::PreserveRows,
-                                scalar_func: false,
-                            })?
-                            .pop()
-                            .unwrap();
-                        row_steps.push(RowStep::Add {
-                            col_type: snap.resolve_col_type(&added.ty),
-                            column: added,
-                            default,
-                        });
+                        // A generated ADD COLUMN backfills each row from its expression over the row
+                        // as the earlier actions left it (generated-columns.md §4.1). A column added
+                        // by this statement is not yet a stored column of that row: 0A000.
+                        if added.generated.is_some() {
+                            let ci = table.columns.len() - 1;
+                            let ge = added.generated.as_ref().unwrap();
+                            if check_referenced_columns(&ge.expr, &table.columns)
+                                .into_iter()
+                                .any(|r| {
+                                    r != ci && matches!(column_sources[r], ColumnSource::Added)
+                                })
+                            {
+                                return Err(EngineError::new(
+                                    SqlState::FeatureNotSupported,
+                                    "a generation expression over a column added by the same ALTER TABLE is not supported yet",
+                                ));
+                            }
+                            self.admit_generated_expr(&table, ci)?;
+                            let mut need = vec![false; table.columns.len()];
+                            need[ci] = true;
+                            let default = self
+                                .resolve_generated_exprs(
+                                    &table,
+                                    Some(&need),
+                                    &mut ParamTypes::default(),
+                                )?
+                                .pop()
+                                .unwrap();
+                            row_steps.push(RowStep::Add {
+                                col_type: snap.resolve_col_type(&added.ty),
+                                column: added,
+                                default,
+                            });
+                        } else {
+                            let default = self
+                                .resolve_default_exprs(&Table {
+                                    name: table.name.clone(),
+                                    columns: vec![added.clone()],
+                                    pk: Vec::new(),
+                                    checks: Vec::new(),
+                                    indexes: Vec::new(),
+                                    foreign_keys: Vec::new(),
+                                    exclusions: Vec::new(),
+                                    on_commit: crate::catalog::OnCommit::PreserveRows,
+                                    scalar_func: false,
+                                })?
+                                .pop()
+                                .unwrap();
+                            row_steps.push(RowStep::Add {
+                                col_type: snap.resolve_col_type(&added.ty),
+                                column: added,
+                                default,
+                            });
+                        }
                         // Inline constraints are the same definitions as CREATE TABLE. Queue them
                         // immediately after the column so later comma-actions see their effects.
                         for fk in foreign_keys.into_iter().rev() {
@@ -2522,6 +2582,52 @@ impl Engine {
                                 SqlState::FeatureNotSupported,
                                 "dropping a primary-key column is not supported yet".to_string(),
                             ));
+                        }
+                        // A generated column reading this one is a dependent (generated-columns.md
+                        // §4.4): 2BP01 under RESTRICT; under CASCADE each such column is dropped
+                        // first (requeued ahead of this drop), so no stored expression is left
+                        // naming the removed column.
+                        let gen_deps: Vec<String> = table
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .filter(|(j, c)| {
+                                *j != ci
+                                    && c.generated.as_ref().is_some_and(|g| {
+                                        check_referenced_columns(&g.expr, &table.columns)
+                                            .contains(&ci)
+                                    })
+                            })
+                            .map(|(_, c)| c.name.clone())
+                            .collect();
+                        if let Some(first) = gen_deps.first() {
+                            if !cascade {
+                                return Err(EngineError::new(
+                                    SqlState::DependentObjectsStillExist,
+                                    format!(
+                                        "cannot drop column {name} of table {} because other objects depend on it",
+                                        table.name
+                                    ),
+                                )
+                                .with_detail(Some(format!(
+                                    "column {first} of table {} depends on column {name} of table {}",
+                                    table.name, table.name
+                                )))
+                                .hinted(error_hint::DROP_CASCADE));
+                            }
+                            actions.push_front(AlterTableEdit::DropColumn {
+                                name,
+                                if_exists,
+                                cascade,
+                            });
+                            for dep in gen_deps.into_iter().rev() {
+                                actions.push_front(AlterTableEdit::DropColumn {
+                                    name: dep,
+                                    if_exists: false,
+                                    cascade: false,
+                                });
+                            }
+                            continue;
                         }
                         // A column a view references cannot be dropped (views.md §6): 2BP01. Under
                         // CASCADE those views are dropped, with every view depending on them.
@@ -3104,6 +3210,12 @@ impl Engine {
                                             || schema_constraint_name_taken(&snap, &old_key, n)
                                     })
                                 };
+                                check_fk_generated_actions(
+                                    &table,
+                                    &local,
+                                    fk_action(d.on_delete, "DELETE")?,
+                                    fk_action(d.on_update, "UPDATE")?,
+                                )?;
                                 for (&li, &ri) in local.iter().zip(&refs) {
                                     if !fk_types_comparable(
                                         &table.columns[li].ty,
@@ -3317,6 +3429,46 @@ impl Engine {
                         ));
                     };
                     match edit.action {
+                        AlterColumnKind::SetDefault(_) | AlterColumnKind::DropDefault
+                            if table.columns[ci].generated.is_some() =>
+                        {
+                            // generated-columns.md §4.3: the expression is not a default.
+                            let hint = if matches!(edit.action, AlterColumnKind::SetDefault(_)) {
+                                "Use ALTER TABLE ... ALTER COLUMN ... SET EXPRESSION instead."
+                            } else {
+                                "Use ALTER TABLE ... ALTER COLUMN ... DROP EXPRESSION instead."
+                            };
+                            return Err(EngineError::new(
+                                SqlState::SyntaxError,
+                                format!(
+                                    "column {} of relation {} is a generated column",
+                                    table.columns[ci].name, table.name
+                                ),
+                            )
+                            .hinted(hint));
+                        }
+                        AlterColumnKind::DropExpression { if_exists } => {
+                            // generated-columns.md §4.2: the column keeps its stored values.
+                            if table.columns[ci].generated.is_none() {
+                                if if_exists {
+                                    continue;
+                                }
+                                return Err(EngineError::new(
+                                    SqlState::ObjectNotInPrerequisiteState,
+                                    format!(
+                                        "column {} of relation {} is not a generated column",
+                                        table.columns[ci].name, table.name
+                                    ),
+                                ));
+                            }
+                            table.columns[ci].generated = None;
+                        }
+                        AlterColumnKind::SetExpression => {
+                            return Err(EngineError::new(
+                                SqlState::FeatureNotSupported,
+                                "ALTER COLUMN ... SET EXPRESSION is not supported yet",
+                            ));
+                        }
                         AlterColumnKind::SetDefault(def) => {
                             if table.columns[ci].identity.is_some() {
                                 return Err(EngineError::new(
@@ -3413,7 +3565,12 @@ impl Engine {
                                     ),
                                 ));
                             }
-                            if col.default.is_some() || col.default_expr.is_some() {
+                            // A stored generated column counts as having one (PostgreSQL keeps its
+                            // expression as the column's default).
+                            if col.default.is_some()
+                                || col.default_expr.is_some()
+                                || col.generated.is_some()
+                            {
                                 return Err(EngineError::new(
                                     SqlState::ObjectNotInPrerequisiteState,
                                     format!(
@@ -3544,6 +3701,35 @@ impl Engine {
                             type_mod,
                             using,
                         } => {
+                            // generated-columns.md §4.3/§4.4: a generated column's own type is
+                            // 0A000 this slice (42611 with USING, PostgreSQL's rule), and a column a
+                            // generated column reads cannot change type (0A000).
+                            if table.columns[ci].generated.is_some() {
+                                if using.is_some() {
+                                    return Err(EngineError::new(
+                                        SqlState::InvalidColumnDefinition,
+                                        "cannot specify USING when altering type of generated column",
+                                    )
+                                    .with_detail(Some(format!(
+                                        "Column \"{}\" is a generated column.",
+                                        table.columns[ci].name
+                                    ))));
+                                }
+                                return Err(EngineError::new(
+                                    SqlState::FeatureNotSupported,
+                                    "altering the type of a generated column is not supported yet",
+                                ));
+                            }
+                            if let Some(g) = generated_reader_of(&table, ci) {
+                                return Err(EngineError::new(
+                                    SqlState::FeatureNotSupported,
+                                    "cannot alter type of a column used by a generated column",
+                                )
+                                .with_detail(Some(format!(
+                                    "Column \"{}\" is used by generated column \"{}\".",
+                                    table.columns[ci].name, table.columns[g].name
+                                ))));
+                            }
                             // A column a view references cannot change type (views.md §6); checked
                             // after every action, so a view a DROP COLUMN … CASCADE drops does not
                             // block it.
@@ -3562,6 +3748,7 @@ impl Engine {
                                     not_null: false,
                                     default: None,
                                     identity: None,
+                                    generated: None,
                                     collation: None,
                                 },
                                 &mut Vec::new(),
@@ -3934,8 +4121,14 @@ impl Engine {
                             col_type,
                             default,
                         } => {
-                            let value =
-                                self.eval_default(column, default.as_ref(), &rng, &mut meter)?;
+                            // A generated column's `default` is its expression over the row
+                            // as built so far (generated-columns.md §4.1).
+                            let value = match (&column.generated, default) {
+                                (Some(_), Some(rx)) => rx.eval(row, &env, &mut meter)?,
+                                _ => {
+                                    self.eval_default(column, default.as_ref(), &rng, &mut meter)?
+                                }
+                            };
                             row.push(coerce_for_store(
                                 value,
                                 col_type,
@@ -4371,6 +4564,11 @@ impl Engine {
                 d.expr_text = text;
                 d.expr = expr;
             }
+            if let Some(g) = &mut c.generated {
+                let (text, expr) = rewrite(&g.expr_text)?;
+                g.expr_text = text;
+                g.expr = expr;
+            }
         }
         for i in &mut table.indexes {
             for k in &mut i.keys {
@@ -4632,7 +4830,20 @@ impl Engine {
             collation,
             no_collation: false,
             collation_conflict: false,
+            generated: def.generated.as_ref().map(generated_expr_of),
         };
+        if let Some(g) = &def.generated {
+            if serial_kind.is_some() {
+                return Err(EngineError::new(
+                    SqlState::SyntaxError,
+                    format!(
+                        "both default and generation expression specified for column {} of table {}",
+                        def.name, table.name
+                    ),
+                ));
+            }
+            require_stored(g)?;
+        }
         if def.primary_key {
             if !table.pk.is_empty() {
                 return Err(EngineError::new(
@@ -5163,9 +5374,21 @@ impl Engine {
         params: &mut ParamTypes,
     ) -> Result<Vec<Option<RExpr>>> {
         let mut out = Vec::with_capacity(table.columns.len());
+        // A stored generated column's slot carries its resolved generation expression instead
+        // (generated-columns.md §3.1): the INSERT row build computes it over the base row, and
+        // `eval_default` never evaluates it as a default.
+        let mut generated = if table.columns.iter().any(|c| c.generated.is_some()) {
+            self.resolve_generated_exprs(table, need, params)?
+        } else {
+            Vec::new()
+        };
         for (i, col) in table.columns.iter().enumerate() {
             if need.is_some_and(|n| !n[i]) {
                 out.push(None);
+                continue;
+            }
+            if col.generated.is_some() {
+                out.push(generated[i].take());
                 continue;
             }
             match &col.default_expr {
@@ -5210,6 +5433,11 @@ impl Engine {
         rng: &std::cell::Cell<crate::seam::StmtRng>,
         meter: &mut Meter,
     ) -> Result<Value> {
+        // A stored generated column has no default: its slot is computed after the base row
+        // (generated-columns.md §3.1), so a `DEFAULT` keyword materializes a placeholder.
+        if col.generated.is_some() {
+            return Ok(Value::Null);
+        }
         match default_rexpr {
             Some(rx) => {
                 meter.checkpoint()?;

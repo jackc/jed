@@ -1,0 +1,264 @@
+# Writes to tables with stored generated columns (spec/design/generated-columns.md §3): an explicit
+# INSERT/UPDATE value is 428C9 (DEFAULT is allowed; OVERRIDING does not lift it); the INSERT row
+# build computes generated columns after the base row and before NOT NULL / CHECK; an UPDATE
+# recomputes a generated column exactly when a column it references is a SET target; the same holds
+# for ON CONFLICT DO UPDATE, MERGE, updatable views, and FK actions; RETURNING sees the computed
+# values. PostgreSQL-oracle-checked; the # cost: lines are jed's metered evaluation.
+# requires: ddl.generated_column, ddl.view_default, ddl.create_table, ddl.check, ddl.not_null, ddl.primary_key, ddl.foreign_key, ddl.foreign_key, ddl.view, dml.view_write, dml.insert, dml.insert_column_list, dml.insert_select, ddl.identity, dml.update, dml.update_default, dml.delete, dml.returning, dml.insert_on_conflict, dml.merge, query.select, query.order_by, types.i32, types.text, resource.cost_metering
+
+statement ok
+CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED, c int)
+
+# --- INSERT: only DEFAULT may target a generated column -------------------------------------------
+
+# one interior node (*) per row
+# cost: 2
+statement ok
+INSERT INTO t (a, c) VALUES (1, 10), (2, 20)
+
+statement error 428C9
+INSERT INTO t VALUES (3, 6, 30)
+
+statement error 428C9
+INSERT INTO t (a, b) VALUES (3, 6)
+
+# a VALUES column that is DEFAULT in every row is accepted; one non-DEFAULT row is not
+statement ok
+INSERT INTO t (a, b, c) VALUES (3, DEFAULT, 30), (4, DEFAULT, 40)
+
+statement error 428C9
+INSERT INTO t (a, b) VALUES (5, DEFAULT), (6, 12)
+
+# INSERT … SELECT naming the column is 428C9 even when the source is empty
+statement error 428C9
+INSERT INTO t (a, b) SELECT a, b FROM t WHERE false
+
+# OVERRIDING does not lift it
+statement error 428C9
+INSERT INTO t (a, b) OVERRIDING SYSTEM VALUE VALUES (5, 10)
+
+statement error 428C9
+INSERT INTO t (a, b) OVERRIDING USER VALUE VALUES (5, 10)
+
+statement ok
+INSERT INTO t (a, c) SELECT a + 10, c FROM t WHERE a = 1
+
+# RETURNING sees the computed value
+query III nosort
+INSERT INTO t (a) VALUES (100) RETURNING a, b, c
+----
+100
+200
+NULL
+
+query III nosort
+SELECT a, b, c FROM t ORDER BY a
+----
+1
+2
+10
+2
+4
+20
+3
+6
+30
+4
+8
+40
+11
+22
+10
+100
+200
+NULL
+
+# --- UPDATE: only SET … = DEFAULT; recompute when a referenced column is assigned ----------------
+
+statement error 428C9
+UPDATE t SET b = 1
+
+statement error 428C9
+UPDATE t SET a = 1, b = 1 WHERE a = 2
+
+# SET b = DEFAULT alone changes nothing
+statement ok
+UPDATE t SET b = DEFAULT WHERE a = 1
+
+query III nosort
+UPDATE t SET a = a + 1 WHERE a = 1 RETURNING a, b, c
+----
+2
+4
+10
+
+# assigning only an unreferenced column leaves b as it was
+statement ok
+UPDATE t SET c = 99 WHERE a = 100
+
+query III nosort
+SELECT a, b, c FROM t WHERE a = 100
+----
+100
+200
+99
+
+# --- the row build: generated after the base row, before NOT NULL and CHECK -----------------------
+
+statement ok
+CREATE TABLE o (a int NOT NULL, c int, b int GENERATED ALWAYS AS (c / 0) STORED)
+
+# the generation error (22012) beats the NOT NULL violation in the earlier column a
+statement error 22012
+INSERT INTO o (a, c) VALUES (NULL, 1)
+
+statement ok
+CREATE TABLE n (a int, b int NOT NULL GENERATED ALWAYS AS (a) STORED CHECK (b > 0))
+
+statement error 23502
+INSERT INTO n (a) VALUES (NULL)
+
+statement error 23514
+INSERT INTO n (a) VALUES (0)
+
+statement ok
+INSERT INTO n (a) VALUES (1)
+
+statement error 23514
+UPDATE n SET a = -1
+
+statement error 23502
+UPDATE n SET a = NULL
+
+# --- ON CONFLICT DO UPDATE ------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE u (k int PRIMARY KEY, v int, g int GENERATED ALWAYS AS (v + 1) STORED)
+
+statement ok
+INSERT INTO u (k, v) VALUES (1, 10)
+
+query III nosort
+INSERT INTO u (k, v) VALUES (1, 50) ON CONFLICT (k) DO UPDATE SET v = excluded.v RETURNING k, v, g
+----
+1
+50
+51
+
+statement error 428C9
+INSERT INTO u (k, v) VALUES (1, 50) ON CONFLICT (k) DO UPDATE SET g = 0
+
+statement ok
+INSERT INTO u (k, v) VALUES (1, 60) ON CONFLICT (k) DO UPDATE SET g = DEFAULT
+
+query III nosort
+SELECT k, v, g FROM u
+----
+1
+50
+51
+
+# --- MERGE ----------------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE src (k int, v int)
+
+statement ok
+INSERT INTO src VALUES (1, 7), (2, 8)
+
+statement ok
+MERGE INTO u USING src ON u.k = src.k WHEN MATCHED THEN UPDATE SET v = src.v WHEN NOT MATCHED THEN INSERT (k, v) VALUES (src.k, src.v)
+
+query III nosort
+SELECT k, v, g FROM u ORDER BY k
+----
+1
+7
+8
+2
+8
+9
+
+statement error 428C9
+MERGE INTO u USING src ON u.k = src.k WHEN MATCHED THEN UPDATE SET g = 1
+
+statement error 428C9
+MERGE INTO u USING src ON u.k = src.k + 10 WHEN NOT MATCHED THEN INSERT (k, v, g) VALUES (src.k + 10, src.v, 0)
+
+# --- an updatable view over the table -------------------------------------------------------------
+
+statement ok
+CREATE VIEW uv AS SELECT k, v, g FROM u
+
+statement ok
+INSERT INTO uv (k, v) VALUES (3, 30)
+
+statement error 428C9
+INSERT INTO uv (k, v, g) VALUES (4, 40, 0)
+
+statement error 428C9
+UPDATE uv SET g = 0
+
+statement ok
+UPDATE uv SET v = 31 WHERE k = 3
+
+query III nosort
+SELECT k, v, g FROM uv ORDER BY k
+----
+1
+7
+8
+2
+8
+9
+3
+31
+32
+
+# a view default on a column that maps to a generated base column is a supplied value: 428C9
+statement ok
+CREATE VIEW uvd AS SELECT k, v, g FROM u
+
+statement ok
+ALTER VIEW uvd ALTER COLUMN g SET DEFAULT 0
+
+statement error 428C9
+INSERT INTO uvd (k, v) VALUES (5, 50)
+
+# --- FK actions recompute a generated column that references the written child column ------------
+
+statement ok
+CREATE TABLE fp (id int PRIMARY KEY)
+
+statement ok
+CREATE TABLE fc (pid int REFERENCES fp ON UPDATE CASCADE ON DELETE SET NULL, label text GENERATED ALWAYS AS ('p' || pid::text) STORED)
+
+statement ok
+INSERT INTO fp VALUES (1), (2)
+
+statement ok
+INSERT INTO fc (pid) VALUES (1), (2)
+
+statement ok
+UPDATE fp SET id = 10 WHERE id = 1
+
+statement ok
+DELETE FROM fp WHERE id = 2
+
+query IT rowsort
+SELECT pid, label FROM fc
+----
+10
+p10
+NULL
+NULL
+
+# --- DELETE needs nothing special ----------------------------------------------------------------
+
+statement ok
+DELETE FROM t WHERE b > 100
+
+query I nosort
+SELECT count(*) FROM t
+----
+5

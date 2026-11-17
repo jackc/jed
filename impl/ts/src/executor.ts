@@ -177,9 +177,22 @@ import {
   isUnparsableError,
   unparsableCheckError,
   unparsableDefaultError,
+  unparsableGeneratedError,
   unparsableIndexError,
   unparsableViewError,
 } from "./unparsed.ts";
+import {
+  checkFkGeneratedActions,
+  generatedDependents,
+  generatedExprOf,
+  generatedInsertError,
+  generatedReaderOf,
+  generatedRecomputeSet,
+  generatedUpdateError,
+  insertTargetedError,
+  rejectGeneratedStructure,
+  requireStored,
+} from "./generated.ts";
 import type { ManifestEntry } from "./commit_manifest.ts";
 import { Meter, type QueryAccount, queryMemoryPeak, StateCharge } from "./cost.ts";
 import { HostBatch, ReadAhead, readAheadCap } from "./host_batch.ts";
@@ -7880,6 +7893,18 @@ export class Engine {
       let def_default: Value | null = null;
       let def_defaultExpr: DefaultExpr | null = null;
       let identityKind: IdentityKind | null = null;
+      // A stored generated column (generated-columns.md §1): only STORED (0A000), never with a
+      // synthesized serial default (42601, like an explicit DEFAULT). Its expression is admitted once
+      // every column exists (below), so a later column is in scope.
+      if (def.generated) {
+        if (serialKind !== undefined) {
+          throw engineError(
+            "syntax_error",
+            `both default and generation expression specified for column ${def.name} of table ${ct.name}`,
+          );
+        }
+        requireStored(def.generated);
+      }
       // A serial pseudo-type OR a GENERATED … AS IDENTITY constraint both desugar to an
       // auto-numbered column: an OWNED sequence + a synthesized DEFAULT nextval(...) + NOT NULL
       // (sequences.md §12/§13). Identity additionally records ALWAYS/BY DEFAULT and gates the
@@ -8030,6 +8055,7 @@ export class Engine {
         default: def_default,
         defaultExpr: def_defaultExpr,
         identity: identityKind,
+        ...(def.generated ? { generated: generatedExprOf(def.generated) } : {}),
         collation,
       });
     }
@@ -8129,6 +8155,12 @@ export class Engine {
       // A temp table's end-of-transaction action (42P16 above for any other) — temp-tables.md §5.1.
       ...(ct.onCommit === undefined ? {} : { onCommit: ct.onCommit }),
     };
+    // Generation expressions (generated-columns.md §2), in column order: after the key constraints
+    // resolve and before any CHECK validates — PostgreSQL cooks column defaults and generation
+    // expressions before the table's CHECK constraints.
+    for (let ci = 0; ci < table.columns.length; ci++) {
+      if (table.columns[ci]!.generated) this.admitGeneratedExpr(table, ci);
+    }
     const checkDeps: (HostFuncDep[] | undefined)[] = [];
     for (const def of ct.checks) {
       // Structural rejections first (a single pre-walk — a documented micro-order
@@ -8353,6 +8385,7 @@ export class Engine {
       // 6. Resolve and store the selected referential actions (§6.6).
       const onDelete = fkAction(fk.onDelete, "DELETE");
       const onUpdate = fkAction(fk.onUpdate, "UPDATE");
+      checkFkGeneratedActions(table, local, onDelete, onUpdate);
       // 7. The referenced columns must be the parent's PK or a UNIQUE set (§6.2).
       const refSet = sortedUnique(refs);
       const matchesUnique =
@@ -8864,8 +8897,16 @@ export class Engine {
     need: readonly boolean[] | null,
     ptypes: ParamTypes = new ParamTypes(),
   ): (RExpr | null)[] {
+    // A stored generated column's slot carries its resolved generation expression instead
+    // (generated-columns.md §3.1): the INSERT row build computes it over the base row, and
+    // evalDefault never evaluates it as a default.
+    const generated = table.columns.some((c) => c.generated)
+      ? this.resolveGeneratedExprs(table, need, ptypes)
+      : [];
     return table.columns.map((col, i) => {
-      if (col.defaultExpr === null || (need !== null && !need[i])) return null;
+      if (need !== null && !need[i]) return null;
+      if (col.generated) return generated[i]!;
+      if (col.defaultExpr === null) return null;
       if (col.defaultExpr.unparsed) throw unparsableDefaultError(table.name, col.name);
       const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
       if (col.type.kind === "scalar") {
@@ -8901,6 +8942,9 @@ export class Engine {
     rng: StmtRng,
     meter: Meter,
   ): Steps<Value> {
+    // A stored generated column has no default: its slot is computed after the base row
+    // (generated-columns.md §3.1), so a DEFAULT keyword materializes a placeholder.
+    if (col.generated) return nullValue();
     if (defaultRExpr === null) return col.default ?? nullValue();
     meter.guard();
     const env: EvalEnv = {
@@ -8949,9 +8993,18 @@ export class Engine {
     const n = table.columns.length;
     const row: Row = new Array(n);
     let nullCol = -1;
+    let hasGenerated = false;
     for (let i = 0; i < n; i++) {
       const col = table.columns[i]!;
       const p = provided[i]!;
+      // A stored generated column's slot is a placeholder until the base row is built
+      // (generated-columns.md §3.1); defaultExprs[i] holds its resolved expression. A provided
+      // slot is an all-DEFAULT VALUES slot (anything else was 428C9).
+      if (col.generated) {
+        hasGenerated = true;
+        row[i] = nullValue();
+        continue;
+      }
       const candidate: Value =
         p >= 0 ? values[p]! : yield* this.evalDefaultSteps(col, defaultExprs[i]!, rng, meter);
       if (col.notNull && candidate.kind === "null") {
@@ -8977,9 +9030,140 @@ export class Engine {
         throw err;
       }
     }
+    if (hasGenerated) {
+      yield* this.computeGeneratedSteps(table.columns, colTypes, defaultExprs, row, rng, meter, table.name);
+      nullCol = generatedNullCol(table.columns, defaultExprs, row, nullCol);
+    }
     if (nullCol >= 0)
       throw yield* this.notNullRowViolationSteps(table.name, table.columns[nullCol]!.name, row);
     return row;
+  }
+
+  // admitGeneratedExpr admits column ci's generation expression against table
+  // (generated-columns.md §2), in PostgreSQL's order: the structural pre-walk; name and type
+  // resolution (42703, operator errors); a reference to a generated column (42P17); immutability
+  // (42P17); then the host-function and timezone narrowings (0A000) and the assignment type
+  // (42804). table holds every column of the statement's end shape, so a later column is in scope.
+  private admitGeneratedExpr(table: Table, ci: number): void {
+    const col = table.columns[ci]!;
+    const ge = col.generated!;
+    rejectGeneratedStructure(ge.expr);
+    const scope = Scope.single(this, table);
+    const pt = new ParamTypes();
+    pt.indexContext = true;
+    const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+    let node: RExpr;
+    let rty: ResolvedType | null = null;
+    if (col.type.kind === "scalar") {
+      const r = resolve(scope, ge.expr, col.type.scalar, forbidden, pt);
+      node = r.node;
+      rty = r.type;
+    } else {
+      node = resolveContainerAssignTy(scope, col.type, col.name, ge.expr, forbidden, pt);
+    }
+    for (const r of checkReferencedColumns(ge.expr, table.columns)) {
+      if (table.columns[r]!.generated) {
+        throw engineError(
+          "invalid_object_definition",
+          `cannot use generated column ${table.columns[r]!.name} in column generation expression`,
+        ).withDetail("A generated column cannot reference another generated column.");
+      }
+    }
+    if (pt.nonimmutable) {
+      throw engineError("invalid_object_definition", "generation expression is not immutable");
+    }
+    if (rexprCallsHost(node)) {
+      throw engineError(
+        "feature_not_supported",
+        "a host function in a column generation expression is not supported yet",
+      );
+    }
+    if (pt.timezoneDeps.dynamic || pt.timezoneDeps.zones.length > 0) {
+      throw engineError(
+        "feature_not_supported",
+        "a time zone dependency in a column generation expression is not supported yet",
+      );
+    }
+    if (rty !== null && col.type.kind === "scalar" && !assignableTo(rty, col.type.scalar)) {
+      throw assignmentError(
+        `column ${col.name} is of type ${canonicalName(col.type.scalar)} but default expression is of type ${rtName(rty)}`,
+      );
+    }
+  }
+
+  // resolveGeneratedExprs resolves the generation expressions a write statement computes, one slot
+  // per column (null for an ordinary column, or a generated one need leaves out). Each resolves
+  // against the table's own columns, as admitted. An unparsable stored expression is XX003
+  // (generated-columns.md §6) — only for a column the statement computes.
+  private resolveGeneratedExprs(
+    table: Table,
+    need: readonly boolean[] | null,
+    ptypes: ParamTypes,
+  ): (RExpr | null)[] {
+    const scope = Scope.single(this, table);
+    return table.columns.map((col, i) => {
+      const ge = col.generated;
+      if (!ge) return null;
+      if (need !== null && !need[i]) return null;
+      if (ge.unparsed) throw unparsableGeneratedError(table.name, col.name);
+      const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+      if (col.type.kind === "scalar") {
+        return resolve(scope, ge.expr, col.type.scalar, forbidden, ptypes).node;
+      }
+      return resolveContainerAssignTy(scope, col.type, col.name, ge.expr, forbidden, ptypes);
+    });
+  }
+
+  // computeGeneratedSteps computes each generated column's resolved expression (generated[i], read
+  // only where column i is generated — a caller may pass the INSERT default slots) over row in
+  // column order, coercing each result to its column's type and typmod (generated-columns.md §3.1
+  // step 2). row holds the built base row; a generated slot is overwritten. NOT NULL is the
+  // caller's (it runs over the complete row afterwards), so a NULL result is stored as is here.
+  private *computeGeneratedSteps(
+    columns: Column[],
+    colTypes: ColType[],
+    generated: readonly (RExpr | null)[],
+    row: Row,
+    rng: StmtRng,
+    meter: Meter,
+    relation: string,
+  ): Steps<void> {
+    if (!columns.some((c, i) => c.generated && (generated[i] ?? null) !== null)) return;
+    meter.guard();
+    const env: EvalEnv = {
+      params: [],
+      outer: [],
+      runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, [], EMPTY_CTE_CTX),
+      runSubquerySteps: (p, o) => this.execHiddenQueryPlanSteps(p, o, [], EMPTY_CTE_CTX),
+      environment: this.session.environment,
+      rng,
+      ctes: EMPTY_CTE_CTX,
+      exec: this,
+    };
+    for (let i = 0; i < columns.length; i++) {
+      const col = columns[i]!;
+      const rx = generated[i] ?? null;
+      if (rx === null || !col.generated) continue;
+      const v = yield* evalExprSteps(rx, row, env, meter);
+      if (v.kind === "null") {
+        row[i] = v;
+        continue;
+      }
+      try {
+        row[i] = coerceForStore(
+          v,
+          colTypes[i]!,
+          col.decimal,
+          col.varcharLen,
+          col.temporal,
+          false,
+          col.name,
+          this.inputZone(),
+        );
+      } catch (e) {
+        throw assignmentHint(stampTable(e, relation));
+      }
+    }
   }
 
   // buildInsertRowAt is buildInsertRow for VALUES row r of a multi-row batch: a slot error it records
@@ -9369,14 +9553,18 @@ export class Engine {
           return { exprText: x.text, expr: x.expr };
         })(),
       }));
-      table.columns = table.columns.map((c) =>
-        c.defaultExpr === null
-          ? c
-          : (() => {
-              const x = rw(c.defaultExpr!.exprText);
-              return { ...c, defaultExpr: { exprText: x.text, expr: x.expr } };
-            })(),
-      );
+      table.columns = table.columns.map((c) => {
+        let out = c;
+        if (c.defaultExpr !== null) {
+          const x = rw(c.defaultExpr.exprText);
+          out = { ...out, defaultExpr: { exprText: x.text, expr: x.expr } };
+        }
+        if (c.generated) {
+          const x = rw(c.generated.exprText);
+          out = { ...out, generated: { exprText: x.text, expr: x.expr } };
+        }
+        return out;
+      });
       table.indexes = table.indexes.map((idx) => ({
         ...idx,
         keys: idx.keys.map((k) =>
@@ -9495,20 +9683,45 @@ export class Engine {
             if (col.primaryKey) table.pk = [table.columns.length - 1];
             columnSources.push({ kind: "added", column: col });
             typeChangedColumns.push(false);
-            rowSteps.push({
-              kind: "add",
-              column: col,
-              colType: resolveColType(col.type, snap.types),
-              defaultExpr: this.resolveDefaultExprs({
-                ...table,
-                columns: [col],
-                pk: [],
-                checks: [],
-                indexes: [],
-                fks: [],
-                exclusions: [],
-              })[0]!,
-            });
+            if (col.generated) {
+              // A generated ADD COLUMN backfills each row from its expression over the row as the
+              // earlier actions left it (generated-columns.md §4.1). A column added by this
+              // statement is not yet a stored column of that row: 0A000.
+              const ci = table.columns.length - 1;
+              if (
+                checkReferencedColumns(col.generated.expr, table.columns).some(
+                  (r) => r !== ci && columnSources[r]!.kind === "added",
+                )
+              ) {
+                throw engineError(
+                  "feature_not_supported",
+                  "a generation expression over a column added by the same ALTER TABLE is not supported yet",
+                );
+              }
+              this.admitGeneratedExpr(table, ci);
+              const need = table.columns.map((_, i) => i === ci);
+              rowSteps.push({
+                kind: "add",
+                column: col,
+                colType: resolveColType(col.type, snap.types),
+                defaultExpr: this.resolveGeneratedExprs(table, need, new ParamTypes())[ci]!,
+              });
+            } else {
+              rowSteps.push({
+                kind: "add",
+                column: col,
+                colType: resolveColType(col.type, snap.types),
+                defaultExpr: this.resolveDefaultExprs({
+                  ...table,
+                  columns: [col],
+                  pk: [],
+                  checks: [],
+                  indexes: [],
+                  fks: [],
+                  exclusions: [],
+                })[0]!,
+              });
+            }
             actions.unshift(
               ...action.checks.map(
                 (def) =>
@@ -9547,6 +9760,30 @@ export class Engine {
                 "feature_not_supported",
                 "dropping a primary-key column is not supported yet",
               );
+            // A generated column reading this one is a dependent (generated-columns.md §4.4): 2BP01
+            // under RESTRICT; under CASCADE each such column is dropped first (requeued ahead of
+            // this drop), so no stored expression is left naming the removed column.
+            const genDeps = generatedDependents(table, ci);
+            if (genDeps.length > 0) {
+              if (!action.cascade) {
+                throw engineError(
+                  "dependent_objects_still_exist",
+                  `cannot drop column ${action.name} of table ${table.name} because other objects depend on it`,
+                )
+                  .withDetail(
+                    `column ${genDeps[0]} of table ${table.name} depends on column ${action.name} of table ${table.name}`,
+                  )
+                  .hinted(DROP_CASCADE);
+              }
+              actions.unshift(
+                ...genDeps.map(
+                  (dep) =>
+                    ({ kind: "dropColumn", name: dep, ifExists: false, cascade: false }) as const,
+                ),
+                action,
+              );
+              continue;
+            }
             // A column a view references cannot be dropped (views.md §6): 2BP01. Under CASCADE
             // those views are dropped, with every view depending on them.
             const dropSource = columnSources[ci]!;
@@ -9943,6 +10180,12 @@ export class Engine {
                 const addition = nameAddition(local.map((i) => table.columns[i]!.name));
                 name = chooseObjectName(table.name, addition, "fkey", derivedTaken);
               }
+              checkFkGeneratedActions(
+                table,
+                local,
+                fkAction(d.onDelete, "DELETE"),
+                fkAction(d.onUpdate, "UPDATE"),
+              );
               for (let p = 0; p < local.length; p++) {
                 const li = local[p]!,
                   ri = refs[p]!;
@@ -10075,7 +10318,39 @@ export class Engine {
           if (ci < 0)
             throw engineError("undefined_column", `column does not exist: ${edit.column}`);
           const col = table.columns[ci]!;
+          if (
+            (edit.action.kind === "setDefault" || edit.action.kind === "dropDefault") &&
+            col.generated
+          ) {
+            // generated-columns.md §4.3: the expression is not a default.
+            throw engineError(
+              "syntax_error",
+              `column ${col.name} of relation ${table.name} is a generated column`,
+            ).hinted(
+              edit.action.kind === "setDefault"
+                ? "Use ALTER TABLE ... ALTER COLUMN ... SET EXPRESSION instead."
+                : "Use ALTER TABLE ... ALTER COLUMN ... DROP EXPRESSION instead.",
+            );
+          }
           switch (edit.action.kind) {
+            case "dropExpression": {
+              // generated-columns.md §4.2: the column keeps its stored values.
+              if (!col.generated) {
+                if (edit.action.ifExists) break;
+                throw engineError(
+                  "object_not_in_prerequisite_state",
+                  `column ${col.name} of relation ${table.name} is not a generated column`,
+                );
+              }
+              const { generated: _dropped, ...plain } = col;
+              table.columns[ci] = plain;
+              break;
+            }
+            case "setExpression":
+              throw engineError(
+                "feature_not_supported",
+                "ALTER COLUMN ... SET EXPRESSION is not supported yet",
+              );
             case "setDefault":
               if (col.identity !== null)
                 throw engineError("syntax_error", "identity column cannot have a default");
@@ -10126,7 +10401,9 @@ export class Engine {
                   "object_not_in_prerequisite_state",
                   `column "${col.name}" of relation "${table.name}" is already an identity column`,
                 );
-              if (col.default !== null || col.defaultExpr !== null)
+              // A stored generated column counts as having one (PostgreSQL keeps its expression as
+              // the column's default).
+              if (col.default !== null || col.defaultExpr !== null || col.generated)
                 throw engineError(
                   "object_not_in_prerequisite_state",
                   `column "${col.name}" of relation "${table.name}" already has a default value`,
@@ -10190,6 +10467,28 @@ export class Engine {
               table.columns[ci] = { ...col, notNull: false };
               break;
             case "setType": {
+              // generated-columns.md §4.3/§4.4: a generated column's own type is 0A000 this slice
+              // (42611 with USING, PostgreSQL's rule), and a column a generated column reads cannot
+              // change type (0A000).
+              if (col.generated) {
+                if (edit.action.using !== null)
+                  throw engineError(
+                    "invalid_column_definition",
+                    "cannot specify USING when altering type of generated column",
+                  ).withDetail(`Column "${col.name}" is a generated column.`);
+                throw engineError(
+                  "feature_not_supported",
+                  "altering the type of a generated column is not supported yet",
+                );
+              }
+              const genReader = generatedReaderOf(table, ci);
+              if (genReader >= 0)
+                throw engineError(
+                  "feature_not_supported",
+                  "cannot alter type of a column used by a generated column",
+                ).withDetail(
+                  `Column "${col.name}" is used by generated column "${table.columns[genReader]!.name}".`,
+                );
               // A column a view references cannot change type (views.md §6); checked after every
               // action, so a view a DROP COLUMN … CASCADE drops does not block it.
               const typeSource = columnSources[ci]!;
@@ -10446,7 +10745,12 @@ export class Engine {
         const row = [...(yield* store.resolveAllSteps(entry.row))];
         for (const step of rowSteps) {
           if (step.kind === "add") {
-            const value = yield* this.evalDefaultSteps(step.column, step.defaultExpr, rng, meter);
+            // A generated column's defaultExpr is its expression over the row as built so far
+            // (generated-columns.md §4.1).
+            const value =
+              step.column.generated && step.defaultExpr !== null
+                ? yield* evalExprSteps(step.defaultExpr, row, env, meter)
+                : yield* this.evalDefaultSteps(step.column, step.defaultExpr, rng, meter);
             row.push(
               coerceForStore(
                 value,
@@ -10952,8 +11256,17 @@ export class Engine {
       default: null,
       defaultExpr: null,
       identity: null,
+      ...(def.generated ? { generated: generatedExprOf(def.generated) } : {}),
       collation,
     };
+    if (def.generated) {
+      if (serialKind !== undefined)
+        throw engineError(
+          "syntax_error",
+          `both default and generation expression specified for column ${def.name} of table ${table.name}`,
+        );
+      requireStored(def.generated);
+    }
     if (def.primaryKey) {
       if (table.pk.length > 0)
         throw engineError(
@@ -13113,12 +13426,14 @@ export class Engine {
       ptypes,
     );
     const rindexes = this.resolveTableIndexes(table, ptypes);
+    // A stored generated column joins the GENERATED ALWAYS targets whatever the OVERRIDING clause
+    // (generated-columns.md §3.1); the list is in column order, PostgreSQL's rewrite order.
     const alwaysTargeted: { col: number; pos: number }[] = [];
-    if (ins.overriding !== "system") {
-      for (let i = 0; i < n; i++) {
-        if (table.columns[i]!.identity === "always" && provided[i]! >= 0) {
-          alwaysTargeted.push({ col: i, pos: provided[i]! });
-        }
+    for (let i = 0; i < n; i++) {
+      const col = table.columns[i]!;
+      if (provided[i]! < 0) continue;
+      if (col.generated || (col.identity === "always" && ins.overriding !== "system")) {
+        alwaysTargeted.push({ col: i, pos: provided[i]! });
       }
     }
 
@@ -13148,7 +13463,7 @@ export class Engine {
     }
     for (const at of alwaysTargeted) {
       if (rows.some((values) => values[at.pos]!.kind !== "default")) {
-        throw generatedAlwaysInsert(table.columns[at.col]!.name);
+        throw insertTargetedError(table.columns[at.col]!);
       }
     }
     const returning =
@@ -13446,15 +13761,16 @@ export class Engine {
     // The GENERATED ALWAYS columns still explicitly targeted (and not OVERRIDING SYSTEM VALUE):
     // supplying a non-DEFAULT value to one is 428C9. Collected as (column ordinal, value position)
     // so the source branches can enforce it (VALUES per-row, SELECT up-front).
+    // A stored generated column joins them whatever the OVERRIDING clause (generated-columns.md
+    // §3.1); the list is in column order, PostgreSQL's rewrite order.
     const alwaysTargeted: { col: number; pos: number }[] = [];
-    if (ins.overriding !== "system") {
-      for (let i = 0; i < n; i++) {
-        if (shouldCooperate()) yield COOPERATE;
+    for (let i = 0; i < n; i++) {
+      if (shouldCooperate()) yield COOPERATE;
 
-        const col = table.columns[i]!;
-        if (col.identity === "always" && provided[i]! >= 0) {
-          alwaysTargeted.push({ col: i, pos: provided[i]! });
-        }
+      const col = table.columns[i]!;
+      if (provided[i]! < 0) continue;
+      if (col.generated || (col.identity === "always" && ins.overriding !== "system")) {
+        alwaysTargeted.push({ col: i, pos: provided[i]! });
       }
     }
 
@@ -13463,7 +13779,7 @@ export class Engine {
       // value, so targeting an ALWAYS identity column without OVERRIDING SYSTEM VALUE is 428C9 —
       // raised up front (PG raises it at rewrite), firing even over a zero-row source.
       if (alwaysTargeted.length > 0) {
-        throw generatedAlwaysInsert(table.columns[alwaysTargeted[0]!.col]!.name);
+        throw insertTargetedError(table.columns[alwaysTargeted[0]!.col]!);
       }
       // SELECT source (§24). Plan the source query, then resolve the RETURNING projection
       // (PostgreSQL's analysis order — both precede any execution), threading ONE ParamTypes
@@ -13638,7 +13954,7 @@ export class Engine {
       if (shouldCooperate()) yield COOPERATE;
 
       if (rowsIn.some((values) => values[at.pos]!.kind !== "default")) {
-        throw generatedAlwaysInsert(table.columns[at.col]!.name);
+        throw insertTargetedError(table.columns[at.col]!);
       }
     }
     // Resolve the RETURNING projection after the source (PostgreSQL's analysis order) and
@@ -14726,6 +15042,7 @@ export class Engine {
       defaultExprs = this.resolveDefaultExprsFor(table, need);
     }
     const plans: AssignPlan[] = [];
+    const generatedDefaults: number[] = [];
     for (const a of oc.assignments) {
       const idx = columnIndex(table, a.column);
       if (idx < 0) {
@@ -14739,12 +15056,19 @@ export class Engine {
       if (table.columns[idx]!.identity === "always" && !a.isDefault) {
         throw generatedAlwaysUpdate(a.column);
       }
+      // A stored generated column takes only DEFAULT, which assigns nothing
+      // (generated-columns.md §3.2).
+      if (table.columns[idx]!.generated && !a.isDefault) {
+        throw generatedUpdateError(a.column);
+      }
       // Assigning a PRIMARY KEY member re-keys the existing row (upsert.md §5), the standalone
       // UPDATE rule carried onto the conflict path.
-      for (const p of plans) {
-        if (p.idx === idx) {
-          throw engineError("duplicate_column", "column " + a.column + " assigned more than once");
-        }
+      if (plans.some((p) => p.idx === idx) || generatedDefaults.includes(idx)) {
+        throw engineError("duplicate_column", "column " + a.column + " assigned more than once");
+      }
+      if (table.columns[idx]!.generated) {
+        generatedDefaults.push(idx);
+        continue;
       }
       const col = table.columns[idx]!;
       // A container (composite / range / array) column takes the standalone UPDATE container rule
@@ -14792,7 +15116,10 @@ export class Engine {
       });
     }
     const filter = oc.filter !== null ? resolveBooleanFilter(scope, oc.filter, ptypes) : null;
-    return { arb, doUpdate: true, assignments: plans, filter };
+    const setTargets = table.columns.map((_, i) => plans.some((p) => p.idx === i));
+    const need = generatedRecomputeSet(table, setTargets);
+    const generated = need !== null ? this.resolveGeneratedExprs(table, need, ptypes) : [];
+    return { arb, doUpdate: true, assignments: plans, filter, generated };
   }
 
   // arbiterExisting looks up the EXISTING (committed) conflicting row for an arbiter key
@@ -15115,7 +15442,10 @@ export class Engine {
     // updated (their committed arbiter entry no longer describes them).
     const affectedArb = new Set<string>();
     const affectedStored = new Set<string>();
-    const pkAssigned = plan.doUpdate && plan.assignments.some((a) => pk.includes(a.idx));
+    const upGenerated = plan.generated ?? [];
+    const pkAssigned =
+      plan.doUpdate &&
+      pk.some((o) => plan.assignments.some((a) => a.idx === o) || (upGenerated[o] ?? null) !== null);
     // For the no-target DO NOTHING path: the planned inserts' keys/prefixes (the arbiter path uses
     // the overlay instead).
     const insPk = new Set<string>();
@@ -15308,7 +15638,7 @@ export class Engine {
       if (plan.filter !== null && !(yield* evalFilterSteps(plan.filter, combined, env, meter)))
         continue;
       const newRow = existing.row.slice();
-      let nullCol: string | null = null;
+      let nullCol = -1;
       for (const ap of plan.assignments) {
         if (shouldCooperate()) yield COOPERATE;
 
@@ -15316,7 +15646,7 @@ export class Engine {
           const raw = yield* evalExprSteps(ap.source, combined, env, meter);
           // NOT NULL over the complete new row (error-fields.md §9.5).
           if (ap.notNull && raw.kind === "null") {
-            nullCol ??= ap.name;
+            if (nullCol < 0) nullCol = ap.idx;
             newRow[ap.idx] = raw;
             continue;
           }
@@ -15325,7 +15655,22 @@ export class Engine {
           throw stampTable(e, table.name);
         }
       }
-      if (nullCol !== null) throw yield* this.notNullRowViolationSteps(relation, nullCol, newRow);
+      // Recompute generated columns reading a SET target, before NOT NULL
+      // (generated-columns.md §3.2).
+      if (upGenerated.length > 0) {
+        yield* this.computeGeneratedSteps(
+          table.columns,
+          colTypes,
+          upGenerated,
+          newRow,
+          rng,
+          meter,
+          relation,
+        );
+        nullCol = generatedNullCol(table.columns, upGenerated, newRow, nullCol);
+      }
+      if (nullCol >= 0)
+        throw yield* this.notNullRowViolationSteps(relation, table.columns[nullCol]!.name, newRow);
       if (checks.length > 0) yield* evalChecksSteps(checks, relation, newRow, checkEnv(), meter);
       yield* viewCheck(newRow);
       // Assigning a key member re-keys the row (upsert.md §5).
@@ -15438,6 +15783,11 @@ export class Engine {
     // assigned an FK local column, must reference an existing parent key — the committed parent
     // state plus (for a self-reference) the statement's end state.
     const assigned = new Set<number>(plan.doUpdate ? plan.assignments.map((a) => a.idx) : []);
+    if (plan.doUpdate) {
+      upGenerated.forEach((g, i) => {
+        if (g !== null) assigned.add(i);
+      });
+    }
     const { fks, temp: fkTemp } = this.targetForeignKeys(dbScope, relation);
     for (const fk of fks) {
       if (shouldCooperate()) yield COOPERATE;
@@ -16529,6 +16879,9 @@ export class Engine {
     }
     const pkMembers = pkIndices(table);
     const plans: AssignPlan[] = [];
+    // SET g = DEFAULT on a stored generated column assigns nothing (generated-columns.md §3.2); its
+    // ordinals are kept only for the repeated-assignment check.
+    const generatedDefaults: number[] = [];
     for (const a of upd.assignments) {
       if (shouldCooperate()) yield COOPERATE;
 
@@ -16543,12 +16896,23 @@ export class Engine {
       if (table.columns[idx]!.identity === "always" && !a.isDefault) {
         throw generatedAlwaysUpdate(a.column);
       }
+      // A stored generated column likewise takes only DEFAULT (generated-columns.md §3.2).
+      if (table.columns[idx]!.generated && !a.isDefault) {
+        throw generatedUpdateError(a.column);
+      }
       for (const p of plans) {
         if (shouldCooperate()) yield COOPERATE;
 
         if (p.idx === idx) {
           throw engineError("duplicate_column", "column " + a.column + " assigned more than once");
         }
+      }
+      if (generatedDefaults.includes(idx)) {
+        throw engineError("duplicate_column", "column " + a.column + " assigned more than once");
+      }
+      if (table.columns[idx]!.generated) {
+        generatedDefaults.push(idx);
+        continue;
       }
       const col = table.columns[idx]!;
       if (a.isDefault) {
@@ -16620,10 +16984,19 @@ export class Engine {
         });
       }
     }
+    // The stored generated columns this UPDATE recomputes — those whose expression references a
+    // SET target (generated-columns.md §3.2) — resolved once against the table's columns. A
+    // recomputed column counts as written below (key, foreign key, carried-value handling).
+    const setTargets: boolean[] = table.columns.map((_, i) => plans.some((p) => p.idx === i));
+    const genNeed = generatedRecomputeSet(table, setTargets);
+    const generated = genNeed !== null ? this.resolveGeneratedExprs(table, genNeed, ptypes) : [];
+    const writtenCols: boolean[] = table.columns.map(
+      (_, i) => setTargets[i]! || (generated[i] ?? null) !== null,
+    );
     // A re-keying UPDATE assigns at least one key member: each matched row's storage key is
     // recomputed (phase 1) and the row is moved (phase 2). An UPDATE that touches no key member
     // keeps every storage key in place — the in-place fast path (writeStore.replace).
-    const pkChanged = pkMembers.length > 0 && plans.some((p) => pkMembers.includes(p.idx));
+    const pkChanged = pkMembers.length > 0 && pkMembers.some((m) => writtenCols[m]);
 
     let filter = this.resolveWriteFilter(scope, table, vw, upd.filter, ptypes);
     // The RETURNING projection resolves last (PostgreSQL's analysis order), against the same
@@ -16707,6 +17080,14 @@ export class Engine {
       if (shouldCooperate()) yield COOPERATE;
       collectTouched(p.source, 0, mask);
     }
+    // A recomputed generated column reads the columns its expression references; an assigned one's
+    // value is the freshly computed one, not a storage read.
+    for (const g of generated) {
+      if (g === null) continue;
+      const gmask: boolean[] = new Array(table.columns.length).fill(false);
+      collectTouched(g, 0, gmask);
+      for (let i = 0; i < gmask.length; i++) if (gmask[i] && !setTargets[i]) mask[i] = true;
+    }
     // A generated action's keyed target reads the FK columns for its membership test (§6.11).
     if (upd.fkTarget !== undefined) {
       for (const column of upd.fkTarget.fk.columns) {
@@ -16728,7 +17109,7 @@ export class Engine {
       for (let i = 0; i < ncols; i++) {
         if (shouldCooperate()) yield COOPERATE;
 
-        if (retMask[i] && !plans.some((p) => p.idx === i)) mask[i] = true; // new side
+        if (retMask[i] && !writtenCols[i]) mask[i] = true; // new side
         if (retMask[ncols + i]) mask[i] = true; // old side — always a storage read
       }
       oldReturned = retMask.slice(ncols);
@@ -16765,7 +17146,7 @@ export class Engine {
     meter.charge(blockCost);
     scanActual += blockCost;
     let filterActual = scanActual;
-    const assignedCol: boolean[] = table.columns.map((_, i) => plans.some((p) => p.idx === i));
+    const assignedCol: boolean[] = writtenCols.slice();
     for (const e of scan.entries) {
       if (shouldCooperate()) yield COOPERATE;
 
@@ -16795,7 +17176,7 @@ export class Engine {
       // inline, so cost-free) so that maintenance sees resident values.
       const row = store.resolveInlineColumns(filtered);
       const newRow = row.slice();
-      let nullCol: string | null = null;
+      let nullCol = -1;
       for (const p of plans) {
         if (shouldCooperate()) yield COOPERATE;
 
@@ -16805,7 +17186,7 @@ export class Engine {
             raw = fkCascadeValue(mapped[upd.fkTarget!.fk.columns.indexOf(p.idx)]!, p.target);
           // NOT NULL over the complete new row, after every assignment (error-fields.md §9.5).
           if (p.notNull && raw.kind === "null") {
-            nullCol ??= p.name;
+            if (nullCol < 0) nullCol = p.idx;
             newRow[p.idx] = raw;
             continue;
           }
@@ -16814,7 +17195,22 @@ export class Engine {
           throw stampTable(e, table.name);
         }
       }
-      if (nullCol !== null) throw yield* this.notNullRowViolationSteps(table.name, nullCol, newRow);
+      // Recompute the generated columns over the assigned row, before NOT NULL
+      // (generated-columns.md §3.1 step 2); a NULL into NOT NULL joins the row-wide check.
+      if (generated.length > 0) {
+        yield* this.computeGeneratedSteps(
+          table.columns,
+          store.columnTypes(),
+          generated,
+          newRow,
+          env.rng,
+          meter,
+          table.name,
+        );
+        nullCol = generatedNullCol(table.columns, generated, newRow, nullCol);
+      }
+      if (nullCol >= 0)
+        throw yield* this.notNullRowViolationSteps(table.name, table.columns[nullCol]!.name, newRow);
       // An unassigned non-key column carries its stored large value over deferred — taken from the
       // stored row, so the statement reading it does not matter — and the rewrite neither re-reads
       // nor recompresses it while the commit keeps its chain (large-values.md §15); every other
@@ -16948,7 +17344,10 @@ export class Engine {
     // updated rows' new referenced values, so a row may reference a value another updated row now
     // supplies. Unmetered, phase 1, before any write.
     const relation = table.name;
-    const assigned = new Set<number>(plans.map((p) => p.idx));
+    const assigned = new Set<number>();
+    writtenCols.forEach((w, i) => {
+      if (w) assigned.add(i);
+    });
     const { fks: updFks, temp: fkTemp } = this.targetForeignKeys(upd.db, upd.table);
     for (const fk of updFks) {
       if (shouldCooperate()) yield COOPERATE;
@@ -17346,12 +17745,14 @@ export class Engine {
         case "delete":
           action = { kind: "delete" };
           break;
-        case "update":
-          action = {
-            kind: "update",
-            assigns: this.mergeAssignments(scope, table, c.action.assignments, ptypes),
-          };
+        case "update": {
+          const assigns = this.mergeAssignments(scope, table, c.action.assignments, ptypes);
+          const setTargets = table.columns.map((_, i) => assigns.some((p) => p.idx === i));
+          const need = generatedRecomputeSet(table, setTargets);
+          const generated = need !== null ? this.resolveGeneratedExprs(table, need, ptypes) : [];
+          action = { kind: "update", assigns, generated };
           break;
+        }
         case "insert": {
           // Through a view, the view column defaults replace the table's (views.md §16.1).
           const cvw = mv?.clauses[ci] ?? null;
@@ -17367,8 +17768,9 @@ export class Engine {
             c.action.values,
           );
           // The omitted columns' expression defaults, resolved once for this action
-          // (constraints.md §2).
-          const need = provided.map((p) => p < 0);
+          // (constraints.md §2). A stored generated column's slot carries its expression
+          // (generated-columns.md §3.1), whether the column was omitted or given DEFAULT.
+          const need = provided.map((p, i) => p < 0 || !!rowTable.columns[i]!.generated);
           const defaults = need.some((b) => b)
             ? this.resolveDefaultExprsFor(rowTable, need)
             : table.columns.map(() => null);
@@ -17497,6 +17899,7 @@ export class Engine {
       defaultExprs = this.resolveDefaultExprsFor(table, need);
     }
     const plans: AssignPlan[] = [];
+    const generatedDefaults: number[] = [];
     for (const a of assigns) {
       const idx = columnIndex(table, a.column);
       if (idx < 0) {
@@ -17507,8 +17910,17 @@ export class Engine {
       if (table.columns[idx]!.identity === "always" && !a.isDefault) {
         throw generatedAlwaysUpdate(a.column);
       }
-      if (plans.some((p) => p.idx === idx)) {
+      // A stored generated column takes only DEFAULT, which assigns nothing
+      // (generated-columns.md §3.2).
+      if (table.columns[idx]!.generated && !a.isDefault) {
+        throw generatedUpdateError(a.column);
+      }
+      if (plans.some((p) => p.idx === idx) || generatedDefaults.includes(idx)) {
         throw engineError("duplicate_column", "column " + a.column + " assigned more than once");
+      }
+      if (table.columns[idx]!.generated) {
+        generatedDefaults.push(idx);
+        continue;
       }
       const col = table.columns[idx]!;
       const base = {
@@ -17681,7 +18093,7 @@ export class Engine {
       (c) =>
         pkMembers.length > 0 &&
         c.action.kind === "update" &&
-        c.action.assigns.some((a) => pkMembers.includes(a.idx)),
+        pkMembers.some((m) => mergeWritten(c.action as MergeUpdateAction, m)),
     );
     const actions: MergePlanned[] = [];
     const affected = new Set<string>();
@@ -17714,14 +18126,14 @@ export class Engine {
         throw new Error("a target row takes UPDATE, DELETE, or DO NOTHING");
       }
       const newRow = row.slice();
-      let nullCol: string | null = null;
+      let nullCol = -1;
       for (const a of action.assigns) {
         if (shouldCooperate()) yield COOPERATE;
         try {
           const raw = yield* evalExprSteps(a.source, evalRow, env, meter);
           // NOT NULL over the complete new row, after every assignment (error-fields.md §9.5).
           if (a.notNull && raw.kind === "null") {
-            nullCol ??= a.name;
+            if (nullCol < 0) nullCol = a.idx;
             newRow[a.idx] = raw;
             continue;
           }
@@ -17730,11 +18142,26 @@ export class Engine {
           throw stampTable(e, relation);
         }
       }
-      if (nullCol !== null) throw yield* self.notNullRowViolationSteps(relation, nullCol, newRow);
+      // Recompute generated columns reading a SET target, before NOT NULL
+      // (generated-columns.md §3.2).
+      if (action.generated.length > 0) {
+        yield* self.computeGeneratedSteps(
+          table.columns,
+          colTypes,
+          action.generated,
+          newRow,
+          stmtRng,
+          meter,
+          relation,
+        );
+        nullCol = generatedNullCol(table.columns, action.generated, newRow, nullCol);
+      }
+      if (nullCol >= 0)
+        throw yield* self.notNullRowViolationSteps(relation, table.columns[nullCol]!.name, newRow);
       // An unassigned non-key large value is carried in its stored form (large-values.md §15);
       // every other deferred value is resolved, unmetered.
       for (let i = 0; i < newRow.length; i++) {
-        const carried = !action.assigns.some((a) => a.idx === i) && !pkMembers.includes(i);
+        const carried = !mergeWritten(action, i) && !pkMembers.includes(i);
         const sv = stored[i]!;
         const nv = newRow[i]!;
         if (carried && sv.kind === "unfetched" && sv.ref.form !== 0x00) newRow[i] = sv;
@@ -18034,7 +18461,7 @@ export class Engine {
           if (a.kind === "insert") row = a.row;
           else if (a.kind === "update") {
             const action = plan.clauses[a.clause]!.action;
-            if (action.kind !== "update" || !action.assigns.some((x) => fk.columns.includes(x.idx)))
+            if (action.kind !== "update" || !fk.columns.some((c) => mergeWritten(action, c)))
               continue;
             row = a.newRow;
           } else continue;
@@ -19788,6 +20215,9 @@ export class Engine {
     const columns = table.columns.slice();
     for (const [i, d] of vw.defaultOverrides) {
       const col = columns[i]!;
+      // A view default on a stored generated column is a supplied value: 428C9 whatever the
+      // OVERRIDING clause (generated-columns.md §3.3), as in PostgreSQL.
+      if (col.generated) throw generatedInsertError(col.name);
       if (col.identity !== null && overriding === "user") continue;
       if (col.identity === "always" && overriding !== "system") {
         throw engineError(
@@ -23818,6 +24248,7 @@ export class Engine {
             : c.identity === "byDefault"
               ? textValue("BY DEFAULT")
               : nullValue(),
+          c.generated ? textValue(c.generated.exprText) : nullValue(),
         ]);
       }
     }
@@ -23838,6 +24269,7 @@ export class Engine {
             boolValue(false),
             nullValue(),
             d === null ? nullValue() : textValue(d.exprText),
+            nullValue(),
             nullValue(),
           ]);
         }
@@ -36003,6 +36435,9 @@ export type ConflictPlan = {
   doUpdate: boolean;
   assignments: AssignPlan[];
   filter: RExpr | null;
+  // The stored generated columns the DO UPDATE recomputes, one slot per column
+  // (generated-columns.md §3.2): those reading a SET target. Empty when none.
+  generated?: (RExpr | null)[];
 };
 
 // checkConflictNames is the decoration-name check on one ON CONFLICT inference element
@@ -38646,6 +39081,8 @@ function mergeTouched(plan: MergePlan, n: number): boolean[] {
     if (c.condition !== null) collectTouched(c.condition, 0, mask);
     if (c.action.kind === "update") {
       for (const a of c.action.assigns) collectTouched(a.source, 0, mask);
+      // A recomputed generated column reads its expression's columns of the target row.
+      for (const g of c.action.generated) if (g !== null) collectTouched(g, 0, mask);
     }
   }
   if (plan.returning !== null) {
@@ -40916,6 +41353,9 @@ export function catalogRelTable(kind: CatalogRelKind): Table {
         col("column_default", "text", false),
         // 'ALWAYS' / 'BY DEFAULT' for an identity column, else NULL (introspection.md §5).
         col("identity_generation", "text", false),
+        // A stored generated column's canonical expression text, else NULL
+        // (generated-columns.md §5).
+        col("generation_expression", "text", false),
       ]);
     case "jed_indexes":
       return table("jed_indexes", [
@@ -44501,6 +44941,43 @@ export function* evalViewChecksSteps(
 
     if (!(yield* evalFilterSteps(c.check, row, env, meter))) throw checkOptionViolation(c.view);
   }
+}
+
+type MergeUpdateAction = Extract<MergeActionPlan, { kind: "update" }>;
+
+// mergeWritten reports whether a MERGE UPDATE action writes column i: an assigned column, or a
+// generated column it recomputes (generated-columns.md §3.2).
+function mergeWritten(action: MergeUpdateAction, i: number): boolean {
+  return action.assigns.some((a) => a.idx === i) || (action.generated[i] ?? null) !== null;
+}
+
+// rexprCallsHost reports whether a resolved expression calls a host function anywhere.
+function rexprCallsHost(node: RExpr): boolean {
+  return node.kind === "hostFunc" || estimatorExpressionChildren(node).some(rexprCallsHost);
+}
+
+// generatedNullCol folds the generated columns a write computed (generated[i] non-null) into the
+// row-wide NOT NULL check (generated-columns.md §3.1 step 3): the smallest NULL NOT NULL column
+// index wins over nullCol (-1 = none so far).
+export function generatedNullCol(
+  columns: Column[],
+  generated: readonly (RExpr | null)[],
+  row: Row,
+  nullCol: number,
+): number {
+  for (let i = 0; i < columns.length; i++) {
+    const col = columns[i]!;
+    if (
+      col.generated &&
+      (generated[i] ?? null) !== null &&
+      col.notNull &&
+      row[i]!.kind === "null" &&
+      (nullCol < 0 || i < nullCol)
+    ) {
+      nullCol = i;
+    }
+  }
+  return nullCol;
 }
 
 // rejectCheckStructure applies the structural CHECK-expression rejections
@@ -49202,12 +49679,18 @@ function collectAssignmentDefaultPrivs(
   }
 }
 
-// collectCheckPrivs adds the named functions of a write target's CHECK constraints, which the write
-// evaluates on each new row.
+// collectCheckPrivs adds the named functions of a write target's CHECK constraints and stored
+// generation expressions (spec/design/generated-columns.md), which the write may evaluate on each
+// new row.
 function collectCheckPrivs(table: Table, req: PrivReq): void {
   const locals = new Set<string>();
   // An unparsed check calls nothing this binary can name; the write itself fails XX003.
   for (const check of table.checks) if (!check.unparsed) collectExprPrivs(check.expr, req, locals);
+  for (const col of table.columns) {
+    if (col.generated && !col.generated.unparsed) {
+      collectExprPrivs(col.generated.expr, req, locals);
+    }
+  }
 }
 
 function insertDefaultNeeds(

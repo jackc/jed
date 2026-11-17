@@ -19,6 +19,9 @@ type mergeClausePlan struct {
 	action    mergeActionKind
 	// assigns is an UPDATE action's resolved assignments, in written order.
 	assigns []assignPlan
+	// generated is the stored generated columns an UPDATE action recomputes, one slot per column
+	// (nil when none — generated-columns.md §3.2).
+	generated []*rExpr
 	// provided[i] = p: table column i takes INSERT value slot p; -1: its default.
 	provided []int
 	// values[p] is an INSERT action's resolved slot p, nil for a DEFAULT slot (whose column is then
@@ -363,6 +366,11 @@ func (db *engine) planMerge(m *mergeStmt, table *catTable, mv *mergeView, bindin
 			if cp.assigns, err = db.mergeAssignments(s, table, c.Assignments, ptypes); err != nil {
 				return nil, err
 			}
+			if need := generatedRecomputeSet(table, assignedMask(len(table.Columns), cp.assigns)); need != nil {
+				if cp.generated, err = db.resolveGeneratedExprs(table, need, ptypes); err != nil {
+					return nil, err
+				}
+			}
 		case mergeInsert:
 			// Through a view, the view column defaults replace the table's (views.md §16.1).
 			rowTable := table
@@ -377,11 +385,13 @@ func (db *engine) planMerge(m *mergeStmt, table *catTable, mv *mergeView, bindin
 			if err != nil {
 				return nil, err
 			}
-			// The omitted columns' expression defaults, resolved once for this action.
+			// The omitted columns' expression defaults, resolved once for this action. A stored
+			// generated column's slot carries its expression (generated-columns.md §3.1), whether the
+			// column was omitted or given DEFAULT.
 			need := make([]bool, n)
 			anyNeed := false
 			for i, p := range provided {
-				if p < 0 {
+				if p < 0 || rowTable.Columns[i].Generated != nil {
 					need[i], anyNeed = true, true
 				}
 			}
@@ -534,6 +544,7 @@ func (db *engine) mergeAssignments(s *scope, table *catTable, assigns []assignme
 		}
 	}
 	plans := make([]assignPlan, 0, len(assigns))
+	var generatedDefaults []int
 	for _, a := range assigns {
 		idx := table.ColumnIndex(a.Column)
 		if idx < 0 {
@@ -542,10 +553,22 @@ func (db *engine) mergeAssignments(s *scope, table *catTable, assigns []assignme
 		if c := table.Columns[idx].Identity; c != nil && *c == identityAlways && !a.IsDefault {
 			return nil, newGeneratedAlwaysUpdate(a.Column)
 		}
+		// A stored generated column takes only DEFAULT, which assigns nothing
+		// (generated-columns.md §3.2).
+		if table.Columns[idx].Generated != nil && !a.IsDefault {
+			return nil, generatedUpdateError(a.Column)
+		}
 		for _, p := range plans {
 			if p.idx == idx {
 				return nil, newError(DuplicateColumn, "column "+a.Column+" assigned more than once")
 			}
+		}
+		if slices.Contains(generatedDefaults, idx) {
+			return nil, newError(DuplicateColumn, "column "+a.Column+" assigned more than once")
+		}
+		if table.Columns[idx].Generated != nil {
+			generatedDefaults = append(generatedDefaults, idx)
+			continue
 		}
 		col := table.Columns[idx]
 		plan := assignPlan{idx: idx, name: col.Name, typmod: columnTypmod(&col), notNull: col.NotNull}
@@ -735,9 +758,7 @@ func (db *engine) executeMergeTarget(written *mergeStmt, params []Value, ctx cte
 	env := &evalEnv{exec: db, params: bound, rng: newStmtRng(), ctes: ctx}
 	pkChanged := make([]bool, len(plan.clauses))
 	for ci := range plan.clauses {
-		pkChanged[ci] = slices.ContainsFunc(plan.clauses[ci].assigns, func(a assignPlan) bool {
-			return slices.Contains(pkMembers, a.idx)
-		})
+		pkChanged[ci] = slices.ContainsFunc(pkMembers, plan.clauses[ci].written)
 	}
 	var actions []mergeAction
 	affected := map[string]struct{}{}
@@ -761,7 +782,7 @@ func (db *engine) executeMergeTarget(written *mergeStmt, params []Value, ctx cte
 		case mergeUpdate:
 			newRow := make(storedRow, len(row))
 			copy(newRow, row)
-			nullCol := ""
+			nullCol := -1
 			assigned := make([]bool, n)
 			for _, a := range c.assigns {
 				assigned[a.idx] = true
@@ -770,8 +791,8 @@ func (db *engine) executeMergeTarget(written *mergeStmt, params []Value, ctx cte
 					return err
 				}
 				if a.notNull && raw.Kind == ValNull {
-					if nullCol == "" {
-						nullCol = a.name
+					if nullCol < 0 {
+						nullCol = a.idx
 					}
 					newRow[a.idx] = NullValue()
 					continue
@@ -782,8 +803,21 @@ func (db *engine) executeMergeTarget(written *mergeStmt, params []Value, ctx cte
 				}
 				newRow[a.idx] = checked
 			}
-			if nullCol != "" {
-				return db.notNullRowViolation(table.Name, nullCol, newRow)
+			// Recompute generated columns reading a SET target, before NOT NULL
+			// (generated-columns.md §3.2). A recomputed column is written like an assigned one.
+			if c.generated != nil {
+				for i, g := range c.generated {
+					if g != nil {
+						assigned[i] = true
+					}
+				}
+				if err := db.computeGenerated(table.Columns, colTypes, c.generated, newRow, env.rng, meter, table.Name); err != nil {
+					return err
+				}
+				nullCol = generatedNotNull(table.Columns, c.generated, newRow, nullCol)
+			}
+			if nullCol >= 0 {
+				return db.notNullRowViolation(table.Name, table.Columns[nullCol].Name, newRow)
 			}
 			// An unassigned non-key large value is carried in its stored form (large-values.md §15);
 			// every other deferred value is resolved, unmetered.
@@ -1175,9 +1209,7 @@ func (db *engine) executeMergeTarget(written *mergeStmt, params []Value, ctx cte
 			case mergeDelete:
 				continue
 			case mergeUpdate:
-				if !slices.ContainsFunc(plan.clauses[a.clause].assigns, func(p assignPlan) bool {
-					return slices.Contains(fk.Columns, p.idx)
-				}) {
+				if !slices.ContainsFunc(fk.Columns, plan.clauses[a.clause].written) {
 					continue
 				}
 			}
@@ -1441,6 +1473,12 @@ func mergeTouched(plan *mergePlan, n int) []bool {
 		for i := range c.assigns {
 			collectTouched(c.assigns[i].source, 0, mask)
 		}
+		// A recomputed generated column reads its expression's columns of the target row.
+		for _, g := range c.generated {
+			if g != nil {
+				collectTouched(g, 0, mask)
+			}
+		}
 	}
 	if plan.returning != nil {
 		mw := plan.m
@@ -1504,6 +1542,11 @@ func mergeInsertColumns(table *catTable, columns []string, columnPos []srcPos, o
 			continue
 		}
 		col := table.Columns[i]
+		// A stored generated column takes only DEFAULT, whatever the OVERRIDING clause
+		// (generated-columns.md §3.1).
+		if col.Generated != nil {
+			return nil, nil, generatedInsertError(col.Name)
+		}
 		if col.Identity != nil && overriding != nil && *overriding == overridingUser {
 			continue
 		}
@@ -1513,4 +1556,15 @@ func mergeInsertColumns(table *catTable, columns []string, columnPos []srcPos, o
 		provided[i] = p
 	}
 	return provided, slotCol, nil
+}
+
+// written reports whether an UPDATE clause writes column i: an assigned column or a recomputed
+// generated one.
+func (c *mergeClausePlan) written(i int) bool {
+	for _, a := range c.assigns {
+		if a.idx == i {
+			return true
+		}
+	}
+	return c.generated != nil && c.generated[i] != nil
 }

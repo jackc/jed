@@ -754,6 +754,20 @@ type conflictPlan struct {
 	doUpdate    bool
 	assignments []assignPlan
 	filter      *rExpr
+	// generated is the stored generated columns the DO UPDATE recomputes, one slot per column
+	// (generated-columns.md §3.2): those reading a SET target. nil when none.
+	generated []*rExpr
+}
+
+// written reports whether the DO UPDATE writes column i: an assigned column or a recomputed
+// generated one.
+func (p *conflictPlan) written(i int) bool {
+	for _, a := range p.assignments {
+		if a.idx == i {
+			return true
+		}
+	}
+	return p.generated != nil && p.generated[i] != nil
 }
 
 // checkConflictOrdering is the written-ordering check on one ON CONFLICT inference element
@@ -1047,6 +1061,7 @@ func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, alias *stri
 		}
 	}
 	plans := make([]assignPlan, 0, len(oc.Assignments))
+	var generatedDefaults []int
 	for _, a := range oc.Assignments {
 		idx := table.ColumnIndex(a.Column)
 		if idx < 0 {
@@ -1058,12 +1073,24 @@ func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, alias *stri
 		if c := table.Columns[idx].Identity; c != nil && *c == identityAlways && !a.IsDefault {
 			return nil, newGeneratedAlwaysUpdate(a.Column)
 		}
+		// A stored generated column takes only DEFAULT, which assigns nothing
+		// (generated-columns.md §3.2).
+		if table.Columns[idx].Generated != nil && !a.IsDefault {
+			return nil, generatedUpdateError(a.Column)
+		}
 		// Assigning a PRIMARY KEY member re-keys the existing row (upsert.md §5), the standalone
 		// UPDATE rule carried onto the conflict path.
 		for _, p := range plans {
 			if p.idx == idx {
 				return nil, newError(DuplicateColumn, "column "+a.Column+" assigned more than once")
 			}
+		}
+		if slices.Contains(generatedDefaults, idx) {
+			return nil, newError(DuplicateColumn, "column "+a.Column+" assigned more than once")
+		}
+		if table.Columns[idx].Generated != nil {
+			generatedDefaults = append(generatedDefaults, idx)
+			continue
 		}
 		col := table.Columns[idx]
 		// A container (composite / range / array) column takes the standalone UPDATE container rule
@@ -1108,7 +1135,15 @@ func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, alias *stri
 		}
 		filter = f
 	}
-	return &conflictPlan{arb: arb, doUpdate: true, assignments: plans, filter: filter}, nil
+	var generated []*rExpr
+	if need := generatedRecomputeSet(table, assignedMask(len(table.Columns), plans)); need != nil {
+		g, err := db.resolveGeneratedExprs(table, need, ptypes)
+		if err != nil {
+			return nil, err
+		}
+		generated = g
+	}
+	return &conflictPlan{arb: arb, doUpdate: true, assignments: plans, filter: filter, generated: generated}, nil
 }
 
 // arbiterExisting looks up the EXISTING (committed) conflicting row for an arbiter key
@@ -1334,12 +1369,16 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 	// supplying a non-DEFAULT value to one is 428C9. Collected as (column ordinal, value position)
 	// so the source branches can enforce it (VALUES per-row, SELECT up-front).
 	type alwaysTarget struct{ col, pos int }
+	// A stored generated column joins them whatever the OVERRIDING clause (generated-columns.md
+	// §3.1); the list is in column order, PostgreSQL's rewrite order.
 	var alwaysTargeted []alwaysTarget
-	if !(ins.Overriding != nil && *ins.Overriding == overridingSystem) {
-		for i, col := range table.Columns {
-			if col.Identity != nil && *col.Identity == identityAlways && provided[i] >= 0 {
-				alwaysTargeted = append(alwaysTargeted, alwaysTarget{col: i, pos: provided[i]})
-			}
+	overrideSystem := ins.Overriding != nil && *ins.Overriding == overridingSystem
+	for i, col := range table.Columns {
+		if provided[i] < 0 {
+			continue
+		}
+		if col.Generated != nil || (!overrideSystem && col.Identity != nil && *col.Identity == identityAlways) {
+			alwaysTargeted = append(alwaysTargeted, alwaysTarget{col: i, pos: provided[i]})
 		}
 	}
 
@@ -1348,7 +1387,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 		// explicit value, so targeting an ALWAYS identity column without OVERRIDING SYSTEM VALUE is
 		// 428C9 — raised up front (PG raises it at rewrite), firing even over a zero-row source.
 		if len(alwaysTargeted) > 0 {
-			return outcome{}, newGeneratedAlwaysInsert(table.Columns[alwaysTargeted[0].col].Name)
+			return outcome{}, insertTargetedError(&table.Columns[alwaysTargeted[0].col])
 		}
 		// SELECT source (§24). Plan the source query, then resolve the RETURNING projection
 		// (PostgreSQL's analysis order — both precede any execution), threading ONE paramTypes
@@ -1529,7 +1568,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 			}
 		}
 		if nonDefault {
-			return outcome{}, newGeneratedAlwaysInsert(table.Columns[at.col].Name)
+			return outcome{}, insertTargetedError(&table.Columns[at.col])
 		}
 	}
 	// Resolve the RETURNING projection after the source (PostgreSQL's analysis order) and
@@ -1868,11 +1907,13 @@ func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx, vw *viewWrite
 		return nil, err
 	}
 	var alwaysTargeted []insertAlwaysTarget
-	if !(ins.Overriding != nil && *ins.Overriding == overridingSystem) {
-		for i, col := range table.Columns {
-			if col.Identity != nil && *col.Identity == identityAlways && provided[i] >= 0 {
-				alwaysTargeted = append(alwaysTargeted, insertAlwaysTarget{col: i, pos: provided[i]})
-			}
+	overrideSystem := ins.Overriding != nil && *ins.Overriding == overridingSystem
+	for i, col := range table.Columns {
+		if provided[i] < 0 {
+			continue
+		}
+		if col.Generated != nil || (!overrideSystem && col.Identity != nil && *col.Identity == identityAlways) {
+			alwaysTargeted = append(alwaysTargeted, insertAlwaysTarget{col: i, pos: provided[i]})
 		}
 	}
 
@@ -1908,7 +1949,7 @@ func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx, vw *viewWrite
 	for _, at := range alwaysTargeted {
 		for _, values := range ins.Rows {
 			if !values[at.pos].IsDefault {
-				return nil, newGeneratedAlwaysInsert(table.Columns[at.col].Name)
+				return nil, insertTargetedError(&table.Columns[at.col])
 			}
 		}
 	}
@@ -2523,7 +2564,15 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 func (db *engine) buildInsertRow(table *catTable, colTypes []colType, provided []int, values []Value, defaultExprs []*rExpr, rng *stmtRng, meter *costMeter) (storedRow, error) {
 	row := make(storedRow, len(table.Columns))
 	nullCol := -1
+	hasGenerated := false
 	for i, col := range table.Columns {
+		// A stored generated column's slot is a placeholder until the base row is built
+		// (generated-columns.md §3.1); defaultExprs[i] holds its resolved expression.
+		if col.Generated != nil {
+			hasGenerated = true
+			row[i] = NullValue()
+			continue
+		}
 		var candidate Value
 		if p := provided[i]; p >= 0 {
 			candidate = values[p]
@@ -2550,6 +2599,12 @@ func (db *engine) buildInsertRow(table *catTable, colTypes []colType, provided [
 			return nil, err
 		}
 		row[i] = v
+	}
+	if hasGenerated {
+		if err := db.computeGenerated(table.Columns, colTypes, defaultExprs, row, rng, meter, table.Name); err != nil {
+			return nil, err
+		}
+		nullCol = generatedNotNull(table.Columns, defaultExprs, row, nullCol)
 	}
 	if nullCol >= 0 {
 		return nil, db.notNullRowViolation(table.Name, table.Columns[nullCol].Name, row)
@@ -2896,8 +2951,8 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 	affectedStored := make(map[string]struct{})
 	pkAssigned := false
 	if plan.doUpdate {
-		for _, ap := range plan.assignments {
-			if slices.Contains(pk, ap.idx) {
+		for _, m := range pk {
+			if plan.written(m) {
 				pkAssigned = true
 			}
 		}
@@ -3089,7 +3144,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 		}
 		newRow := make(storedRow, n)
 		copy(newRow, existRow)
-		nullCol := ""
+		nullCol := -1
 		for _, ap := range plan.assignments {
 			raw, err := ap.source.eval(combined, env, meter)
 			if err != nil {
@@ -3097,8 +3152,8 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 			}
 			// NOT NULL over the complete new row (error-fields.md §9.5).
 			if ap.notNull && raw.Kind == ValNull {
-				if nullCol == "" {
-					nullCol = ap.name
+				if nullCol < 0 {
+					nullCol = ap.idx
 				}
 				newRow[ap.idx] = NullValue()
 				continue
@@ -3109,8 +3164,16 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 			}
 			newRow[ap.idx] = checked
 		}
-		if nullCol != "" {
-			return 0, nil, db.notNullRowViolation(relation, nullCol, newRow)
+		// Recompute generated columns reading a SET target, before NOT NULL
+		// (generated-columns.md §3.2).
+		if plan.generated != nil {
+			if err := db.computeGenerated(table.Columns, store.colTypes, plan.generated, newRow, rng, meter, relation); err != nil {
+				return 0, nil, err
+			}
+			nullCol = generatedNotNull(table.Columns, plan.generated, newRow, nullCol)
+		}
+		if nullCol >= 0 {
+			return 0, nil, db.notNullRowViolation(relation, table.Columns[nullCol].Name, newRow)
 		}
 		if len(checks) > 0 {
 			cenv := &evalEnv{exec: db, rng: rng}
@@ -3264,6 +3327,11 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 	if plan.doUpdate {
 		for _, ap := range plan.assignments {
 			assigned[ap.idx] = struct{}{}
+		}
+		for i, g := range plan.generated {
+			if g != nil {
+				assigned[i] = struct{}{}
+			}
 		}
 	}
 	fkTemp, _ := db.fkDomain(dbScope, table.Name)
@@ -4373,6 +4441,9 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 	}
 	pkMembers := table.PKIndices()
 	plans := make([]assignPlan, 0, len(upd.Assignments))
+	// SET g = DEFAULT on a stored generated column assigns nothing (generated-columns.md §3.2);
+	// its ordinals are kept only for the repeated-assignment check.
+	var generatedDefaults []int
 	for _, a := range upd.Assignments {
 		idx := table.ColumnIndex(a.Column)
 		if idx < 0 {
@@ -4383,11 +4454,23 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 		if c := table.Columns[idx].Identity; c != nil && *c == identityAlways && !a.IsDefault {
 			return outcome{}, newGeneratedAlwaysUpdate(a.Column)
 		}
+		// A stored generated column likewise takes only DEFAULT (generated-columns.md §3.2).
+		if table.Columns[idx].Generated != nil && !a.IsDefault {
+			return outcome{}, generatedUpdateError(a.Column)
+		}
 		for _, p := range plans {
 			if p.idx == idx {
 				return outcome{}, newError(DuplicateColumn,
 					"column "+a.Column+" assigned more than once")
 			}
+		}
+		if slices.Contains(generatedDefaults, idx) {
+			return outcome{}, newError(DuplicateColumn,
+				"column "+a.Column+" assigned more than once")
+		}
+		if table.Columns[idx].Generated != nil {
+			generatedDefaults = append(generatedDefaults, idx)
+			continue
 		}
 		col := table.Columns[idx]
 		if a.IsDefault {
@@ -4435,12 +4518,24 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 			})
 		}
 	}
+	// The stored generated columns this UPDATE recomputes — those whose expression references a
+	// SET target (generated-columns.md §3.2) — resolved once against the table's columns. A
+	// recomputed column counts as written below (key, foreign key, carried-value handling).
+	setTargets := assignedMask(len(table.Columns), plans)
+	var generated []*rExpr
+	if need := generatedRecomputeSet(table, setTargets); need != nil {
+		if generated, err = db.resolveGeneratedExprs(table, need, ptypes); err != nil {
+			return outcome{}, err
+		}
+	}
+	written := make([]bool, len(table.Columns))
+	for i := range written {
+		written[i] = setTargets[i] || (generated != nil && generated[i] != nil)
+	}
 	// A re-keying UPDATE assigns at least one key member: each matched row's storage key is
 	// recomputed (phase 1) and the row is moved (phase 2). An UPDATE that touches no key member
 	// keeps every storage key in place — the in-place fast path (writeStore.Replace).
-	pkChanged := len(pkMembers) > 0 && slices.ContainsFunc(plans, func(p assignPlan) bool {
-		return slices.Contains(pkMembers, p.idx)
-	})
+	pkChanged := len(pkMembers) > 0 && slices.ContainsFunc(pkMembers, func(m int) bool { return written[m] })
 
 	filter, err := db.resolveWriteFilter(s, table, vw, upd.Filter, ptypes)
 	if err != nil {
@@ -4536,6 +4631,20 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 	for i := range plans {
 		collectTouched(plans[i].source, 0, mask)
 	}
+	// A recomputed generated column reads the columns its expression references; an assigned one's
+	// value is the freshly computed one, not a storage read.
+	for _, g := range generated {
+		if g == nil {
+			continue
+		}
+		gmask := make([]bool, len(table.Columns))
+		collectTouched(g, 0, gmask)
+		for i := range mask {
+			if gmask[i] && !setTargets[i] {
+				mask[i] = true
+			}
+		}
+	}
 	// A generated action's keyed target reads the FK columns for its membership test (§6.11).
 	if upd.fkTarget != nil {
 		for _, column := range upd.fkTarget.fk.Columns {
@@ -4553,7 +4662,7 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 			collectTouched(node, 0, retMask)
 		}
 		for i := range mask {
-			if retMask[i] && !slices.ContainsFunc(plans, func(p assignPlan) bool { return p.idx == i }) {
+			if retMask[i] && !written[i] {
 				mask[i] = true // new side
 			}
 			if retMask[ncols+i] {
@@ -4598,9 +4707,7 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 	scanActual += blockCost
 	filterActual := scanActual
 	assignedCol := make([]bool, len(store.colTypes))
-	for _, p := range plans {
-		assignedCol[p.idx] = true
-	}
+	copy(assignedCol, written)
 	for _, e := range entries {
 		if err := meter.Step(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 			return outcome{}, err
@@ -4649,7 +4756,7 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 		}
 		newRow := make(storedRow, len(row))
 		copy(newRow, row)
-		nullCol := ""
+		nullCol := -1
 		for _, p := range plans {
 			raw, err := p.source.eval(row, env, meter)
 			if err != nil {
@@ -4663,8 +4770,8 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 			}
 			// NOT NULL over the complete new row, after every assignment (error-fields.md §9.5).
 			if p.notNull && raw.Kind == ValNull {
-				if nullCol == "" {
-					nullCol = p.name
+				if nullCol < 0 {
+					nullCol = p.idx
 				}
 				newRow[p.idx] = NullValue()
 				continue
@@ -4675,8 +4782,16 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 			}
 			newRow[p.idx] = checked
 		}
-		if nullCol != "" {
-			return outcome{}, db.notNullRowViolation(table.Name, nullCol, newRow)
+		// Recompute the generated columns over the assigned row, before NOT NULL
+		// (generated-columns.md §3.1 step 2); a NULL into NOT NULL joins the row-wide check.
+		if generated != nil {
+			if err := db.computeGenerated(table.Columns, store.colTypes, generated, newRow, env.rng, meter, table.Name); err != nil {
+				return outcome{}, err
+			}
+			nullCol = generatedNotNull(table.Columns, generated, newRow, nullCol)
+		}
+		if nullCol >= 0 {
+			return outcome{}, db.notNullRowViolation(table.Name, table.Columns[nullCol].Name, newRow)
 		}
 		// An unassigned non-key column carries its stored large value over deferred — taken from the
 		// stored row, so the statement reading it does not matter — and the rewrite neither re-reads
@@ -4839,8 +4954,10 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 	// supplies. Unmetered, phase 1, before any write.
 	relation := table.Name
 	assigned := make(map[int]struct{}, len(plans))
-	for _, p := range plans {
-		assigned[p.idx] = struct{}{}
+	for i, w := range written {
+		if w {
+			assigned[i] = struct{}{}
+		}
 	}
 	fkTemp, hasFKs := db.fkDomain(upd.DB, upd.Table)
 	for fki := range table.ForeignKeys {
@@ -5098,4 +5215,13 @@ func insertDefaultNeeds(provided []int, rows [][]insertValue) []bool {
 		}
 	}
 	return need
+}
+
+// assignedMask marks the columns an assignment list writes (the SET targets).
+func assignedMask(n int, plans []assignPlan) []bool {
+	m := make([]bool, n)
+	for _, p := range plans {
+		m[p.idx] = true
+	}
+	return m
 }

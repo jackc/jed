@@ -177,8 +177,10 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // and meta offset 60 counts a (parent, slot) remap list in the manifest area's last third, which lets
 // a commit keep an interior whose only change is a child's page, and its catalog chain. v54: a
 // base-plus-offsets region may store up to 16 values whole as exceptions (region kind 6), taken when
-// it saves more than kind 1 (format.md "Leaf node"; spec/design/leaf-write-cost.md §8–§9).
-pub(crate) const FORMAT_VERSION: u16 = 54;
+// it saves more than kind 1 (format.md "Leaf node"; spec/design/leaf-write-cost.md §8–§9). v55:
+// stored generated columns — column flags bit7 `is_generated`, always with bit3, and the
+// expression-text slot holds the generation expression (spec/design/generated-columns.md §6).
+pub(crate) const FORMAT_VERSION: u16 = 55;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 #[path = "remap.rs"]
@@ -5499,11 +5501,15 @@ fn table_entry_bytes(
                 if col.default_expr.is_some() {
                     flags |= 0b1000;
                 }
+                // bit7 is_generated (v55): the generation expression takes the expr-text slot.
+                if col.generated.is_some() {
+                    flags |= 0b1000_1000;
+                }
                 out.push(flags);
                 let tn = r.name.as_bytes();
                 out.extend_from_slice(&(tn.len() as u16).to_be_bytes());
                 out.extend_from_slice(tn);
-                if let Some(de) = &col.default_expr {
+                if let Some(de) = col.default_expr.as_ref().or(col.generated.as_ref()) {
                     let et = de.expr_text.as_bytes();
                     out.extend_from_slice(&(et.len() as u16).to_be_bytes());
                     out.extend_from_slice(et);
@@ -5520,8 +5526,14 @@ fn table_entry_bytes(
                 if col.collation.is_some() {
                     flags |= 0b100_0000;
                 }
+                // bit7 is_generated + bit3 (v55): the generation expression text follows the
+                // element descriptor, before the collation name.
+                if col.generated.is_some() {
+                    flags |= 0b1000_1000;
+                }
                 out.push(flags);
                 push_array_element_type(&mut out, elem);
+                push_generated_text(&mut out, col);
                 if let Some(coll) = &col.collation {
                     let cb = coll.as_bytes();
                     out.extend_from_slice(&(cb.len() as u16).to_be_bytes());
@@ -5533,9 +5545,15 @@ fn table_entry_bytes(
                 // scalar code (spec/design/ranges.md §3). Ranges carry no default this slice (flags
                 // bits 2/3 = 0), so the entry is type_code ‖ flags ‖ element_code.
                 out.push(17);
-                let flags = if col.not_null { 0b10u8 } else { 0 };
+                let mut flags = if col.not_null { 0b10u8 } else { 0 };
+                // bit7 is_generated + bit3 (v55): the generation expression text follows the
+                // element descriptor.
+                if col.generated.is_some() {
+                    flags |= 0b1000_1000;
+                }
                 out.push(flags);
                 push_range_element_type(&mut out, elem);
+                push_generated_text(&mut out, col);
             }
             Type::Record(_) => {
                 unreachable!("an anonymous record is never stored (composite.md §1)")
@@ -5566,6 +5584,11 @@ fn table_entry_bytes(
                 if col.collation.is_some() {
                     flags |= 0b100_0000;
                 }
+                // bit7 is_generated (v55) — a stored generated column, always with bit3: its
+                // generation expression takes the expr-text slot (generated-columns.md §6).
+                if col.generated.is_some() {
+                    flags |= 0b1000_1000;
+                }
                 out.push(flags);
                 // A decimal column appends its typmod (precision, scale) — only for type_code 6,
                 // so non-decimal entries are byte-unchanged. `precision 0` = unconstrained.
@@ -5593,7 +5616,7 @@ fn table_entry_bytes(
                     // A column DEFAULT is always a scalar value (composite columns carry no
                     // default this slice — composite.md §12), so encode the scalar body directly.
                     out.extend_from_slice(&encode_scalar(*s, d));
-                } else if let Some(de) = &col.default_expr {
+                } else if let Some(de) = col.default_expr.as_ref().or(col.generated.as_ref()) {
                     let et = de.expr_text.as_bytes();
                     out.extend_from_slice(&(et.len() as u16).to_be_bytes());
                     out.extend_from_slice(et);
@@ -8383,6 +8406,39 @@ fn validate_loaded_references(snap: &Snapshot) -> Result<()> {
     Ok(())
 }
 
+/// A container column's generation-expression text (v55, flags bit7): u16 length + UTF-8.
+fn push_generated_text(out: &mut Vec<u8>, col: &Column) {
+    if let Some(g) = &col.generated {
+        let et = g.expr_text.as_bytes();
+        out.extend_from_slice(&(et.len() as u16).to_be_bytes());
+        out.extend_from_slice(et);
+    }
+}
+
+/// Read a stored expression's text and parse it, keeping text this binary cannot parse
+/// (spec/design/unparsable-definitions.md).
+fn read_stored_expr(buf: &[u8], pos: &mut usize) -> Result<DefaultExpr> {
+    let expr_text = read_string(buf, pos)?;
+    let (expr, unparsed) = parse_stored_expression(&expr_text);
+    Ok(DefaultExpr {
+        expr_text,
+        expr,
+        unparsed,
+    })
+}
+
+/// The v55 `is_generated` flag rules for a container column (generated-columns.md §6): bit7
+/// requires bit3, and bits 2, 4 and 5 are never set on such a column; returns whether it is set.
+fn container_generated_flag(flags: u8) -> Result<bool> {
+    if flags & 0b11_0100 != 0 {
+        return Err(corrupt("invalid container column flags"));
+    }
+    match (flags & 0b1000_0000 != 0, flags & 0b1000 != 0) {
+        (true, false) => Err(corrupt("is_generated set without default_is_expr")),
+        (g, _) => Ok(g),
+    }
+}
+
 /// Decode one catalog table entry: the `Table` (its pk list, checks, and index definitions
 /// included), its `root_data_page`, and each index's root page (parallel to
 /// `Table::indexes`).
@@ -8406,19 +8462,19 @@ fn decode_table_entry(
             if flags & 0b01 != 0 {
                 return Err(corrupt("reserved column flag bit0 set"));
             }
-            if flags & !0b1010 != 0 {
+            if flags & !0b1000_1010 != 0 {
                 return Err(corrupt("invalid composite column flags"));
             }
+            let is_generated = container_generated_flag(flags)?;
             let tname = read_string(buf, pos)?;
-            let default_expr = if flags & 0b1000 != 0 {
-                let expr_text = read_string(buf, pos)?;
-                // Text this binary cannot parse is kept, unparsed (unparsable-definitions.md).
-                let (expr, unparsed) = parse_stored_expression(&expr_text);
-                Some(DefaultExpr {
-                    expr_text,
-                    expr,
-                    unparsed,
-                })
+            // Text this binary cannot parse is kept, unparsed (unparsable-definitions.md).
+            let mut default_expr = if flags & 0b1000 != 0 {
+                Some(read_stored_expr(buf, pos)?)
+            } else {
+                None
+            };
+            let generated = if is_generated {
+                default_expr.take()
             } else {
                 None
             };
@@ -8436,6 +8492,7 @@ fn decode_table_entry(
                 collation: None,
                 no_collation: false,
                 collation_conflict: false,
+                generated,
             });
             continue;
         }
@@ -8446,7 +8503,15 @@ fn decode_table_entry(
             if flags & 0b01 != 0 {
                 return Err(corrupt("reserved column flag bit0 set"));
             }
+            if container_generated_flag(flags)? != (flags & 0b1000 != 0) {
+                return Err(corrupt("default_is_expr set on an array column"));
+            }
             let elem = read_array_element_type(buf, pos)?;
+            let generated = if flags & 0b1000_0000 != 0 {
+                Some(read_stored_expr(buf, pos)?)
+            } else {
+                None
+            };
             // bit6 has_collation (v36): a text[] column's non-`C` collation name follows the
             // element descriptor; the bit on any other element type is corrupt (array.md §3).
             let collation = if flags & 0b100_0000 != 0 {
@@ -8471,6 +8536,7 @@ fn decode_table_entry(
                 collation,
                 no_collation: false,
                 collation_conflict: false,
+                generated,
             });
             continue;
         }
@@ -8481,7 +8547,16 @@ fn decode_table_entry(
             if flags & 0b01 != 0 {
                 return Err(corrupt("reserved column flag bit0 set"));
             }
+            if flags & 0b100_0000 != 0 || container_generated_flag(flags)? != (flags & 0b1000 != 0)
+            {
+                return Err(corrupt("invalid range column flags"));
+            }
             let elem = read_range_element_type(buf, pos)?;
+            let generated = if flags & 0b1000_0000 != 0 {
+                Some(read_stored_expr(buf, pos)?)
+            } else {
+                None
+            };
             columns.push(Column {
                 name: cname,
                 ty: Type::Range(Box::new(elem)),
@@ -8496,18 +8571,21 @@ fn decode_table_entry(
                 collation: None,
                 no_collation: false,
                 collation_conflict: false,
+                generated,
             });
             continue;
         }
         let ty = scalar_for_type_code(tc).ok_or_else(|| corrupt("unknown type code"))?;
         let flags = read_u8(buf, pos)?;
         // bit0 was the primary_key flag through v4; v5 retired it (the pk list below is the
-        // authority) and reserves it as must-be-zero. bit6 is has_collation (v17); bit7 reserved.
+        // authority) and reserves it as must-be-zero. bit6 is has_collation (v17); bit7 is
+        // is_generated (v55): always with bit3, never with bit2 or bit4 (generated-columns.md §6).
         if flags & 0b01 != 0 {
             return Err(corrupt("reserved column flag bit0 set"));
         }
-        if flags & 0b1000_0000 != 0 {
-            return Err(corrupt("reserved column flag bit7 set"));
+        let is_generated = flags & 0b1000_0000 != 0;
+        if is_generated && (flags & 0b1000 == 0 || flags & 0b1_0100 != 0) {
+            return Err(corrupt("invalid is_generated column flags"));
         }
         // bit4 is_identity + bit5 identity_always (v15) — identity_always is meaningful only with
         // is_identity (spec/design/sequences.md §13).
@@ -8557,15 +8635,14 @@ fn decode_table_entry(
         } else {
             None
         };
-        let default_expr = if flags & 0b1000 != 0 {
-            let expr_text = read_string(buf, pos)?;
-            // Text this binary cannot parse is kept, unparsed (spec/design/unparsable-definitions.md).
-            let (expr, unparsed) = parse_stored_expression(&expr_text);
-            Some(DefaultExpr {
-                expr_text,
-                expr,
-                unparsed,
-            })
+        // Text this binary cannot parse is kept, unparsed (spec/design/unparsable-definitions.md).
+        let mut default_expr = if flags & 0b1000 != 0 {
+            Some(read_stored_expr(buf, pos)?)
+        } else {
+            None
+        };
+        let generated = if is_generated {
+            default_expr.take()
         } else {
             None
         };
@@ -8590,6 +8667,7 @@ fn decode_table_entry(
             collation,
             no_collation: false,
             collation_conflict: false,
+            generated,
         });
     }
     // The primary key (v5): member ordinals in KEY order. Each must name a real column,

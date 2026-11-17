@@ -130,11 +130,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ the CLI dump still writes neither standalone sequences nor a `serial` column's
     owned sequence (a replayed `serial` default names a sequence that does not exist); identity columns
     are dumped (cli.md §3).
-- [ ] **Generated columns** (`GENERATED ALWAYS AS (expr) STORED`) — PostgreSQL and SQLite both have
-  them; jed has only identity columns. Stored text binds like a `CHECK`: persisted canonical token
-  text, the [index-dependencies.md](spec/design/index-dependencies.md) purity contract, host-function
-  dependencies as for `CHECK` (extensibility.md §7.1), and an entry in the
-  [compatibility.md](spec/design/compatibility.md) manifest if that lands. _(size: L)_
+- [x] **Stored generated columns** (`GENERATED ALWAYS AS (expr) STORED`, format v55). → [generated-columns.md](spec/design/generated-columns.md)
+  - [ ] _follow-on:_ `VIRTUAL` generated columns (PostgreSQL 18's default when neither keyword is
+    written; jed rejects both forms with `0A000` today).
+  - [ ] _follow-on:_ `ALTER COLUMN … SET EXPRESSION AS (expr)` (a table rewrite) and `ALTER COLUMN …
+    TYPE` on a generated column (recompute under the new type); a generated `ADD COLUMN` over a
+    column added by the same statement.
+  - [ ] _follow-on:_ host functions in a generation expression (the index rule, extensibility.md
+    §8.1, with a persisted dependency list on the column) and timezone-dependent expressions (a
+    persisted timezone dependency list, index-dependencies.md); both `0A000` today. An entry in the
+    [compatibility.md](spec/design/compatibility.md) manifest if that lands.
 - [x] **Temporary tables** (with spill-to-disk past `temp_buffers`). → [temp-tables.md](spec/design/temp-tables.md)
   - [ ] _follow-on:_ a host-configurable spill directory (shared with the external sort) so WASI/OPFS
     hosts can offer a temp spill target; migrating a shrunken spilled domain back into RAM.

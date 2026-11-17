@@ -53,6 +53,13 @@ export type Column = {
   // INSERT/UPDATE value is accepted (428C9). Persisted as two column flag bits (format_version 15:
   // bit4 is_identity, bit5 identity_always).
   identity: IdentityKind | null;
+  // The column's GENERATION EXPRESSION when it is a stored generated column (`GENERATED ALWAYS AS
+  // (expr) STORED` — spec/design/generated-columns.md), else absent/null. A generated column has no
+  // default / defaultExpr and is never an identity column: the expression lives here so no
+  // default-applying path can mistake it for a default. It resolves against the table's own columns
+  // and is computed per row after the base row is built (§3.1). Persisted through the
+  // expression-default text slot with column flag bit7 is_generated (format_version 55, §6).
+  generated?: DefaultExpr | null;
   // The column's EFFECTIVE collation — null is C (byte / code-point order, the unchanged fast path),
   // a non-empty name a loaded non-C collation (spec/design/collation.md §1). Frozen at CREATE TABLE:
   // an explicit COLLATE "name", else the per-database default as of creation (PG-matching). Only a

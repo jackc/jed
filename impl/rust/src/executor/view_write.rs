@@ -802,6 +802,11 @@ impl Engine {
         let mut out = table.clone();
         for (i, default) in &vw.default_overrides {
             let col = &mut out.columns[*i];
+            // A stored generated base column takes no value at all, so a view default for it is
+            // 428C9 whatever the OVERRIDING clause (generated-columns.md §3.3).
+            if col.generated.is_some() {
+                return Err(generated_insert_error(&col.name));
+            }
             match (col.identity, overriding) {
                 (Some(_), Some(Overriding::User)) => continue,
                 (Some(IdentityKind::Always), o) if o != Some(Overriding::System) => {

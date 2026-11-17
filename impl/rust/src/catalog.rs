@@ -48,6 +48,14 @@ pub struct Column {
     /// whether an explicit INSERT/UPDATE value is accepted (`428C9`). Persisted as two column flag
     /// bits (format_version 15: bit 4 `is_identity`, bit 5 `identity_always`).
     pub identity: Option<IdentityKind>,
+    /// The column's **generation expression** when it is a stored generated column
+    /// (`GENERATED ALWAYS AS (expr) STORED` — spec/design/generated-columns.md), else `None`. A
+    /// generated column has no `default` / `default_expr` and is never an identity column: the
+    /// expression lives here so no default-applying path can mistake it for a default. It resolves
+    /// against the table's own columns and is computed per row after the base row is built
+    /// (§3.1). Persisted through the expression-default text slot with column flag bit 7
+    /// `is_generated` (format_version 55, §6).
+    pub generated: Option<DefaultExpr>,
     /// The column's **effective** collation — `None` is `C` (byte / code-point order, the unchanged
     /// fast path), `Some(name)` a loaded non-`C` collation (spec/design/collation.md §1). Frozen at
     /// CREATE TABLE: an explicit `COLLATE "name"` clause, else the per-database default collation as
@@ -898,6 +906,12 @@ pub(crate) fn unparsable_default_error(table: &str, column: &str) -> crate::erro
     ))
 }
 
+pub(crate) fn unparsable_generated_error(table: &str, column: &str) -> crate::error::EngineError {
+    unparsable_error(format!(
+        "generation expression of column \"{column}\" of table \"{table}\""
+    ))
+}
+
 pub(crate) fn unparsable_index_error(table: &str, index: &str) -> crate::error::EngineError {
     unparsable_error(format!("index \"{index}\" of table \"{table}\""))
 }
@@ -927,6 +941,14 @@ impl Table {
     pub(crate) fn unparsed_error(&self, defaults: bool) -> crate::error::Result<()> {
         if let Some(c) = self.checks.iter().find(|c| c.unparsed) {
             return Err(unparsable_check_error(&self.name, &c.name));
+        }
+        // A generation expression names the columns it depends on, so every caller needs it parsed.
+        if let Some(col) = self
+            .columns
+            .iter()
+            .find(|c| c.generated.as_ref().is_some_and(|g| g.unparsed))
+        {
+            return Err(unparsable_generated_error(&self.name, &col.name));
         }
         if defaults {
             for col in &self.columns {

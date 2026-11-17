@@ -45,6 +45,9 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   requirements manifest, read-vs-write dependency tagging, the heap-scan read-degradation, and the
   unification of collation skew + function drift; the model views / functional indexes / generated
   columns / host functions register into (CLAUDE.md §13).
+- [generated-columns.md](generated-columns.md) — stored generated columns (`GENERATED ALWAYS AS
+  (expr) STORED`): admission of the expression, the INSERT row-build order, the UPDATE recompute
+  rule, the ALTER TABLE forms, `jed_columns.generation_expression`, and the v55 column flag bit.
 - [unparsable-definitions.md](unparsable-definitions.md) — stored SQL (a view, `CHECK`, expression
   `DEFAULT`, expression or partial index) that this binary's parser rejects, as when a newer jed wrote
   it: the load keeps the object unparsed and byte-for-byte, only statements that need it fail with

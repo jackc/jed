@@ -47,7 +47,9 @@ Nine relations ship today:
   key, in **key** order; `NULL` for a non-member), `column_default` (the `DEFAULT` as SQL
   text — an expression default in its stored canonical form, such as `uuidv7 ( )`, or a constant
   as a literal of its stored value, such as `1.50` or `'draft'`; `NULL` for no default), and
-  `identity_generation` (`ALWAYS` or `BY DEFAULT` for an identity column, `NULL` otherwise). A view
+  `identity_generation` (`ALWAYS` or `BY DEFAULT` for an identity column, `NULL` otherwise), and
+  `generation_expression` (a [generated column](../tables/#generated-columns)'s expression in
+  its stored canonical form, such as `qty * price`; `NULL` otherwise). A view
   column's `type` is the type a query over the view produces: a column read straight from a table
   keeps its length or precision (`varchar(80)`), and a computed one has none (`text`); a view column
   is never `not_null`, keyed, or an identity; its view default appears in `column_default`. Views

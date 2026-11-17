@@ -1552,6 +1552,28 @@ fn default_expr_table_db() -> Session {
     db
 }
 
+/// Stored generated columns (format v55, spec/design/generated-columns.md §6): column flags bit7
+/// `is_generated` with bit3, the generation text in the expr-text slot — scalar, NOT NULL text,
+/// array and range entries. EMPTY table — the catalog encoding is the cross-core proof.
+fn generated_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, a i32, \
+         g i32 GENERATED ALWAYS AS (a * 2) STORED, \
+         s text NOT NULL GENERATED ALWAYS AS (a::text || 'x') STORED, \
+         arr i32[] GENERATED ALWAYS AS (ARRAY[a, id]) STORED, \
+         r i32range GENERATED ALWAYS AS (i32range(a, a + 1)) STORED)",
+    );
+    db
+}
+
 /// A table with a timestamp column — exercises the value codec's i64-instant branch (type
 /// code 8): a positive instant, a pre-1970 negative one, a BC-era one, the ±infinity sentinels,
 /// and a NULL. The literals parse to the same micros the golden stores. The PK stays i32 (a
@@ -2352,6 +2374,7 @@ fn write_matches_goldens() {
         ("uuid_table.jed", uuid_table_db),
         ("default_table.jed", default_table_db),
         ("default_expr_table.jed", default_expr_table_db),
+        ("generated_table.jed", generated_table_db),
         ("timestamp_table.jed", timestamp_table_db),
         ("timestamptz_table.jed", timestamptz_table_db),
         ("interval_table.jed", interval_table_db),

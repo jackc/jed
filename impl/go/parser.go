@@ -1913,6 +1913,7 @@ func (p *parser) parseColumnDef(tableName string, checks *[]checkDef, uniques *[
 	notNull := false
 	var def *defaultDef
 	var identity *identitySpec
+	var generated *generatedDef
 	collation := ""
 	for {
 		if p.atCheckConstraint() {
@@ -2003,6 +2004,39 @@ func (p *parser) parseColumnDef(tableName string, checks *[]checkDef, uniques *[
 			if err := p.expectKeyword("as"); err != nil {
 				return columnDef{}, err
 			}
+			// `GENERATED ALWAYS AS ( expr ) [STORED | VIRTUAL]` — a generated column
+			// (spec/design/generated-columns.md §1), told from IDENTITY by the `(`.
+			if p.peek().Kind == tokLParen {
+				if !always {
+					return columnDef{}, newError(SyntaxError, "for a generated column, GENERATED ALWAYS must be specified")
+				}
+				p.advance()
+				start := p.pos
+				expr, err := p.parseExpr()
+				if err != nil {
+					return columnDef{}, err
+				}
+				text := renderTokens(p.tokens[start:p.pos])
+				if err := p.expect(tokRParen); err != nil {
+					return columnDef{}, err
+				}
+				kind := generatedUnspecified
+				switch p.peekKeyword() {
+				case "stored":
+					p.advance()
+					kind = generatedStored
+				case "virtual":
+					p.advance()
+					kind = generatedVirtual
+				}
+				if generated != nil {
+					return columnDef{}, newError(SyntaxError, fmt.Sprintf(
+						"multiple generation clauses specified for column \"%s\" of table \"%s\"", name, tableName,
+					))
+				}
+				generated = &generatedDef{Expr: expr, Text: text, Kind: kind}
+				continue
+			}
 			if err := p.expectKeyword("identity"); err != nil {
 				return columnDef{}, err
 			}
@@ -2041,7 +2075,21 @@ func (p *parser) parseColumnDef(tableName string, checks *[]checkDef, uniques *[
 			fk.Columns = []string{name}
 			*foreignKeys = append(*foreignKeys, fk)
 		default:
-			return columnDef{Name: name, TypeName: typeName, TypePos: typePos, TypeMod: typeMod, PrimaryKey: primaryKey, NotNull: notNull, Default: def, Identity: identity, Collation: collation}, nil
+			// PostgreSQL's transformColumnDefinition checks these after the constraint loop
+			// (spec/design/generated-columns.md §1).
+			if generated != nil {
+				if def != nil {
+					return columnDef{}, newError(SyntaxError, fmt.Sprintf(
+						"both default and generation expression specified for column \"%s\" of table \"%s\"", name, tableName,
+					))
+				}
+				if identity != nil {
+					return columnDef{}, newError(SyntaxError, fmt.Sprintf(
+						"both identity and generation expression specified for column \"%s\" of table \"%s\"", name, tableName,
+					))
+				}
+			}
+			return columnDef{Name: name, TypeName: typeName, TypePos: typePos, TypeMod: typeMod, PrimaryKey: primaryKey, NotNull: notNull, Default: def, Identity: identity, Generated: generated, Collation: collation}, nil
 		}
 	}
 }
@@ -3316,6 +3364,23 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 			setTarget := p.peekKeywordAt(1)
 			isIdentitySet := p.peekKeyword() == "set" && setTarget != "default" && setTarget != "data" && setTarget != "not"
 			switch {
+			case p.peekKeyword() == "set" && setTarget == "expression":
+				// `SET EXPRESSION AS ( expr )` (generated-columns.md §4.3).
+				p.advance()
+				p.advance()
+				if err := p.expectKeyword("as"); err != nil {
+					return nil, err
+				}
+				if err := p.expect(tokLParen); err != nil {
+					return nil, err
+				}
+				if _, err := p.parseExpr(); err != nil {
+					return nil, err
+				}
+				if err := p.expect(tokRParen); err != nil {
+					return nil, err
+				}
+				a.Kind = alterSetExpression
 			case p.peekKeyword() == "restart" || isIdentitySet:
 				// The identity option list (alter.md §2.8): `SET GENERATED …`,
 				// `SET <sequence_option>`, `RESTART …`, in any order.
@@ -3382,6 +3447,17 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 				} else if p.peekKeyword() == "identity" {
 					p.advance()
 					a.Kind = alterDropIdentity
+					if p.peekKeyword() == "if" {
+						p.advance()
+						if err := p.expectKeyword("exists"); err != nil {
+							return nil, err
+						}
+						a.IfExists = true
+					}
+				} else if p.peekKeyword() == "expression" {
+					// `DROP EXPRESSION [IF EXISTS]` (generated-columns.md §4.2).
+					p.advance()
+					a.Kind = alterDropExpression
 					if p.peekKeyword() == "if" {
 						p.advance()
 						if err := p.expectKeyword("exists"); err != nil {

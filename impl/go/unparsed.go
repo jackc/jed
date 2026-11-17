@@ -23,6 +23,10 @@ func unparsableDefaultError(table, column string) error {
 	return unparsableError("default of column \"" + column + "\" of table \"" + table + "\"")
 }
 
+func unparsableGeneratedError(table, column string) error {
+	return unparsableError("generation expression of column \"" + column + "\" of table \"" + table + "\"")
+}
+
 func unparsableIndexError(table, index string) error {
 	return unparsableError("index \"" + index + "\" of table \"" + table + "\"")
 }
@@ -45,6 +49,12 @@ func tableUnparsedError(t *catTable, defaults bool) error {
 	for i := range t.Checks {
 		if t.Checks[i].Unparsed {
 			return unparsableCheckError(t.Name, t.Checks[i].Name)
+		}
+	}
+	// A generation expression names the columns it depends on, so every caller needs it parsed.
+	for i := range t.Columns {
+		if g := t.Columns[i].Generated; g != nil && g.Unparsed {
+			return unparsableGeneratedError(t.Name, t.Columns[i].Name)
 		}
 	}
 	for i := range t.Columns {

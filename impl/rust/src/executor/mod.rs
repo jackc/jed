@@ -26,7 +26,8 @@ pub(crate) use crate::catalog::{
     HostFuncDep, IdentityKind, IndexDef, IndexKey, IndexKeyExpr, IndexKind, SeqDataType, SeqOwner,
     SequenceDef, Table, TimeZoneDep, TimeZoneDeps, ViewDef, ViewDep, ViewDepKind,
     catalog_type_text, is_unparsable_error, resolve_col_type, unparsable_check_error,
-    unparsable_default_error, unparsable_index_error, unparsable_view_error,
+    unparsable_default_error, unparsable_generated_error, unparsable_index_error,
+    unparsable_view_error,
 };
 pub(crate) use crate::collation::{self, Collation};
 pub(crate) use crate::cost::{Lifetime, Meter};
@@ -70,7 +71,9 @@ mod autoname;
 pub(crate) use autoname::*;
 mod create_table_as;
 mod ddl;
+mod generated;
 pub(crate) use ddl::IndexDeriveSkip;
+pub(crate) use generated::*;
 mod index_dependencies;
 pub(crate) use index_dependencies::*;
 mod dml;

@@ -725,6 +725,11 @@ func (db *engine) tableWithViewDefaults(table *catTable, vw *viewWrite, overridi
 	out.Columns = append([]catColumn(nil), table.Columns...)
 	for _, o := range vw.defaultOverrides {
 		col := &out.Columns[o.ordinal]
+		// A view default on a stored generated column is a supplied value: 428C9 whatever the
+		// OVERRIDING clause (generated-columns.md §3.1), as in PostgreSQL.
+		if col.Generated != nil {
+			return nil, generatedInsertError(col.Name)
+		}
 		if col.Identity != nil {
 			if overriding != nil && *overriding == overridingUser {
 				continue

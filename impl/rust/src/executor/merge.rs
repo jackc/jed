@@ -16,8 +16,9 @@ pub(crate) struct MergeClausePlan {
 }
 
 pub(crate) enum MergeActionPlan {
-    /// The resolved assignments, in written order.
-    Update(Vec<AssignPlan>),
+    /// The resolved assignments, in written order, and the stored generated columns the clause
+    /// recomputes (one slot per column; empty when none — generated-columns.md §3.2).
+    Update(Vec<AssignPlan>, Vec<Option<RExpr>>),
     Delete,
     /// `provided[i] = Some(p)` — table column `i` takes value slot `p`; `None` — its default.
     /// `values[p]` is `None` for a `DEFAULT` slot (whose column is then omitted).
@@ -480,7 +481,15 @@ impl Engine {
                 MergeAction::DoNothing => MergeActionPlan::DoNothing,
                 MergeAction::Delete => MergeActionPlan::Delete,
                 MergeAction::Update(assigns) => {
-                    MergeActionPlan::Update(self.merge_assignments(scope, table, assigns, ptypes)?)
+                    let plans = self.merge_assignments(scope, table, assigns, ptypes)?;
+                    let set_targets: Vec<bool> = (0..table.columns.len())
+                        .map(|i| plans.iter().any(|p| p.idx == i))
+                        .collect();
+                    let generated = match generated_recompute_set(table, &set_targets) {
+                        Some(need) => self.resolve_generated_exprs(table, Some(&need), ptypes)?,
+                        None => Vec::new(),
+                    };
+                    MergeActionPlan::Update(plans, generated)
                 }
                 MergeAction::Insert {
                     columns,
@@ -504,7 +513,13 @@ impl Engine {
                         values,
                     )?;
                     // The omitted columns' expression defaults, resolved once for this action.
-                    let need: Vec<bool> = provided.iter().map(Option::is_none).collect();
+                    // A stored generated column's slot carries its expression (generated-columns.md
+                    // §3.1), whether the column was omitted or given DEFAULT.
+                    let need: Vec<bool> = provided
+                        .iter()
+                        .zip(&row_table.columns)
+                        .map(|(p, c)| p.is_none() || c.generated.is_some())
+                        .collect();
                     let defaults = if need.iter().any(|&b| b) {
                         self.resolve_default_exprs_for(
                             row_table,
@@ -717,16 +732,26 @@ impl Engine {
             Vec::new()
         };
         let mut plans: Vec<AssignPlan> = Vec::with_capacity(assigns.len());
+        let mut generated_defaults: Vec<usize> = Vec::new();
         for a in assigns {
             let idx = col_idx(table, &a.column).map_err(|e| e.with_position(a.pos.0))?;
             if table.columns[idx].identity == Some(IdentityKind::Always) && !a.is_default {
                 return Err(EngineError::generated_always_update(&a.column));
             }
-            if plans.iter().any(|p| p.idx == idx) {
+            // A stored generated column takes only DEFAULT, which assigns nothing
+            // (generated-columns.md §3.2).
+            if table.columns[idx].generated.is_some() && !a.is_default {
+                return Err(generated_update_error(&a.column));
+            }
+            if plans.iter().any(|p| p.idx == idx) || generated_defaults.contains(&idx) {
                 return Err(EngineError::new(
                     SqlState::DuplicateColumn,
                     format!("column {} assigned more than once", a.column),
                 ));
+            }
+            if table.columns[idx].generated.is_some() {
+                generated_defaults.push(idx);
+                continue;
             }
             let col = &table.columns[idx];
             let (target, col_type) = match &col.ty {
@@ -854,7 +879,7 @@ impl Engine {
                 self.fold_uncorrelated_in_rexpr(cond, &bound, ctx, &mut meter.accrued)?;
             }
             match &mut c.action {
-                MergeActionPlan::Update(assigns) => {
+                MergeActionPlan::Update(assigns, _) => {
                     for a in assigns {
                         self.fold_uncorrelated_in_rexpr(
                             &mut a.source,
@@ -905,9 +930,10 @@ impl Engine {
             .clauses
             .iter()
             .map(|c| match &c.action {
-                MergeActionPlan::Update(assigns) => {
-                    assigns.iter().any(|a| pk_members.contains(&a.idx))
-                }
+                MergeActionPlan::Update(assigns, generated) => pk_members.iter().any(|&m| {
+                    assigns.iter().any(|a| a.idx == m)
+                        || generated.get(m).is_some_and(Option::is_some)
+                }),
                 _ => false,
             })
             .collect();
@@ -957,7 +983,12 @@ impl Engine {
                         src,
                     });
                 }
-                MergeActionPlan::Update(assigns) => {
+                MergeActionPlan::Update(assigns, generated) => {
+                    // A recomputed generated column is written like an assigned one.
+                    let written = |i: usize| {
+                        assigns.iter().any(|a| a.idx == i)
+                            || generated.get(i).is_some_and(Option::is_some)
+                    };
                     // The new row starts as the old one, except that an assigned column (always
                     // written below) holds a placeholder and a carried large value its stored form,
                     // so neither is copied from its resolved old value only to be replaced.
@@ -965,7 +996,7 @@ impl Engine {
                         .iter()
                         .enumerate()
                         .map(|(i, v)| match stored.as_ref().map(|s| &s[i]) {
-                            _ if assigns.iter().any(|a| a.idx == i) => Value::Null,
+                            _ if written(i) => Value::Null,
                             Some(Value::Unfetched(u))
                                 if !pk_members.contains(&i) && u.is_large_form() =>
                             {
@@ -974,11 +1005,11 @@ impl Engine {
                             _ => v.clone(),
                         })
                         .collect();
-                    let mut null_col: Option<&str> = None;
+                    let mut null_col: Option<usize> = None;
                     for a in assigns {
                         let raw = a.source.eval(eval_row, &env, meter)?;
                         if a.not_null && matches!(raw, Value::Null) {
-                            null_col.get_or_insert(&a.name);
+                            null_col.get_or_insert(a.idx);
                             new_row[a.idx] = Value::Null;
                             continue;
                         }
@@ -986,14 +1017,39 @@ impl Engine {
                             .check(raw, &self.input_zone())
                             .map_err(|e| e.with_table(&relation))?;
                     }
-                    if let Some(col) = null_col {
-                        return Err(self.not_null_row_violation(&relation, col, &new_row));
+                    // Recompute generated columns reading a SET target, before NOT NULL
+                    // (generated-columns.md §3.2).
+                    if !generated.is_empty() {
+                        self.compute_generated(
+                            &table.columns,
+                            &col_types,
+                            generated,
+                            &mut new_row,
+                            &stmt_rng,
+                            meter,
+                            &relation,
+                        )?;
+                        for (i, g) in generated.iter().enumerate() {
+                            if g.is_some()
+                                && table.columns[i].not_null
+                                && matches!(new_row[i], Value::Null)
+                                && null_col.is_none_or(|c| i < c)
+                            {
+                                null_col = Some(i);
+                            }
+                        }
+                    }
+                    if let Some(ci) = null_col {
+                        return Err(self.not_null_row_violation(
+                            &relation,
+                            &table.columns[ci].name,
+                            &new_row,
+                        ));
                     }
                     // An unassigned non-key large value is carried in its stored form
                     // (large-values.md §15); every other deferred value is resolved, unmetered.
                     for (i, v) in new_row.iter_mut().enumerate() {
-                        let carried =
-                            !assigns.iter().any(|a| a.idx == i) && !pk_members.contains(&i);
+                        let carried = !written(i) && !pk_members.contains(&i);
                         match stored.as_ref().map(|s| &s[i]) {
                             Some(Value::Unfetched(u)) if carried && u.is_large_form() => {
                                 *v = Value::Unfetched(u.clone());
@@ -1412,10 +1468,15 @@ impl Engine {
                     Planned::Update {
                         new_row, clause, ..
                     } => {
-                        let MergeActionPlan::Update(assigns) = &plan.clauses[*clause].action else {
+                        let MergeActionPlan::Update(assigns, generated) =
+                            &plan.clauses[*clause].action
+                        else {
                             unreachable!("an update came from an UPDATE clause")
                         };
-                        if !assigns.iter().any(|a| fk.columns.contains(&a.idx)) {
+                        if !fk.columns.iter().any(|&c| {
+                            assigns.iter().any(|a| a.idx == c)
+                                || generated.get(c).is_some_and(Option::is_some)
+                        }) {
                             continue;
                         }
                         new_row
@@ -1697,9 +1758,13 @@ pub(crate) fn merge_touched(plan: &MergePlan, n: usize) -> Vec<bool> {
         if let Some(cond) = &c.condition {
             collect_touched(cond, 0, &mut mask);
         }
-        if let MergeActionPlan::Update(assigns) = &c.action {
+        if let MergeActionPlan::Update(assigns, generated) = &c.action {
             for a in assigns {
                 collect_touched(&a.source, 0, &mut mask);
+            }
+            // A recomputed generated column reads its expression's columns of the target row.
+            for g in generated.iter().flatten() {
+                collect_touched(g, 0, &mut mask);
             }
         }
     }
@@ -1777,6 +1842,11 @@ fn merge_insert_columns(
             continue;
         }
         let col = &table.columns[i];
+        // A stored generated column takes only DEFAULT, whatever the OVERRIDING clause
+        // (generated-columns.md §3.1).
+        if col.generated.is_some() {
+            return Err(generated_insert_error(&col.name));
+        }
         if col.identity.is_some() && overriding == Some(Overriding::User) {
             continue;
         }

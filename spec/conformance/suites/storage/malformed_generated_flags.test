@@ -1,0 +1,6 @@
+# Malformed catalog: a stored generated column whose flags also set bit4 is_identity
+# (spec/design/generated-columns.md §6; format.md v55). Ruby-forged (verify.rb MALFORMED_FIXTURES).
+# A generated column is never an identity column, so open rejects the entry as XX001.
+# requires: harness.fixture_open, harness.fixture_open_error
+# skip: disk prebuilt malformed image must remain the initial state
+# fixture: fileformat/fixtures/malformed_generated_flags.jed error XX001

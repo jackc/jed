@@ -23,7 +23,7 @@ INSERT INTO txn VALUES (1, 1, 25.00), (2, 2, 10.00);`;
 
 <svelte:head>
 	<title>Tables &amp; constraints — jed</title>
-	<meta name="description" content="Create and alter typed tables — from column definitions or from a query with CREATE TABLE AS — with serial and identity auto-numbering, defaults, upserts and MERGE, and enforced PRIMARY KEY, NOT NULL, CHECK, UNIQUE and FOREIGN KEY constraints." />
+	<meta name="description" content="Create and alter typed tables — from column definitions or from a query with CREATE TABLE AS — with serial and identity auto-numbering, generated columns, defaults, upserts and MERGE, and enforced PRIMARY KEY, NOT NULL, CHECK, UNIQUE and FOREIGN KEY constraints." />
 </svelte:head>
 
 # Tables & constraints
@@ -441,6 +441,40 @@ ALTER TABLE ticket ALTER COLUMN id DROP IDENTITY;
 `SET` and `DROP IDENTITY` on a column that is not an identity column report `55000` (`IF EXISTS`
 makes the drop a no-op). Each action can be combined with the other `ALTER TABLE` actions, runs left
 to right, and rolls back with the statement or transaction.
+
+<span id="generated-columns"></span>
+
+## Generated columns — `GENERATED ALWAYS AS (…) STORED`
+
+A stored generated column holds a value computed from the other columns of its row. jed computes it
+on every `INSERT` and recomputes it when an `UPDATE` changes a column it reads; it is stored like any
+other column, so it can be indexed, keyed, and checked:
+
+```sql
+CREATE TABLE line (
+  qty   i32 NOT NULL,
+  price numeric(10,2) NOT NULL,
+  total numeric(12,2) GENERATED ALWAYS AS (qty * price) STORED
+);
+INSERT INTO line (qty, price) VALUES (3, 2.50);
+UPDATE line SET qty = 4;
+SELECT * FROM line;
+```
+
+- The expression may read any column of the table except another generated column, and must be
+  immutable: no subqueries, aggregates, window functions, parameters, or functions that read the
+  clock, a sequence, or the session (`42P17`, `0A000`, `42803`, `42P20`).
+- You cannot write a generated column: an explicit value in `INSERT` or `UPDATE` is `428C9`, whatever
+  the `OVERRIDING` clause. `DEFAULT` is allowed and changes nothing.
+- An `UPDATE`, `ON CONFLICT DO UPDATE`, `MERGE`, or a foreign-key action recomputes the generated
+  columns that read a column it assigns, before `NOT NULL` and `CHECK` are enforced.
+- `ALTER TABLE … ADD COLUMN … GENERATED ALWAYS AS (…) STORED` fills existing rows, and
+  `ALTER COLUMN … DROP EXPRESSION` turns the column into an ordinary one that keeps its values.
+  Dropping a column a generated column reads needs `CASCADE`, which drops the generated column too.
+- jed has only `STORED` generated columns. PostgreSQL 18 also has `VIRTUAL` ones, computed on read,
+  and makes them the default when neither keyword is written; in jed both `VIRTUAL` and the bare form
+  are `0A000`. `ALTER COLUMN … SET EXPRESSION` and changing a generated column's type are not
+  supported yet.
 
 ## Upsert with `ON CONFLICT`
 

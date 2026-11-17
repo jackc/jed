@@ -2262,6 +2262,9 @@ pub(crate) enum ConflictActionPlan {
     DoUpdate {
         assignments: Vec<AssignPlan>,
         filter: Option<RExpr>,
+        /// The stored generated columns the DO UPDATE recomputes, one slot per column
+        /// (generated-columns.md §3.2): those reading a SET target. Empty when none.
+        generated: Vec<Option<RExpr>>,
     },
 }
 
