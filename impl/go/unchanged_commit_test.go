@@ -76,7 +76,7 @@ func TestUnchangedCommits(t *testing.T) {
 			version := db.Txid()
 			count.writes, count.syncs, count.grows = 0, 0, 0
 			if mode != "auto" && mode != "script" {
-				if err := s.Begin(context.Background(), true); err != nil {
+				if err := s.beginBlockCtx(context.Background(), true); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -102,9 +102,9 @@ func TestUnchangedCommits(t *testing.T) {
 			}
 			switch mode {
 			case "tx", "failed":
-				err = s.Commit()
+				err = s.commitBlock()
 			case "rollback":
-				err = s.Rollback()
+				err = s.rollbackBlock()
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -129,7 +129,7 @@ func TestUnchangedCommits(t *testing.T) {
 	version := db.Txid()
 	count.writes, count.syncs = 0, 0
 	for _, body := range []func(*Transaction) error{func(*Transaction) error { return nil }, func(tx *Transaction) error { var n int; return tx.QueryRow(context.Background(), "SELECT 1").Scan(&n) }} {
-		if err := db.Update(context.Background(), body); err != nil {
+		if err := db.update(context.Background(), body); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -153,7 +153,7 @@ func BenchmarkWritableNoopCommit(b *testing.B) {
 			}
 			b.ResetTimer()
 			for b.Loop() {
-				if err := db.Update(context.Background(), func(tx *Transaction) error {
+				if err := db.update(context.Background(), func(tx *Transaction) error {
 					if sql == "" {
 						return nil
 					}
@@ -197,7 +197,7 @@ func TestAttachmentCommitLeavesMainUntouched(t *testing.T) {
 	}
 	version := db.Txid()
 	// Main is a candidate write domain but no rows match. Only the attachment may persist.
-	if err := s.Begin(context.Background(), true); err != nil {
+	if err := s.beginBlockCtx(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	for _, sql := range []string{"DELETE FROM t WHERE id = 999", "CREATE TABLE a.t (id i32 PRIMARY KEY)", "INSERT INTO a.t VALUES (1)"} {
@@ -205,7 +205,7 @@ func TestAttachmentCommitLeavesMainUntouched(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := s.Commit(); err != nil {
+	if err := s.commitBlock(); err != nil {
 		t.Fatal(err)
 	}
 	after, err := os.ReadFile(path)

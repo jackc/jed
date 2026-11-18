@@ -572,7 +572,7 @@ func TestEncryptedCredentialChangeErrors(t *testing.T) {
 	}
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	writer := mustSession(db, SessionOptions{})
-	if err := writer.Begin(context.Background(), true); err != nil {
+	if err := writer.beginBlockCtx(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := writer.Exec(t.Context(), "INSERT INTO t VALUES (1)"); err != nil {
@@ -581,7 +581,7 @@ func TestEncryptedCredentialChangeErrors(t *testing.T) {
 	if got := encCode(db.ChangeCredential("main", newCred, Argon2Params{})); got != "55006" {
 		t.Fatalf("under an open writer: %q", got)
 	}
-	if err := writer.Rollback(); err != nil {
+	if err := writer.rollbackBlock(); err != nil {
 		t.Fatal(err)
 	}
 	writer.Close()

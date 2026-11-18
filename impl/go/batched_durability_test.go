@@ -263,7 +263,7 @@ func TestRelaxedBackgroundFlushWithConcurrentReaders(t *testing.T) {
 					return
 				default:
 				}
-				s := db.ReadSession()
+				s := db.readSession()
 				rows, err := s.queryValues("SELECT count(*), min(v), max(v) FROM t", nil)
 				if err != nil {
 					s.Close()
@@ -601,7 +601,7 @@ func TestRelaxedStoragePrecheckIgnoresTheDeadline(t *testing.T) {
 				sql = fmt.Sprintf("UPDATE t SET v = left(md5(v), %d) || v WHERE id %% 5 = 0", 1+i%20)
 			}
 			s := mustSession(db, SessionOptions{})
-			err := s.Begin(context.Background(), true)
+			err := s.beginBlockCtx(context.Background(), true)
 			if err == nil {
 				_, err = queryOutcome(s, sql, nil)
 			}
@@ -609,7 +609,7 @@ func TestRelaxedStoragePrecheckIgnoresTheDeadline(t *testing.T) {
 				_, err = queryOutcome(s, "INSERT INTO m.log VALUES ("+strconv.FormatInt(i, 10)+")", nil)
 			}
 			if err == nil {
-				err = s.Commit()
+				err = s.commitBlock()
 			}
 			s.Close()
 			code := ""

@@ -90,7 +90,7 @@ func TestTrailingTruncationWaitsForAnOlderReader(t *testing.T) {
 	growAndShrink(t, db)
 	// A reader pinned at the post-delete version keeps every page of that version, so the free list
 	// may not be reused and nothing is truncated while it is open: the high-water never goes down.
-	reader := db.ReadSession()
+	reader := db.readSession()
 	high := db.PageCount()
 	s := mustSession(db, SessionOptions{})
 	for k := 0; k < 400; k++ {

@@ -40,7 +40,7 @@ func TestUpdateClosureSQLCommitIs2D000AndNeverDiscardsWrites(t *testing.T) {
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY)")
 
 	// The closure propagates the 2D000: Update rolls back and reports it.
-	err := s.Update(context.Background(), func(tx *Transaction) error {
+	err := s.updateBlock(context.Background(), func(tx *Transaction) error {
 		if _, e := queryOutcome(tx, "INSERT INTO t VALUES (1)", nil); e != nil {
 			return e
 		}
@@ -65,7 +65,7 @@ func TestUpdateClosureSQLCommitIs2D000AndNeverDiscardsWrites(t *testing.T) {
 	}
 
 	// The closure swallows the error and returns nil: Update still reports that nothing committed.
-	err = s.Update(context.Background(), func(tx *Transaction) error {
+	err = s.updateBlock(context.Background(), func(tx *Transaction) error {
 		_, _ = queryOutcome(tx, "INSERT INTO t VALUES (1)", nil)
 		_, _ = queryOutcome(tx, "ROLLBACK", nil)
 		_, _ = queryOutcome(tx, "INSERT INTO t VALUES (5)", nil)
@@ -93,14 +93,14 @@ func TestClosureTransactionHandleCommitRollbackIs2D000WithoutAborting(t *testing
 	s := mustSession(memDB(), SessionOptions{})
 	defer s.Close()
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY)")
-	err := s.Update(context.Background(), func(tx *Transaction) error {
+	err := s.updateBlock(context.Background(), func(tx *Transaction) error {
 		if _, e := queryOutcome(tx, "INSERT INTO t VALUES (1)", nil); e != nil {
 			return e
 		}
-		if c := ctxCode(t, tx.Commit()); c != "2D000" {
+		if c := ctxCode(t, tx.Commit(context.Background())); c != "2D000" {
 			t.Fatalf("tx.Commit inside Update: want 2D000, got %s", c)
 		}
-		if c := ctxCode(t, tx.Rollback()); c != "2D000" {
+		if c := ctxCode(t, tx.Rollback(context.Background())); c != "2D000" {
 			t.Fatalf("tx.Rollback inside Update: want 2D000, got %s", c)
 		}
 		// not a statement error: the block is still open and usable
@@ -114,7 +114,7 @@ func TestClosureTransactionHandleCommitRollbackIs2D000WithoutAborting(t *testing
 		t.Fatalf("rows = %d want 2", n)
 	}
 	// View: the same gate.
-	err = s.View(context.Background(), func(tx *Transaction) error {
+	err = s.viewBlock(context.Background(), func(tx *Transaction) error {
 		if _, e := queryOutcome(tx, "COMMIT", nil); ctxCode(t, e) != "2D000" {
 			t.Fatalf("COMMIT inside View: want 2D000, got %v", e)
 		}
@@ -130,7 +130,7 @@ func TestSavepointsWorkInsideUpdateClosure(t *testing.T) {
 	s := mustSession(memDB(), SessionOptions{})
 	defer s.Close()
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY)")
-	err := s.Update(context.Background(), func(tx *Transaction) error {
+	err := s.updateBlock(context.Background(), func(tx *Transaction) error {
 		for _, sql := range []string{"INSERT INTO t VALUES (1)", "SAVEPOINT a", "INSERT INTO t VALUES (2)", "ROLLBACK TO a", "INSERT INTO t VALUES (3)", "RELEASE a"} {
 			if _, e := queryOutcome(tx, sql, nil); e != nil {
 				return e
@@ -202,7 +202,7 @@ func TestParseStageErrorsPoisonAnOpenBlock(t *testing.T) {
 	expectPoisoned("a Prepare 42601")
 
 	// the closure's Transaction too
-	err := s.Update(context.Background(), func(tx *Transaction) error {
+	err := s.updateBlock(context.Background(), func(tx *Transaction) error {
 		if _, e := queryOutcome(tx, "SELECT 1 FROM", nil); ctxCode(t, e) != "42601" {
 			t.Fatalf("want 42601, got %v", e)
 		}
@@ -228,7 +228,7 @@ func TestCloseAttachDetachNeverWaitForAnOpenWriteBlock(t *testing.T) {
 	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY)")
-	if err := s.Begin(context.Background(), true); err != nil {
+	if err := s.beginBlockCtx(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	mustExec(t, s, "INSERT INTO t VALUES (1)")
@@ -243,7 +243,7 @@ func TestCloseAttachDetachNeverWaitForAnOpenWriteBlock(t *testing.T) {
 		t.Fatalf("Detach with an open write block: want 55006, got %s", c)
 	}
 	// The refusals disturbed nothing: the block commits and the operations then succeed.
-	if err := s.Commit(); err != nil {
+	if err := s.commitBlock(); err != nil {
 		t.Fatal(err)
 	}
 	if n := txCount(t, s, "t"); n != 1 {

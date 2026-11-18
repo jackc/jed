@@ -13,7 +13,7 @@ func TestContextCancelsPageClientWriterWait(t *testing.T) {
 	owner, client := remoteFixture(t)
 	blocker := mustSession(owner, SessionOptions{})
 	defer blocker.Close()
-	if err := blocker.Begin(t.Context(), true); err != nil {
+	if err := blocker.beginBlockCtx(t.Context(), true); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
@@ -52,7 +52,7 @@ func TestContextCancelsPageClientWriterWait(t *testing.T) {
 	if err := client.QueryRow(t.Context(), "SELECT count(*) FROM t").Scan(&count); err != nil || count != 2000 {
 		t.Fatalf("client read after cancellation: %d, %v", count, err)
 	}
-	if err := blocker.Rollback(); err != nil {
+	if err := blocker.rollbackBlock(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := client.Exec(t.Context(), "INSERT INTO t VALUES (3000, 'retry')"); err != nil {
@@ -64,7 +64,7 @@ func TestContextCancelsOwnerWriterWait(t *testing.T) {
 	owner, client := remoteFixture(t)
 	blocker := mustSession(client, SessionOptions{})
 	defer blocker.Close()
-	if err := blocker.Begin(t.Context(), true); err != nil {
+	if err := blocker.beginBlockCtx(t.Context(), true); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
@@ -89,7 +89,7 @@ func TestContextCancelsOwnerWriterWait(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("owner wait did not cancel")
 	}
-	if err := blocker.Rollback(); err != nil {
+	if err := blocker.rollbackBlock(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := owner.Exec(t.Context(), "INSERT INTO t VALUES (3000, 'retry')"); err != nil {

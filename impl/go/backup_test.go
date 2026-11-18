@@ -177,13 +177,13 @@ func TestBackupDoesNotWaitForTheWriterOrReaders(t *testing.T) {
 	defer db.Close()
 	writer := mustSession(db, SessionOptions{})
 	defer writer.Close()
-	if err := writer.Begin(context.Background(), true); err != nil {
+	if err := writer.beginBlockCtx(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := writer.Exec(t.Context(), "INSERT INTO t VALUES (5000, 'pending', 1)"); err != nil {
 		t.Fatal(err)
 	}
-	reader := db.ReadSession()
+	reader := db.readSession()
 	defer reader.Close()
 	if _, err := queryOutcome(reader, "SELECT count(*) FROM t", nil); err != nil {
 		t.Fatal(err)
@@ -202,7 +202,7 @@ func TestBackupDoesNotWaitForTheWriterOrReaders(t *testing.T) {
 		}
 		copyDB.Close()
 	}
-	if err := writer.Commit(); err != nil {
+	if err := writer.commitBlock(); err != nil {
 		t.Fatal(err)
 	}
 }

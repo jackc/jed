@@ -365,17 +365,17 @@ func endSession(kind string, s *cSession) error {
 		if s.isWrite {
 			return fmt.Errorf("close of a write session (use commit/rollback)")
 		}
-		s.h.Close()
+		_ = s.h.Close()
 	case "commit":
 		if !s.isWrite {
 			return fmt.Errorf("commit of a read session (use close)")
 		}
-		return s.h.Commit()
+		return jed.CommitSessionForTesting(s.h)
 	case "rollback":
 		if !s.isWrite {
 			return fmt.Errorf("rollback of a read session (use close)")
 		}
-		return s.h.Rollback()
+		return jed.RollbackSessionForTesting(s.h)
 	}
 	return nil
 }
@@ -415,7 +415,7 @@ func runScheduleSequential(steps []cStep, header []string) error {
 				if st.blocks {
 					return fmt.Errorf("open %s: `blocks` is only valid for a write session", st.sid)
 				}
-				sessions[st.sid] = &cSession{h: db.ReadSession(), isWrite: false} // readers never take the gate
+				sessions[st.sid] = &cSession{h: jed.ReadSessionForTesting(db), isWrite: false} // readers never take the gate
 			case "write":
 				if st.blocks {
 					// Layer 2: assert the gate is held, then QUEUE the open — running Write() now
@@ -431,7 +431,7 @@ func runScheduleSequential(steps []cStep, header []string) error {
 					if gateHolder != "" {
 						return fmt.Errorf("open %s write: the gate is held by %q — use `blocks`", st.sid, gateHolder)
 					}
-					sessions[st.sid] = &cSession{h: db.WriteSession(), isWrite: true}
+					sessions[st.sid] = &cSession{h: jed.WriteSessionForTesting(db), isWrite: true}
 					gateHolder = st.sid
 				}
 			default:
@@ -455,7 +455,7 @@ func runScheduleSequential(steps []cStep, header []string) error {
 			if st.sid == gateHolder {
 				gateHolder = ""
 				if blockedSid != "" {
-					sessions[blockedSid] = &cSession{h: db.WriteSession(), isWrite: true}
+					sessions[blockedSid] = &cSession{h: jed.WriteSessionForTesting(db), isWrite: true}
 					gateHolder = blockedSid
 					blockedSid = ""
 				}
@@ -527,7 +527,7 @@ type cWorker struct {
 // `close` (or a closed command channel during teardown) deregisters by closing the handle.
 func readWorker(db *jed.Database, sid string, cmd chan cCmd, reply chan error, done chan struct{}) {
 	defer close(done)
-	s := &cSession{h: db.ReadSession(), isWrite: false}
+	s := &cSession{h: jed.ReadSessionForTesting(db), isWrite: false}
 	reply <- nil // ack the open: the snapshot is pinned + registered
 	for c := range cmd {
 		if c.end {
@@ -549,16 +549,16 @@ func readWorker(db *jed.Database, sid string, cmd chan cCmd, reply chan error, d
 // working set, and on `commit`/`rollback` (or teardown) ends the transaction, releasing the gate.
 func writeWorker(db *jed.Database, sid string, cmd chan cCmd, reply chan error, done chan struct{}) {
 	defer close(done)
-	s := &cSession{h: db.WriteSession(), isWrite: true}
+	s := &cSession{h: jed.WriteSessionForTesting(db), isWrite: true}
 	reply <- nil // ack the open: the writer gate is held, the working set captured
 	for c := range cmd {
 		if c.end {
 			var err error
 			switch c.kind {
 			case "commit":
-				err = s.h.Commit()
+				err = jed.CommitSessionForTesting(s.h)
 			case "rollback":
-				err = s.h.Rollback()
+				err = jed.RollbackSessionForTesting(s.h)
 			default:
 				err = fmt.Errorf("%s of a write session (use commit/rollback)", c.kind)
 			}
@@ -567,7 +567,7 @@ func writeWorker(db *jed.Database, sid string, cmd chan cCmd, reply chan error, 
 		}
 		reply <- runRecord(s, sid, c.rec)
 	}
-	_ = s.h.Rollback() // teardown: command channel closed without an explicit end (release gate)
+	_ = jed.RollbackSessionForTesting(s.h) // teardown: command channel closed without an explicit end (release gate)
 }
 
 // newCWorker mints the channels for a per-session worker goroutine.

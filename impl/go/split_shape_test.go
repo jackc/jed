@@ -12,6 +12,7 @@ package jed
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -107,7 +108,7 @@ func TestSplitShapeCostsArePinned(t *testing.T) {
 	}
 	pin(shuf, "SELECT count(*) FROM t", 4450)
 	pin(shuf, "SELECT id FROM t WHERE v = 3", 1907)
-	if err := tx.Rollback(); err != nil {
+	if err := tx.Rollback(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	after, err := shuf.ToImage(256, 1)

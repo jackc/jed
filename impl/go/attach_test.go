@@ -103,7 +103,7 @@ func TestAttachmentWorkingRootsAndCursorsDoNotAlias(t *testing.T) {
 	attachExec(t, s, "CREATE TABLE work.t (id i32 PRIMARY KEY, v i32)")
 	attachExec(t, s, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
 	attachExec(t, s, "INSERT INTO work.t VALUES (1, 100), (2, 200), (3, 300)")
-	if err := s.Begin(context.Background(), true); err != nil {
+	if err := s.beginBlockCtx(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	mainPin, err := s.queryValues("SELECT id, v FROM t ORDER BY id", nil)
@@ -145,7 +145,7 @@ func TestAttachmentWorkingRootsAndCursorsDoNotAlias(t *testing.T) {
 	}
 	_ = mainPin.Close()
 	_ = workPin.Close()
-	if err := s.Rollback(); err != nil {
+	if err := s.rollbackBlock(); err != nil {
 		t.Fatal(err)
 	}
 	fresh := mustSession(db, SessionOptions{})
@@ -191,7 +191,7 @@ func TestDetachInUseIs55006(t *testing.T) {
 	if err := db.Attach("mydb", AttachMemory(), false); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
-	reader := db.ReadSession() // pins the committed roots in the live registry
+	reader := db.readSession() // pins the committed roots in the live registry
 	if err := db.Detach("mydb"); err == nil {
 		t.Fatal("detach while a reader is live: want 55006, got nil")
 	} else if code := err.(*EngineError).Code(); code != "55006" {
@@ -409,12 +409,12 @@ func TestAttachFileOneDurableWriter(t *testing.T) {
 
 	s := mustSession(db, SessionOptions{})
 	defer s.Close()
-	if err := s.Begin(context.Background(), true); err != nil {
+	if err := s.beginBlockCtx(context.Background(), true); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	attachExec(t, s, "INSERT INTO m VALUES (1)")       // main (file) dirtied
 	attachExec(t, s, "INSERT INTO extra.e VALUES (1)") // a SECOND durable (file) database dirtied
-	if err := s.Commit(); err == nil {
+	if err := s.commitBlock(); err == nil {
 		t.Fatal("commit writing two durable databases: want 0A000, got nil")
 	} else if code := err.(*EngineError).Code(); code != "0A000" {
 		t.Fatalf("two durable writers: want 0A000, got %s", code)
@@ -451,12 +451,12 @@ func TestAttachFileWithMemoryMainMultiWrite(t *testing.T) {
 	s := mustSession(db, SessionOptions{})
 	defer s.Close()
 	attachExec(t, s, "CREATE TABLE local (id i32 PRIMARY KEY)")
-	if err := s.Begin(context.Background(), true); err != nil {
+	if err := s.beginBlockCtx(context.Background(), true); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	attachExec(t, s, "INSERT INTO local VALUES (1)")  // in-memory main (free)
 	attachExec(t, s, "INSERT INTO work.w VALUES (1)") // the one durable writer
-	if err := s.Commit(); err != nil {
+	if err := s.commitBlock(); err != nil {
 		t.Fatalf("memory-main + one file attachment should commit: %v", err)
 	}
 	if rows := queryRows(t, s, "SELECT id FROM work.w"); len(rows) != 1 || rows[0][0].Int != 1 {

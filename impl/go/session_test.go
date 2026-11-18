@@ -161,7 +161,7 @@ func TestAdditionalSessionUpdateClosureCommitsToSharedStorage(t *testing.T) {
 	}
 
 	s := mustSession(db, SessionOptions{})
-	err := s.Update(context.Background(), func(tx *Transaction) error {
+	err := s.updateBlock(context.Background(), func(tx *Transaction) error {
 		if _, err := queryOutcome(tx, "INSERT INTO t VALUES (1)", nil); err != nil {
 			return err
 		}

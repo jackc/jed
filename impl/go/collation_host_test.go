@@ -498,7 +498,7 @@ func TestCollationHostOpsRejectedInReadOnlyOrFailedBlock(t *testing.T) {
 	// block is 25006 and an aborted block is 25P02, never a success that COMMIT then discards.
 	env := loadFixtureBundle(t)
 	db := mustSession(memDBIn(env), SessionOptions{})
-	if err := db.Begin(context.Background(), false); err != nil {
+	if err := db.beginBlockCtx(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.SetDefaultCollation("unicode"); err == nil || err.(*EngineError).Code() != "25006" {
@@ -507,10 +507,10 @@ func TestCollationHostOpsRejectedInReadOnlyOrFailedBlock(t *testing.T) {
 	if _, err := db.UpgradeCollations(); err == nil || err.(*EngineError).Code() != "25006" {
 		t.Fatalf("read-only block upgrade: want 25006, got %v", err)
 	}
-	if err := db.Commit(); err != nil {
+	if err := db.commitBlock(); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Begin(context.Background(), true); err != nil {
+	if err := db.beginBlockCtx(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := queryOutcome(db, "SELECT * FROM absent", nil); err == nil {
@@ -522,7 +522,7 @@ func TestCollationHostOpsRejectedInReadOnlyOrFailedBlock(t *testing.T) {
 	if _, err := db.UpgradeCollations(); err == nil || err.(*EngineError).Code() != "25P02" {
 		t.Fatalf("failed block upgrade: want 25P02, got %v", err)
 	}
-	if err := db.Rollback(); err != nil {
+	if err := db.rollbackBlock(); err != nil {
 		t.Fatal(err)
 	}
 	if db.DefaultCollation() != "C" {

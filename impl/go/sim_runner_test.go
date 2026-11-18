@@ -1388,7 +1388,7 @@ func (r *simRunner) stepOpen(i int, st simStep) {
 	var s *Session
 	switch st.mode {
 	case "read":
-		s = r.db.ReadSession()
+		s = r.db.readSession()
 	case "write":
 		for sid, ss := range r.sessions {
 			if ss.write {
@@ -1396,7 +1396,7 @@ func (r *simRunner) stepOpen(i int, st simStep) {
 				return
 			}
 		}
-		s = r.db.WriteSession()
+		s = r.db.writeSession()
 	default:
 		r.fail(i, "unknown session mode %q", st.mode)
 		return
@@ -1422,7 +1422,7 @@ func (r *simRunner) stepOpen(i int, st simStep) {
 				return false
 			}
 			if st.mode == "write" {
-				_ = s.Rollback()
+				_ = s.rollbackBlock()
 			} else {
 				s.Close()
 			}
@@ -1623,11 +1623,11 @@ func (r *simRunner) checkLive() error {
 
 // committedView is the version and digest of database d a fresh read session sees.
 func (r *simRunner) committedView(d *simDB) (uint64, string, bool) {
-	rs := r.db.ReadSession()
+	rs := r.db.readSession()
 	digest, ok := r.digest(rs, d)
 	rs.Close()
 	if !ok && r.reopenStale() {
-		rs = r.db.ReadSession()
+		rs = r.db.readSession()
 		defer rs.Close()
 		digest, ok = r.digest(rs, d)
 	}
@@ -1635,11 +1635,11 @@ func (r *simRunner) committedView(d *simDB) (uint64, string, bool) {
 }
 
 func (r *simRunner) committedDigest(d *simDB) (string, bool) {
-	rs := r.db.ReadSession()
+	rs := r.db.readSession()
 	digest, ok := r.digest(rs, d)
 	rs.Close()
 	if !ok && r.reopenStale() {
-		rs = r.db.ReadSession()
+		rs = r.db.readSession()
 		defer rs.Close()
 		digest, ok = r.digest(rs, d)
 	}
@@ -1697,7 +1697,7 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 		dg, okd := r.digest(ss.s, d)
 		before[k] = inflight{dg, r.lastDigestText, okd}
 	}
-	err := ss.s.Commit()
+	err := ss.s.commitBlock()
 	if err != nil {
 		code := simCode(err)
 		if strings.HasPrefix(code, "non-engine") {
@@ -2142,7 +2142,7 @@ func (r *simRunner) stepEnd(i int, st simStep) {
 	}
 	delete(r.sessions, st.sid)
 	if st.kind == "rollback" {
-		if err := ss.s.Rollback(); err != nil {
+		if err := ss.s.rollbackBlock(); err != nil {
 			r.emit(`{"i":%d,"op":"rollback","sid":%q,"error":%q}`, i, st.sid, simCode(err))
 			return
 		}
@@ -2357,7 +2357,7 @@ func (r *simRunner) stepBackup(i int, st simStep) {
 	}
 	copyDB := databaseOver(sharedCoreFromEngine(e))
 	defer copyDB.Close()
-	rs := copyDB.ReadSession()
+	rs := copyDB.readSession()
 	dg, ok := r.digest(rs, d)
 	rs.Close()
 	switch {
@@ -3012,7 +3012,7 @@ func (r *simRunner) sessionsOf(pid int) []string {
 func (r *simRunner) closeProc(pid int) error {
 	for _, sid := range r.sessionsOf(pid) {
 		if ss := r.sessions[sid]; ss.write {
-			_ = ss.s.Rollback()
+			_ = ss.s.rollbackBlock()
 		} else {
 			ss.s.Close()
 		}

@@ -21,7 +21,7 @@ func TestTempOnCommitHostTransaction(t *testing.T) {
 	sess := mustSession(memDB(), SessionOptions{})
 	defer sess.Close()
 	sessExec(t, sess, "CREATE TEMP TABLE d (id i32 PRIMARY KEY) ON COMMIT DELETE ROWS")
-	err := sess.Update(context.Background(), func(tx *Transaction) error {
+	err := sess.updateBlock(context.Background(), func(tx *Transaction) error {
 		if _, err := tx.Exec(context.Background(), "INSERT INTO d VALUES (1), (2)"); err != nil {
 			return err
 		}

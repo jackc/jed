@@ -4,17 +4,55 @@ package jed
 // query it (with optional $N bind parameters), and iterate result rows. Thin wrappers over the
 // parser + executor — the conformance contract still binds (the executor is unchanged).
 
-// Transaction is an open explicit transaction (spec/design/api.md §2.2, transactions.md §4.4).
-// Statements run through the ergonomic Query/Exec/QueryRow (ergonomic.go); Commit/Rollback end it. Go
-// has no destructor, so a raw Begin caller must end it explicitly — View/Update do that automatically
-// (and are preferred).
+import "context"
+
+// AccessMode selects whether a transaction may write.
+type AccessMode uint8
+
+const (
+	// ReadWrite transactions may read and write. It is the zero value, PostgreSQL's default.
+	// Beginning one waits for the database's single writer slot.
+	ReadWrite AccessMode = iota
+	// ReadOnly transactions read one consistent snapshot and never wait for a writer. A write
+	// inside fails with SQLSTATE 25006.
+	ReadOnly
+)
+
+// TxOptions configures a transaction started by Begin or BeginFunc. The zero value is a
+// read-write transaction.
+type TxOptions struct {
+	AccessMode AccessMode
+}
+
+func (o TxOptions) writable() (bool, error) {
+	switch o.AccessMode {
+	case ReadWrite:
+		return true, nil
+	case ReadOnly:
+		return false, nil
+	}
+	return false, newError(InvalidParameterValue, "invalid parameter value: unknown transaction access mode")
+}
+
+// Transaction is an open transaction, started by Begin or handed to a BeginFunc callback.
+// Run statements through its Query and Exec methods and end it with Commit or Rollback.
+// A Transaction must not be used from more than one goroutine at a time.
+//
+// Transaction control belongs to the Transaction: running COMMIT or ROLLBACK as SQL through it
+// fails with SQLSTATE 2D000. SAVEPOINT, RELEASE and ROLLBACK TO work as in PostgreSQL.
 type Transaction struct {
-	db   *engine
-	done bool
-	// scoped marks a Transaction handed to a View/Update closure (Session.withBlock): the closure IS the
-	// block's lifetime, so ending it from inside — SQL COMMIT/ROLLBACK or this handle's Commit/Rollback —
-	// is 2D000 invalid_transaction_termination (spec/design/api.md §2.2), never a silent discard of
-	// the closure's writes.
+	db *engine
+	// sess is the session whose block this transaction is; nil for an engine-level transaction
+	// (the white-box tests' engine.Begin).
+	sess *Session
+	// owned marks a transaction whose session was minted for it (Database.Begin): ending the
+	// transaction closes the session.
+	owned bool
+	done  bool
+	// scoped marks a Transaction handed to a BeginFunc callback (Session.withBlock): the callback IS
+	// the block's lifetime, so ending it from inside — SQL COMMIT/ROLLBACK or this handle's
+	// Commit/Rollback — is 2D000 invalid_transaction_termination (spec/design/api.md §2.2), never a
+	// silent discard of the callback's writes.
 	scoped bool
 }
 
@@ -25,6 +63,9 @@ type Transaction struct {
 // (42601 / the 54000 input-size limit) is a statement error too, so it aborts the block
 // (transactions.md §6 — PostgreSQL aborts on ANY error, the parse stage included).
 func (tx *Transaction) queryValues(sql string, params []Value) (*Rows, error) {
+	if err := tx.checkOpen(); err != nil {
+		return nil, err
+	}
 	stmt, err := tx.db.parse(sql)
 	if err != nil {
 		tx.db.failOpenBlock()
@@ -33,55 +74,87 @@ func (tx *Transaction) queryValues(sql string, params []Value) (*Rows, error) {
 	return tx.queryStmt(stmt, params, nil, nil)
 }
 
-// queryStmt routes a parsed statement through the engine's lazy lanes after the closure-scope gate:
-// inside a View/Update closure SQL COMMIT/ROLLBACK is 2D000 and aborts the block (api.md §2.2 — the
-// PostgreSQL rule for COMMIT inside a procedure called within a transaction block; the Transaction's
-// later statements would otherwise run outside the block the wrapper is about to end, and their
+// queryStmt routes a parsed statement through the engine's lazy lanes after the transaction-control
+// gate: through a session-backed Transaction SQL COMMIT/ROLLBACK is 2D000 and aborts the block
+// (api.md §2.2 — the PostgreSQL rule for COMMIT inside a procedure called within a transaction
+// block; the Transaction's later statements would otherwise run outside the block, and a callback's
 // writes be discarded). A nested BEGIN stays the engine's 25001 / 25P02 (transactions.md §4.2), and
 // the SAVEPOINT family runs on the open block as api.md §2.2 specifies.
 func (tx *Transaction) queryStmt(stmt statement, params []Value, sc *stmtCache, ic *insertStmtCache) (*Rows, error) {
-	if tx.scoped && (stmt.Commit != nil || stmt.Rollback != nil) {
+	if err := tx.checkOpen(); err != nil {
+		return nil, err
+	}
+	if (tx.scoped || tx.sess != nil) && (stmt.Commit != nil || stmt.Rollback != nil) {
 		tx.db.failOpenBlock()
 		return nil, errInvalidTransactionTermination()
 	}
 	return tx.db.queryStmt(stmt, params, sc, ic)
 }
 
-// errInvalidTransactionTermination is 2D000: a View/Update closure may not end its own block.
+// checkOpen rejects a statement through a session-backed Transaction that has already ended: it
+// would otherwise run on the session in autocommit, outside the transaction its caller meant.
+func (tx *Transaction) checkOpen() error {
+	if tx.done && !tx.scoped && tx.sess != nil {
+		return newError(NoActiveSQLTransaction, "the transaction has already ended")
+	}
+	return nil
+}
+
+// errInvalidTransactionTermination is 2D000: a Transaction's block ends only through its own
+// Commit/Rollback, and a BeginFunc callback's only when the callback returns.
 func errInvalidTransactionTermination() error {
 	return newError(InvalidTransactionTermination, "invalid transaction termination")
 }
 
-// Render renders v in the owning session's current time zone — Session.Render
-// (spec/design/timezones.md §9.5).
+// Render renders v as PostgreSQL shows a result column, in the transaction's session time zone.
+// See Session.Render.
 func (tx *Transaction) Render(v Value) (string, error) {
 	return v.renderIn(tx.db.session.timeZone)
 }
 
-// Commit publishes the transaction durably (per synchronous). Idempotent after the transaction
-// has ended.
-func (tx *Transaction) Commit() error {
+// Commit commits the transaction. A canceled ctx rolls it back instead and returns the
+// cancellation error; once commit work starts it is not canceled. If a statement in the
+// transaction failed, Commit rolls back and returns SQLSTATE 25P02, so a failed transaction
+// never looks committed. Commit on a transaction that has already ended returns nil.
+// Inside a BeginFunc callback it fails with SQLSTATE 2D000: return from the callback instead.
+func (tx *Transaction) Commit(ctx context.Context) error {
 	if tx.scoped {
-		return errInvalidTransactionTermination() // the closure ends the block (api.md §2.2)
+		return errInvalidTransactionTermination() // the callback ends the block (api.md §2.2)
 	}
 	if tx.done {
 		return nil
 	}
 	tx.done = true
-	return tx.db.Commit()
+	if tx.sess == nil {
+		return tx.db.Commit()
+	}
+	defer tx.release()
+	return tx.sess.finishCallerBlock(ctx)
 }
 
-// Rollback discards the transaction's working set. Idempotent after the transaction has ended, so
-// a `defer tx.Rollback()` after a Commit is a safe no-op (the View/Update wrappers rely on this).
-func (tx *Transaction) Rollback() error {
+// Rollback rolls the transaction back. It returns nil on a transaction that has already ended,
+// so deferring it after Begin is safe. ctx is accepted for symmetry with Commit; a rollback
+// never waits. Inside a BeginFunc callback it fails with SQLSTATE 2D000.
+func (tx *Transaction) Rollback(ctx context.Context) error {
 	if tx.scoped {
-		return errInvalidTransactionTermination() // the closure ends the block (api.md §2.2)
+		return errInvalidTransactionTermination() // the callback ends the block (api.md §2.2)
 	}
 	if tx.done {
 		return nil
 	}
 	tx.done = true
-	return tx.db.Rollback()
+	if tx.sess == nil {
+		return tx.db.Rollback()
+	}
+	defer tx.release()
+	return tx.sess.rollbackBlock()
+}
+
+// release closes the session a Database.Begin minted for this transaction.
+func (tx *Transaction) release() {
+	if tx.owned {
+		_ = tx.sess.Close()
+	}
 }
 
 // Begin opens an explicit transaction (spec/design/api.md §2.2). writable false is READ ONLY (a
@@ -112,11 +185,11 @@ func (db *engine) withTx(writable bool, fn func(tx *Transaction) error) error {
 		return err
 	}
 	// Rolls back on an early return or panic; a no-op once Commit has ended the transaction.
-	defer func() { _ = tx.Rollback() }()
+	defer func() { _ = tx.Rollback(context.Background()) }()
 	if err := fn(tx); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return tx.Commit(context.Background())
 }
 
 // PreparedStatement is a parsed, reusable statement (spec/design/api.md §2.4): a standalone value

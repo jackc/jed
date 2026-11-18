@@ -2598,7 +2598,7 @@ func (s *Database) ReadOnly() bool { return s.core.readOnlyMode() }
 // the live set; the session serves reads from that snapshot for its life — lock-free, never blocked
 // by and never blocking a writer — and a write through it is 25006. The caller must Close it to
 // deregister (advancing the watermark), idiomatically `defer s.Close()`. (The old SharedDB.Read().)
-func (s *Database) ReadSession() *Session {
+func (s *Database) readSession() *Session {
 	rt, v, gen, atts := s.core.pinLatestAll() // atomic load+register (transactions.md §8): no load→register gap
 	snap := rt.committed
 	// Reads never mutate the snapshot (a write is rejected before dispatch), so the engine shares the
@@ -2617,14 +2617,14 @@ func (s *Database) ReadSession() *Session {
 // set. Statements run with full transaction semantics (read-your-writes, failed-block poisoning);
 // Commit publishes the working set, Rollback / Close discards it and releases the gate. (The old
 // SharedDB.Write().)
-func (s *Database) WriteSession() *Session {
+func (s *Database) writeSession() *Session {
 	if s.core.readOnlyMode() {
 		// A read-only file has no writer (api.md §2.1); a "write" session degrades to a pinned
 		// read-only one — a write through it is 25006, mirroring PostgreSQL hot standby.
-		return s.ReadSession()
+		return s.readSession()
 	}
 	if err := s.core.acquireWriter(0); err != nil {
-		failed := s.ReadSession()
+		failed := s.readSession()
 		failed.pendingErr = err
 		return failed
 	}
@@ -2699,22 +2699,26 @@ func (db *Database) ExecuteScript(ctx context.Context, sql string) (ScriptSummar
 	return s.ExecuteScript(ctx, sql)
 }
 
-// View runs fn in a READ ONLY transaction on a fresh session. It rolls back on
-// error or panic. ctx controls admission and the pre-commit check; pass it to
-// queries in fn to cancel their execution too.
-func (db *Database) View(ctx context.Context, fn func(tx *Transaction) error) error {
+// Begin starts a transaction on a new session that belongs to the transaction: Commit or
+// Rollback ends both. The transaction must be ended; defer Rollback after a successful Begin.
+// ctx bounds the wait for the writer slot of a read-write transaction.
+func (db *Database) Begin(ctx context.Context, opts TxOptions) (*Transaction, error) {
 	s := db.sessionWithState(newSession(db.core.env))
-	defer s.Close()
-	return s.View(ctx, fn)
+	tx, err := s.Begin(ctx, opts)
+	if err != nil {
+		_ = s.Close()
+		return nil, err
+	}
+	tx.owned = true
+	return tx, nil
 }
 
-// Update runs fn in a READ WRITE transaction on a fresh session (scoped sugar, §2.2): the closure's
-// statements commit together, or roll back together on error or panic. ctx
-// controls writer acquisition and the pre-commit check; pass it to statements in fn too.
-func (db *Database) Update(ctx context.Context, fn func(tx *Transaction) error) error {
+// BeginFunc runs fn in a transaction on a new session. The transaction commits when fn returns
+// nil and rolls back when fn returns an error or panics; see Session.BeginFunc.
+func (db *Database) BeginFunc(ctx context.Context, opts TxOptions, fn func(tx *Transaction) error) error {
 	s := db.sessionWithState(newSession(db.core.env))
 	defer s.Close()
-	return s.Update(ctx, fn)
+	return s.BeginFunc(ctx, opts, fn)
 }
 
 // Prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4): a standalone
@@ -3306,9 +3310,9 @@ func (s *Session) publish() error {
 	return nil
 }
 
-// Commit commits an open write block / write session (publish + release the gate, §2.4). With no open
+// commitBlock commits an open write block / write session (publish + release the gate, §2.4). With no open
 // block this is a lenient no-op (PostgreSQL). The session stays usable (autocommit) afterward.
-func (s *Session) Commit() error {
+func (s *Session) commitBlock() error {
 	if s.engine.session.tx != nil {
 		_, err := s.endBlock(true)
 		return err
@@ -3316,9 +3320,9 @@ func (s *Session) Commit() error {
 	return nil
 }
 
-// Rollback rolls back an open write block / write session (discard the working set + release the
+// rollbackBlock rolls back an open write block / write session (discard the working set + release the
 // gate, §2.4). With no open block this is a no-op success.
-func (s *Session) Rollback() error {
+func (s *Session) rollbackBlock() error {
 	if s.engine.session.tx != nil {
 		_, err := s.endBlock(false)
 		return err
@@ -3329,22 +3333,24 @@ func (s *Session) Rollback() error {
 // Close closes the session (spec/design/session.md §2.3): roll back any open block and deregister its
 // snapshot pin (advancing the watermark). Idempotent; the caller must Close (Go has no destructor),
 // idiomatically `defer s.Close()`.
-func (s *Session) Close() {
+func (s *Session) Close() error {
+	var err error
 	if s.engine.session.tx != nil {
-		_, _ = s.endBlock(false)
+		_, err = s.endBlock(false)
 	} else {
 		s.finishBlock()
 	}
 	s.engine.releaseTempDomain() // session-local temp tables (and any scratch file) go with the session
+	return err
 }
 
-// Begin opens an explicit transaction block on this session (spec/design/session.md §2.2 — the
+// beginBlockCtx opens an explicit transaction block on this session (spec/design/session.md §2.2 — the
 // host-API spelling of SQL BEGIN). writable true is READ WRITE (eager gate, the BEGIN READ WRITE
 // form); false is READ ONLY (pins + registers in the watermark, no gate). Statements then run on the
-// session until Commit/Rollback. A nested Begin (a block is already open) is 25001.
+// session until Commit/Rollback. A nested beginBlockCtx (a block is already open) is 25001.
 // ctx controls this begin operation only; cancellation after return does not
 // automatically roll back the transaction. Statements take their own contexts.
-func (s *Session) Begin(ctx context.Context, writable bool) error {
+func (s *Session) beginBlockCtx(ctx context.Context, writable bool) error {
 	done := contextDone(ctx)
 	if err := doneErr(done); err != nil {
 		return contextError(ctx, err)
@@ -3354,43 +3360,67 @@ func (s *Session) Begin(ctx context.Context, writable bool) error {
 	return contextError(ctx, err)
 }
 
-// View runs fn in a READ ONLY transaction on this session (bbolt-style auto-commit/rollback, §2.2).
-// Errors and panics roll it back. ctx controls admission and the pre-commit check;
-// pass ctx to queries in fn to cancel their execution too.
-func (s *Session) View(ctx context.Context, fn func(tx *Transaction) error) error {
-	return s.withBlock(ctx, false, fn)
+// Begin starts a transaction on the session. While it is open, statements the session runs
+// directly also run inside it. The transaction must be ended with Commit or Rollback; defer
+// Rollback after a successful Begin. ctx bounds the wait for the writer slot of a read-write
+// transaction; each statement takes its own context. Beginning while a transaction is open
+// fails with SQLSTATE 25001.
+func (s *Session) Begin(ctx context.Context, opts TxOptions) (*Transaction, error) {
+	writable, err := opts.writable()
+	if err != nil {
+		return nil, err
+	}
+	if err := s.beginBlockCtx(ctx, writable); err != nil {
+		return nil, err
+	}
+	return &Transaction{db: s.engine, sess: s}, nil
 }
 
-// Update runs fn in a READ WRITE transaction on this session (bbolt-style auto-commit/rollback,
-// §2.2): the block is opened (eager gate), fn runs, and the session commits on success / rolls back
-// on error or panic — publishing through the shared core. ctx controls writer
-// acquisition and the pre-commit check; pass it to statements in fn too.
-func (s *Session) Update(ctx context.Context, fn func(tx *Transaction) error) error {
-	return s.withBlock(ctx, true, fn)
+// BeginFunc runs fn in a transaction on the session. The transaction commits when fn returns
+// nil and rolls back when fn returns an error or panics. If fn swallows a statement error, the
+// transaction is rolled back and BeginFunc returns SQLSTATE 25P02. Calling Commit or Rollback
+// on tx inside fn fails with SQLSTATE 2D000. ctx bounds the wait for the writer slot and is
+// checked before commit; pass it to the statements in fn to cancel them too.
+func (s *Session) BeginFunc(ctx context.Context, opts TxOptions, fn func(tx *Transaction) error) error {
+	writable, err := opts.writable()
+	if err != nil {
+		return err
+	}
+	return s.withBlock(ctx, writable, fn)
 }
 
 func (s *Session) withBlock(ctx context.Context, writable bool, fn func(tx *Transaction) error) error {
-	if err := s.Begin(ctx, writable); err != nil {
+	if err := s.beginBlockCtx(ctx, writable); err != nil {
 		return err
 	}
 	// End the block on every exit, including panic and runtime.Goexit. After a
 	// successful commit or an explicit rollback this is an idempotent no-op.
-	defer s.Rollback()
+	defer s.rollbackBlock()
 	// scoped: the session ends the block (publishing through the shared core / releasing the gate), so
 	// the Transaction's own Commit/Rollback — and SQL COMMIT/ROLLBACK through it — are 2D000 (api.md
-	// §2.2): the closure's writes are never discarded by ending the block early.
+	// §2.2): the callback's writes are never discarded by ending the block early.
 	tx := &Transaction{db: s.engine, done: true, scoped: true}
 	if err := fn(tx); err != nil {
 		_, _ = s.endBlock(false)
 		return err
 	}
+	return s.finishCallerBlock(ctx)
+}
+
+// finishCallerBlock commits the host-opened block (Transaction.Commit, the BeginFunc return): a
+// canceled ctx rolls back instead, and a block a statement failed rolls back with 25P02 — the host
+// API reports that, so writes are never discarded behind a nil return (transactions.md §6, where SQL
+// COMMIT of a failed block is a silent ROLLBACK). A block already ended underneath is a no-op.
+func (s *Session) finishCallerBlock(ctx context.Context) error {
+	cur := s.engine.session.tx
+	if cur == nil {
+		return nil
+	}
 	if err := doneErr(contextDone(ctx)); err != nil {
+		_, _ = s.endBlock(false)
 		return contextError(ctx, err)
 	}
-	if cur := s.engine.session.tx; cur != nil && cur.failed {
-		// The closure swallowed a statement error: the block is failed, so "commit" would be a silent
-		// ROLLBACK (transactions.md §6). A closure API reports that — its writes are never discarded
-		// behind a nil return.
+	if cur.failed {
 		_, _ = s.endBlock(false)
 		return newError(InFailedSQLTransaction,
 			"current transaction is aborted, commands ignored until end of transaction block")
@@ -3422,7 +3452,7 @@ func (s *Session) ExecuteScript(ctx context.Context, sql string) (summary Script
 		if _, err := s.beginBlock(true, true); err != nil {
 			return ScriptSummary{}, err
 		}
-		defer s.Rollback()
+		defer s.rollbackBlock()
 	}
 	summary, err = s.engine.runScriptBody(sql)
 	if err == nil {

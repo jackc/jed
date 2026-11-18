@@ -132,10 +132,10 @@ func TestCommitAndRollbackAreNoopsUnderAutocommit(t *testing.T) {
 	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1)")
-	if err := db.Commit(); err != nil {
+	if err := db.commitBlock(); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Rollback(); err != nil { // does NOT undo the autocommitted insert
+	if err := db.rollbackBlock(); err != nil { // does NOT undo the autocommitted insert
 		t.Fatal(err)
 	}
 	rows := queryRows(t, db, "SELECT id FROM t")
@@ -224,7 +224,7 @@ func TestPreparedHandleMethods(t *testing.T) {
 	}
 
 	// Transaction: the same statement inside an explicit block, read-your-writes, rolled back.
-	err = s.Update(context.Background(), func(tx *Transaction) error {
+	err = s.updateBlock(context.Background(), func(tx *Transaction) error {
 		if _, err := tx.ExecPrepared(ctx, insert, 3, 300); err != nil {
 			return err
 		}
@@ -334,7 +334,7 @@ func TestCommitOnInMemoryIsNoopSuccess(t *testing.T) {
 	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	before := db.Txid()
-	if err := db.Commit(); err != nil { // no open block -> no-op success, not an error
+	if err := db.commitBlock(); err != nil { // no open block -> no-op success, not an error
 		t.Fatal(err)
 	}
 	if db.Txid() != before || db.Path() != "" {
@@ -454,13 +454,13 @@ func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
 	// ...and an explicit READ WRITE request, via SQL or the host API.
 	wantCode("BEGIN READ WRITE", "25006")
 	var ee *EngineError
-	if err := s.Begin(context.Background(), true); !errors.As(err, &ee) || ee.Code() != "25006" {
+	if err := s.beginBlockCtx(context.Background(), true); !errors.As(err, &ee) || ee.Code() != "25006" {
 		t.Fatalf("Begin(true) on a read-only handle: %v", err)
 	}
-	if err := rodb.View(context.Background(), func(tx *Transaction) error { _, err := tx.queryValues("SELECT id FROM t", nil); return err }); err != nil {
+	if err := rodb.view(context.Background(), func(tx *Transaction) error { _, err := tx.queryValues("SELECT id FROM t", nil); return err }); err != nil {
 		t.Fatalf("View on a read-only handle: %v", err)
 	}
-	err = rodb.Update(context.Background(), func(tx *Transaction) error { _, err := queryOutcome(tx, "DELETE FROM t", nil); return err })
+	err = rodb.update(context.Background(), func(tx *Transaction) error { _, err := queryOutcome(tx, "DELETE FROM t", nil); return err })
 	if !errors.As(err, &ee) || ee.Code() != "25006" {
 		t.Fatalf("Update on a read-only handle: %v", err)
 	}

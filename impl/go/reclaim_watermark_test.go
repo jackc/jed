@@ -70,7 +70,7 @@ func TestFallbackReaderSnapshotIsolationUnderReclamation(t *testing.T) {
 
 	go func() {
 		<-readerReady
-		rd = db.ReadSession() // pins the PRIOR committed version (this commit is not yet published)
+		rd = db.readSession() // pins the PRIOR committed version (this commit is not yet published)
 		pinnedCount, pinErr = countOf(db, rd)
 		close(readerPinned)
 	}()

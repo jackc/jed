@@ -337,7 +337,7 @@ func TestStorageLimitPinnedReaderBlocksForcedCompaction(t *testing.T) {
 	// A reader pinned at the current version keeps every page a compaction would keep: the delete
 	// (admitted over the limit) orphans pages, and the next commit's forced compaction is allowed only
 	// once no reader pins a version older than the committed one.
-	r := db.ReadSession()
+	r := db.readSession()
 	storageExec(t, w, "DELETE FROM t WHERE id >= 50")
 	if code := storageExecCode(w, storageBatch(50, 50)); code != "54P06" {
 		t.Fatalf("pinned reader: want 54P06, got %q", code)

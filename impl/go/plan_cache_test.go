@@ -175,7 +175,7 @@ func TestInsertCacheFillsInRowOnlyTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Begin(context.Background(), true); err != nil {
+	if err := s.beginBlockCtx(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := prepOutcome(s, stmt, []Value{IntValue(1), IntValue(10)}); err != nil {
@@ -191,7 +191,7 @@ func TestInsertCacheFillsInRowOnlyTransaction(t *testing.T) {
 	if stmt.ic.p.Load().plan != entry.plan {
 		t.Fatal("second INSERT in transaction did not hit")
 	}
-	if err := s.Rollback(); err != nil {
+	if err := s.rollbackBlock(); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -341,7 +341,7 @@ func TestInsertCacheInvalidationIdentities(t *testing.T) {
 	}
 	plan = stmt.ic.p.Load().plan
 
-	if err := s.Begin(context.Background(), true); err != nil {
+	if err := s.beginBlockCtx(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	mustExec(t, s, "DROP INDEX t_v_idx")
@@ -351,7 +351,7 @@ func TestInsertCacheInvalidationIdentities(t *testing.T) {
 	if stmt.ic.p.Load().plan != plan {
 		t.Fatal("working DDL execution replaced the committed cache entry")
 	}
-	if err := s.Rollback(); err != nil {
+	if err := s.rollbackBlock(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := prepOutcome(s, stmt, []Value{IntValue(5), IntValue(50)}); err != nil {
@@ -456,13 +456,13 @@ func TestInsertCacheRechecksPrivilegeAndReadOnly(t *testing.T) {
 	if stmt.ic.p.Load().plan != plan {
 		t.Fatal("failed privilege gate changed cache")
 	}
-	if err := writer.Begin(context.Background(), false); err != nil {
+	if err := writer.beginBlockCtx(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := prepOutcome(writer, stmt, []Value{IntValue(2), IntValue(20)}); sessCode(t, err) != "25006" {
 		t.Fatalf("cached INSERT read-only gate = %v, want 25006", err)
 	}
-	_ = writer.Rollback()
+	_ = writer.rollbackBlock()
 	if stmt.ic.p.Load().plan != plan {
 		t.Fatal("failed read-only gate changed cache")
 	}
@@ -705,7 +705,7 @@ func TestPlanCacheEstimatorRevisionRollback(t *testing.T) {
 		t.Fatal("expected fill")
 	}
 	committed := stmt.sc.p.Load()
-	if err := db.Begin(context.Background(), true); err != nil {
+	if err := db.beginBlockCtx(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	mustExec(t, db, "INSERT INTO t VALUES (2, 10)")
@@ -716,7 +716,7 @@ func TestPlanCacheEstimatorRevisionRollback(t *testing.T) {
 	if stmt.sc.p.Load() != committed {
 		t.Fatal("working-transaction statistics populated the committed cache slot")
 	}
-	if err := db.Rollback(); err != nil {
+	if err := db.rollbackBlock(); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := drainQ(t, db, stmt, IntValue(10))
@@ -935,7 +935,7 @@ func TestPlanCacheFillOnlyFromCommitted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := db.Begin(context.Background(), true); err != nil {
+	if err := db.beginBlockCtx(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	inTx, _ := drainQ(t, db, stmt, IntValue(1))
@@ -945,7 +945,7 @@ func TestPlanCacheFillOnlyFromCommitted(t *testing.T) {
 	if stmt.sc.p.Load() != nil {
 		t.Fatal("a plan first executed inside a transaction must not be cached (fill-only-from-committed)")
 	}
-	if err := db.Commit(); err != nil {
+	if err := db.commitBlock(); err != nil {
 		t.Fatal(err)
 	}
 

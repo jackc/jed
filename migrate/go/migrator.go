@@ -211,21 +211,23 @@ func (m *Migrator) runStep(mg Migration, direction, sql string, newVersion int) 
 	if m.onStart != nil {
 		m.onStart(mg.Sequence, mg.Name, direction, sql)
 	}
-	if err := m.session.Begin(context.Background(), true); err != nil {
+	ctx := context.Background()
+	tx, err := m.session.Begin(ctx, jed.TxOptions{})
+	if err != nil {
 		return err
 	}
 	for span := range jed.SplitStatements(sql) {
 		if _, err := m.session.ExecuteScript(context.Background(), span.Text); err != nil {
-			_ = m.session.Rollback()
+			_ = tx.Rollback(ctx)
 			return &MigrationError{Name: mg.Name, Direction: direction, Statement: span.Text, Err: err}
 		}
 	}
 	bump := fmt.Sprintf("update %s set version = %d", m.versionTable, newVersion)
 	if _, err := m.session.ExecuteScript(context.Background(), bump); err != nil {
-		_ = m.session.Rollback()
+		_ = tx.Rollback(ctx)
 		return fmt.Errorf("migrate: updating %s to version %d: %w", m.versionTable, newVersion, err)
 	}
-	return m.session.Commit()
+	return tx.Commit(ctx)
 }
 
 // ensureVersionTable creates the version table (seeded with 0) if it does not already exist,

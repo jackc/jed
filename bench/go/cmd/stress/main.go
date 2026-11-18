@@ -128,6 +128,30 @@ func parseOp(op string) []string {
 // execWrite runs a write statement through the ergonomic Exec, which drains and releases the row-less
 // cursor for us — a write materializes at the call, so this returns its error. The session persists
 // across calls (setup drives one WriteSession through many writes then Commit).
+// beginWrite mints a session holding the writer slot (Begin blocks while another writer holds it —
+// the real contention path) with an open read-write transaction; statements run on the session.
+func beginWrite(db *jed.Database) (*jed.Session, *jed.Transaction) {
+	return begin(db, jed.ReadWrite)
+}
+
+// beginRead mints a session pinned to one committed snapshot for its life.
+func beginRead(db *jed.Database) *jed.Session {
+	s, _ := begin(db, jed.ReadOnly)
+	return s
+}
+
+func begin(db *jed.Database, mode jed.AccessMode) (*jed.Session, *jed.Transaction) {
+	s, err := db.Session(jed.SessionOptions{})
+	if err != nil {
+		panic(err)
+	}
+	tx, err := s.Begin(context.Background(), jed.TxOptions{AccessMode: mode})
+	if err != nil {
+		panic(err)
+	}
+	return s, tx
+}
+
 func execWrite(sess *jed.Session, sql string) error {
 	_, err := sess.Exec(context.Background(), sql)
 	return err
@@ -148,14 +172,15 @@ func queryScalar(r *jed.Session, sql string) (string, error) {
 
 // setup runs the file's setup SQL as one durable write transaction (committed version 1).
 func setup(db *jed.Database, f *stressFile) error {
-	w := db.WriteSession()
+	w, tx := beginWrite(db)
+	defer w.Close()
 	for _, s := range f.Setup.SQL {
 		if err := execWrite(w, s); err != nil {
-			_ = w.Rollback()
+			_ = tx.Rollback(context.Background())
 			return fmt.Errorf("setup %q: %w", s, err)
 		}
 	}
-	return w.Commit()
+	return tx.Commit(context.Background())
 }
 
 // checkFinal runs `[final].query` against the final committed snapshot, folds the rows into the
@@ -164,7 +189,7 @@ func checkFinal(db *jed.Database, fin *stressFinal) (checksum string, ok bool, e
 	if fin == nil {
 		return "", true, nil
 	}
-	r := db.ReadSession()
+	r := beginRead(db)
 	defer r.Close()
 	rows, err := r.Query(context.Background(), fin.Query)
 	if err != nil {
@@ -219,14 +244,16 @@ func finalEqual(got, want [][]int64) bool {
 // blocks while another writer holds it — the real contention path), running `op`, and committing.
 func runWriter(db *jed.Database, stmts []string, iterations int) error {
 	for i := 0; i < iterations; i++ {
-		w := db.WriteSession()
+		w, tx := beginWrite(db)
 		for _, s := range stmts {
 			if err := execWrite(w, s); err != nil {
-				_ = w.Rollback()
+				_ = w.Close()
 				return fmt.Errorf("writer exec %q: %w", s, err)
 			}
 		}
-		if err := w.Commit(); err != nil {
+		err := tx.Commit(context.Background())
+		_ = w.Close()
+		if err != nil {
 			return fmt.Errorf("writer commit: %w", err)
 		}
 	}
@@ -236,7 +263,7 @@ func runWriter(db *jed.Database, stmts []string, iterations int) error {
 // runReader runs one reader worker: `iterations` snapshots, each asserting the invariant.
 func runReader(db *jed.Database, query, expect string, iterations int, checks *int64) error {
 	for i := 0; i < iterations; i++ {
-		r := db.ReadSession()
+		r := beginRead(db)
 		got, err := queryScalar(r, query)
 		r.Close()
 		if err != nil {
@@ -309,6 +336,7 @@ type seqWorker struct {
 	iter       int
 	op         int
 	wh         *jed.Session
+	wtx        *jed.Transaction
 	rh         *jed.Session
 }
 
@@ -373,20 +401,22 @@ func stepSeq(db *jed.Database, w *seqWorker, idx int, gateHolder *int, checks *i
 	case "writer":
 		switch {
 		case w.op == 0: // acquire (the gate is free — guaranteed by runnable)
-			w.wh = db.WriteSession()
+			w.wh, w.wtx = beginWrite(db)
 			*gateHolder = idx
 			w.op++
 		case w.op <= len(w.stmts): // exec stmt[op-1]
 			if err := execWrite(w.wh, w.stmts[w.op-1]); err != nil {
-				_ = w.wh.Rollback()
+				_ = w.wh.Close()
 				return fmt.Errorf("writer exec %q: %w", w.stmts[w.op-1], err)
 			}
 			w.op++
 		default: // commit
-			if err := w.wh.Commit(); err != nil {
+			err := w.wtx.Commit(context.Background())
+			_ = w.wh.Close()
+			if err != nil {
 				return fmt.Errorf("writer commit: %w", err)
 			}
-			w.wh = nil
+			w.wh, w.wtx = nil, nil
 			*gateHolder = -1
 			w.op = 0
 			w.iter++
@@ -394,7 +424,7 @@ func stepSeq(db *jed.Database, w *seqWorker, idx int, gateHolder *int, checks *i
 	case "reader":
 		switch w.op {
 		case 0: // open a snapshot
-			w.rh = db.ReadSession()
+			w.rh = beginRead(db)
 			w.op++
 		case 1: // assert the invariant
 			got, err := queryScalar(w.rh, w.query)

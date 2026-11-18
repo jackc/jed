@@ -25,7 +25,7 @@ import (
 func seededKV(t *testing.T, n int64) *Database {
 	t.Helper()
 	db := memDB()
-	w := db.WriteSession()
+	w := db.writeSession()
 	if _, err := queryOutcome(w, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)", nil); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -34,7 +34,7 @@ func seededKV(t *testing.T, n int64) *Database {
 			t.Fatalf("insert %d: %v", i, err)
 		}
 	}
-	if err := w.Commit(); err != nil {
+	if err := w.commitBlock(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	return db
@@ -178,13 +178,13 @@ func TestStreamingCursorPinsSnapshot(t *testing.T) {
 	// A concurrent writer repeatedly rebuilds the same rightmost working leaf while the cursor is
 	// open. This is the focused committed-root alias guard for insert-transient work: the pinned
 	// root must remain byte/value-stable through every mutation, then a fresh reader must see them.
-	w := db.WriteSession()
+	w := db.writeSession()
 	for id := int64(4); id <= 67; id++ {
 		if _, err := queryOutcome(w, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", id, id*10), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := w.Commit(); err != nil {
+	if err := w.commitBlock(); err != nil {
 		t.Fatal(err)
 	}
 	if db.Version() != 2 || db.OldestLiveTxid() != 1 {
@@ -223,7 +223,7 @@ func TestWriteTransactionCursorStableAcrossLaterInserts(t *testing.T) {
 	db := seededKV(t, 3)
 	writer := mustSession(db, SessionOptions{})
 	defer writer.Close()
-	if err := writer.Begin(context.Background(), true); err != nil {
+	if err := writer.beginBlockCtx(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := queryOutcome(writer, "INSERT INTO t VALUES (4, 40)", nil); err != nil {
@@ -257,7 +257,7 @@ func TestWriteTransactionCursorStableAcrossLaterInserts(t *testing.T) {
 		t.Fatalf("pinned cursor rest = %v, want [2 3 4]", rest)
 	}
 	_ = pinned.Close()
-	if err := writer.Commit(); err != nil {
+	if err := writer.commitBlock(); err != nil {
 		t.Fatal(err)
 	}
 	fresh := mustSession(db, SessionOptions{})
@@ -497,11 +497,11 @@ func TestBufferedCursorPinsSnapshot(t *testing.T) {
 		t.Fatalf("open buffered cursor must pin v1, oldest=%d", db.OldestLiveTxid())
 	}
 
-	w := db.WriteSession()
+	w := db.writeSession()
 	if _, err := queryOutcome(w, "INSERT INTO t VALUES (4, 40), (5, 50)", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Commit(); err != nil {
+	if err := w.commitBlock(); err != nil {
 		t.Fatal(err)
 	}
 	if db.Version() != 2 || db.OldestLiveTxid() != 1 {
@@ -651,7 +651,7 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.setSpillDirForTest(dir) // isolate live-run assertions from parallel OS-temp spills
-	w := db.WriteSession()
+	w := db.writeSession()
 	if _, err := queryOutcome(w, "CREATE TABLE t (id i32 PRIMARY KEY, k i32)", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -661,7 +661,7 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := w.Commit(); err != nil {
+	if err := w.commitBlock(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -834,11 +834,11 @@ func TestDeferredCursorPinsSnapshot(t *testing.T) {
 		t.Fatalf("open deferred cursor must pin v1, oldest=%d", db.OldestLiveTxid())
 	}
 
-	w := db.WriteSession()
+	w := db.writeSession()
 	if _, err := queryOutcome(w, "INSERT INTO t VALUES (4, 40), (5, 50)", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Commit(); err != nil {
+	if err := w.commitBlock(); err != nil {
 		t.Fatal(err)
 	}
 	if db.Version() != 2 || db.OldestLiveTxid() != 1 {
@@ -1071,11 +1071,11 @@ func TestPreparedQueryPinsSnapshot(t *testing.T) {
 		t.Fatalf("open prepared cursor must pin v1, oldest=%d", db.OldestLiveTxid())
 	}
 
-	w := db.WriteSession()
+	w := db.writeSession()
 	if _, err := queryOutcome(w, "INSERT INTO t VALUES (4, 40), (5, 50)", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Commit(); err != nil {
+	if err := w.commitBlock(); err != nil {
 		t.Fatal(err)
 	}
 	if db.OldestLiveTxid() != 1 {

@@ -236,7 +236,7 @@ func TestCursorCancellationInFlight(t *testing.T) {
 						defer s.Close()
 						exercise(s)
 					case "transaction":
-						if code := cancelCode(t, db.Update(context.Background(), func(tx *Transaction) error { return exercise(tx) })); code != "57014" {
+						if code := cancelCode(t, db.update(context.Background(), func(tx *Transaction) error { return exercise(tx) })); code != "57014" {
 							t.Fatal(code)
 						}
 					}

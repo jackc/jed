@@ -1,5 +1,7 @@
 package jed
 
+import "context"
+
 // White-box test helpers that materialize the production queryValues seam. The public API has one
 // result type — *Rows (a statement is a *Rows with no output columns, carrying the command tag). These
 // helpers drain that cursor into an outcome so a test can assert on the full result set + tag at once,
@@ -56,4 +58,22 @@ func drainOutcome(rows *Rows) (outcome, error) {
 		out.Kind = outcomeStatement
 	}
 	return out, nil
+}
+
+// view / update and viewBlock / updateBlock are the white-box tests' shorthand for BeginFunc with a
+// read-only or read-write TxOptions.
+func (db *Database) view(ctx context.Context, fn func(tx *Transaction) error) error {
+	return db.BeginFunc(ctx, TxOptions{AccessMode: ReadOnly}, fn)
+}
+
+func (db *Database) update(ctx context.Context, fn func(tx *Transaction) error) error {
+	return db.BeginFunc(ctx, TxOptions{}, fn)
+}
+
+func (s *Session) viewBlock(ctx context.Context, fn func(tx *Transaction) error) error {
+	return s.BeginFunc(ctx, TxOptions{AccessMode: ReadOnly}, fn)
+}
+
+func (s *Session) updateBlock(ctx context.Context, fn func(tx *Transaction) error) error {
+	return s.BeginFunc(ctx, TxOptions{}, fn)
 }

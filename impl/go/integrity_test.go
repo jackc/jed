@@ -356,7 +356,7 @@ func TestIntegrityHostSurface(t *testing.T) {
 	}
 
 	// A check beside an open write transaction neither waits for it nor sees its writes.
-	w := db.WriteSession()
+	w := db.writeSession()
 	if _, err := w.Exec(ctx, "INSERT INTO t VALUES (1000, 1, 'pending')"); err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +364,7 @@ func TestIntegrityHostSurface(t *testing.T) {
 	if err != nil || !report.OK() || report.Rows != 300 {
 		t.Fatalf("beside a writer: %v %d %+v", err, report.Rows, report.Findings)
 	}
-	if err := w.Commit(); err != nil {
+	if err := w.commitBlock(); err != nil {
 		t.Fatal(err)
 	}
 	w.Close()

@@ -83,7 +83,7 @@ func TestFileBackedExplicitTransactionPersistsThenRollsBack(t *testing.T) {
 			t.Fatalf("create table: %v", err)
 		}
 		// A committed explicit block is durable.
-		if err := s.Begin(context.Background(), true); err != nil {
+		if err := s.beginBlockCtx(context.Background(), true); err != nil {
 			t.Fatalf("begin: %v", err)
 		}
 		if _, err := queryOutcome(s, "INSERT INTO t VALUES (1)", nil); err != nil {
@@ -92,20 +92,20 @@ func TestFileBackedExplicitTransactionPersistsThenRollsBack(t *testing.T) {
 		if _, err := queryOutcome(s, "INSERT INTO t VALUES (2)", nil); err != nil {
 			t.Fatalf("insert 2: %v", err)
 		}
-		if err := s.Commit(); err != nil {
+		if err := s.commitBlock(); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
 		if got := readCount(t, s); got != 2 {
 			t.Fatalf("after commit count = %d, want 2", got)
 		}
 		// A rolled-back block leaves nothing.
-		if err := s.Begin(context.Background(), true); err != nil {
+		if err := s.beginBlockCtx(context.Background(), true); err != nil {
 			t.Fatalf("begin2: %v", err)
 		}
 		if _, err := queryOutcome(s, "INSERT INTO t VALUES (3)", nil); err != nil {
 			t.Fatalf("insert 3: %v", err)
 		}
-		if err := s.Rollback(); err != nil {
+		if err := s.rollbackBlock(); err != nil {
 			t.Fatalf("rollback: %v", err)
 		}
 		if got := readCount(t, s); got != 2 {
@@ -181,7 +181,7 @@ func TestFileBackedReadOnlyOpenRejectsWrites(t *testing.T) {
 		t.Fatalf("write on read-only handle: got %v, want 25006", err)
 	}
 	// A read/write session minted from a read-only core also rejects writes.
-	w := db.WriteSession()
+	w := db.writeSession()
 	defer w.Close()
 	if _, err := queryOutcome(w, "INSERT INTO t VALUES (3)", nil); err == nil || errCodeOf(err) != "25006" {
 		t.Fatalf("write via session on read-only core: got %v, want 25006", err)
@@ -219,13 +219,13 @@ func TestFileBackedReadersRunConcurrentlyWithAWriter(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 2; i <= 40; i++ {
-			w := db.WriteSession()
+			w := db.writeSession()
 			if _, err := queryOutcome(w, fmt.Sprintf("INSERT INTO t VALUES (%d)", i), nil); err != nil {
 				t.Errorf("writer insert %d: %v", i, err)
 				w.Close()
 				return
 			}
-			if err := w.Commit(); err != nil {
+			if err := w.commitBlock(); err != nil {
 				t.Errorf("writer commit %d: %v", i, err)
 			}
 			w.Close()
@@ -237,7 +237,7 @@ func TestFileBackedReadersRunConcurrentlyWithAWriter(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 40; i++ {
-				rd := db.ReadSession()
+				rd := db.readSession()
 				first := readCount(t, rd)
 				second := readCount(t, rd)
 				rd.Close()

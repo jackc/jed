@@ -232,7 +232,15 @@ func (s *jedStmt) Close() error { return nil }
 func (e *engine) NewReaderPool(n int) (bench.ReaderPool, error) {
 	readers := make([]*jed.Session, n)
 	for i := range readers {
-		readers[i] = e.db.ReadSession()
+		s, err := e.db.Session(jed.SessionOptions{})
+		if err != nil {
+			return nil, err
+		}
+		// A read-only transaction pins one committed snapshot for the reader's life.
+		if _, err := s.Begin(context.Background(), jed.TxOptions{AccessMode: jed.ReadOnly}); err != nil {
+			return nil, err
+		}
+		readers[i] = s
 	}
 	return &jedPool{readers: readers}, nil
 }

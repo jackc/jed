@@ -148,7 +148,7 @@ func run() error {
 		case "QUERY_I64":
 			value, err = queryI64(db, sql(argument))
 		case "READ_OPEN":
-			reader = db.ReadSession()
+			reader = jed.ReadSessionForTesting(db)
 		case "READ_QUERY_I64":
 			value, err = queryI64(reader, sql(argument))
 		case "READ_CLOSE":
@@ -165,14 +165,14 @@ func run() error {
 				writer, err = db.Session(jed.SessionOptions{LockTimeout: timeout})
 			}
 			if err == nil {
-				err = writer.Begin(context.Background(), true)
+				_, err = writer.Begin(context.Background(), jed.TxOptions{})
 			}
 		case "WRITE_EXEC":
 			_, err = writer.Exec(context.Background(), sql(argument))
 		case "WRITE_COMMIT":
-			err = writer.Commit()
+			err = jed.CommitSessionForTesting(writer)
 		case "WRITE_ROLLBACK":
-			err = writer.Rollback()
+			err = jed.RollbackSessionForTesting(writer)
 		case "COMPACT":
 			name := argument
 			if name == "" {

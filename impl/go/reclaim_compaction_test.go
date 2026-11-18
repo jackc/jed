@@ -84,7 +84,7 @@ func TestCompactionDefersWhileOlderReaderPinned(t *testing.T) {
 
 	// Pin an older version with an open read session: compaction must NOT free pages it may still
 	// observe, so it defers and the high-water leaks while the reader is open.
-	reader := db.ReadSession()
+	reader := db.readSession()
 	for k := 0; k < 200; k++ {
 		sessExec(t, sess, fmt.Sprintf("UPDATE t SET pad = 'p%d-%s' WHERE id = 15", k, pad))
 	}

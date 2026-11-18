@@ -211,7 +211,7 @@ func TestReadOnlyDatabaseDirectorySpillsToHostTemp(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ro.Close()
-	s := ro.ReadSession()
+	s := ro.readSession()
 	defer s.Close()
 	s.SetWorkMem(64) // force dozens of external-sort runs through the shared read-session plumbing
 	rows, _ := runQuery(t, s, "SELECT id FROM t ORDER BY k, id")

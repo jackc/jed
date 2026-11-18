@@ -92,13 +92,13 @@ func TestFailedMainPersistLeavesInMemoryAttachmentIntact(t *testing.T) {
 	seedAttachment(t, s)
 
 	// Main's durable commit fails at its barrier after the attachment was dirtied in the same tx.
-	if err := s.Begin(context.Background(), true); err != nil {
+	if err := s.beginBlockCtx(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	dirtyAttachment(t, s)
 	mustExec(t, s, "INSERT INTO t VALUES (1)")
 	armStorageFault(t, db.core.storage, commitFault{point: faultSync, n: 1})
-	wantCode(t, s.Commit(), "58030")
+	wantCode(t, s.commitBlock(), "58030")
 
 	// Nothing published: a fresh session sees the attachment's prior root.
 	assertAttachmentRows(t, db, expectedRows(func(int64) int64 { return 0 }))
@@ -106,12 +106,12 @@ func TestFailedMainPersistLeavesInMemoryAttachmentIntact(t *testing.T) {
 	// attachment pages before main's persist fails. They must never land on pages the published root
 	// uses. (An attachment-only commit would not persist main at all, transactions.md §2.1.)
 	for k := 0; k < 4; k++ {
-		if err := s.Begin(context.Background(), true); err != nil {
+		if err := s.beginBlockCtx(context.Background(), true); err != nil {
 			t.Fatal(err)
 		}
 		mustExec(t, s, fmt.Sprintf("UPDATE a.t SET v = %d WHERE id %% 7 = %d", 10+k, k))
 		mustExec(t, s, fmt.Sprintf("INSERT INTO t VALUES (%d)", 10+k))
-		wantCode(t, s.Commit(), "58030")
+		wantCode(t, s.commitBlock(), "58030")
 		assertAttachmentRows(t, db, expectedRows(func(int64) int64 { return 0 }))
 	}
 }
@@ -133,14 +133,14 @@ func TestFailedLaterAttachmentLeavesEarlierAttachmentIntact(t *testing.T) {
 	seedAttachment(t, s)
 
 	// a stages before b (in-memory attachments commit in name order); b's pack fails.
-	if err := s.Begin(context.Background(), true); err != nil {
+	if err := s.beginBlockCtx(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	dirtyAttachment(t, s)
 	mustExec(t, s, "INSERT INTO b.t VALUES (1)")
 	mustExec(t, s, "INSERT INTO t VALUES (1)")
 	armStorageFault(t, db.core.attachment("b").storage, commitFault{point: faultBodyWrite, n: 1, tearBytes: -1})
-	wantCode(t, s.Commit(), "58030")
+	wantCode(t, s.commitBlock(), "58030")
 	assertAttachmentRows(t, db, expectedRows(func(int64) int64 { return 0 }))
 
 	// Main and a stay writable. Each later commit rewrites one leaf path and reuses a's free list; the

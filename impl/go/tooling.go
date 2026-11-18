@@ -46,3 +46,19 @@ func SetVerifyLivePages(on bool) { setVerifyLivePages(on) }
 
 // TempSpills returns the process-wide count used to verify forced spilling.
 func TempSpills() uint64 { return tempSpillsForTooling() }
+
+// ReadSessionForTesting mints a session pinned READ ONLY to the committed snapshot for its life —
+// session.md §2.4's read_session, which the concurrency harness drives (the public API spells it
+// Session + Begin with ReadOnly).
+func ReadSessionForTesting(db *Database) *Session { return db.readSession() }
+
+// WriteSessionForTesting mints a session holding the writer gate with an open READ WRITE block —
+// session.md §2.4's write_session (blocks until the gate is free).
+func WriteSessionForTesting(db *Database) *Session { return db.writeSession() }
+
+// CommitSessionForTesting ends the session's open block the way SQL COMMIT does: a failed block
+// rolls back without an error (transactions.md §6). No open block is a no-op.
+func CommitSessionForTesting(s *Session) error { return s.commitBlock() }
+
+// RollbackSessionForTesting rolls back the session's open block; no open block is a no-op.
+func RollbackSessionForTesting(s *Session) error { return s.rollbackBlock() }

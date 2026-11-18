@@ -98,7 +98,7 @@ func TestSerializeExcludesUncommittedChanges(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := s.Begin(context.Background(), true); err != nil {
+	if err := s.beginBlockCtx(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := queryOutcome(s, "INSERT INTO t VALUES (2)", nil); err != nil {
@@ -106,7 +106,7 @@ func TestSerializeExcludesUncommittedChanges(t *testing.T) {
 	}
 	// The writer holds the gate; the export never waits for it.
 	data := mustSerialize(t, db, "main")
-	if err := s.Commit(); err != nil {
+	if err := s.commitBlock(); err != nil {
 		t.Fatal(err)
 	}
 	if n := countRows(t, mustDeserialize(t, data, DeserializeOptions{}), "t"); n != 1 {

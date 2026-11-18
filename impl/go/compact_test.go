@@ -268,7 +268,7 @@ func TestCompactionPreconditionsFailWithoutWriting(t *testing.T) {
 	}
 
 	// A pinned reader blocks it, and so does an open cursor.
-	reader := db.ReadSession()
+	reader := db.readSession()
 	if code := compactCode(t, db.Compact("main")); code != "55006" {
 		t.Fatalf("pinned reader: %s, want 55006", code)
 	}
@@ -288,13 +288,13 @@ func TestCompactionPreconditionsFailWithoutWriting(t *testing.T) {
 
 	// An open write transaction blocks it; compaction never waits for the writer gate.
 	writer := mustSession(db, SessionOptions{})
-	if err := writer.Begin(context.Background(), true); err != nil {
+	if err := writer.beginBlockCtx(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if code := compactCode(t, db.Compact("main")); code != "55006" {
 		t.Fatalf("open write transaction: %s, want 55006", code)
 	}
-	if err := writer.Rollback(); err != nil {
+	if err := writer.rollbackBlock(); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()

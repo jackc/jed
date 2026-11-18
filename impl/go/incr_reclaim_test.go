@@ -27,7 +27,7 @@ func TestIncrReclaimReaderHoldsOnlyNewerGenerations(t *testing.T) {
 	}
 	st := db.core.storage
 	steady := db.PageCount()
-	rd := db.ReadSession()
+	rd := db.readSession()
 	pinned, err := countOf(db, rd)
 	if err != nil {
 		t.Fatal(err)

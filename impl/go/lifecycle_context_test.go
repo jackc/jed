@@ -40,9 +40,9 @@ func TestSessionCallbackPanicCleanup(t *testing.T) {
 					panic(marker)
 				}
 				if writable {
-					_ = s.Update(t.Context(), body)
+					_ = s.updateBlock(t.Context(), body)
 				} else {
-					_ = s.View(t.Context(), body)
+					_ = s.viewBlock(t.Context(), body)
 				}
 			}()
 			if s.InTransaction() {
@@ -55,7 +55,7 @@ func TestSessionCallbackPanicCleanup(t *testing.T) {
 			if len(db.core.live) != 0 {
 				t.Fatal("panic retained a read pin")
 			}
-			if err := s.Commit(); err != nil {
+			if err := s.commitBlock(); err != nil {
 				t.Fatal(err)
 			}
 			if n := txCount(t, db, "t"); n != 0 {
@@ -93,7 +93,7 @@ func TestContextCancelsLocalWriterWait(t *testing.T) {
 			mustExec(t, db, "CREATE TABLE t (id i64 PRIMARY KEY)")
 			blocker := mustSession(db, SessionOptions{})
 			defer blocker.Close()
-			if err := blocker.Begin(t.Context(), true); err != nil {
+			if err := blocker.beginBlockCtx(t.Context(), true); err != nil {
 				t.Fatal(err)
 			}
 			s := mustSession(db, SessionOptions{})
@@ -113,9 +113,9 @@ func TestContextCancelsLocalWriterWait(t *testing.T) {
 				case "prepared":
 					_, err = s.ExecPrepared(ctx, stmt)
 				case "begin":
-					err = s.Begin(ctx, true)
+					err = s.beginBlockCtx(ctx, true)
 				case "update":
-					err = db.Update(ctx, func(*Transaction) error { return errors.New("callback ran") })
+					err = db.update(ctx, func(*Transaction) error { return errors.New("callback ran") })
 				case "script":
 					_, err = s.ExecuteScript(ctx, "INSERT INTO t VALUES (1)")
 				}
@@ -132,7 +132,7 @@ func TestContextCancelsLocalWriterWait(t *testing.T) {
 			if s.InTransaction() {
 				t.Fatal("canceled acquisition opened a transaction")
 			}
-			if err := blocker.Rollback(); err != nil {
+			if err := blocker.rollbackBlock(); err != nil {
 				t.Fatal(err)
 			}
 			mustExec(t, db, "INSERT INTO t VALUES (2)")
@@ -154,8 +154,8 @@ func TestContextDeadlineErrorIdentity(t *testing.T) {
 	requireContextError(t, db.QueryRow(ctx, "SELECT 1").Scan(&n), context.DeadlineExceeded)
 	_, err := s.Exec(ctx, "SELECT 1")
 	requireContextError(t, err, context.DeadlineExceeded)
-	requireContextError(t, s.Begin(ctx, true), context.DeadlineExceeded)
-	requireContextError(t, db.View(ctx, func(*Transaction) error { t.Fatal("callback ran"); return nil }), context.DeadlineExceeded)
+	requireContextError(t, s.beginBlockCtx(ctx, true), context.DeadlineExceeded)
+	requireContextError(t, db.view(ctx, func(*Transaction) error { t.Fatal("callback ran"); return nil }), context.DeadlineExceeded)
 	_, err = db.ExecuteScript(ctx, "")
 	requireContextError(t, err, context.DeadlineExceeded)
 	if s.InTransaction() {
@@ -178,9 +178,9 @@ func TestCallbackContextCanceledBeforeCommit(t *testing.T) {
 		}
 		var err error
 		if session {
-			err = s.Update(ctx, body)
+			err = s.updateBlock(ctx, body)
 		} else {
-			err = db.Update(ctx, body)
+			err = db.update(ctx, body)
 		}
 		requireContextError(t, err, context.Canceled)
 		if s.InTransaction() {
@@ -207,7 +207,7 @@ func TestScriptContextCancellationRollback(t *testing.T) {
 		mustExec(t, db, "CREATE TABLE t (id i64 PRIMARY KEY)")
 		s := mustSession(db, SessionOptions{})
 		if existing {
-			if err := s.Begin(t.Context(), true); err != nil {
+			if err := s.beginBlockCtx(t.Context(), true); err != nil {
 				t.Fatal(err)
 			}
 			mustExec(t, s, "INSERT INTO t VALUES (99)")
@@ -221,7 +221,7 @@ func TestScriptContextCancellationRollback(t *testing.T) {
 		} else if s.InTransaction() {
 			t.Fatal("script did not end its wrapper")
 		}
-		if err := s.Rollback(); err != nil {
+		if err := s.rollbackBlock(); err != nil {
 			t.Fatal(err)
 		}
 		if n := txCount(t, db, "t"); n != 0 {
@@ -262,7 +262,7 @@ func TestCancellationAfterPublicationPreservesSuccess(t *testing.T) {
 				}
 				_, err = db.ExecPrepared(ctx, stmt)
 			case "update":
-				err = db.Update(ctx, func(tx *Transaction) error { _, e := tx.Exec(ctx, "INSERT INTO t VALUES (1)"); return e })
+				err = db.update(ctx, func(tx *Transaction) error { _, e := tx.Exec(ctx, "INSERT INTO t VALUES (1)"); return e })
 			case "script":
 				_, err = db.ExecuteScript(ctx, "INSERT INTO t VALUES (1)")
 			}
