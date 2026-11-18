@@ -311,6 +311,16 @@ func TestRegexLiteralPrefixCheckpoints(t *testing.T) {
 		start            int
 	}{
 		{"needle", "abcneedxneedleneedle", 1},
+		{"aaab", "aaaaaaaaaa", 0},
+		{"aaab", "xxaaaaab", 2},
+		{"aaab", "aaaaaxaaaab", 1},
+		{"((猫猫猫犬))", "😀猫猫猫猫猫猫犬", 1},
+		{"((((((((aaab))))))))", "aaaaaaaab", 0},
+		{"(aaab)+", "aaabaaaaabaaab", 0},
+		{"(?:aaab)+c", "aaabaaaaabaaabc", 0},
+		{"aaab(a|ab)*b", "aaabaaaaabaaabab", 0},
+		{"a{32}b", strings.Repeat("a", 65) + "b", 0},
+		{"aaab", strings.Repeat("a", 8200) + "b", 0},
 		{"(a)+b", "axxxaaaab", 0},
 		{"((界))(.*)", "猫😀界xyz", 1},
 		{"((((((((z))))))))", "abczz", 0},
@@ -328,6 +338,7 @@ func TestRegexLiteralPrefixCheckpoints(t *testing.T) {
 			t.Fatal(err)
 		}
 		slow.prefixPC = 0
+		slow.overlapWidth = 0
 		input := []rune(tc.subject)
 		run := func(p *regexProgram, stmt, life int64, phase uint8, cancel <-chan struct{}) outcome {
 			lifetime := int64(19)
@@ -362,7 +373,15 @@ func TestRegexLiteralPrefixCheckpoints(t *testing.T) {
 		} else {
 			for _, pos := range []int64{255, 256, 4095, 4096, 8192} {
 				check(0, 19+4+5*pos, 0, nil)
+				if tc.pattern == "aaab" {
+					// After priming, N copies of a cost 8*N+1 including the seed.
+					check(0, 19+8*pos+1, 7, open)
+				}
 			}
+		}
+		if tc.pattern == "aaab" {
+			// Poll and both ceilings fall due on the fifth a.
+			check(48, 60, 252, closed)
 		}
 		for _, phase := range []uint8{0, 1, 250, 255} {
 			check(0, 0, phase, closed)

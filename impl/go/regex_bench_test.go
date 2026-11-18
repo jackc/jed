@@ -25,6 +25,8 @@ func BenchmarkRegexPredicate(b *testing.B) {
 		{"false_starts", "needle[0-9]+", strings.Repeat("nxxxxx", 341) + "needle42", true},
 		{"unicode_prefix", "猫[a-z]+", strings.Repeat("界", 2048) + "猫abc", true},
 		{"dense_starts", "aaab", strings.Repeat("a", 2048), false},
+		{"dense_starts_long", "aaab", strings.Repeat("a", 65536), false},
+		{"dense_starts_late_hit", "aaab", strings.Repeat("a", 65536) + "b", true},
 		{"groups", strings.Repeat("(a)", 12), strings.Repeat("a", 12), true},
 		{"wide_class", class.String(), strings.Repeat("界", 256), false},
 	} {

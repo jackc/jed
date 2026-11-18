@@ -121,6 +121,28 @@ The `regex_literal_prefix` SQL lane searches the 10k-row orders note column for 
 One 54-iteration run per revision measured 7.00 → 2.46 ms per query (−64.8%) with matching
 answer checksums.
 
+**Go dense overlapping starts (2026-11-18).** On a run of `a`, the `aaab` search reaches
+a steady state after three characters. Each subsequent `a` advances the same ordered thread
+list and costs eight steps. The Go core batches these transitions under the checkpoint rule in
+[regex.md §4](regex.md#4-execution--the-pike-vm-leftmost-first-capture-tracking).
+
+Median time per precompiled predicate over three samples, Core Ultra 9 285K, Go 1.27.1,
+`mise run bench:regex-go` with `-cpu 1`. Inputs were already Go runes for jed and strings for
+Go regexp. The timing includes statement and session cost accrual in jed.
+
+| Input to `aaab` | Go before | Go after | Go regexp | jed cost per match |
+|---|---:|---:|---:|---:|
+| 2,048 copies of `a` | 74.8 µs | 0.525 µs | 0.302 µs | 16,385 |
+| 65,536 copies of `a` | 2.40 ms | 12.6 µs | 1.04 ms | 524,289 |
+| 65,536 copies of `a`, then `b` | 2.40 ms | 12.7 µs | 1.03 ms | 524,296 |
+
+Go regexp selects different execution paths at these lengths. The shorter subject fits its
+bounded bit-state matcher, while the longer subject goes through its NFA. The three optimized
+jed predicates reported zero allocations after warmup and the same costs as before.
+The `regex_dense_starts` SQL lane reads both long subjects from a scratch table and returns the
+id of the one with the trailing `b`. One 100-iteration run per revision measured 6.67 → 0.285 ms
+per query with matching checksums.
+
 **Variable-width scan result (2026-10-13).** Track A4 ([packed-leaf.md §11](packed-leaf.md)) lets the
 columnar lanes read text, bytea, and array columns in place. The seven `varscan_*` lanes run over a
 100k-row scratch table (nullable text, `text[]`, `bytea`; no secondary index); `gin_stats_common_tag`

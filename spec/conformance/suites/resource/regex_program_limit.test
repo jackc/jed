@@ -58,3 +58,16 @@ query B nosort
 SELECT '😀aa猫' ~ '((猫))' FROM one
 ----
 true
+
+# Overlapping literal starts reach this ceiling mid-run.
+# max_cost: 60
+statement error 54P01
+SELECT 'aaaaaaaa' ~ 'aaab' FROM one
+
+# 10 instructions, 65 explored states and 4 scan/operator/output units.
+# max_cost: 80
+# cost: 79
+query B nosort
+SELECT 'aaaaaaaa' ~ 'aaab' FROM one
+----
+false

@@ -358,3 +358,19 @@ input = "😀aa猫"
 matched = true
 caps = [[3, 4], [3, 4], [3, 4]]
 steps = 38
+
+# Dense overlapping starts. After three a's each additional a costs eight steps.
+[[case]]
+pattern = "aaab"
+input = "aaaaaaaa"
+matched = false
+caps = []
+steps = 65
+
+# Each surviving start retains its own code-point offsets at the end of the run.
+[[case]]
+pattern = "((猫猫猫犬))"
+input = "猫猫猫猫猫猫犬"
+matched = true
+caps = [[3, 7], [3, 7], [3, 7]]
+steps = 74

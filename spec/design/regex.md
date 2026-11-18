@@ -342,8 +342,17 @@ recreates the same two threads: `Jmp` at 2, `Split` at 0, the saves at 3 through
 position the literal thread carries only the initial saves, all set to that position.
 A core may scan a consecutive run of such misses and charge their combined steps. A batch
 must stop before any due cancellation poll or cost ceiling, leaving the boundary position
-to the ordinary VM. The initial closure, candidate positions, overlapping partial matches
-and end of input follow the usual rules.
+to the ordinary VM.
+
+A second shortcut applies when `w` consecutive copies of the same literal start at pc `k`,
+followed by a different literal at `k+w`. Suppose the parked pcs are exactly `k+w, …, k, 1`
+in priority order. On another copy of the repeated character the oldest start dies, the next
+`w` threads each advance one instruction, and the wrapper seeds a fresh start. This reproduces
+the same ordered pcs at a cost of `w+k+1` explored states. A batch of `n` such characters
+keeps the captures of the surviving threads and installs the initial saves for each new start
+at its own code-point offset. The same cost and cancellation boundaries apply. The ordinary
+VM handles the position that breaks the run, including a match of the following literal,
+and the end-of-input checkpoint.
 
 ### 4.1 Capture slots — a persistent array
 

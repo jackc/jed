@@ -89,13 +89,14 @@ func (c *regexClass) admits(r rune) bool {
 // group count (excluding group 0, the whole match), plus the shape of its capture-slot trees (capShape)
 // and a pool of dedup sets (regexSeen) that its searches reuse.
 type regexProgram struct {
-	insts      []regexInst
-	classes    []regexClass
-	ngroups    int
-	capDepth   int
-	capLeafLen int
-	prefixPC   int // first literal after the ordinary wrapper and initial Saves, or zero
-	seenPool   sync.Pool
+	insts        []regexInst
+	classes      []regexClass
+	ngroups      int
+	capDepth     int
+	capLeafLen   int
+	prefixPC     int // first literal after the ordinary wrapper and initial Saves, or zero
+	overlapWidth int // leading identical Char instructions followed by a different Char
+	seenPool     sync.Pool
 }
 
 func (p *regexProgram) ninst() int { return len(p.insts) }
@@ -997,6 +998,13 @@ func compileRegexWrapped(pattern string, mode regexMode, wrapper regexWrapper) (
 		}
 		if prog.insts[pc].op == opChar {
 			prog.prefixPC = pc
+			end := pc + 1
+			for prog.insts[end].op == opChar && prog.insts[end].ch == prog.insts[pc].ch {
+				end++
+			}
+			if end-pc >= 2 && prog.insts[end].op == opChar {
+				prog.overlapWidth = end - pc
+			}
 		}
 	}
 	prog.capDepth, prog.capLeafLen = capShape(2 * (p.ngroups + 1))
@@ -1299,6 +1307,52 @@ func (p *regexProgram) skipLiteralMisses(input []rune, m *costMeter) int {
 	return n
 }
 
+// initialRegexCaps is the capture history of a fresh start at sp, up to its first literal.
+func initialRegexCaps[C any, R capRep[C]](p *regexProgram, seen *regexSeen, sp int) C {
+	var rep R
+	var caps C
+	for pc := 3; pc < p.prefixPC; pc++ {
+		caps = rep.with(p, seen, caps, p.insts[pc].x, int64(sp))
+	}
+	return caps
+}
+
+// skipOverlappingStarts batches the steady state of a repeated literal prefix (regex.md §4).
+// For aaab the parked threads must be waiting for b, a, a, a, and the wrapper, in that order.
+func skipOverlappingStarts[C any, R capRep[C]](p *regexProgram, seen *regexSeen, list []regexThread[C], input []rune, sp int, m *costMeter) int {
+	width := p.overlapWidth
+	literal := p.insts[p.prefixPC].ch
+	if input[sp] != literal || list[width+1].pc != 1 {
+		return 0
+	}
+	for i := 0; i <= width; i++ {
+		if list[i].pc != p.prefixPC+width-i {
+			return 0
+		}
+	}
+
+	perRune := int64(p.prefixPC+1+width) * costs.RegexStep
+	limit := m.stepsBeforeCheckpoint(min(4096, len(input)-sp), perRune)
+	n := 0
+	for n < limit && input[sp+n] == literal {
+		n++
+	}
+	if n == 0 {
+		return 0
+	}
+	m.chargeStepsBeforeCheckpoint(n, perRune)
+	// Oldest first: copying from a younger thread preserves its original history.
+	// Threads seeded during the batch have consumed width-i runes by its end.
+	for i := 0; i <= width; i++ {
+		if i+n <= width {
+			list[i].caps = list[i+n].caps
+		} else {
+			list[i].caps = initialRegexCaps[C, R](p, seen, sp+n-(width-i))
+		}
+	}
+	return n
+}
+
 // pikeSearch is search over the capture representation R.
 func pikeSearch[C any, R capRep[C]](p *regexProgram, seen *regexSeen, input []rune, start int, gate, ends []bool, m *costMeter) (regexCaps, bool, error) {
 	var rep R
@@ -1323,11 +1377,13 @@ func pikeSearch[C any, R capRep[C]](p *regexProgram, seen *regexSeen, input []ru
 				sp += n
 				// The wrapper starts a fresh thread at sp. Only its leading
 				// Saves survive the skipped positions; pc 1 still has unset slots.
-				caps := unset
-				for pc := 3; pc < p.prefixPC; pc++ {
-					caps = rep.with(p, seen, caps, p.insts[pc].x, int64(sp))
-				}
-				clist[0].caps = caps
+				clist[0].caps = initialRegexCaps[C, R](p, seen, sp)
+				continue
+			}
+		}
+		if p.overlapWidth != 0 && len(clist) == p.overlapWidth+2 && sp < length {
+			if n := skipOverlappingStarts[C, R](p, seen, clist, input, sp, m); n > 0 {
+				sp += n
 				continue
 			}
 		}
