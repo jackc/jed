@@ -101,6 +101,26 @@ provide throughput comparisons and have no jed cost meter. In the separate `rege
 SQL lane, one 54-iteration run per revision over the 10k-row dataset measured 8.71 → 7.55 ms per
 query (−13.3%), with matching answer checksums.
 
+**Go literal-prefix search (2026-11-18).** The Go VM now batches positions where the leading
+literal fails and only the search wrapper remains active. `mise run bench:regex-go` on the same
+Core Ultra 9 285K, Go 1.27.1, with `-cpu 1` and three samples per case. Median nanoseconds per precompiled
+predicate, with input conversion excluded:
+
+| Subject and pattern | Go before | Go after | Go regexp | jed cost per match |
+|---|---:|---:|---:|---:|
+| `needle` after 2,048 misses | 39,220 | 575 | 62 | 10,281 |
+| `needle` absent from 2,048 characters | 39,161 | 413 | 44 | 10,244 |
+| `needle[0-9]+` after 341 false starts | 45,272 | 17,425 | 399 | 10,624 |
+| `猫[a-z]+` after 2,048 copies of `界` | 39,089 | 508 | 840 | 10,267 |
+| `aaab` absent from 2,048 copies of `a` | 73,122 | 77,577 | 301 | 16,385 |
+
+Each case retained its step count and reported zero allocations after warmup. The dense-start
+case keeps overlapping partial matches active, so the ordinary VM handles it. In that case the
+after run took 6% longer; the standard-library control also took 4% longer in the after run.
+The `regex_literal_prefix` SQL lane searches the 10k-row orders note column for `needle[0-9]+`.
+One 54-iteration run per revision measured 7.00 → 2.46 ms per query (−64.8%) with matching
+answer checksums.
+
 **Variable-width scan result (2026-10-13).** Track A4 ([packed-leaf.md §11](packed-leaf.md)) lets the
 columnar lanes read text, bytea, and array columns in place. The seven `varscan_*` lanes run over a
 100k-row scratch table (nullable text, `text[]`, `bytea`; no secondary index); `gin_stats_common_tag`

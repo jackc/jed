@@ -292,3 +292,81 @@ func TestRegexSimilarVectors(t *testing.T) {
 		}
 	}
 }
+
+// Compare partial cost, ceiling precedence and cancellation sampling against
+// single-position execution. Those internal meter states are outside the corpus.
+func TestRegexLiteralPrefixCheckpoints(t *testing.T) {
+	closed := make(chan struct{})
+	close(closed)
+	open := make(chan struct{})
+	type outcome struct {
+		slots             []int64
+		matched           bool
+		err               error
+		accrued, lifetime int64
+		pollPhase         uint8
+	}
+	for _, tc := range []struct {
+		pattern, subject string
+		start            int
+	}{
+		{"needle", "abcneedxneedleneedle", 1},
+		{"(a)+b", "axxxaaaab", 0},
+		{"((界))(.*)", "猫😀界xyz", 1},
+		{"((((((((z))))))))", "abczz", 0},
+		{"a+b|z", "aaaaz", 0}, // alternation has no required initial literal
+		{"x.*?y", "xxxabc", 0},
+		{"b", "", 0},
+		{"z", strings.Repeat("x", 8200) + "z", 0},
+	} {
+		fast, err := compileRegex(tc.pattern)
+		if err != nil {
+			t.Fatal(err)
+		}
+		slow, err := compileRegex(tc.pattern)
+		if err != nil {
+			t.Fatal(err)
+		}
+		slow.prefixPC = 0
+		input := []rune(tc.subject)
+		run := func(p *regexProgram, stmt, life int64, phase uint8, cancel <-chan struct{}) outcome {
+			lifetime := int64(19)
+			m := costMeter{Accrued: 7, Limit: stmt, lifetimeTotal: &lifetime, lifetimeLimit: life, cancelSteps: phase, cancel: cancel}
+			seen := p.takeSeen()
+			defer p.seenPool.Put(seen)
+			caps, ok, err := p.search(seen, input, tc.start, &m)
+			o := outcome{matched: ok, err: err, accrued: m.Accrued, lifetime: lifetime, pollPhase: m.cancelSteps}
+			if ok {
+				o.slots = p.slots(caps)
+			}
+			return o
+		}
+		check := func(stmt, life int64, phase uint8, cancel <-chan struct{}) {
+			t.Helper()
+			got, want := run(fast, stmt, life, phase, cancel), run(slow, stmt, life, phase, cancel)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("%q start %d limits %d/%d phase %d: got %+v, want %+v", tc.pattern, tc.start, stmt, life, phase, got, want)
+			}
+		}
+		check(0, 0, 0, nil)
+		check(0, 0, 7, open)
+		if len(input) < 100 {
+			last := run(slow, 0, 0, 0, nil).accrued + 1
+			for stmt := int64(7); stmt <= last; stmt++ {
+				check(stmt, 0, 0, nil)
+				// Starting totals differ by 12. Exercise both orders and ties.
+				for delta := int64(11); delta <= 13; delta++ {
+					check(stmt, stmt+delta, 250, open)
+				}
+			}
+		} else {
+			for _, pos := range []int64{255, 256, 4095, 4096, 8192} {
+				check(0, 19+4+5*pos, 0, nil)
+			}
+		}
+		for _, phase := range []uint8{0, 1, 250, 255} {
+			check(0, 0, phase, closed)
+			check(29, 41, phase, closed)
+		}
+	}
+}

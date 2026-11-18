@@ -94,6 +94,7 @@ type regexProgram struct {
 	ngroups    int
 	capDepth   int
 	capLeafLen int
+	prefixPC   int // first literal after the ordinary wrapper and initial Saves, or zero
 	seenPool   sync.Pool
 }
 
@@ -989,6 +990,15 @@ func compileRegexWrapped(pattern string, mode regexMode, wrapper regexWrapper) (
 		return nil, err
 	}
 	prog := &regexProgram{insts: c.insts, classes: c.classes, ngroups: p.ngroups}
+	if wrapper == wrapSearch {
+		pc := 4 // first body instruction, after Save 0
+		for prog.insts[pc].op == opSave {
+			pc++
+		}
+		if prog.insts[pc].op == opChar {
+			prog.prefixPC = pc
+		}
+	}
 	prog.capDepth, prog.capLeafLen = capShape(2 * (p.ngroups + 1))
 	return prog, nil
 }
@@ -1274,6 +1284,21 @@ func (p *regexProgram) matchEnds(input []rune, gate []bool, m *costMeter) ([]boo
 	return ends, nil
 }
 
+// skipLiteralMisses batches consecutive failures of the first literal when only
+// it and the search wrapper are active (regex.md §4). Leave the position that
+// would trip a cost limit or poll cancellation to the normal consume loop.
+func (p *regexProgram) skipLiteralMisses(input []rune, m *costMeter) int {
+	perRune := int64(p.prefixPC+1) * costs.RegexStep
+	limit := m.stepsBeforeCheckpoint(min(len(input), 4096), perRune)
+	literal := p.insts[p.prefixPC].ch
+	n := 0
+	for n < limit && input[n] != literal {
+		n++
+	}
+	m.chargeStepsBeforeCheckpoint(n, perRune)
+	return n
+}
+
 // pikeSearch is search over the capture representation R.
 func pikeSearch[C any, R capRep[C]](p *regexProgram, seen *regexSeen, input []rune, start int, gate, ends []bool, m *costMeter) (regexCaps, bool, error) {
 	var rep R
@@ -1291,7 +1316,21 @@ func pikeSearch[C any, R capRep[C]](p *regexProgram, seen *regexSeen, input []ru
 		return regexCaps{}, false, err
 	}
 
-	for sp := start; sp <= length; sp++ {
+	for sp := start; sp <= length; {
+		if p.prefixPC != 0 && len(clist) == 2 && clist[0].pc == p.prefixPC && clist[1].pc == 1 &&
+			sp < length && input[sp] != p.insts[p.prefixPC].ch {
+			if n := p.skipLiteralMisses(input[sp:], m); n > 0 {
+				sp += n
+				// The wrapper starts a fresh thread at sp. Only its leading
+				// Saves survive the skipped positions; pc 1 still has unset slots.
+				caps := unset
+				for pc := 3; pc < p.prefixPC; pc++ {
+					caps = rep.with(p, seen, caps, p.insts[pc].x, int64(sp))
+				}
+				clist[0].caps = caps
+				continue
+			}
+		}
 		generation := seen.next()
 		nlist = nlist[:0]
 	inner:
@@ -1340,6 +1379,7 @@ func pikeSearch[C any, R capRep[C]](p *regexProgram, seen *regexSeen, input []ru
 		if len(clist) == 0 {
 			break
 		}
+		sp++
 	}
 	return rep.result(matched), found, nil
 }

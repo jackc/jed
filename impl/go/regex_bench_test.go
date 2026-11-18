@@ -21,6 +21,10 @@ func BenchmarkRegexPredicate(b *testing.B) {
 	}{
 		{"filter", "[aeiou]{2}", "invoice received", true},
 		{"late_literal", "needle", strings.Repeat("x", 2048) + "needle", true},
+		{"missing_literal", "needle", strings.Repeat("x", 2048), false},
+		{"false_starts", "needle[0-9]+", strings.Repeat("nxxxxx", 341) + "needle42", true},
+		{"unicode_prefix", "猫[a-z]+", strings.Repeat("界", 2048) + "猫abc", true},
+		{"dense_starts", "aaab", strings.Repeat("a", 2048), false},
 		{"groups", strings.Repeat("(a)", 12), strings.Repeat("a", 12), true},
 		{"wide_class", class.String(), strings.Repeat("界", 256), false},
 	} {

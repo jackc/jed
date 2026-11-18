@@ -45,3 +45,16 @@ SELECT 'a' ~ 'a{9999999999}' FROM one
 # max_cost: 60
 statement error 54P01
 SELECT 'aaaaaaaaaaaaaaaaaaaaaaaa' ~ '^(a|aa)*b$' FROM one
+
+# A ceiling reached in the run before the literal still trips at the VM checkpoint.
+# max_cost: 26
+statement error 54P01
+SELECT '😀aa猫' ~ '((猫))' FROM one
+
+# 11 compiled instructions, 38 explored states, and 4 scan/operator/output units.
+# max_cost: 54
+# cost: 53
+query B nosort
+SELECT '😀aa猫' ~ '((猫))' FROM one
+----
+true

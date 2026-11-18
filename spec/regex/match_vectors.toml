@@ -350,3 +350,11 @@ input = "δ"
 matched = true
 caps = [[0, 1]]
 steps = 11
+
+# Three prefix misses, then a hit: initial closure 6, 7 per rune, 4 closing states.
+[[case]]
+pattern = "((猫))"
+input = "😀aa猫"
+matched = true
+caps = [[3, 4], [3, 4], [3, 4]]
+steps = 38

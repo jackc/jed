@@ -3161,6 +3161,19 @@ iterations = 54
 seed = 4220
 expect_rows_per_iter = 1
 
+# Unanchored literal prefix with a nonliteral suffix, over the same note column.
+[[bench]]
+name = "regex_literal_prefix"
+description = "Literal prefix on the orders note"
+dataset = "small"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT count(*) FROM orders WHERE note ~ 'needle[0-9]+'"
+warmup = 5
+iterations = 54
+seed = 4220
+expect_rows_per_iter = 1
+
 # Capture-tracking regex over the same 10k notes: a global regexp_replace whose two groups the
 # template reorders and repeats, so every match records capture slots (the persistent capture-slot
 # tree, spec/design/regex.md §4.1) and expands the template (cost.md §8.1). Each match adds one

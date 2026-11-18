@@ -334,6 +334,17 @@ prints as NULL in `regexp_match` (Slice 2). A new version of the slots on `Save`
 priority discipline costs; for the boolean operators it is dead weight but kept for engine
 uniformity.
 
+For the ordinary unanchored wrapper, a run of initial `Save` instructions followed by a
+literal `Char` admits a shortcut. Suppose the only parked threads are that `Char` at pc
+`k` and the wrapper's `AnyChar` at pc 1, in that order. Consuming a nonmatching code point
+recreates the same two threads: `Jmp` at 2, `Split` at 0, the saves at 3 through `k−1`,
+`Char` at `k`, and `AnyChar` at 1. That is exactly `k+1` explored states. At the new
+position the literal thread carries only the initial saves, all set to that position.
+A core may scan a consecutive run of such misses and charge their combined steps. A batch
+must stop before any due cancellation poll or cost ceiling, leaving the boundary position
+to the ordinary VM. The initial closure, candidate positions, overlapping partial matches
+and end of input follow the usual rules.
+
 ### 4.1 Capture slots — a persistent array
 
 `regex_step` is the meter's only measure of match work, so each step must stand for a bounded
