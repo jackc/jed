@@ -19,17 +19,21 @@ import (
 	"time"
 )
 
-// Ownership is an opener's ownership preference under the page service (page-service.md §8.2).
+// Ownership is an opener's preference for owning a shared database file under LockingAuto.
+// One process at a time owns the file and serves it to the others; ownership passes to another
+// process when the owner closes or yields.
 type Ownership uint8
 
+// The ownership preferences.
 const (
-	// OwnershipPrefer becomes owner when the database is free and asks a yielding owner to yield. The
-	// default, for applications.
+	// OwnershipPrefer, the default and the right choice for applications, takes ownership when
+	// the file is free and asks an OwnershipYield owner to hand it over.
 	OwnershipPrefer Ownership = iota
-	// OwnershipYield becomes owner when the database is free and hands ownership to a prefer requester.
-	// For tools: the CLI, an SSH helper, a backup.
+	// OwnershipYield takes ownership when the file is free and hands it to an OwnershipPrefer
+	// opener that asks. It suits tools such as the CLI, an SSH helper, or a backup.
 	OwnershipYield
-	// OwnershipNever never owns: an open with no owner fails 55006, and a client never promotes.
+	// OwnershipNever never takes ownership: an open fails with SQLSTATE 55006 when no other
+	// process owns the file, and the handle never becomes the owner later.
 	OwnershipNever
 )
 

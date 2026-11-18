@@ -157,6 +157,8 @@ def go_file(es)
     // The numeric value carries no meaning: compare SQLState constants, or compare Code strings.
     type SQLState int
 
+    // SQLSTATE codes, one per registered error. Each constant's comment gives its code and message
+    // template.
     const (
     #{consts}
     )

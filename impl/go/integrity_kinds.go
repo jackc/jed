@@ -2,93 +2,127 @@
 
 package jed
 
-// IntegrityKind names what an [IntegrityFinding] found wrong. Its string form is the registered
-// finding kind, identical in every core.
+// IntegrityKind names what an [IntegrityFinding] found wrong. Its value is a stable snake_case
+// name, such as "page_corrupt", that is the same in every jed implementation.
 type IntegrityKind string
 
-// IntegritySkipReason names why an [IntegritySkip] could not check an object. Its string form is
-// the registered skip reason, identical in every core.
+// IntegritySkipReason names why an [IntegritySkip] could not check an object. Its value is a
+// stable snake_case name, such as "missing_host_function", that is the same in every jed
+// implementation.
 type IntegritySkipReason string
 
-// Integrity-check finding kinds.
+// The integrity-check finding kinds, in the order of the checks that report them: the database
+// header and catalog, table and index structure, free-space accounting, index agreement
+// ([IntegrityFull] only) and constraints ([IntegrityCheckOptions].Constraints only).
 const (
-	// IntegrityMetaInvalid: The pinned generation's meta slot no longer verifies: a later open would select the other slot.
+	// IntegrityMetaInvalid means the pinned generation's meta slot no longer verifies: a later open
+	// would select the other slot.
 	IntegrityMetaInvalid IntegrityKind = "meta_invalid"
-	// IntegrityManifestPageMismatch: A page the generation's commit manifest lists, or a manifest-overflow page, no longer carries its recorded identity.
+	// IntegrityManifestPageMismatch means a page the generation's commit manifest lists, or a
+	// manifest-overflow page, no longer carries its recorded identity.
 	IntegrityManifestPageMismatch IntegrityKind = "manifest_page_mismatch"
-	// IntegrityCatalogPageCorrupt: A catalog page fails verification or does not decode.
+	// IntegrityCatalogPageCorrupt means a catalog page fails verification or does not decode.
 	IntegrityCatalogPageCorrupt IntegrityKind = "catalog_page_corrupt"
-	// IntegrityCatalogMismatch: The stored catalog chain is not the encoding of the snapshot's catalog.
+	// IntegrityCatalogMismatch means the stored catalog chain is not the encoding of the snapshot's
+	// catalog.
 	IntegrityCatalogMismatch IntegrityKind = "catalog_mismatch"
-	// IntegritySequenceOutOfRange: A sequence's current value lies outside its minimum and maximum.
+	// IntegritySequenceOutOfRange means a sequence's current value lies outside its minimum and
+	// maximum.
 	IntegritySequenceOutOfRange IntegrityKind = "sequence_out_of_range"
-	// IntegrityPageOutOfRange: A pointer names a page outside the body range [first body page, page_count). key is set when an overflow pointer of a row names it.
+	// IntegrityPageOutOfRange means a pointer names a page outside the body range [first body page,
+	// page_count). Key is set when an overflow pointer of a row names it.
 	IntegrityPageOutOfRange IntegrityKind = "page_out_of_range"
-	// IntegrityPageReachedTwice: A pointer names a page the walk already reached: two trees, two nodes, or two overflow values share a page. key is set when an overflow pointer of a row names it.
+	// IntegrityPageReachedTwice means a pointer names a page the walk already reached: two trees,
+	// two nodes, or two overflow values share a page. Key is set when an overflow pointer of a row
+	// names it.
 	IntegrityPageReachedTwice IntegrityKind = "page_reached_twice"
-	// IntegrityPageCorrupt: A tree page fails its checksum or authentication tag, or its node structure does not decode.
+	// IntegrityPageCorrupt means a tree page fails its checksum or authentication tag, or its node
+	// structure does not decode.
 	IntegrityPageCorrupt IntegrityKind = "page_corrupt"
-	// IntegrityPageTypeWrong: A tree pointer names a page of another type.
+	// IntegrityPageTypeWrong means a tree pointer names a page of another type.
 	IntegrityPageTypeWrong IntegrityKind = "page_type_wrong"
-	// IntegrityTreeDepthUneven: A leaf lies at a different depth from the tree's first leaf.
+	// IntegrityTreeDepthUneven means a leaf lies at a different depth from the tree's first leaf.
 	IntegrityTreeDepthUneven IntegrityKind = "tree_depth_uneven"
-	// IntegrityKeysUnordered: A node's keys or separators do not ascend strictly. Reported at most once per page.
+	// IntegrityKeysUnordered means a node's keys or separators do not ascend strictly. Reported at
+	// most once per page.
 	IntegrityKeysUnordered IntegrityKind = "keys_unordered"
-	// IntegritySeparatorViolation: A node holds a key outside the bounds its parent's separators give it. Reported at most once per page.
+	// IntegritySeparatorViolation means a node holds a key outside the bounds its parent's
+	// separators give it. Reported at most once per page.
 	IntegritySeparatorViolation IntegrityKind = "separator_violation"
-	// IntegrityRowKeyNotPrimaryKey: A row is stored under a key that is not the primary-key encoding of its values.
+	// IntegrityRowKeyNotPrimaryKey means a row is stored under a key that is not the primary-key
+	// encoding of its values.
 	IntegrityRowKeyNotPrimaryKey IntegrityKind = "row_key_not_primary_key"
-	// IntegrityValueUndecodable: A stored inline value does not decode as its column's type.
+	// IntegrityValueUndecodable means a stored inline value does not decode as its column's type.
 	IntegrityValueUndecodable IntegrityKind = "value_undecodable"
-	// IntegrityOverflowChainCorrupt: An out-of-line value's chain fails verification, ends early, revisits a page, or does not decompress or decode to its column's type. page is the row's leaf.
+	// IntegrityOverflowChainCorrupt means an out-of-line value's chain fails verification, ends
+	// early, revisits a page, or does not decompress or decode to its column's type. Page is the
+	// row's leaf.
 	IntegrityOverflowChainCorrupt IntegrityKind = "overflow_chain_corrupt"
-	// IntegrityRowCountMismatch: The table's persisted row count differs from the rows its tree holds.
+	// IntegrityRowCountMismatch means the table's persisted row count differs from the rows its
+	// tree holds.
 	IntegrityRowCountMismatch IntegrityKind = "row_count_mismatch"
-	// IntegrityGistBoundsViolation: A GiST interior's bound for a child does not contain every bound in that child.
+	// IntegrityGistBoundsViolation means a GiST interior's bound for a child does not contain every
+	// bound in that child.
 	IntegrityGistBoundsViolation IntegrityKind = "gist_bounds_violation"
-	// IntegrityLiveCountMismatch: The live page count in the meta differs from the pages reachable from the catalog root. Not reported when any tree was unreadable.
+	// IntegrityLiveCountMismatch means the live page count in the meta differs from the pages
+	// reachable from the catalog root. Not reported when any tree was unreadable.
 	IntegrityLiveCountMismatch IntegrityKind = "live_count_mismatch"
-	// IntegrityFreeListCorrupt: A free-list page fails verification or does not decode, or the chain leaves the body range or revisits a page.
+	// IntegrityFreeListCorrupt means a free-list page fails verification or does not decode, or the
+	// chain leaves the body range or revisits a page.
 	IntegrityFreeListCorrupt IntegrityKind = "free_list_corrupt"
-	// IntegrityFreePageOutOfRange: The free list names a page outside the body range.
+	// IntegrityFreePageOutOfRange means the free list names a page outside the body range.
 	IntegrityFreePageOutOfRange IntegrityKind = "free_page_out_of_range"
-	// IntegrityFreePageDuplicate: The free list names a page twice.
+	// IntegrityFreePageDuplicate means the free list names a page twice.
 	IntegrityFreePageDuplicate IntegrityKind = "free_page_duplicate"
-	// IntegrityFreePageLive: The free list names a reachable page, or a free-list page is itself reachable.
+	// IntegrityFreePageLive means the free list names a reachable page, or a free-list page is
+	// itself reachable.
 	IntegrityFreePageLive IntegrityKind = "free_page_live"
-	// IntegrityFreePageManifestDependency: The free list names a page the generation's commit manifest depends on.
+	// IntegrityFreePageManifestDependency means the free list names a page the generation's commit
+	// manifest depends on.
 	IntegrityFreePageManifestDependency IntegrityKind = "free_page_manifest_dependency"
-	// IntegrityIndexEntryMissing: A row derives an index entry the index does not hold. key is the row's storage key.
+	// IntegrityIndexEntryMissing means a row derives an index entry the index does not hold. Key is
+	// the row's storage key.
 	IntegrityIndexEntryMissing IntegrityKind = "index_entry_missing"
-	// IntegrityIndexEntryCountMismatch: The index holds entries no row derives.
+	// IntegrityIndexEntryCountMismatch means the index holds entries no row derives.
 	IntegrityIndexEntryCountMismatch IntegrityKind = "index_entry_count_mismatch"
-	// IntegrityIndexEntryError: Deriving a row's index entry raised an error, where the write that stored it succeeded.
+	// IntegrityIndexEntryError means deriving a row's index entry raised an error, where the write
+	// that stored it succeeded.
 	IntegrityIndexEntryError IntegrityKind = "index_entry_error"
-	// IntegrityNotNullViolation: A NOT NULL column holds NULL. object is the table.
+	// IntegrityNotNullViolation means a NOT NULL column holds NULL. Object is the table.
 	IntegrityNotNullViolation IntegrityKind = "not_null_violation"
-	// IntegrityTypmodViolation: A value exceeds its column's typmod (varchar length, numeric precision or scale, temporal precision). object is the table.
+	// IntegrityTypmodViolation means a value exceeds its column's typmod (varchar length, numeric
+	// precision or scale, temporal precision). Object is the table.
 	IntegrityTypmodViolation IntegrityKind = "typmod_violation"
-	// IntegrityCheckViolation: A row does not satisfy a CHECK constraint. object is the constraint.
+	// IntegrityCheckViolation means a row does not satisfy a CHECK constraint. Object is the
+	// constraint.
 	IntegrityCheckViolation IntegrityKind = "check_violation"
-	// IntegrityCheckError: Evaluating a CHECK constraint on a row raised an error. object is the constraint.
+	// IntegrityCheckError means evaluating a CHECK constraint on a row raised an error. Object is
+	// the constraint.
 	IntegrityCheckError IntegrityKind = "check_error"
-	// IntegrityUniqueViolation: Two rows share a key a UNIQUE index or primary key forbids. object is the index; key is the second row's storage key.
+	// IntegrityUniqueViolation means two rows share a key a UNIQUE index or primary key forbids.
+	// Object is the index; Key is the second row's storage key.
 	IntegrityUniqueViolation IntegrityKind = "unique_violation"
-	// IntegrityForeignKeyViolation: A referencing row's key has no referenced row. object is the constraint.
+	// IntegrityForeignKeyViolation means a referencing row's key has no referenced row. Object is
+	// the constraint.
 	IntegrityForeignKeyViolation IntegrityKind = "foreign_key_violation"
 )
 
-// Integrity-check skip reasons.
+// The integrity-check skip reasons.
 const (
-	// IntegritySkipUnparsableDefinition: The object's stored text does not parse in this binary (XX003).
+	// IntegritySkipUnparsableDefinition means the object's stored text does not parse in this
+	// binary (XX003).
 	IntegritySkipUnparsableDefinition IntegritySkipReason = "unparsable_definition"
-	// IntegritySkipMissingHostFunction: An expression names a host function the environment does not register.
+	// IntegritySkipMissingHostFunction means an expression names a host function the environment
+	// does not register.
 	IntegritySkipMissingHostFunction IntegritySkipReason = "missing_host_function"
-	// IntegritySkipMissingLoadedData: A collation or time zone the object pins is not loaded, or is loaded at another version (XX002).
+	// IntegritySkipMissingLoadedData means a collation or time zone the object pins is not loaded,
+	// or is loaded at another version (XX002).
 	IntegritySkipMissingLoadedData IntegritySkipReason = "missing_loaded_data"
-	// IntegritySkipTableUnreadable: The table's tree had a finding that left rows unread, so its indexes' agreement and its constraints are not checked.
+	// IntegritySkipTableUnreadable means the table's tree had a finding that left rows unread, so
+	// its indexes' agreement and its constraints are not checked.
 	IntegritySkipTableUnreadable IntegritySkipReason = "table_unreadable"
-	// IntegritySkipIndexUnreadable: The index's walk reported a finding (even one that left it readable), so its agreement is not checked.
+	// IntegritySkipIndexUnreadable means the index's walk reported a finding (even one that left it
+	// readable), so its agreement is not checked.
 	IntegritySkipIndexUnreadable IntegritySkipReason = "index_unreadable"
 )
 

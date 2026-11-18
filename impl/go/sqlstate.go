@@ -13,6 +13,8 @@ package jed
 // The numeric value carries no meaning: compare SQLState constants, or compare Code strings.
 type SQLState int
 
+// SQLSTATE codes, one per registered error. Each constant's comment gives its code and message
+// template.
 const (
 	// ConnectionFailure is 08006 — {detail}.
 	ConnectionFailure SQLState = iota

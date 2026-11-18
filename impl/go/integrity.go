@@ -22,40 +22,43 @@ import (
 	"sort"
 )
 
-// IntegrityLevel selects how much an integrity check covers (spec/design/integrity-check.md §3).
+// IntegrityLevel selects how much [Database.IntegrityCheck] covers.
 type IntegrityLevel int
 
+// The integrity check levels.
 const (
-	// IntegrityFull is every check of IntegrityQuick plus agreement between each index and its table
-	// (§3.4). The zero value, so the default.
+	// IntegrityFull runs every check of IntegrityQuick and also verifies that each index holds
+	// exactly the entries its table's rows call for. It is the zero value, so the default.
 	IntegrityFull IntegrityLevel = iota
-	// IntegrityQuick checks the generation, every tree and page, and the space accounting, but not
-	// index agreement (SQLite's quick_check boundary).
+	// IntegrityQuick checks the database header and catalog, every table and index structure and
+	// page, and free-space accounting, but not whether indexes agree with their tables. It is like
+	// SQLite's quick_check.
 	IntegrityQuick
 )
 
 // defaultIntegrityMaxFindings is the finding limit of the zero options (§2; SQLite's limit too).
 const defaultIntegrityMaxFindings = 100
 
-// IntegrityCheckOptions configures Database.IntegrityCheck. The zero value is the thorough default:
-// a full check that stops after 100 findings.
+// IntegrityCheckOptions configures [Database.IntegrityCheck]. The zero value runs a full check that
+// stops after 100 findings and does not re-check constraints.
 type IntegrityCheckOptions struct {
 	// Level is IntegrityFull (the zero value) or IntegrityQuick.
 	Level IntegrityLevel
-	// Constraints also re-checks declared constraints against the stored rows (§3.4), independent of
-	// Level: NOT NULL and column typmods, CHECK, uniqueness of every unique B-tree index, and foreign
-	// keys. Off by default: a CHECK may need a host function or loaded data the handle lacks.
+	// Constraints also re-checks declared constraints against the stored rows, at either Level:
+	// NOT NULL, column type modifiers (such as varchar(n) lengths), CHECK, uniqueness of every
+	// unique B-tree index, and foreign keys. It is off by default because a CHECK may need a host
+	// function or loaded data the handle lacks; such a constraint is reported in
+	// [IntegrityReport].Skipped.
 	Constraints bool
-	// MaxFindings stops the check after this many findings, setting IntegrityReport.Truncated.
-	// It follows the Unlimited rule: 0 selects the default of 100, and Unlimited checks
-	// everything.
+	// MaxFindings stops the check after this many findings, setting [IntegrityReport].Truncated.
+	// 0 selects the default of 100, and [Unlimited] reports every finding.
 	MaxFindings int
 }
 
-// IntegrityFinding is one thing wrong with a database (§2). Every field but Detail is part of the
-// cross-core contract.
+// IntegrityFinding is one problem [Database.IntegrityCheck] found. Every field except Detail is
+// stable: the same file checked with the same options always yields the same findings.
 type IntegrityFinding struct {
-	// Kind is a registered finding kind (spec/integrity/findings.toml; the Integrity* constants).
+	// Kind is what is wrong, one of the IntegrityKind constants.
 	Kind IntegrityKind
 	// Database is the name the check was called with.
 	Database string
@@ -63,54 +66,59 @@ type IntegrityFinding struct {
 	Object string
 	// Page is the page the finding is about, or nil.
 	Page *uint32
-	// Key is the row's storage key when the finding is about one row, else nil.
+	// Key is the row's internal storage key when the finding is about one row, else nil.
 	Key []byte
-	// Detail is a human-readable explanation; not part of the contract.
+	// Detail is a human-readable explanation. Its wording may change between releases.
 	Detail string
 }
 
-// IntegritySkip is an object a requested check could not cover, and why (§3.5).
+// IntegritySkip records an object a requested check could not cover, and why. The rest of the
+// check still runs.
 type IntegritySkip struct {
-	// Object is the index (or table) the check skipped.
+	// Object is the index, table or constraint the check skipped.
 	Object string
-	// Reason is a registered skip reason (the IntegritySkip* constants).
+	// Reason is why, one of the IntegritySkipReason constants.
 	Reason IntegritySkipReason
 }
 
-// IntegrityReport is the result of an integrity check (§2).
+// IntegrityReport is the result of [Database.IntegrityCheck].
 type IntegrityReport struct {
-	// Findings in the contract order of §4; empty when the check found nothing.
+	// Findings lists the problems found, in a fixed order: the database header and catalog first,
+	// then each table in name order (its own structure, then each of its indexes in name order),
+	// then constraints, then free-space accounting. It is empty when nothing was found.
 	Findings []IntegrityFinding
-	// Truncated is set when MaxFindings was reached: more findings may exist.
+	// Truncated is set when MaxFindings was reached; more findings may exist, and Findings is a
+	// prefix of the full list.
 	Truncated bool
-	// Skipped lists the checks that could not run on an object.
+	// Skipped lists the objects a requested check could not cover.
 	Skipped []IntegritySkip
-	// Pages is the distinct pages the walk reached, plus the free-list pages it read.
+	// Pages is the number of distinct pages the check reached, including free-list pages.
 	Pages uint64
-	// Rows is the records the walk visited in table leaves.
+	// Rows is the number of table rows the check visited.
 	Rows uint64
 }
 
 // OK reports whether the check found nothing: no findings and not truncated.
 func (r IntegrityReport) OK() bool { return len(r.Findings) == 0 && !r.Truncated }
 
-// IntegrityCheck checks the storage of database name — `main` or an attachment, exact name — and
-// returns what it finds as structured findings (spec/design/integrity-check.md). It pins the
-// database's committed snapshot as a read session does and never takes the writer gate: commits
-// proceed meanwhile and the check does not see them. It verifies the pinned generation's meta,
-// manifest, and catalog; walks every table, index, and overflow chain, checking page verification,
-// node types, tree shape, key order, stored values, primary keys, and row counts; checks the free list
-// and the live page count; and, at IntegrityFull, that each index (B-tree, expression, partial, GIN,
-// GiST) holds exactly the entries the write path derives from its table's rows. With
-// opts.Constraints it then re-checks every table's declared constraints against its rows (NOT NULL,
-// typmods, CHECK, unique indexes, foreign keys) as their own stage. Pages come through
-// the handle's pager, so a page cached since it was verified is not re-read; a host that wants every
-// byte read from storage checks a freshly opened handle. It never writes.
+// IntegrityCheck checks the storage of the database name ("main" or the exact name of an
+// attachment) and reports what it finds. It reads the latest committed state, as a read-only
+// transaction does, and never blocks writers: commits made while it runs are not seen. It never
+// writes.
 //
-// A damaged page is a finding (XX001 while reading never fails the call). The call fails only for
-// 42704 when name is not `main` or an attachment (`temp` included), 57014 when ctx is canceled (polled
-// at every page and row; a canceled check returns no report), and an I/O error reading the store. A
-// host-API act — not metered and not reachable from SQL.
+// The check verifies the database header and catalog; walks every table, index and large-value
+// chain, checking each page, the tree structure, key order, stored values, primary keys and row
+// counts; and checks free-space accounting. At [IntegrityFull] it also verifies that each index
+// (B-tree, expression, partial, GIN, GiST) holds exactly the entries its table's rows call for.
+// With opts.Constraints it then re-checks declared constraints against the stored rows.
+//
+// Pages already cached by the handle are not re-read from storage; to check every byte on disk,
+// check a freshly opened handle.
+//
+// Damage is reported as findings, not as an error. The call fails with SQLSTATE 42704 when name is
+// not "main" or an attachment ("temp" included), with 57014 when ctx is canceled (no report is
+// returned), and with an I/O error when reading storage fails. The check is not charged to the
+// cost meter and cannot be run from SQL.
 func (db *Database) IntegrityCheck(ctx context.Context, name string, opts IntegrityCheckOptions) (IntegrityReport, error) {
 	if ctx == nil {
 		ctx = context.Background()

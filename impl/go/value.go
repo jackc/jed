@@ -7,59 +7,54 @@ import (
 	"strings"
 )
 
-// ValueKind tags a runtime value: NULL, an integer, a boolean, text, decimal, or bytea.
+// ValueKind identifies the SQL type of a [Value]. [Value.Kind] reports it; a NULL of any type
+// reports ValNull.
 type ValueKind int
 
+// The value kinds. Each comment names the SQL types of that kind and the Go type [Value.Scan]
+// produces for it.
 const (
-	// ValNull is SQL NULL. It is the zero ValueKind, so a zero Value is NULL.
+	// ValNull is SQL NULL. It is the zero ValueKind, so a zero Value is NULL. Scan into *any
+	// yields nil; scanning into a plain pointer fails (use *Null[T], *any, *Value or a Scanner).
 	ValNull ValueKind = iota
-	// ValInt is an integer (any int* column type; stored as i64).
+	// ValInt is an integer of any width (i16, i32 or i64). Scan produces int64, and also accepts
+	// *int, *int32, *int16 (failing on overflow) and *float64.
 	ValInt
-	// ValBool is a boolean (the boolean column type; false/true stored as a bool-byte).
+	// ValBool is a boolean. Scan produces bool.
 	ValBool
-	// ValText is a text string (the text column type); Str holds its UTF-8 content.
+	// ValText is text. Scan produces string.
 	ValText
-	// ValDecimal is an exact decimal (spec/design/decimal.md); Dec holds the value.
+	// ValDecimal is an exact decimal (numeric). Scan produces [Decimal].
 	ValDecimal
-	// ValBytea is a byte string (the bytea column type); Str holds its raw bytes (a Go
-	// string is an immutable byte sequence — any byte, incl 0x00; keeps Value ==-comparable).
+	// ValBytea is a byte string (bytea). Scan produces []byte.
 	ValBytea
-	// ValUUID is a fixed 16-byte UUID (the uuid column type); Str holds the 16 raw bytes (like
-	// ValBytea, but a distinct kind: a uuid renders 8-4-4-4-12 and is its own comparison family,
-	// so a uuid never equals a bytea even with identical bytes — spec/design/types.md §14).
+	// ValUUID is a uuid. Scan into *[]byte produces its 16 raw bytes; Scan into *any produces its
+	// canonical 8-4-4-4-12 lowercase hex string. A uuid never equals a bytea, even with the same
+	// bytes.
 	ValUUID
-	// ValTimestamp is a zoneless timestamp; Int holds the i64 microsecond instant (the
-	// sentinels NegInfinity/PosInfinity are -infinity/+infinity — spec/design/timestamp.md).
+	// ValTimestamp is a timestamp without time zone. Scan produces a UTC [time.Time] holding the
+	// wall-clock reading; ±infinity cannot be scanned into time.Time (*any yields the Value).
 	ValTimestamp
-	// ValTimestamptz is a UTC-instant timestamptz; Int holds the i64 microsecond instant.
+	// ValTimestamptz is a timestamp with time zone, an absolute instant. Scan produces a UTC
+	// [time.Time]; ±infinity cannot be scanned into time.Time (*any yields the Value).
 	ValTimestamptz
-	// ValInterval is a span — Iv holds the three fields (months/days/micros). Comparison/dedup
-	// go through the canonical 128-bit span, NOT field equality (spec/design/interval.md).
+	// ValInterval is an interval. Scan produces [Interval]. Intervals compare by their total span
+	// (1 day equals 24 hours), not field by field.
 	ValInterval
-	// ValFloat32 is an IEEE 754 binary32 (the f32 / real type, spec/design/float.md). Int
-	// holds math.Float32bits(value) zero-extended to i64 — the bits are stored VERBATIM (a
-	// stored -0.0 keeps its sign bit); the total order / dedup / keys canonicalize -0→+0 and
-	// collapse NaN patterns at COMPARISON time, not in storage (float.md §3).
+	// ValFloat32 is a single-precision float (f32, PostgreSQL's real). Scan produces float32 or
+	// float64. A stored -0 keeps its sign.
 	ValFloat32
-	// ValFloat64 is an IEEE 754 binary64 (the f64 / double-precision type). Int holds
-	// math.Float64bits(value); same verbatim-storage / canonical-comparison rule as f32.
+	// ValFloat64 is a double-precision float (f64, PostgreSQL's double precision). Scan produces
+	// float64 or float32.
 	ValFloat64
-	// ValDate is a calendar date; Int holds the i32 day count since 1970-01-01 (the sentinels
-	// DateNegInfinity/DatePosInfinity are -infinity/+infinity — spec/design/date.md). Compares by
-	// the day count; renders YYYY-MM-DD.
+	// ValDate is a calendar date. Scan produces a [time.Time] at UTC midnight of that date;
+	// ±infinity cannot be scanned into time.Time (*any yields the Value).
 	ValDate
-	// ValComposite is a composite (row) value — an ordered list of field values, recursive (a
-	// field may itself be a ValComposite), spec/design/composite.md §2. Comp holds a *[]Value
-	// POINTER so the flat Value struct stays ==-comparable (the slice would otherwise be
-	// non-comparable, like Dec): composite equality and hashing are forced through the structural
-	// Eq3 / value-key path, never raw ==, the rule Decimal/Interval already follow. The field
-	// count and per-field types match the value's composite type; the storage codec / comparator /
-	// recordOut all recurse over this list.
+	// ValComposite is a composite (row) value, an ordered list of field values that may
+	// themselves be composites. Scan into *[]Value produces a copy of the fields.
 	ValComposite
-	// ValArray is an array value (spec/design/array.md §2) — a flat (1-D) list of element values
-	// (a NULL element is a ValNull, an empty list is the empty array `{}`). Array holds a *[]Value
-	// POINTER so the flat Value struct stays ==-comparable (like Comp). Comparison uses PG btree
-	// semantics (NULLs comparable and mutually equal — NOT the composite 3VL rule, §5).
+	// ValArray is an array. Scan into *[ArrayVal] produces a copy of its shape and elements.
+	// Arrays compare with NULL elements equal to each other, as PostgreSQL's btree ordering does.
 	ValArray
 	// valUnfetched is an unfetched large-value reference (spec/design/large-values.md §14): a
 	// stored external/compressed value loaded as its on-disk pointer instead of being
@@ -68,26 +63,19 @@ const (
 	// must never reach a comparison, render, or encode. It is POISONED: those paths panic loudly
 	// (an engine bug), never read it as NULL.
 	valUnfetched
-	// ValRange is a range value (spec/design/ranges.md §2/§4) — the distinguished empty range or a
-	// non-empty range over a scalar element. Range holds a *RangeVal POINTER so the flat Value
-	// struct stays ==-comparable (like Comp/Array); range equality/hashing/comparison go through
-	// Eq3 / the structural value-key path, never raw ==. Discrete ranges are stored canonical (`[)`).
+	// ValRange is a range (int4range, tsrange, a user-defined range, …). Scan into *[RangeVal]
+	// produces its bounds. Ranges over discrete types are always in canonical [) form.
 	ValRange
-	// ValJSON is a json value (spec/design/json.md §4) — JSON text stored VERBATIM (the original
-	// UTF-8 text, preserving whitespace, key order, and duplicate keys), held in Str. NOT comparable
-	// (PG ships no btree/hash opclass — §5); the resolver maps any comparison attempt to 42883.
-	// Rendered verbatim (json_out).
+	// ValJSON is a json value: the original text kept verbatim, including whitespace, key order
+	// and duplicate keys. json values are not comparable (a comparison fails with SQLSTATE
+	// 42883). [Value.String] returns the text.
 	ValJSON
-	// ValJSONB is a jsonb value (spec/design/json.md §2) — the canonical tagged-node tree, held in
-	// Json (a *JSONNode POINTER so the flat Value struct stays ==-comparable, like Comp/Array;
-	// equality/hashing/comparison go through Eq3 / the value-key, never raw ==). Numbers exact
-	// Decimal, object keys deduped + sorted. Comparable by PG's total btree order (§5). Rendered
-	// canonically (jsonb_out).
+	// ValJSONB is a jsonb value: parsed JSON with exact decimal numbers and object keys
+	// deduplicated (the last duplicate wins) and sorted. Scan into *[JSONNode] produces a copy of
+	// the tree.
 	ValJSONB
-	// ValJSONPath is a jsonpath value (spec/design/jsonpath.md, P1a) — the canonical normalized source
-	// text, held in Str (like ValJSON's verbatim text). NOT comparable (the resolver maps any
-	// comparison to 42883); rendered as its text. Literal-only this slice (non-storable), so it never
-	// reaches the value/spill codec — those paths panic.
+	// ValJSONPath is a jsonpath value, held as its normalized text. jsonpath values are not
+	// comparable (a comparison fails with SQLSTATE 42883). [Value.String] returns the text.
 	ValJSONPath
 )
 
@@ -160,10 +148,13 @@ func (u *unfetchedValue) bufferedPayloadLen() int64 {
 
 // Value is one SQL value of any jed type, including NULL. The zero Value is NULL.
 //
-// Values arrive in Rows.Value, Rows.Row and host function arguments. Read one with Scan, which
-// converts to Go types the way Rows.Scan does, or with String for its canonical text. Build one
-// with the constructors (IntValue, TextValue, …) to return from a host function or to bind as a
-// parameter. Kind reports which type the value has.
+// Values arrive from [Rows.Value], [Rows.Row] and as host function arguments. Read one with
+// [Value.Scan], which converts to Go types the way [Rows.Scan] does, or with [Value.String] for
+// its canonical text. Build one with the constructors ([IntValue], [TextValue], …) to return from
+// a host function or to bind as a parameter. [Value.Kind] reports which type the value has.
+//
+// Compare Values with SQL, not with ==: == on two Values does not implement SQL equality for
+// decimals, intervals, arrays and the other structured kinds.
 type Value struct {
 	// num holds every scalar that reduces to an i64, stored INLINE with no allocation — the hot
 	// path: integers (any int* width), a boolean (0/1 — the old Bool field folded in), timestamp /
@@ -230,44 +221,52 @@ func (v Value) rangeVal() *RangeVal { return v.ref.(*RangeVal) }
 // jsonb returns the *JSONNode of a ValJSONB value.
 func (v Value) jsonb() *JSONNode { return v.ref.(*JSONNode) }
 
-// RangeVal is a range value (spec/design/ranges.md §4). Either the distinguished Empty range
-// (Empty == true, both bounds nil) or a non-empty range with optional Lower/Upper bound values — a
-// nil bound is unbounded/infinite on that side (and its inclusivity flag is then false). The bound
-// values are element values; the element type comes from the range's *type*, not stored here (the
-// array precedent). The stored form is CANONICAL (discrete ranges in `[)` form, the empty range
-// normalized — §4), so structural equality on the stored form is the correct value-level equality.
+// RangeVal is the content of a range value. It is either the empty range (Empty is true and both
+// bounds are nil) or a non-empty range whose Lower and Upper bounds are optional element values.
+// The element type comes from the range's SQL type and is not stored here.
+//
+// Ranges the engine produces are in canonical form: a range over a discrete type (int4range,
+// int8range, daterange) is always inclusive-lower, exclusive-upper ("[1,5)"), and any range with
+// no points is the empty range. Two canonical RangeVals are equal exactly when their fields are.
 type RangeVal struct {
-	Empty    bool
-	Lower    *Value
-	Upper    *Value
+	// Empty reports the empty range. When it is true the other fields are zero.
+	Empty bool
+	// Lower is the lower bound, or nil when the range is unbounded below.
+	Lower *Value
+	// Upper is the upper bound, or nil when the range is unbounded above.
+	Upper *Value
+	// LowerInc reports whether Lower is included in the range. It is false when Lower is nil.
 	LowerInc bool
+	// UpperInc reports whether Upper is included in the range. It is false when Upper is nil.
 	UpperInc bool
 }
 
 // EmptyRangeVal returns the empty range (the canonical representation: no bounds, no inclusivity).
 func emptyRangeVal() *RangeVal { return &RangeVal{Empty: true} }
 
-// RangeValue wraps a *RangeVal as a Value.
+// RangeValue returns a range Value with content r. The Value shares r, so r must not be modified
+// afterward.
 func RangeValue(r *RangeVal) Value { return Value{kind: ValRange, ref: r} }
 
-// ArrayVal is a shaped array value (spec/design/array.md §4). Shape is a value property: Dims holds
-// the per-dimension element counts (row-major), Lbounds the per-dimension lower bounds (default 1,
-// same length as Dims), and Elements the flattened row-major element values (its length is the
-// product of Dims). ndim is len(Dims); the empty array is ndim 0 (all slices empty). Equality and
-// ordering are structural and, like PG array_eq/array_cmp, include Dims and Lbounds — so
-// [2:4]={1,2,3} and {1,2,3} are distinct (Eq3/Lt3/Gt3 / the value key).
+// ArrayVal is the content of an array value, possibly multidimensional. The shape is part of the
+// value: as in PostgreSQL, '[2:4]={1,2,3}' and '{1,2,3}' hold the same elements but are different
+// arrays. The empty array '{}' has zero dimensions, and Dims, Lbounds and Elements are empty.
 type ArrayVal struct {
-	Dims     []int
-	Lbounds  []int32
+	// Dims holds the length of each dimension, outermost first.
+	Dims []int
+	// Lbounds holds the lower bound (first subscript) of each dimension; it has the same length
+	// as Dims. The default lower bound is 1.
+	Lbounds []int32
+	// Elements holds the elements in row-major order; its length is the product of Dims. A NULL
+	// element is a NULL Value.
 	Elements []Value
 }
 
-// Ndim is the dimension count (0 = the empty array).
+// Ndim returns the number of dimensions, 0 for the empty array.
 func (a *ArrayVal) Ndim() int { return len(a.Dims) }
 
-// Ubound is the upper bound of dimension d (lb + len - 1), computed in int64 so an array whose
-// bounds were never validated cannot wrap (every value the engine builds satisfies
-// checkArrayBounds, so the result is always within the i32 domain).
+// Ubound returns the upper bound (last subscript) of dimension d, counting from 0: its lower
+// bound plus its length minus 1. It panics if d is out of range.
 func (a *ArrayVal) Ubound(d int) int64 { return int64(a.Lbounds[d]) + int64(a.Dims[d]) - 1 }
 
 // arrayMaxSize is PostgreSQL's MaxArraySize (MaxAllocSize / sizeof(Datum) = 134217727): the number
@@ -302,13 +301,13 @@ func oneDimArray(elems []Value) *ArrayVal {
 	return &ArrayVal{Dims: []int{len(elems)}, Lbounds: []int32{1}, Elements: elems}
 }
 
-// IntValue builds a non-null integer value.
+// IntValue returns an integer Value.
 func IntValue(n int64) Value { return Value{kind: ValInt, num: n} }
 
-// NullValue builds a NULL value.
+// NullValue returns a NULL Value, the same as the zero Value.
 func NullValue() Value { return Value{kind: ValNull} }
 
-// BoolValue builds a boolean value (false/true stored as Int 0/1).
+// BoolValue returns a boolean Value.
 func BoolValue(b bool) Value {
 	var i int64
 	if b {
@@ -317,62 +316,69 @@ func BoolValue(b bool) Value {
 	return Value{kind: ValBool, num: i}
 }
 
-// TextValue builds a non-null text value.
+// TextValue returns a text Value. s should be valid UTF-8.
 func TextValue(s string) Value { return Value{kind: ValText, ref: s} }
 
-// DecimalValue builds a non-null decimal value.
+// DecimalValue returns a decimal (numeric) Value.
 func DecimalValue(d Decimal) Value { return Value{kind: ValDecimal, ref: &d} }
 
-// ByteaValue builds a non-null bytea value from raw bytes (stored as a byte-holding string).
+// ByteaValue returns a bytea Value holding a copy of b.
 func ByteaValue(b []byte) Value { return Value{kind: ValBytea, ref: string(b)} }
 
-// UUIDValue builds a non-null uuid value from its 16 raw bytes (stored as a byte-holding string,
-// like bytea, but tagged ValUUID). The caller must pass exactly 16 bytes (ParseUUID guarantees).
+// UUIDValue returns a uuid Value from its 16 raw bytes, copying them. b must be exactly 16 bytes
+// long.
 func UUIDValue(b []byte) Value { return Value{kind: ValUUID, ref: string(b)} }
 
-// TimestampValue builds a non-null timestamp from its i64 microsecond instant.
+// TimestampValue returns a timestamp (without time zone) Value. m is the wall-clock reading in
+// microseconds since 1970-01-01 00:00:00; [math.MinInt64] and [math.MaxInt64] are -infinity and
+// infinity.
 func TimestampValue(m int64) Value { return Value{kind: ValTimestamp, num: m} }
 
-// TimestamptzValue builds a non-null timestamptz from its i64 microsecond instant.
+// TimestamptzValue returns a timestamptz Value. m is the instant in microseconds since the Unix
+// epoch (1970-01-01 00:00:00 UTC); [math.MinInt64] and [math.MaxInt64] are -infinity and
+// infinity.
 func TimestamptzValue(m int64) Value { return Value{kind: ValTimestamptz, num: m} }
 
-// IntervalValue builds a non-null interval value.
+// IntervalValue returns an interval Value.
 func IntervalValue(iv Interval) Value { return Value{kind: ValInterval, ref: iv} }
 
-// DateValue builds a non-null date from its i32 day count since 1970-01-01.
+// DateValue returns a date Value. d is the number of days since 1970-01-01; [math.MinInt32] and
+// [math.MaxInt32] are -infinity and infinity.
 func DateValue(d int32) Value { return Value{kind: ValDate, num: int64(d)} }
 
-// JSONValue builds a non-null json value from its verbatim UTF-8 text (spec/design/json.md §4).
+// JSONValue returns a json Value holding s verbatim. s is not validated here; it should be valid
+// JSON text.
 func JSONValue(s string) Value { return Value{kind: ValJSON, ref: s} }
 
-// JSONBValue builds a non-null jsonb value from its canonical node tree (spec/design/json.md §2).
-// The node is held by pointer so Value stays ==-comparable; equality/ordering go through Eq3/Cmp.
+// JSONBValue returns a jsonb Value holding the tree n. n should be canonical, as the engine's
+// own jsonb values are: object members sorted by key with no duplicate keys (see [JSONNode]).
 func JSONBValue(n JSONNode) Value { return Value{kind: ValJSONB, ref: &n} }
 
-// JSONPathValue builds a non-null jsonpath value from its canonical normalized text
-// (spec/design/jsonpath.md, P1a). The text lives in Str, like a verbatim json value.
+// JSONPathValue returns a jsonpath Value holding s, which should be the normalized text of a
+// jsonpath.
 func JSONPathValue(s string) Value { return Value{kind: ValJSONPath, ref: s} }
 
-// CompositeValue builds a non-null composite (row) value from its field values
-// (spec/design/composite.md §2). The slice is held by pointer so Value stays ==-comparable;
-// structural equality/ordering go through Eq3/Lt3/Gt3, never raw ==.
+// CompositeValue returns a composite (row) Value with the given field values, in field order.
+// The Value shares fields, so its elements must not be modified afterward.
 func CompositeValue(fields []Value) Value { return Value{kind: ValComposite, ref: &fields} }
 
-// ArrayValue builds a 1-D array value from its element list (spec/design/array.md §2).
+// ArrayValue returns a one-dimensional array Value with lower bound 1 holding elems. An empty
+// elems gives the empty array '{}'. The Value shares elems, so its elements must not be modified
+// afterward.
 func ArrayValue(elems []Value) Value { return Value{kind: ValArray, ref: oneDimArray(elems)} }
 
 // ArrayValueOf builds an array value from an already-shaped ArrayVal (spec/design/array.md §4).
 func arrayValueOf(a *ArrayVal) Value { return Value{kind: ValArray, ref: a} }
 
-// Float32Value builds a non-null f32 value from a Go f32 — the bits are stored verbatim
-// in Int (math.Float32bits, zero-extended), so -0.0 / NaN / ±Inf keep their original pattern
-// (spec/design/float.md §3/§10). The total order / keys canonicalize at comparison time, not here.
+// Float32Value returns an f32 Value. -0 and the infinities are kept as given; a NaN is
+// stored as the single canonical NaN. In comparisons -0 equals 0, and NaN equals NaN and sorts
+// above every other value, as in PostgreSQL.
 func Float32Value(f float32) Value {
 	return Value{kind: ValFloat32, num: int64(math.Float32bits(f))}
 }
 
-// Float64Value builds a non-null f64 value from a Go f64 — the bits are stored verbatim
-// in Int (math.Float64bits), preserving -0.0 / NaN / ±Inf bit patterns (spec/design/float.md §3/§10).
+// Float64Value returns an f64 Value. -0, infinities and NaN behave as
+// with [Float32Value].
 func Float64Value(f float64) Value {
 	return Value{kind: ValFloat64, num: int64(math.Float64bits(f))}
 }
@@ -607,12 +613,11 @@ func (v Value) sqlLiteral() string {
 	return "'" + strings.ReplaceAll(v.String(), "'", "''") + "'"
 }
 
-// String formats for conformance output: integers as shortest decimal, booleans as
-// the canonical "true"/"false", NULL (including a NULL/unknown boolean) as the literal
-// "NULL" (spec/design/conformance.md §1; the canonical spelling is a §8 decision). This is the
-// zone-free canonical render: a timestamptz renders in UTC (+00) at any depth, so the text
-// re-parses to the same instant under any session zone. Session.String renders the way PostgreSQL
-// shows a result column, in the session zone (spec/design/timezones.md §9.5).
+// String returns the value's canonical text: PostgreSQL's output format for its type (booleans
+// as "true"/"false", bytea as "\x…" hex, arrays as "{…}", json verbatim, and so on), and "NULL"
+// for NULL. A timestamptz, at any depth, renders in UTC ("+00"), so the text means the same
+// instant under any session time zone; [Session.Render] renders in the session's time zone
+// instead, as PostgreSQL shows a result column.
 func (v Value) String() string {
 	switch v.kind {
 	case ValNull:

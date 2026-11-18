@@ -14,10 +14,16 @@ import "sort"
 // environment — there is no process-wide default, so libraries and tests in one process stay
 // isolated (environment.md §7).
 
-// Environment is an immutable set of outside inputs (environment.md §3). Build one with
-// NewEnvironmentBuilder (or NewEnvironment for the empty default) and pass it in OpenOptions /
-// CreateOptions. It is safe to share across goroutines and databases: its contents never change
-// after Build (the sources it names are themselves goroutine-safe objects a host may control).
+// Environment is the immutable set of inputs a database takes from the host rather than from its
+// file: loaded Unicode data (collations and case mapping), loaded time-zone data, host functions,
+// and the random and clock sources. Build one with an [EnvironmentBuilder] (or [NewEnvironment]
+// for an empty one) and pass it in [OpenOptions], [CreateOptions] or [DeserializeOptions].
+// Opening without one gives the database a fresh, empty Environment; there is no process-wide
+// default.
+//
+// An Environment never changes after it is built, so it is safe to share across goroutines and
+// databases. The random and clock sources it holds are shared objects the host may still control
+// (reseed a [SeededRandom], advance a [ManualClock]).
 type Environment struct {
 	// collations is the loaded collation set keyed by exact (case-sensitive) name. "C" is never here
 	// (table-free, built in).
@@ -40,11 +46,13 @@ type Environment struct {
 	keySeed *uint64
 }
 
-// EnvironmentBuilder accumulates an Environment's contents (environment.md §3). Every load and
-// registration validates as it is made (a malformed bundle is XX001, a conflicting function
-// registration 42723). Loads are FIRST-WINS: a collation, property table, or zone name already
-// present is not replaced, so re-loading the same bundle is an idempotent no-op. Build snapshots the
-// builder, so later builder calls never affect an Environment already built. Not goroutine-safe.
+// EnvironmentBuilder collects the contents of an [Environment]. Each load and registration is
+// validated when it is made. Loads are first-wins: a collation, case-mapping table or time zone
+// already present is not replaced, so loading the same bundle twice has no further effect.
+// [EnvironmentBuilder.Build] takes a snapshot, so later calls on the builder never change an
+// Environment already built.
+//
+// An EnvironmentBuilder is not safe for concurrent use.
 type EnvironmentBuilder struct {
 	collations map[string]*compiledCollation
 	property   *propertyTable
@@ -55,8 +63,10 @@ type EnvironmentBuilder struct {
 	keySeed    *uint64
 }
 
-// NewEnvironmentBuilder returns an empty builder: the built-in C collation and ASCII casing, UTC and
-// fixed offsets, no host functions, the OS random source, and the wall clock.
+// NewEnvironmentBuilder returns an empty builder. An Environment built from it has only the
+// built-in data: the C collation and ASCII-only case mapping, the UTC and fixed-offset time
+// zones, no host functions, the operating system's random source ([OSRandomSource]) and the wall
+// clock ([WallClock]).
 func NewEnvironmentBuilder() *EnvironmentBuilder {
 	return &EnvironmentBuilder{
 		collations: map[string]*compiledCollation{},
@@ -66,15 +76,14 @@ func NewEnvironmentBuilder() *EnvironmentBuilder {
 	}
 }
 
-// NewEnvironment returns the empty environment (NewEnvironmentBuilder().Build()) — what open/create
-// use when no environment is given.
+// NewEnvironment returns an empty Environment, the same as NewEnvironmentBuilder().Build(). It is
+// what a database uses when none is given.
 func NewEnvironment() *Environment { return NewEnvironmentBuilder().Build() }
 
-// LoadUnicodeData loads a JUCD Unicode-data bundle (spec/design/collation.md §4/§9): parse the bundle,
-// merge the root + each per-locale delta (§5.1), add every collation by name, and keep the
-// property/casing section (§16). First-wins, as above. A malformed bundle is XX001 and leaves the
-// builder unchanged. Privileged host op — the engine reads no file path (§11); the host sources the
-// bytes.
+// LoadUnicodeData loads a jed Unicode-data bundle (JUCD) from data: it adds every collation the
+// bundle provides by name, and its Unicode case-mapping and character-property table. Names
+// already loaded are kept (first wins). A malformed bundle fails with SQLSTATE XX001 and leaves
+// the builder unchanged. The engine never reads files itself; the host supplies the bytes.
 func (b *EnvironmentBuilder) LoadUnicodeData(data []byte) error {
 	bundle, err := openBundle(data)
 	if err != nil {
@@ -95,10 +104,10 @@ func (b *EnvironmentBuilder) LoadUnicodeData(data []byte) error {
 	return nil
 }
 
-// LoadTimeZoneData loads a JTZ bundle (spec/design/timezones.md §3.3/§4): parse each zone's TZif,
-// add it by name, then resolve each link alias onto its target's tables. First-wins, as above. A
-// malformed bundle (or TZif) is XX001 and leaves the builder unchanged. UTC and fixed offsets are
-// built in and need no load.
+// LoadTimeZoneData loads a jed time-zone bundle (JTZ) from data, adding each zone and each alias
+// (link) the bundle provides by name. Names already loaded are kept (first wins). A malformed
+// bundle fails with SQLSTATE XX001 and leaves the builder unchanged. UTC and fixed offsets are
+// built in and need no data.
 func (b *EnvironmentBuilder) LoadTimeZoneData(data []byte) error {
 	bundle, err := openTzBundle(data)
 	if err != nil {
@@ -127,11 +136,11 @@ func (b *EnvironmentBuilder) LoadTimeZoneData(data []byte) error {
 	return nil
 }
 
-// RegisterFunction registers a host scalar function (extensibility.md §4.2). Errors on a negative
-// cost (22023), an unknown argument/result type name (42704), or a second function with an identical
-// (name, arg-types) signature (42723 — signature-level, not name-level: a host may overload a name
-// across argument types). A signature that shadows a built-in is accepted but never reached
-// (built-ins win).
+// RegisterFunction adds the host scalar function f, callable from SQL by its name. A name may be
+// overloaded across argument types. It fails with SQLSTATE 22023 for a negative cost, 42704 for
+// an unknown argument or result type name, and 42723 when a function with the same name and
+// argument types is already registered. A function with the same signature as a built-in is
+// accepted but never called: the built-in wins.
 func (b *EnvironmentBuilder) RegisterFunction(f *HostFunction) error {
 	entry, err := resolveHostFunction(f)
 	if err != nil {
@@ -146,8 +155,9 @@ func (b *EnvironmentBuilder) RegisterFunction(f *HostFunction) error {
 	return nil
 }
 
-// SetRandomSource installs the random source the uuid generators draw from (entropy.md §6); nil
-// restores the default OS random source. Pass a *SeededRandom for a byte-identical cross-core stream.
+// SetRandomSource sets the source of random bytes for the uuid generators (gen_random_uuid,
+// uuidv4, uuidv7). nil restores the default, [OSRandomSource]. Pass a [SeededRandom] for a
+// reproducible sequence.
 func (b *EnvironmentBuilder) SetRandomSource(s RandomSource) {
 	if s == nil {
 		s = OSRandomSource()
@@ -155,8 +165,9 @@ func (b *EnvironmentBuilder) SetRandomSource(s RandomSource) {
 	b.random = s
 }
 
-// SetClockSource installs the clock the clock functions and uuidv7 read (entropy.md §6); nil
-// restores the default wall clock. Pass a *ManualClock or *AdvancingClock for a controllable clock.
+// SetClockSource sets the clock that SQL functions such as now() and uuidv7 read. nil restores
+// the default, [WallClock]. Pass a [ManualClock] or [AdvancingClock] for a clock the host
+// controls.
 func (b *EnvironmentBuilder) SetClockSource(c ClockSource) {
 	if c == nil {
 		c = WallClock()
@@ -164,18 +175,17 @@ func (b *EnvironmentBuilder) SetClockSource(c ClockSource) {
 	b.clock = c
 }
 
-// SetInsecureSeededKeyEntropy makes encrypted databases draw their key material and nonces from an
-// INSECURE splitmix64 stream seeded with seed instead of the OS CSPRNG (spec/fileformat/encrypted.md
-// §8): each database opened or created through the environment starts its own stream from seed, so
-// every core writes byte-identical encrypted files for the same history. Separate from the SQL random
-// source, so seeding uuidv4 never seeds a key. For tests and fixtures only — the keys are predictable.
+// SetInsecureSeededKeyEntropy makes encrypted databases draw their key material and nonces from a
+// deterministic stream seeded with seed instead of the operating system's secure random source.
+// Each database opened or created with the Environment starts its own stream from seed, so the
+// same operations write identical encrypted files. It is independent of [SetRandomSource]. Use it
+// only for tests and fixtures: the keys it produces are predictable and offer no security.
 func (b *EnvironmentBuilder) SetInsecureSeededKeyEntropy(seed uint64) {
 	b.keySeed = &seed
 }
 
-// Build returns an Environment holding the builder's current contents. The maps and the function
-// list are copied (their entries are shared by reference — they are immutable), so continuing to use
-// the builder never changes the returned Environment.
+// Build returns an Environment holding the builder's current contents. Later calls on the
+// builder do not affect the returned Environment, and Build may be called again.
 func (b *EnvironmentBuilder) Build() *Environment {
 	collations := make(map[string]*compiledCollation, len(b.collations))
 	for k, v := range b.collations {
@@ -213,9 +223,9 @@ func (b *EnvironmentBuilder) Build() *Environment {
 	}
 }
 
-// ToBuilder returns a builder pre-filled with this environment's contents (environment.md §3): the
-// loaded data and host functions are shared by reference, and the sources are the same objects. A
-// derived builder may add bundles and functions and replace sources; e itself is unaffected.
+// ToBuilder returns a builder pre-filled with e's contents, including the same random and clock
+// source objects. Use it to derive a new Environment with more data or functions or different
+// sources; e itself is unaffected.
 func (e *Environment) ToBuilder() *EnvironmentBuilder {
 	b := &EnvironmentBuilder{
 		collations: make(map[string]*compiledCollation, len(e.collations)),
@@ -236,9 +246,9 @@ func (e *Environment) ToBuilder() *EnvironmentBuilder {
 	return b
 }
 
-// LoadedCollations introspects the loaded collation set (collation.md §4.2) — every collation a
-// loaded bundle provides, ascending by name (no hash-iteration leak, CLAUDE.md §8). IsDefault is
-// always false here (a per-database property). C is built in and not listed.
+// LoadedCollations returns every collation the loaded Unicode data provides, sorted by name. The
+// built-in C collation is not listed. IsDefault is always false and Verdict is always
+// CollationFull, since the default collation and version skew are properties of a database.
 func (e *Environment) LoadedCollations() []CollationInfo {
 	colls := e.collationTables()
 	out := make([]CollationInfo, len(colls))
@@ -257,8 +267,8 @@ func (e *Environment) LoadedCollations() []CollationInfo {
 	return out
 }
 
-// LoadedTimeZones introspects the loaded zone set (timezones.md §3.3): every zone + alias a loaded
-// bundle provides, ascending by name. UTC and fixed offsets are built in and not listed.
+// LoadedTimeZones returns every time zone and alias the loaded time-zone data provides, sorted by
+// name. The built-in UTC and fixed offsets are not listed.
 func (e *Environment) LoadedTimeZones() []TimeZoneInfo {
 	names := make([]string, 0, len(e.zones))
 	for n := range e.zones {

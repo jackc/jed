@@ -13,10 +13,14 @@ package jed
 
 import "strings"
 
-// Privilege is one table DML privilege or the function EXECUTE privilege. The four table privileges
-// and EXECUTE are disjoint by object kind, so one flat enum (and one PrivilegeSet) covers both.
+// Privilege is one privilege a session may hold on an object: SELECT, INSERT, UPDATE or DELETE on
+// a table or view, or EXECUTE on a function. jed has no users or roles; the host sets a session's
+// privileges with [Session.Grant], [Session.Revoke] and [Session.SetDefaultPrivileges], and a
+// statement that needs a privilege the session lacks fails with SQLSTATE 42501.
 type Privilege int
 
+// The privileges. PrivSelect through PrivDelete apply to tables and views; PrivExecute applies to
+// functions.
 const (
 	PrivSelect Privilege = iota
 	PrivInsert
@@ -28,8 +32,8 @@ const (
 // bit is the bit this privilege occupies in a PrivilegeSet.
 func (p Privilege) bit() uint8 { return 1 << uint(p) }
 
-// PrivilegeFromName parses a privilege keyword (case-insensitive) — the spelling used by the
-// # grant: / # revoke: / # default_privileges: conformance directives and the host API.
+// PrivilegeFromName returns the privilege named by a SQL keyword ("SELECT", "INSERT", "UPDATE",
+// "DELETE" or "EXECUTE"), ignoring case and surrounding space. ok is false for any other name.
 func PrivilegeFromName(name string) (Privilege, bool) {
 	switch strings.ToUpper(strings.TrimSpace(name)) {
 	case "SELECT":
@@ -47,37 +51,42 @@ func PrivilegeFromName(name string) (Privilege, bool) {
 	}
 }
 
-// PrivilegeSet is a small set of Privileges, held as a bitmask (allocation-free, comparable).
+// PrivilegeSet is a set of [Privilege] values. It is a small comparable value; the zero
+// PrivilegeSet is empty.
 type PrivilegeSet uint8
 
+// Common privilege sets.
 const (
 	// PrivSetEmpty is the empty set.
 	PrivSetEmpty PrivilegeSet = 0
-	// PrivSetAllTable is the four table DML privileges — the default table envelope.
+	// PrivSetAllTable holds the four table privileges SELECT, INSERT, UPDATE and DELETE. It is a
+	// session's default set for every table.
 	PrivSetAllTable = PrivilegeSet(1<<uint(PrivSelect) | 1<<uint(PrivInsert) | 1<<uint(PrivUpdate) | 1<<uint(PrivDelete))
-	// PrivSetExecute is just EXECUTE — the default function envelope.
+	// PrivSetExecute holds only EXECUTE. Every function has it by default.
 	PrivSetExecute = PrivilegeSet(1 << uint(PrivExecute))
 )
 
 // Contains reports whether p is in the set.
 func (s PrivilegeSet) Contains(p Privilege) bool { return uint8(s)&p.bit() != 0 }
 
-// With returns this set with p added.
+// With returns s with p added.
 func (s PrivilegeSet) With(p Privilege) PrivilegeSet { return s | PrivilegeSet(p.bit()) }
 
-// Union returns the union of two sets.
+// Union returns the privileges in s, other, or both.
 func (s PrivilegeSet) Union(other PrivilegeSet) PrivilegeSet { return s | other }
 
-// Minus returns this set with other's members removed.
+// Minus returns s with the privileges in other removed.
 func (s PrivilegeSet) Minus(other PrivilegeSet) PrivilegeSet { return s &^ other }
 
 // IsEmpty reports whether the set is empty.
 func (s PrivilegeSet) IsEmpty() bool { return s == 0 }
 
-// Privileges is the session's authorization envelope (spec/design/session.md §5.3): the default
-// table-privilege set plus per-object grant / revoke deltas. Object names are keyed exactly
-// (matched against the canonical catalog name). The zero value is unusable — build with
-// newPrivileges (fully permissive: every table privilege, every function).
+// Privileges is a session's privilege settings: a default set for all tables, plus privileges
+// granted and revoked on individual tables, views and functions. A privilege on an object is held
+// when it is in the default set (for a table) or always (EXECUTE on a function), or granted on the
+// object, and has not been revoked on it; a revoke wins over both. Object names match the name as
+// stored in the catalog, exactly. A session starts with every privilege; read the current
+// settings with [Session.Privileges].
 type Privileges struct {
 	defaultTable PrivilegeSet
 	grant        map[string]PrivilegeSet
@@ -89,8 +98,8 @@ func newPrivileges() Privileges {
 	return Privileges{defaultTable: PrivSetAllTable}
 }
 
-// IsPermissive reports whether this envelope is fully permissive — the default table set, no grants,
-// no revokes — so a statement needs no per-object check (the resolve-time fast path).
+// IsPermissive reports whether pv grants everything: the default table set is
+// [PrivSetAllTable] and there are no per-object grants or revokes.
 func (pv *Privileges) IsPermissive() bool {
 	return pv.defaultTable == PrivSetAllTable && len(pv.grant) == 0 && len(pv.revoke) == 0
 }
@@ -122,13 +131,13 @@ func (pv *Privileges) effective(name string, base PrivilegeSet) PrivilegeSet {
 	return base.Union(pv.grant[name]).Minus(pv.revoke[name])
 }
 
-// AllowsTable reports whether table name (exact) holds privilege p.
+// AllowsTable reports whether the session holds privilege p on the table or view name.
 func (pv *Privileges) AllowsTable(name string, p Privilege) bool {
 	return pv.effective(name, pv.defaultTable).Contains(p)
 }
 
-// AllowsFunction reports whether function name (exact) holds EXECUTE (functions default to
-// EXECUTE granted on all).
+// AllowsFunction reports whether the session holds EXECUTE on the function name. Every function
+// has EXECUTE unless it was revoked.
 func (pv *Privileges) AllowsFunction(name string) bool {
 	return pv.effective(name, PrivSetExecute).Contains(PrivExecute)
 }

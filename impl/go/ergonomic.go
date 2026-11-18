@@ -36,22 +36,24 @@ import (
 	"time"
 )
 
-// ErrNoRows is returned by Row.Scan when the query produced no rows (database/sql's sentinel).
+// ErrNoRows is returned by [Row.Scan] when the query produced no rows. Test for it with errors.Is.
 var ErrNoRows = errors.New("jed: no rows in result set")
 
-// Valuer lets a host type convert itself to a query parameter (the arg-conversion escape hatch).
+// Valuer is implemented by types that convert themselves to a query parameter. Query, Exec and
+// QueryRow call JedValue on any argument that implements it and bind the returned [Value].
 type Valuer interface{ JedValue() (Value, error) }
 
-// Scanner lets a host type receive a Value during Scan (the scan-target escape hatch).
+// Scanner is implemented by scan destinations that convert a column value themselves.
+// [Rows.Scan], [Row.Scan] and [Value.Scan] call ScanJed with the column's value, which may be
+// NULL.
 type Scanner interface{ ScanJed(v Value) error }
 
-// Queryer is satisfied by *Database, *Session, and *Transaction so a data-access helper can take a
-// database, a session, or an open transaction interchangeably (api.md §11). The
-// *Prepared methods run a PreparedStatement — a standalone parsed value bound to no session — on
-// the handle, which supplies the session that execute observes; a *PreparedStatement itself carries
-// no query methods (the handle chosen at each call is what determines the session, api.md §2.4).
-// Applications should usually define an interface in their own package with only
-// the methods they need. Queryer is a convenience for helpers using the full set.
+// Queryer is implemented by *Database, *Session and *Transaction, so a helper can run statements
+// on a database, a session or an open transaction interchangeably. The *Prepared methods run a
+// [PreparedStatement] in the session the receiver supplies.
+//
+// Applications should usually define an interface in their own package with only the methods
+// they need. Queryer is a convenience for helpers that use the full set.
 type Queryer interface {
 	Query(ctx context.Context, sql string, args ...any) (*Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) *Row
@@ -127,119 +129,147 @@ func ergoExec(ctx context.Context, eng *engine, args []any, raw func([]Value) (*
 	return Result{rowsAffected: n, hasAffected: ok, cost: rows.Cost()}, nil
 }
 
-// Query runs a query on the autocommit handle, binding native args. It mints the fresh autocommit
-// session explicitly (rather than via queryValues) so cancellation arms on the engine that runs
-// the statement.
+// Query runs sql in a new autocommit session and returns its rows. args bind to $1, $2, … in
+// order. An argument may be nil (NULL), a bool, any integer type (a uint or uint64 above
+// math.MaxInt64 is an error), float32, float64, a string (which must be valid UTF-8 without NUL
+// bytes, else SQLSTATE 22021), []byte, [Decimal], [Interval], time.Time, a [Value], a [Valuer],
+// or any other slice, which binds as a one-dimensional array (a nil slice is NULL). A time.Time
+// binds as timestamptz; where the parameter is a timestamp or date, its calendar fields in its
+// own location are used.
+//
+// A statement that returns no rows is valid: the Rows has no columns and carries the command tag
+// in [Rows.RowsAffected]. The caller must Close the Rows, or iterate it to the end, and then check
+// [Rows.Err]. If ctx is canceled before or during execution, the statement fails with SQLSTATE
+// 57014 and the error wraps ctx.Err().
 func (db *Database) Query(ctx context.Context, sql string, args ...any) (*Rows, error) {
 	s := db.sessionWithState(newSession(db.core.env))
 	defer s.Close()
 	return ergoQuery(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryValues(sql, p) })
 }
 
-// Exec runs a non-query statement on the autocommit handle and returns its command tag. It routes
-// through the same total query seam as Query and discards any result set (§11) — so Exec and Query
-// are one path, and a SELECT run through Exec is valid (its rows are dropped).
+// Exec runs sql in a new autocommit session and returns its command tag. args bind as in
+// [Database.Query]. A query run through Exec is valid; its rows are read and discarded. If ctx is
+// canceled before or during execution, the statement fails with SQLSTATE 57014.
 func (db *Database) Exec(ctx context.Context, sql string, args ...any) (Result, error) {
 	s := db.sessionWithState(newSession(db.core.env))
 	defer s.Close()
 	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryValues(sql, p) })
 }
 
-// QueryRow runs a query and returns a one-row handle; a setup error defers to Row.Scan.
+// QueryRow runs sql in a new autocommit session and returns a [Row] holding its first row. args
+// bind as in [Database.Query]. Any error is deferred to [Row.Scan], which returns [ErrNoRows] when
+// the query produced no rows.
 func (db *Database) QueryRow(ctx context.Context, sql string, args ...any) *Row {
 	rows, err := db.Query(ctx, sql, args...)
 	return &Row{rows: rows, err: err}
 }
 
-// Query / Exec / QueryRow inside an explicit transaction — identical shape to *Database, so a
-// data-access function written against Queryer runs on either a handle or a transaction. The
-// statement runs on tx.db, so cancellation arms there.
+// Query runs sql inside the transaction and returns its rows. args bind as in [Database.Query].
+// The caller must Close the Rows, or iterate it to the end, and then check [Rows.Err].
+//
+// An error, including one reached while iterating the Rows or a canceled ctx (SQLSTATE 57014),
+// aborts the transaction: later statements fail with SQLSTATE 25P02 until it is rolled back or
+// rolled back to a savepoint. COMMIT or ROLLBACK run as SQL fails with SQLSTATE 2D000; use
+// [Transaction.Commit] or [Transaction.Rollback]. After the transaction has ended, Query fails
+// with SQLSTATE 25P01.
 func (tx *Transaction) Query(ctx context.Context, sql string, args ...any) (*Rows, error) {
 	return ergoQuery(ctx, tx.db, args, func(p []Value) (*Rows, error) { return tx.queryValues(sql, p) })
 }
 
+// Exec runs sql inside the transaction and returns its command tag. args bind as in
+// [Database.Query], and errors abort the transaction as described for [Transaction.Query]. A
+// query run through Exec is valid; its rows are read and discarded.
 func (tx *Transaction) Exec(ctx context.Context, sql string, args ...any) (Result, error) {
 	return ergoExec(ctx, tx.db, args, func(p []Value) (*Rows, error) { return tx.queryValues(sql, p) })
 }
 
+// QueryRow runs sql inside the transaction and returns a [Row] holding its first row. args bind
+// as in [Database.Query]. Any error is deferred to [Row.Scan], which returns [ErrNoRows] when the
+// query produced no rows.
 func (tx *Transaction) QueryRow(ctx context.Context, sql string, args ...any) *Row {
 	rows, err := tx.Query(ctx, sql, args...)
 	return &Row{rows: rows, err: err}
 }
 
-// QueryPrepared / ExecPrepared / QueryRowPrepared run a PreparedStatement — SQL fixed at Prepare, so
-// there is no sql argument. The same trio sits on *Database (fresh autocommit session per call),
-// *Session (this durable session), and *Transaction (inside the open block): the handle supplies the
-// session the execute observes, so one statement may be reused across sessions — and goroutines —
-// while its cached plan is reused whenever the executing handle's database + committed catalog still
-// match the cache (spec/design/api.md §2.4).
-
-// QueryPrepared runs a prepared query on a fresh autocommit session, binding native args.
+// QueryPrepared runs stmt in a new autocommit session and returns its rows, as [Database.Query]
+// does for SQL text.
 func (db *Database) QueryPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (*Rows, error) {
 	s := db.sessionWithState(newSession(db.core.env))
 	defer s.Close()
 	return ergoQuery(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryStmt(stmt.ast, p, &stmt.sc, &stmt.ic) })
 }
 
-// ExecPrepared runs a prepared statement on a fresh autocommit session and returns its command tag.
+// ExecPrepared runs stmt in a new autocommit session and returns its command tag, as
+// [Database.Exec] does for SQL text.
 func (db *Database) ExecPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (Result, error) {
 	s := db.sessionWithState(newSession(db.core.env))
 	defer s.Close()
 	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryStmt(stmt.ast, p, &stmt.sc, &stmt.ic) })
 }
 
-// QueryRowPrepared runs a prepared query and returns a one-row handle; a setup error defers to Row.Scan.
+// QueryRowPrepared runs stmt in a new autocommit session and returns a [Row] holding its first
+// row, as [Database.QueryRow] does for SQL text.
 func (db *Database) QueryRowPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) *Row {
 	rows, err := db.QueryPrepared(ctx, stmt, args...)
 	return &Row{rows: rows, err: err}
 }
 
-// QueryPrepared runs a prepared query on this session (its pinned snapshot, privileges, temp domain).
+// QueryPrepared runs stmt on the session and returns its rows, as [Session.Query] does for SQL
+// text.
 func (s *Session) QueryPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (*Rows, error) {
 	return ergoQuery(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryStmt(stmt.ast, p, &stmt.sc, &stmt.ic) })
 }
 
-// ExecPrepared runs a prepared statement on this session and returns its command tag.
+// ExecPrepared runs stmt on the session and returns its command tag, as [Session.Exec] does for
+// SQL text.
 func (s *Session) ExecPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (Result, error) {
 	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryStmt(stmt.ast, p, &stmt.sc, &stmt.ic) })
 }
 
-// QueryRowPrepared runs a prepared query and returns a one-row handle; a setup error defers to Row.Scan.
+// QueryRowPrepared runs stmt on the session and returns a [Row] holding its first row, as
+// [Session.QueryRow] does for SQL text.
 func (s *Session) QueryRowPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) *Row {
 	rows, err := s.QueryPrepared(ctx, stmt, args...)
 	return &Row{rows: rows, err: err}
 }
 
-// QueryPrepared runs a prepared query within this transaction (against its working set).
+// QueryPrepared runs stmt inside the transaction and returns its rows, as [Transaction.Query] does
+// for SQL text.
 func (tx *Transaction) QueryPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (*Rows, error) {
 	return ergoQuery(ctx, tx.db, args, func(p []Value) (*Rows, error) { return tx.queryStmt(stmt.ast, p, &stmt.sc, &stmt.ic) })
 }
 
-// ExecPrepared runs a prepared statement within this transaction and returns its command tag.
+// ExecPrepared runs stmt inside the transaction and returns its command tag, as
+// [Transaction.Exec] does for SQL text.
 func (tx *Transaction) ExecPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (Result, error) {
 	return ergoExec(ctx, tx.db, args, func(p []Value) (*Rows, error) { return tx.queryStmt(stmt.ast, p, &stmt.sc, &stmt.ic) })
 }
 
-// QueryRowPrepared runs a prepared query and returns a one-row handle; a setup error defers to Row.Scan.
+// QueryRowPrepared runs stmt inside the transaction and returns a [Row] holding its first row, as
+// [Transaction.QueryRow] does for SQL text.
 func (tx *Transaction) QueryRowPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) *Row {
 	rows, err := tx.QueryPrepared(ctx, stmt, args...)
 	return &Row{rows: rows, err: err}
 }
 
-// Query / Exec / QueryRow on a durable session — identical shape to *Database, but unlike the
-// autocommit *Database (which mints a fresh session per call) session state (an open block, session
-// variables, currval, session-local temp) persists across calls. Each runs on the session's own
-// engine, so cancellation arms on the engine that runs the statement. Sugar over the same total query
-// seam (the raw s.queryValues); Exec drains-and-discards, so a SELECT run through it streams and is
-// discarded (spec/design/api.md §11).
+// Query runs sql on the session and returns its rows. args bind as in [Database.Query]. Unlike
+// [Database.Query], which uses a new session per call, the session's state persists across
+// calls: an open transaction, settings, sequence currval and temporary tables. The caller must
+// Close the Rows, or iterate it to the end, and then check [Rows.Err]. If ctx is canceled before
+// or during execution, the statement fails with SQLSTATE 57014 and the error wraps ctx.Err().
 func (s *Session) Query(ctx context.Context, sql string, args ...any) (*Rows, error) {
 	return ergoQuery(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryValues(sql, p) })
 }
 
+// Exec runs sql on the session and returns its command tag. args bind as in [Database.Query]. A
+// query run through Exec is valid; its rows are read and discarded.
 func (s *Session) Exec(ctx context.Context, sql string, args ...any) (Result, error) {
 	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryValues(sql, p) })
 }
 
+// QueryRow runs sql on the session and returns a [Row] holding its first row. args bind as in
+// [Database.Query]. Any error is deferred to [Row.Scan], which returns [ErrNoRows] when the query
+// produced no rows.
 func (s *Session) QueryRow(ctx context.Context, sql string, args ...any) *Row {
 	rows, err := s.Query(ctx, sql, args...)
 	return &Row{rows: rows, err: err}
@@ -247,30 +277,32 @@ func (s *Session) QueryRow(ctx context.Context, sql string, args ...any) *Row {
 
 // ───────────────────────────── Result (command tag) ─────────────────────────────
 
-// Result is the command tag of a non-query statement.
+// Result is the command tag returned by Exec: the affected-row count and the execution cost.
 type Result struct {
 	rowsAffected int64
 	hasAffected  bool
 	cost         int64
 }
 
-// RowsAffected reports how many rows a DML statement touched; ok is false for DDL / transaction
-// control (which carry no count, mirroring PostgreSQL — api.md §4).
+// RowsAffected returns the number of rows an INSERT, UPDATE, DELETE or MERGE affected. ok is false
+// for a statement that carries no count, such as a query, DDL or transaction control.
 func (r Result) RowsAffected() (n int64, ok bool) { return r.rowsAffected, r.hasAffected }
 
-// Cost is the deterministic execution cost accrued (CLAUDE.md §13).
+// Cost returns the execution cost the statement accrued. Cost is deterministic: the same statement
+// on the same data always costs the same.
 func (r Result) Cost() int64 { return r.cost }
 
 // ───────────────────────────── Row (single-row) ─────────────────────────────
 
-// Row is a one-row result handle from QueryRow.
+// Row is the result of QueryRow. Read it with [Row.Scan].
 type Row struct {
 	rows *Rows
 	err  error
 }
 
-// Scan reads the single row into dest, then closes the cursor. ErrNoRows if the query was empty;
-// extra rows are ignored (database/sql / pgx semantics).
+// Scan copies the first row's columns into dest, as [Rows.Scan] does, and releases the result. It
+// returns [ErrNoRows] if the query produced no rows, or the query's error if it failed. Rows after
+// the first are ignored.
 func (row *Row) Scan(dest ...any) error {
 	if row.err != nil {
 		return row.err
@@ -287,10 +319,17 @@ func (row *Row) Scan(dest ...any) error {
 
 // ───────────────────────────── Rows: Scan / Values / Err / Close ─────────────────────────────
 
-// Scan converts the current row's columns into the pointer destinations, one per column. It uses
-// an inline type switch with explicit cases for the common types and never reflects on this path,
-// and it does not let dest escape — so it is allocation-free (api.md §11). NULL into a plain
-// scalar pointer is an error; use *jed.Null[T], *any, or a Scanner to accept NULL.
+// Scan copies the current row's columns into dest, one pointer per column. Supported
+// destinations are *int64, *int, *int32 and *int16 (an out-of-range value is an error),
+// *float64 and *float32 (from either float type or an integer), *bool, *string (text), *[]byte
+// (bytea or uuid), *[Decimal], *[Interval], *time.Time (a finite timestamp, timestamptz or date,
+// in UTC), *[ArrayVal], *[RangeVal], *[JSONNode] (jsonb), *[]Value (a composite's fields),
+// *[Value] (the raw value), *any (as [Rows.Values] converts it), and any [Scanner]. Scanning NULL
+// into any other destination is an error; use *Null[T], *any, *Value or a Scanner to accept
+// NULL.
+//
+// Scan itself does not allocate, apart from the copies it makes for *[]byte and the container
+// destinations. Call it only after [Rows.Next] returns true.
 func (r *Rows) Scan(dest ...any) error {
 	if !r.valid {
 		return errors.New("jed: Scan called without a successful Next")
@@ -307,9 +346,11 @@ func (r *Rows) Scan(dest ...any) error {
 	return nil
 }
 
-// Values returns the current row as natural Go values (pgx's Values) — for callers that do not
-// know the schema statically. Scalars map to Go primitives; rich types map to their jed value
-// type (a richer container mapping is an api.md §11 follow-up).
+// Values returns the current row as Go values, for callers that do not know the result's columns
+// in advance. NULL is nil; integers are int64; floats are float32 or float64; bool, text and
+// bytea are bool, string and []byte; a uuid is its canonical string; decimal and interval are
+// [Decimal] and [Interval]; a finite timestamp, timestamptz or date is a time.Time in UTC. Any
+// other value, including an infinite timestamp, array, range, composite or json, is its [Value].
 func (r *Rows) Values() ([]any, error) {
 	if !r.valid {
 		return nil, errors.New("jed: Values called without a successful Next")
@@ -322,15 +363,14 @@ func (r *Rows) Values() ([]any, error) {
 	return out, nil
 }
 
-// Err returns the terminal iteration error, including cancellation or a streaming execution fault.
-// Check it after the loop.
+// Err returns the error, if any, that ended iteration early, such as a canceled context (SQLSTATE
+// 57014) or a statement error raised while rows were being produced. Check it after the loop.
 func (r *Rows) Err() error { return r.err }
 
-// Close releases the cursor's pinned read snapshot (spec/design/streaming.md §5): it closes the
-// underlying cursor and deregisters the reader-liveness watermark pin (if any), advancing
-// oldestLiveTxid. A no-op for a buffered cursor (it pins nothing). Idempotent. The ergonomic
-// iterators (All/MapRows/Scan) close automatically on loop exit, as does Next on exhaustion or
-// error. A caller that stops early must Close (Go has no destructor).
+// Close releases the Rows and the database snapshot it reads from. Next closes the Rows when the
+// rows run out or an error occurs, and [Rows.All], [MapRows] and [Row.Scan] close it when they
+// finish, but a caller that stops reading early must call Close; an open Rows keeps old data from
+// being reclaimed. Close is idempotent and always returns nil.
 func (r *Rows) Close() error {
 	if r.closed {
 		return nil
@@ -348,12 +388,15 @@ func (r *Rows) Close() error {
 	return nil
 }
 
-// ColumnTypes is the canonical jed type name of each output column (parallel to ColumnNames).
+// ColumnTypes returns the type name of each result column, in the same order as
+// [Rows.ColumnNames].
 func (r *Rows) ColumnTypes() []string { return r.columnTypes }
 
 // ───────────────────────────── Rows: typed fast path ─────────────────────────────
 
-// Int returns column col as an int64 (the hot-loop accessor — skips the Scan type switch).
+// Int returns column col (0-based) of the current row as an int64. It fails if the value is not an
+// integer, including NULL. The typed accessors are a faster alternative to [Rows.Scan] in hot
+// loops.
 func (r *Rows) Int(col int) (int64, error) {
 	v, err := r.col(col)
 	if err != nil {
@@ -365,7 +408,8 @@ func (r *Rows) Int(col int) (int64, error) {
 	return v.num, nil
 }
 
-// Text returns column col as a string.
+// Text returns column col of the current row as a string. It fails if the value is not text,
+// including NULL.
 func (r *Rows) Text(col int) (string, error) {
 	v, err := r.col(col)
 	if err != nil {
@@ -377,7 +421,8 @@ func (r *Rows) Text(col int) (string, error) {
 	return v.str(), nil
 }
 
-// Bool returns column col as a bool.
+// Bool returns column col of the current row as a bool. It fails if the value is not a boolean,
+// including NULL.
 func (r *Rows) Bool(col int) (bool, error) {
 	v, err := r.col(col)
 	if err != nil {
@@ -389,7 +434,8 @@ func (r *Rows) Bool(col int) (bool, error) {
 	return v.boolVal(), nil
 }
 
-// Float returns column col as a float64 (either float width widens).
+// Float returns column col of the current row as a float64, converting from either float type or
+// an integer. It fails for any other value, including NULL.
 func (r *Rows) Float(col int) (float64, error) {
 	v, err := r.col(col)
 	if err != nil {
@@ -398,7 +444,8 @@ func (r *Rows) Float(col int) (float64, error) {
 	return asFloat(v)
 }
 
-// Bytes returns column col as a []byte (bytea or uuid).
+// Bytes returns a copy of column col of the current row, a bytea or uuid, as a []byte. It fails
+// for any other value, including NULL.
 func (r *Rows) Bytes(col int) ([]byte, error) {
 	v, err := r.col(col)
 	if err != nil {
@@ -416,7 +463,8 @@ func (r *Rows) IsNull(col int) bool {
 	return err == nil && v.kind == ValNull
 }
 
-// Value returns column col of the current row as the raw engine Value (full fidelity).
+// Value returns column col of the current row as a [Value], losing nothing. It returns a NULL
+// Value if col is out of range or there is no current row.
 func (r *Rows) Value(col int) Value {
 	v, err := r.col(col)
 	if err != nil {
@@ -445,10 +493,10 @@ func (r *Rows) colName(i int) string {
 
 // ───────────────────────────── Iterators (Go 1.23+) ─────────────────────────────
 
-// All returns a single-use iterator over the remaining rows; the yielded *Rows is positioned at
-// the current row (call Scan/typed accessors on it). The iterator Closes the cursor on loop exit
-// — break, return, panic, or exhaustion — so no `defer rows.Close()` is needed. Check rows.Err()
-// after the loop for a terminal error (e.g. a canceled context).
+// All returns a single-use iterator over the remaining rows. Each iteration yields r positioned at
+// the next row; read it with [Rows.Scan] or the typed accessors. The iterator closes r when the
+// loop ends for any reason (exhaustion, break, return or panic), so no deferred Close is needed.
+// Check [Rows.Err] after the loop.
 func (r *Rows) All() iter.Seq[*Rows] {
 	return func(yield func(*Rows) bool) {
 		defer r.Close()
@@ -460,13 +508,14 @@ func (r *Rows) All() iter.Seq[*Rows] {
 	}
 }
 
-// MapRows returns an iterator that maps each row through fn and yields (value, error). A terminal
-// stream error (a canceled ctx, a future mid-stream fault) is delivered as a final (zero, err)
-// pair. The iterator is single-use. Once iteration begins, it closes rows on
-// completion, error, or early loop exit. If it is never iterated, the caller must
-// close rows. It returns iter.Seq2[T, error], so it cannot be passed directly to
-// slices.Collect, which accepts iter.Seq[T]. Handle each error in the loop.
-// Pair with RowToStructByName for struct mapping:
+// MapRows returns a single-use iterator that maps each remaining row through fn and yields the
+// result with fn's error. Iteration stops after the first error from fn. An error that ends the
+// rows early, such as a canceled context, is yielded last as a zero value with the error.
+//
+// Once iteration begins, MapRows closes rows when the loop ends for any reason. If the iterator is
+// never used, the caller must close rows. Because it returns an iter.Seq2[T, error], it cannot be
+// passed to slices.Collect, which takes an iter.Seq[T]; handle each error in the loop. Pair it with
+// [RowToStructByName] to map rows to structs:
 //
 //	for u, err := range jed.MapRows(rows, jed.RowToStructByName[User]) { ... }
 func MapRows[T any](rows *Rows, fn func(*Rows) (T, error)) iter.Seq2[T, error] {
@@ -490,7 +539,9 @@ func MapRows[T any](rows *Rows, fn func(*Rows) (T, error)) iter.Seq2[T, error] {
 
 // ───────────────────────────── Generic row mappers ─────────────────────────────
 
-// RowTo scans a single-column row into a T (for `SELECT count(*)`-shaped queries).
+// RowTo returns the current row's only column as a T, converted as [Rows.Scan] converts into a *T.
+// It fails if the row does not have exactly one column. Use it with [MapRows], or for a query such
+// as SELECT count(*).
 func RowTo[T any](rows *Rows) (T, error) {
 	var out T
 	if !rows.valid {
@@ -504,11 +555,11 @@ func RowTo[T any](rows *Rows) (T, error) {
 	return out, err
 }
 
-// RowToStructByName maps the current row into a struct T by matching column names against `db:"…"`
-// tags (falling back to the field name, case-insensitively). An exact `db:"-"` tag excludes
-// a field. Every result column must match an exported, non-excluded field or mapping fails.
-// This is the convenience path: it
-// reflects once per row, which is fine off the hot loop — use Scan / typed accessors when it isn't.
+// RowToStructByName returns the current row as a struct T, matching each column name,
+// case-insensitively, to an exported field's `db:"name"` tag or, without a tag, its field name. A
+// `db:"-"` tag excludes a field. It fails if a column has no matching field; fields with no
+// matching column keep their zero value. It uses reflection on every row, so prefer [Rows.Scan]
+// or the typed accessors in hot loops.
 func RowToStructByName[T any](rows *Rows) (T, error) {
 	var out T
 	if !rows.valid {
@@ -550,15 +601,17 @@ func RowToStructByName[T any](rows *Rows) (T, error) {
 
 // ───────────────────────────── Null[T] ─────────────────────────────
 
-// Null[T] is a nullable scan target / parameter for any supported scalar T (the generic analog of
-// sql.NullInt64 etc.). It implements Scanner and Valuer, so it slots into Scan and the arg path
-// without a per-type case.
+// Null is a value of type T that may be NULL, usable as a scan destination and as a query
+// argument, like database/sql's sql.Null. T is any type Scan and the query methods accept.
 type Null[T any] struct {
-	Val   T
+	// Val is the value. It is ignored when Valid is false; scanning NULL sets it to T's zero value.
+	Val T
+	// Valid reports whether the value is not NULL.
 	Valid bool
 }
 
-// ScanJed receives a Value: NULL clears Valid, anything else scans into Val.
+// ScanJed implements [Scanner]. NULL sets Val to its zero value and Valid to false; any other value
+// is converted into Val, and Valid is set to true.
 func (n *Null[T]) ScanJed(v Value) error {
 	if v.kind == ValNull {
 		var z T
@@ -569,7 +622,8 @@ func (n *Null[T]) ScanJed(v Value) error {
 	return assignValue(v, &n.Val)
 }
 
-// JedValue produces the parameter Value: NULL when !Valid, else Val converted.
+// JedValue implements [Valuer]. It returns NULL when Valid is false, else Val converted as a query
+// argument.
 func (n Null[T]) JedValue() (Value, error) {
 	if !n.Valid {
 		return NullValue(), nil
@@ -673,10 +727,10 @@ func toValue(a any) (Value, error) {
 
 // ───────────────────────────── scan conversion (Value → *T) ─────────────────────────────
 
-// Scan converts v into dest, a pointer, as Rows.Scan converts a column. Besides the Rows.Scan
-// destinations it accepts *ArrayVal for an array, *RangeVal for a range, *JSONNode for jsonb, and
-// *[]Value for a composite's fields; the result is a copy the caller may modify. NULL into a
-// plain pointer is an error: use *Null[T], *any, *Value, or a Scanner.
+// Scan converts v into dest, a pointer, as [Rows.Scan] converts a column, including into
+// *[ArrayVal] for an array, *[RangeVal] for a range, *[JSONNode] for jsonb and *[]Value for a
+// composite's fields. The result is a copy the caller may modify. Scanning NULL into a plain
+// pointer is an error; use *Null[T], *any, *Value or a [Scanner].
 func (v Value) Scan(dest any) error { return scanOne(v, dest) }
 
 func scanOne(v Value, dest any) error {

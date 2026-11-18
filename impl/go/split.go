@@ -9,22 +9,23 @@ import (
 // session-level ExecuteScript convenience (§4.2). The splitter depends on NEITHER Session nor
 // Engine — a top-level core export, conceptually part of the lexer surface (CLAUDE.md §5).
 
-// StatementSpan is one statement carved out of a multi-statement string (spec/design/session.md
-// §4.1). Text is the statement's source — feed it to queryValues/Prepare — and Offset is
-// the byte offset of its first significant byte in the original input (for error reporting).
+// StatementSpan is one statement of a multi-statement string, as yielded by [SplitStatements].
 type StatementSpan struct {
-	Text   string
+	// Text is the statement's SQL, without the terminating semicolon and with leading and trailing
+	// whitespace and comments removed. Pass it to Query, Exec or Prepare.
+	Text string
+	// Offset is the byte offset of Text in the original string, for error reporting.
 	Offset int
 }
 
-// SplitStatements returns a lazy iterator over the statements in sql (spec/design/session.md §4.1),
-// splitting on top-level `;` while respecting string literals, quoted identifiers, dollar-quoted
-// strings, and line/block comments — a `;` inside any of those is never a boundary. It is pure and total (no
-// Session/Engine, never an error: a lone `!` is just a byte to the splitter — the parse error is
-// the host's when it runs the span). Empty spans (a leading/standalone `;`, or whitespace/comment-
-// only text between separators) are skipped, so every yielded span has significant content; the
-// text has leading/trailing whitespace and comments trimmed (interior comments kept). It buffers
-// nothing across statements — an O(n) scan, no parse tree.
+// SplitStatements returns an iterator over the statements in sql, split at each semicolon that is
+// not inside a string literal, quoted identifier, dollar-quoted string or comment. It does not
+// parse the statements and never fails; a malformed statement is yielded as is and fails when it
+// is run. Empty statements, those with only whitespace or comments, are skipped. Each statement's
+// text has leading and trailing whitespace and comments removed; comments inside it are kept.
+//
+// Use SplitStatements to run a script statement by statement, for example to manage transactions
+// yourself; [Session.ExecuteScript] runs a whole script in one call.
 func SplitStatements(sql string) iter.Seq[StatementSpan] {
 	return func(yield func(StatementSpan) bool) {
 		b := []byte(sql)
@@ -159,17 +160,15 @@ func dollarTagLen(b []byte, i int) int {
 func isTagAlpha(c byte) bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
 func isTagDigit(c byte) bool { return c >= '0' && c <= '9' }
 
-// ScriptSummary is the O(1) summary of an ExecuteScript run (spec/design/session.md §4.2). It
-// carries only counts — never the result rows, which ExecuteScript discards — so memory is bounded
-// by construction regardless of how many rows the script's statements touch.
+// ScriptSummary is the result of [Database.ExecuteScript] and [Session.ExecuteScript]. It holds
+// only totals; the rows the script's queries return are discarded.
 type ScriptSummary struct {
-	// StatementsRun is how many statements ran (each non-empty span the splitter yielded).
+	// StatementsRun is the number of statements that ran.
 	StatementsRun int64
-	// RowsAffectedTotal is the sum of the DML command-tag counts (INSERT/UPDATE/DELETE rows
-	// affected). A SELECT or a DDL/transaction-control statement contributes nothing.
+	// RowsAffectedTotal is the total number of rows affected by the script's INSERT, UPDATE,
+	// DELETE and MERGE statements. Queries and DDL add nothing.
 	RowsAffectedTotal int64
-	// Cost is the total accrued execution cost across every statement (the deterministic cost
-	// meter, CLAUDE.md §13) — the figure a future lifetime_max_cost budget bounds.
+	// Cost is the total execution cost of the script's statements.
 	Cost int64
 }
 

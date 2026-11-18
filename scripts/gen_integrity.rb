@@ -46,14 +46,45 @@ def rust_file
   out << "];\n"
 end
 
+# go_doc renders a registry description as the Go doc comment of constant name: "<name> means
+# <description>", with the sentence-initial field names (object, key, page) capitalized to the
+# IntegrityFinding field names, wrapped at 100 columns (a tab counted as 4).
+def go_doc(name, description)
+  text = description.sub(/\A./, &:downcase).gsub(/(\. |; )(object|key|page)\b/) { "#{$1}#{$2.capitalize}" }
+  lines = []
+  line = +"// #{name} means"
+  text.split(" ").each do |word|
+    if 4 + line.length + 1 + word.length > 100
+      lines << line
+      line = +"// #{word}"
+    else
+      line << " " << word
+    end
+  end
+  lines << line
+  lines.map { |l| "\t#{l}\n" }.join
+end
+
 def go_file
   out = +"// #{HEADER}\n\npackage jed\n\n"
-  out << "// IntegrityKind names what an [IntegrityFinding] found wrong. Its string form is the registered\n// finding kind, identical in every core.\ntype IntegrityKind string\n\n"
-  out << "// IntegritySkipReason names why an [IntegritySkip] could not check an object. Its string form is\n// the registered skip reason, identical in every core.\ntype IntegritySkipReason string\n\n"
-  out << "// Integrity-check finding kinds.\nconst (\n"
-  findings.each { |f| out << "\t// Integrity#{pascal(f['kind'])}: #{f['description']}\n\tIntegrity#{pascal(f['kind'])} IntegrityKind = \"#{f['kind']}\"\n" }
-  out << ")\n\n// Integrity-check skip reasons.\nconst (\n"
-  skips.each { |s| out << "\t// IntegritySkip#{pascal(s['reason'])}: #{s['description']}\n\tIntegritySkip#{pascal(s['reason'])} IntegritySkipReason = \"#{s['reason']}\"\n" }
+  out << "// IntegrityKind names what an [IntegrityFinding] found wrong. Its value is a stable snake_case\n" \
+         "// name, such as \"page_corrupt\", that is the same in every jed implementation.\n" \
+         "type IntegrityKind string\n\n"
+  out << "// IntegritySkipReason names why an [IntegritySkip] could not check an object. Its value is a\n" \
+         "// stable snake_case name, such as \"missing_host_function\", that is the same in every jed\n" \
+         "// implementation.\ntype IntegritySkipReason string\n\n"
+  out << "// The integrity-check finding kinds, in the order of the checks that report them: the database\n" \
+         "// header and catalog, table and index structure, free-space accounting, index agreement\n" \
+         "// ([IntegrityFull] only) and constraints ([IntegrityCheckOptions].Constraints only).\nconst (\n"
+  findings.each do |f|
+    name = "Integrity#{pascal(f['kind'])}"
+    out << go_doc(name, f["description"]) << "\t#{name} IntegrityKind = \"#{f['kind']}\"\n"
+  end
+  out << ")\n\n// The integrity-check skip reasons.\nconst (\n"
+  skips.each do |s|
+    name = "IntegritySkip#{pascal(s['reason'])}"
+    out << go_doc(name, s["description"]) << "\t#{name} IntegritySkipReason = \"#{s['reason']}\"\n"
+  end
   out << ")\n\n// integrityFindingKinds lists every finding kind, in registry order.\nvar integrityFindingKinds = []IntegrityKind{\n"
   findings.each { |f| out << "\tIntegrity#{pascal(f['kind'])},\n" }
   out << "}\n\n// integritySkipReasons lists every skip reason, in registry order.\nvar integritySkipReasons = []IntegritySkipReason{\n"

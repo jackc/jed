@@ -38,9 +38,12 @@ const (
 	expLimit = int64(decimalMaxIntDigits) + int64(maxScale) + 2
 )
 
-// Decimal is an exact base-10 decimal. Neg is the sign (always false for zero — no negative
-// zero); Scale is the display scale; Limbs is the coefficient magnitude (base 10^9, LSB-first,
-// no high zero limbs; nil/empty == zero).
+// Decimal is an exact base-10 number, the Go form of a SQL decimal (numeric) value. It is always
+// finite and has no negative zero. Besides its numeric value it carries a scale, the number of
+// digits after the decimal point: 1.50 has scale 2, and 1.5 has scale 1. The scale affects only
+// the text form; 1.50 and 1.5 compare equal.
+//
+// The zero Decimal is 0 with scale 0. Build one with [ParseDecimal].
 type Decimal struct {
 	neg   bool
 	scale uint32
@@ -85,9 +88,9 @@ func decimalFromDigitsScale(neg bool, digits string, scale uint32) Decimal {
 	return newDecimal(neg, scale, magFromDecimalStr(digits))
 }
 
-// ParseDecimal parses s as a decimal for a host to bind as a parameter (spec/design/api.md §5): the
-// text→decimal input form (optional sign, digits with at most one '.', optional e-notation), its
-// scale as written ("1.50" has scale 2). Malformed input is a 22P02 engine error.
+// ParseDecimal parses s as a decimal: an optional sign, digits with at most one '.', and an
+// optional exponent ("1.5e3"). The scale is as written, so "1.50" has scale 2. Malformed input
+// fails with SQLSTATE 22P02.
 func ParseDecimal(s string) (Decimal, error) { return parseDecimalLiteral(s) }
 
 // decimalFromParts is the canonical (coefficient digits, scale) for a decimal literal, from its
@@ -152,7 +155,7 @@ func decimalFromRadixDigits(neg bool, digits string, base int) (Decimal, error) 
 	return newDecimal(neg, 0, limbs), nil
 }
 
-// IsZero reports whether the value is zero.
+// IsZero reports whether d is zero, at any scale.
 func (d Decimal) IsZero() bool { return len(d.limbs) == 0 }
 
 // precision is the number of significant digits in the coefficient (0 for zero).
@@ -198,7 +201,8 @@ func (d Decimal) canonicalString() string {
 	return sign + digits + "e" + strconv.FormatUint(uint64(scale), 10)
 }
 
-// Cmp is the total order over finite decimals by value: <0, 0, >0.
+// Cmp compares d and o by numeric value, ignoring scale. It returns -1 if d < o, 0 if they are
+// equal, and +1 if d > o.
 func (d Decimal) Cmp(o Decimal) int {
 	if d.neg != o.neg {
 		if d.neg { // neg sorts below non-neg; zero is non-neg
@@ -227,8 +231,9 @@ func (d Decimal) cmpMagLimbs(o Decimal) int {
 	return magCmp(a, b)
 }
 
-// String is the canonical decimal string (spec/design/decimal.md §6): optional '-', the integer
-// digits, and — iff Scale > 0 — '.' and exactly Scale fractional digits.
+// String returns d in plain decimal notation: an optional '-', the integer digits, and, when the
+// scale is above 0, a '.' followed by exactly scale digits. ParseDecimal("1.50").String() is
+// "1.50".
 func (d Decimal) String() string {
 	digits := magToDecimalStr(d.limbs) // "0" for zero
 	var b strings.Builder

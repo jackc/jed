@@ -27,39 +27,55 @@ import "fmt"
 // runtime taint yet, for floats or anything). `Cost` IS enforced: the declared static weight
 // (cost.md §6 design (a)) is charged per call.
 
-// Volatility is a host function's planning volatility (PostgreSQL's notion). Recorded on
-// registration; only VolatilityImmutable will later admit constant-folding / an index-backing
-// expression (extensibility.md §4.2 / §8.1). This slice folds no host function regardless.
+// Volatility declares how stable a host function's results are, as PostgreSQL's function
+// volatility does. Set it with [HostFunction.WithVolatility]; the default is VolatilityVolatile.
 type Volatility int
 
+// The volatility levels, from most to least stable.
 const (
-	// VolatilityImmutable: same inputs ⇒ same output, forever. The only rung that will later back an
-	// index expression or be constant-folded.
+	// VolatilityImmutable declares that the function always returns the same result for the same
+	// arguments. Only an immutable function may appear in an index expression.
 	VolatilityImmutable Volatility = iota
-	// VolatilityStable: stable within a single statement, not across.
+	// VolatilityStable declares that the function returns the same result for the same arguments
+	// within one statement, but not necessarily across statements.
 	VolatilityStable
-	// VolatilityVolatile: may differ on every call (the safe default).
+	// VolatilityVolatile declares that the function may return a different result on every call.
+	// It is the default. A volatile function is always called exactly once per row it is
+	// evaluated for; a more stable batch function may be called ahead on a batch of rows.
 	VolatilityVolatile
 )
 
-// HostKernel maps evaluated argument values to a result value (or an error). STRICT — never invoked
-// with a NULL argument (the engine short-circuits NULL→NULL, §4.2).
+// HostKernel computes a host function's result for one row. args holds one value per declared
+// argument, already converted to the declared types. Host functions are strict: when any argument
+// is NULL the result is NULL and the kernel is not called, so args never contains a NULL. A
+// returned error fails the statement.
 type HostKernel func(args []Value) (Value, error)
 
-// HostBatchKernel is a host BATCH kernel (extensibility.md §4.2.1) — the column-in → column-out ABI
-// every host function is evaluated through. args is column-major: args[j][i] is argument j of row i;
-// every column has the same length n ≥ 1 and holds no NULL (strict — a row with a NULL argument is
-// never sent). The kernel appends one result per row, in row order, to out (handed in empty) and
-// returns it. On error, the length of the returned slice is the index of the failing row — the rows
-// before it succeeded — so a batch raises for the same row a single-row call would. Must be the
-// row-wise map of a scalar function: result i depends only on row i's arguments. A zero-argument
-// kernel (no columns) is always handed exactly one row.
+// HostBatchKernel computes a host function's results for a batch of rows in one call. args is
+// column-major: args[j][i] is argument j of row i. Every column has the same length n, at least 1,
+// and holds no NULL: as with [HostKernel], a row with a NULL argument gets a NULL result without
+// being sent. A function with no arguments is always given exactly one row.
+//
+// The kernel appends one result per row, in row order, to out (passed in empty) and returns it.
+// To fail, it returns the results of the rows before the failing one together with the error, so
+// the number of results returned is the index of the failing row and the statement fails at the
+// same row a one-row-at-a-time call would. Returning too few or too many results otherwise fails
+// with SQLSTATE 22000. Result i must depend only on row i's arguments.
 type HostBatchKernel func(args [][]Value, out []Value) ([]Value, error)
 
-// HostFunction is a host scalar function to register (extensibility.md §4.2). Build it with
-// NewHostFunction (a single-row kernel) or NewHostBatchFunction (a batch kernel, §4.2.1) — safe
-// defaults: Volatile, not cross-core, unit cost — and refine with the fluent setters. Argument/result types are canonical scalar type NAMES ("i64", "text", "f64", … — the
-// spellings scalarTypeFromName accepts), resolved at RegisterFunction.
+// HostFunction describes a scalar function written in Go that SQL can call. Create one with
+// [NewHostFunction] or [NewHostBatchFunction], adjust it with the With methods, and register it
+// with [EnvironmentBuilder.RegisterFunction]. Host functions take and return existing SQL types;
+// they live in the [Environment], not in the database file, so every process that opens a
+// database must register the functions its queries, indexes and CHECK constraints use.
+//
+// Argument and result types are lowercase SQL type names: "int2"/"smallint", "int4"/"int"/
+// "integer", "int8"/"bigint", "numeric"/"decimal", "real"/"float4", "double precision"/"float8"/
+// "float", "text"/"varchar", "boolean"/"bool", "bytea", "uuid", "date", "timestamp",
+// "timestamptz", "interval", "json", "jsonb" and "jsonpath". Unknown names fail at registration.
+//
+// When a host function has the same name and argument types as a built-in function, the
+// built-in is called.
 type HostFunction struct {
 	name         string
 	argTypeNames []string
@@ -86,10 +102,9 @@ type HostFunction struct {
 	batchKernel HostBatchKernel
 }
 
-// NewHostFunction builds a host scalar function with a SINGLE-ROW kernel and safe defaults — Volatile,
-// not cross-core-deterministic, unit cost. Refine with WithVolatility / WithCrossCore / WithCost. A
-// batch evaluation calls it once per row (§4.2.1); use NewHostBatchFunction to take a whole column per
-// call instead.
+// NewHostFunction returns a host function named name that takes arguments of argTypes, returns
+// resultType, and computes each row with kernel. It starts volatile, not cross-core, with cost 1
+// and no component identity. Use [NewHostBatchFunction] to process many rows per call instead.
 func NewHostFunction(name string, argTypes []string, resultType string, kernel HostKernel) *HostFunction {
 	return &HostFunction{
 		name:         name,
@@ -102,9 +117,8 @@ func NewHostFunction(name string, argTypes []string, resultType string, kernel H
 	}
 }
 
-// NewHostBatchFunction builds a host scalar function with a BATCH kernel (extensibility.md §4.2.1) —
-// one call per column of rows rather than per row, which amortizes a per-call boundary. Same safe
-// defaults as NewHostFunction.
+// NewHostBatchFunction is like [NewHostFunction] but takes a batch kernel, called once for many
+// rows, which amortizes per-call overhead. It has the same defaults.
 func NewHostBatchFunction(name string, argTypes []string, resultType string, kernel HostBatchKernel) *HostFunction {
 	return &HostFunction{
 		name:         name,
@@ -117,25 +131,30 @@ func NewHostBatchFunction(name string, argTypes []string, resultType string, ker
 	}
 }
 
-// WithVolatility declares the planning volatility (default Volatile).
+// WithVolatility sets the function's volatility (default VolatilityVolatile) and returns f.
 func (f *HostFunction) WithVolatility(v Volatility) *HostFunction { f.volatility = v; return f }
 
-// WithCrossCore declares the function's results cross-core byte-identical (default false). Recorded
-// for the determinism ledger (§10); not enforced this slice.
+// WithCrossCore declares whether the function returns byte-identical results in every jed
+// implementation (default false) and returns f. It is currently recorded only.
 func (f *HostFunction) WithCrossCore(b bool) *HostFunction { f.crossCore = b; return f }
 
-// WithCost declares the per-call static cost weight (default 1; cost.md §6 design (a)). Must be
-// non-negative.
+// WithCost sets the cost charged to the statement's execution-cost meter for each call (default
+// 1) and returns f. A negative cost fails at registration with SQLSTATE 22023.
 func (f *HostFunction) WithCost(c int64) *HostFunction { f.cost = c; return f }
 
-// WithComponentID declares the COMPONENT IDENTITY (extensibility.md §7, step 4) — a stable string that
-// names this function's implementation independently of its SQL name. Required to use the function in a
-// persisted index expression (§8.1). Default unset (nil).
+// WithComponentID sets the function's component identity and returns f. The identity is a stable
+// string naming the implementation independently of its SQL name, such as
+// "com.example/geo_hash". It is required to use the function in an index expression or a CHECK
+// constraint (otherwise creating the index or constraint fails with SQLSTATE 42P17); the database
+// records it and checks it when the index or constraint is used. Default unset.
 func (f *HostFunction) WithComponentID(id string) *HostFunction { f.componentID = &id; return f }
 
-// WithSemanticVersion declares the SEMANTIC VERSION (extensibility.md §7) — bump it when a change to
-// the results would invalidate keys/values derived from the function. A dependent index records this
-// and a mismatch on reopen forces a rebuild, never a silent stale-key read. Default 0.
+// WithSemanticVersion sets the function's semantic version (default 0) and returns f. Increase it
+// whenever a change to the function's results would invalidate stored data derived from it. An
+// index or CHECK constraint records the component identity and version it was built with; when
+// the registered function no longer matches, queries stop using the index, writes to the table
+// and statements that evaluate the constraint fail with SQLSTATE XX002, and the index must be
+// rebuilt or the constraint re-added.
 func (f *HostFunction) WithSemanticVersion(v uint32) *HostFunction { f.semanticVersion = v; return f }
 
 // hostFuncEntry is a registered host function with its types RESOLVED (the internal form the

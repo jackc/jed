@@ -54,9 +54,11 @@ type zoneRef struct {
 }
 
 // TimeZoneInfo describes a named time zone or alias loaded into an Environment.
-// TzdataVersion identifies the time-zone database release supplying its rules.
 type TimeZoneInfo struct {
-	Name          string
+	// Name is the zone or alias name, such as "America/Chicago".
+	Name string
+	// TzdataVersion identifies the time-zone database release that supplies the zone's rules,
+	// such as "2024a".
 	TzdataVersion string
 }
 

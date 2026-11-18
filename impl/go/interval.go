@@ -25,11 +25,19 @@ const (
 	microDaysPerDay = int64(1_000_000) // TSROUND's 1e-6 quantum, applied to the fractional-month days
 )
 
-// Interval is a span of time — three independent fields. Comparison/ordering/dedup go through the
-// canonical 128-bit span (Span), NOT the field triple, so `'1 mon'` == `'30 days'` == `'720:00:00'`.
+// Interval is the Go form of a SQL interval value. As in PostgreSQL, it keeps months, days and
+// microseconds as three independent fields, so adding '1 month' to a timestamp moves it by one
+// calendar month rather than a fixed number of days.
+//
+// SQL compares intervals by their total span, counting a month as 30 days and a day as 24 hours,
+// so '1 mon', '30 days' and '720:00:00' are equal in SQL even though their Interval fields
+// differ. Comparing two Intervals with == compares the fields.
 type Interval struct {
+	// Months is the number of months (a year is 12 months).
 	Months int32
-	Days   int32
+	// Days is the number of days.
+	Days int32
+	// Micros is the time part in microseconds.
 	Micros int64
 }
 

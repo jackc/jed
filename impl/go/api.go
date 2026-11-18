@@ -9,6 +9,7 @@ import "context"
 // AccessMode selects whether a transaction may write.
 type AccessMode uint8
 
+// Transaction access modes, for [TxOptions].
 const (
 	// ReadWrite transactions may read and write. It is the zero value, PostgreSQL's default.
 	// Beginning one waits for the database's single writer slot.
@@ -21,6 +22,8 @@ const (
 // TxOptions configures a transaction started by Begin or BeginFunc. The zero value is a
 // read-write transaction.
 type TxOptions struct {
+	// AccessMode is ReadWrite (the default) or ReadOnly. Any other value makes Begin fail with
+	// SQLSTATE 22023.
 	AccessMode AccessMode
 }
 
@@ -106,8 +109,8 @@ func errInvalidTransactionTermination() error {
 	return newError(InvalidTransactionTermination, "invalid transaction termination")
 }
 
-// Render renders v as PostgreSQL shows a result column, in the transaction's session time zone.
-// See Session.Render.
+// Render formats v as PostgreSQL displays a result column, rendering timestamptz values in the
+// transaction's session time zone, as [Session.Render] does.
 func (tx *Transaction) Render(v Value) (string, error) {
 	return v.renderIn(tx.db.session.timeZone)
 }
@@ -192,14 +195,11 @@ func (db *engine) withTx(writable bool, fn func(tx *Transaction) error) error {
 	return tx.Commit(context.Background())
 }
 
-// PreparedStatement is a parsed, reusable statement (spec/design/api.md §2.4): a standalone value
-// holding only the parsed AST and its plan cache — no session or database reference (the converged
-// cross-core shape; Rust arrived here via the borrow checker, api.md §6). It is run by handing it to
-// a handle's QueryPrepared / ExecPrepared / QueryRowPrepared (Database, Session, or Transaction —
-// ergonomic.go): the handle chosen at each call supplies the session the execute observes (privilege
-// envelope, pinned snapshot, temp domain, writer gate), so one statement outlives any session and may
-// be shared across sessions — and across goroutines (the plan cache is a lock-free atomic slot; the
-// executing handle itself keeps its own single-goroutine contract).
+// PreparedStatement is a statement parsed once by Prepare and run any number of times. It is not
+// tied to a session: run it with the QueryPrepared, ExecPrepared or QueryRowPrepared method of a
+// [Database], [Session] or [Transaction], which supplies the session it runs in (its privileges,
+// snapshot and temporary tables). A PreparedStatement may be shared across sessions and
+// goroutines. Its query plan is cached and reused until a schema change requires planning again.
 type PreparedStatement struct {
 	ast statement
 	// sc memoizes the resolved scan plan across executes so a repeated query skips planning (the
@@ -267,12 +267,27 @@ func (db *engine) queryStmt(stmt statement, params []Value, sc *stmtCache, ic *i
 	return rowsFromOutcome(out, db.session.queryAccount()), nil
 }
 
-// Rows is a cursor over a statement's rows (spec/design/api.md §4). It walks the pull source (cursor.go)
-// one row at a time, exposing the column names, command tag, and accrued execution cost. The source is
-// buffered for the materialized drive (a write / a shape no lazy lane covers) and a lazy streaming pull
-// pipeline (S3, streaming.md §4) for a single-table no-blocking-op read — the seam is the same either
-// way, so callers are unchanged. It is the one result type of the total queryValues seam: a non-query
-// statement is a Rows with no output columns, carrying its command tag (rowsAffected).
+// Rows is the result of Query: a statement's rows, read one at a time, with the column names and
+// types, the command tag and the execution cost. Rows are produced as they are read, so a large
+// result need not fit in memory. A statement that returns no rows yields a Rows with no columns
+// whose command tag is in [Rows.RowsAffected].
+//
+// Read the rows with [Rows.Next] and [Rows.Scan], or with [Rows.All] or [MapRows], then check
+// [Rows.Err]. Call [Rows.Close] if you stop before the end:
+//
+//	rows, err := db.Query(ctx, "SELECT id, name FROM users")
+//	if err != nil {
+//		return err
+//	}
+//	defer rows.Close()
+//	for rows.Next() {
+//		var id int64
+//		var name string
+//		if err := rows.Scan(&id, &name); err != nil {
+//			return err
+//		}
+//	}
+//	return rows.Err()
 type Rows struct {
 	// executionComplete marks materialized results, whose execution and any commit
 	// finished before Query returned. Later cancellation cannot undo that success.
@@ -350,8 +365,9 @@ func (r *Rows) setErr(err error) {
 	}
 }
 
-// Next advances to the next row, returning false when the result is exhausted OR the captured
-// context has been canceled (Err then reports the cancellation).
+// Next advances to the next row and reports whether there is one. It returns false when the rows
+// run out, when producing a row fails, or when the query's context is canceled while rows are
+// still being produced; [Rows.Err] tells which. Next closes the Rows when it returns false.
 func (r *Rows) Next() bool {
 	r.valid = false
 	if r.closed || r.err != nil {
@@ -380,18 +396,19 @@ func (r *Rows) Next() bool {
 	return true
 }
 
-// Row returns the current row (valid after a Next that returned true).
+// Row returns the current row's values. It is meaningful only after [Rows.Next] returns true.
 func (r *Rows) Row() []Value { return r.current }
 
-// ColumnNames are the output column names of the query result.
+// ColumnNames returns the names of the result columns. A statement that returns no rows has
+// none.
 func (r *Rows) ColumnNames() []string { return r.columnNames }
 
-// Cost is the deterministic execution cost accrued by the query (CLAUDE.md §13).
+// Cost returns the execution cost the statement has accrued so far; once every row has been read,
+// it is the statement's total. Cost is deterministic: the same statement on the same data always
+// costs the same.
 func (r *Rows) Cost() int64 { return r.cursor.costAccrued() }
 
-// RowsAffected reports the command tag carried on a Rows: how many rows a DML statement
-// (INSERT/UPDATE/DELETE without RETURNING) touched; ok is false for a SELECT / DDL / transaction
-// control, which have no count (spec/design/api.md §4). This is how the exec-side path (Exec) surfaces
-// the tag after draining the result set — a statement run through the total query seam is a Rows with
-// no columns whose tag lives here.
+// RowsAffected returns the number of rows an INSERT, UPDATE, DELETE or MERGE without RETURNING
+// affected. ok is false for a statement that carries no count, such as a query, DDL or
+// transaction control. Exec returns the same count in its [Result].
 func (r *Rows) RowsAffected() (n int64, ok bool) { return r.rowsAffected, r.hasAffected }

@@ -5,24 +5,23 @@ import (
 	"errors"
 )
 
-// DeserializeOptions are the handle settings of an in-memory database built from bytes
-// (spec/design/api.md §2.8). Its page size and contents come from the image.
+// DeserializeOptions are the settings of an in-memory database built by [Deserialize]. The page
+// size and contents come from the image itself.
 type DeserializeOptions struct {
-	// Environment is the environment the database runs in (spec/design/environment.md), as for
-	// CreateOptions.Environment; the image's collation references resolve against it. nil ⇒ a fresh
-	// empty environment.
+	// Environment supplies the loaded Unicode and time-zone data, host functions, and random and
+	// clock sources, as for CreateOptions.Environment; the image's collation references resolve
+	// against it. nil uses a fresh, empty Environment.
 	Environment *Environment
-	// MaxStorageBytes is the committed-storage limit in bytes (spec/design/memory.md §8), as for
-	// CreateOptions.MaxStorageBytes. Zero or negative is unlimited (the default).
+	// MaxStorageBytes is the committed-storage limit in bytes, as for
+	// CreateOptions.MaxStorageBytes. 0 selects the default, no limit; Unlimited also sets none.
 	MaxStorageBytes int64
 }
 
-// Deserialize builds a new in-memory database whose initial state is the database image data
-// (spec/design/api.md §2.8; SQLite's sqlite3_deserialize): the bytes of a jed database file, or what
-// Database.Serialize returned. The bytes are copied — the caller keeps its buffer — and the image is
-// opened as a file is, from its newer valid meta slot, at the image's own page size and version.
-// Later commits change only the in-memory copy; serialize again to get them back as bytes. A
-// malformed image is XX001; an encrypted one is 55000 (an in-memory database cannot be encrypted).
+// Deserialize builds a new in-memory database whose initial state is the database image data:
+// the bytes of a jed database file, or what [Database.Serialize] returned. data is copied, so the
+// caller keeps its buffer. Later commits change only the in-memory copy; call Serialize again to
+// get them back as bytes. A malformed image fails with SQLSTATE XX001, and an encrypted one with
+// 55000 (an in-memory database cannot be encrypted).
 func Deserialize(data []byte, opts DeserializeOptions) (*Database, error) {
 	if err := opts.normalizeLimits(); err != nil {
 		return nil, err
@@ -44,15 +43,14 @@ func Deserialize(data []byte, opts DeserializeOptions) (*Database, error) {
 	return databaseOver(c), nil
 }
 
-// Serialize exports database name — `main` or an attachment, exact name — as bytes
-// (spec/design/api.md §2.8; SQLite's sqlite3_serialize): the clean from-scratch image of its
-// committed state, at its page size and committed version, which Deserialize loads and which
-// is also a valid database file. The image holds no dead pages and is byte-identical in every core
-// for the same committed state. The export pins the committed snapshot as a read session does and
-// never takes the writer gate: commits proceed meanwhile and are not included, and an open
-// transaction's uncommitted changes never are. Errors: 42704 for a name that is not attached (and
-// for temp), 0A000 for an encrypted database (the export would be plaintext). A host-API act — not
-// metered and not reachable from SQL.
+// Serialize returns the committed state of database name ("main" or an attachment) as bytes:
+// a compact image with no dead pages, which [Deserialize] loads and which is also a valid
+// database file. The same committed state always produces the same bytes. Serialize reads a
+// snapshot and never waits for the writer slot: commits that land meanwhile are not included,
+// and neither are an open transaction's uncommitted changes. ctx is checked before the export
+// starts. It fails with SQLSTATE 42704 for a name that is not attached (including temp) and
+// 0A000 for an encrypted database, since the image would be plaintext. Serialize is not
+// reachable from SQL and is not charged to any cost limit.
 func (db *Database) Serialize(ctx context.Context, name string) ([]byte, error) {
 	if err := doneErr(contextDone(ctx)); err != nil {
 		return nil, contextError(ctx, err)

@@ -56,27 +56,29 @@ const (
 	credentialKey        byte = 2
 )
 
-// Credential unlocks an encrypted database: a passphrase (the key-encryption key is Argon2id of it)
-// or a 32-byte key the host keeps elsewhere (the KEK is HKDF of it). It is an argument of
-// create/open/attach, never a setting, and no formatting verb ever shows it
-// (spec/design/encryption.md §5). Build one with PassphraseCredential or KeyCredential.
+// Credential unlocks an encrypted database. It is either a passphrase, which is stretched with
+// Argon2id, or a 32-byte key the host keeps elsewhere. Build one with [PassphraseCredential] or
+// [KeyCredential] and pass it to [Create], [Open], or [AttachSource.WithCredential]. A credential
+// is never stored in the file, and printing one with any fmt verb shows only a redacted form.
 type Credential struct {
 	kind       byte
 	passphrase string
 	key        [32]byte
 }
 
-// PassphraseCredential is a passphrase credential.
+// PassphraseCredential returns a credential that derives the database's unlocking key from
+// passphrase with Argon2id. The Argon2id cost is chosen at create time; see [Argon2Params].
 func PassphraseCredential(passphrase string) *Credential {
 	return &Credential{kind: credentialPassphrase, passphrase: passphrase}
 }
 
-// KeyCredential is a host-supplied 32-byte key credential.
+// KeyCredential returns a credential for a 32-byte key the host supplies, for example from a
+// key-management service. No passphrase stretching is applied.
 func KeyCredential(key [32]byte) *Credential {
 	return &Credential{kind: credentialKey, key: key}
 }
 
-// String never shows the secret.
+// String returns a redacted description of the credential's kind; it never shows the secret.
 func (c Credential) String() string {
 	if c.kind == credentialPassphrase {
 		return "Credential.Passphrase(<redacted>)"
@@ -84,23 +86,28 @@ func (c Credential) String() string {
 	return "Credential.Key(<redacted>)"
 }
 
-// GoString never shows the secret.
+// GoString returns the same redacted form as String, so %#v never shows the secret.
 func (c Credential) GoString() string { return c.String() }
 
-// Format renders every verb (%v, %+v, %#v, %s, %x, …) as the redacted String.
+// Format implements [fmt.Formatter]: every verb (%v, %+v, %#v, %s, %x, …) prints the redacted
+// String.
 func (c Credential) Format(f fmt.State, _ rune) { _, _ = f.Write([]byte(c.String())) }
 
-// Argon2Params are the Argon2id parameters a passphrase credential is stretched with at create
-// (encrypted.md §5). The zero value means the default, RFC 9106's second recommendation; any other
-// value must stay within the format's bounds (22023 otherwise), which a reader checks before running
-// the KDF.
+// Argon2Params are the Argon2id parameters that stretch a passphrase credential. They are
+// chosen when the database is created or rekeyed and recorded in the file, so later opens use
+// the same ones. The zero value selects [DefaultArgon2Params]. Any other value must be within
+// the bounds given on each field, or the operation fails with SQLSTATE 22023.
 type Argon2Params struct {
-	MemoryKiB   uint32
-	Iterations  uint32
+	// MemoryKiB is the memory cost in KiB, from 8 × Parallelism to 1048576 (1 GiB).
+	MemoryKiB uint32
+	// Iterations is the number of passes, from 1 to 16.
+	Iterations uint32
+	// Parallelism is the number of lanes, from 1 to 16.
 	Parallelism uint32
 }
 
-// DefaultArgon2Params is RFC 9106's second recommendation: m = 64 MiB, t = 3, p = 4.
+// DefaultArgon2Params returns the default Argon2id parameters, RFC 9106's second recommendation:
+// 64 MiB of memory, 3 iterations, and 4 lanes.
 func DefaultArgon2Params() Argon2Params {
 	return Argon2Params{MemoryKiB: 65536, Iterations: 3, Parallelism: 4}
 }

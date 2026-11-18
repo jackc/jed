@@ -130,30 +130,25 @@ type outcome struct {
 	HasRowsAffected bool
 }
 
-// DefaultPageSize is the default serialization page size (8 KiB — spec/design/storage.md §3),
-// used for a fresh in-memory or newly-created database when no explicit size is given.
+// DefaultPageSize is the page size, in bytes (8 KiB), of a new database when none is given.
 const DefaultPageSize uint32 = 8192
 
-// DefaultMaxSQLLength is the default per-handle input-SQL byte limit (1 MiB — CLAUDE.md §13;
-// spec/design/api.md §8, cost.md §7). The §13 input-size gate's default ceiling: generous for
-// hand-written / ORM SQL, yet bounds the parse tree to a few MB so unbounded untrusted input
-// cannot exhaust memory. A caller raises it (trusted bulk loads) or sets 0 for unlimited via
-// SetMaxSQLLength. Identical across cores (§8).
+// DefaultMaxSQLLength is the default limit, in bytes (1 MiB), on the SQL text a session accepts.
+// It is generous for hand-written and generated SQL while keeping untrusted input from exhausting
+// memory. Raise it, or remove it with Unlimited, through [Session.SetMaxSQLLength] or
+// SessionOptions.MaxSQLLength.
 const DefaultMaxSQLLength = 1 << 20
 
-// DefaultTempBuffers is the default per-session RESIDENT budget for SESSION-LOCAL temporary tables, in
-// BYTES (spec/design/temp-tables.md §6/§7) — PostgreSQL's temp_buffers. Once a session's temp domain
-// outgrows it, a host with a spill directory migrates the domain to a scratch file and bounds its page
-// cache by it. Residency only: results, cost, and the 54P03 point never depend on it. 0 ⇒ never spill
-// (unbounded residency).
+// DefaultTempBuffers is the default memory, in bytes (32 MiB), a session's temporary tables keep
+// resident, like PostgreSQL's temp_buffers. Past it, when scratch storage is available, the
+// temporary tables move to a scratch file, with this much of them cached in memory. It never
+// changes results or cost. See [Session.SetTempBuffers].
 const DefaultTempBuffers = 32 << 20
 
-// DefaultMaxTempStorageBytes is the default per-session storage ceiling for SESSION-LOCAL temporary
-// tables, in BYTES (spec/design/temp-tables.md §7). Temp tables RETAIN bytes across statements, which
-// neither the per-statement cost ceiling (maxCost) nor the cumulative budget (lifetimeMaxCost) bounds,
-// so maxTempStorageBytes is the §13 gate that does: once the temp domain's committed page bytes exceed
-// it — resident or spilled alike — the next temp write aborts 54P03. 0 ⇒ unlimited (a trusted handle).
-// Identical across cores (§8); the abort point is part of the cross-core contract.
+// DefaultMaxTempStorageBytes is the default storage limit, in bytes (1 GiB), of a session's
+// temporary tables, in memory or in a scratch file alike. Once their committed pages exceed it,
+// the next write to a temporary table fails with SQLSTATE 54P03. The cost limits do not bound this
+// storage, since temporary tables keep it across statements. See [Session.SetMaxTempStorageBytes].
 const DefaultMaxTempStorageBytes = 1 << 30
 
 // maxCompositeDepth is the maximum composite-type nesting depth (CLAUDE.md §13; spec/design/cost.md

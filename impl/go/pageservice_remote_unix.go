@@ -29,19 +29,19 @@ const remoteRetryInterval = 250 * time.Millisecond
 // remoteStderrTail is how much of the transport command's standard error a failed open reports.
 const remoteStderrTail = 2048
 
-// OpenRemote opens a database that another machine (or process) serves over a stream: a page client
-// whose connection is the standard input and output of command, run once per connection
-// (spec/pageservice/README.md §5.3). The CLI opens `ssh://host/path` as
-// `[]string{"ssh", "--", "host", "jed pages '/path'"}`. name identifies the database in this process
-// (one handle per name, like a path) and is what Path reports.
+// OpenRemote opens a database that another machine or process serves over a stream: the
+// standard input and output of command, which is run once per connection. The jed CLI opens
+// ssh://host/path as []string{"ssh", "--", "host", "jed pages '/path'"}. name identifies the
+// database in this process (one handle per name, as with a path) and is what [Database.Path]
+// reports.
 //
-// The handle is an ordinary page client: it runs its own engine over pages fetched through the
-// command, commits through it, and when the connection ends it runs the command again (re-election,
-// README.md §6.5) — it never becomes the owner, whatever opts.Ownership says. opts.Credential unlocks
-// an encrypted database here and is also sent in every connection's hello, for a serving end that must
-// own the database (README.md §3.1). An open that cannot reach the database in opts.FileLockTimeout
-// fails 08006 with the command's standard error; an error the remote side reports (58P01, 0A000, …)
-// is returned as is. Unix only.
+// The handle is a client of the serving end: it reads pages and commits through the
+// connection, and when the connection ends it runs command again to reconnect. It never becomes
+// the owner of the database, whatever opts.Ownership says. opts.Credential unlocks an encrypted
+// database locally and is also sent on every connection, for a serving end that must open the
+// database itself. If the database cannot be reached within opts.FileLockTimeout, OpenRemote
+// fails with SQLSTATE 08006 and includes the tail of the command's standard error; an error the
+// remote side reports (58P01, 0A000, …) is returned as is. Unix only.
 func OpenRemote(command []string, name string, opts OpenOptions) (*Database, error) {
 	if err := opts.validateDurations(); err != nil {
 		return nil, err

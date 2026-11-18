@@ -16,35 +16,42 @@ import (
 	"time"
 )
 
-// Locking selects how a file database coordinates with other processes (spec/design/locking.md,
-// page-service.md): LockingAuto (the default) is the page service — the opener that takes presence EX
-// owns the file and serves it, every other opener is its page client — where the host supports it, and
-// a non-serving owner elsewhere; LockingExclusive is a non-serving owner (a second opener waits, then
-// fails 55006); LockingNone skips coordination (an unsafe escape hatch).
+// Locking selects how a file database coordinates with other processes that open the same file.
+// Locking is a property of the handle and is not stored in the file. On a platform without file
+// locks, LockingAuto and LockingExclusive fail with SQLSTATE 0A000.
 type Locking uint8
 
+// The locking modes.
 const (
+	// LockingAuto, the default, lets several processes share the file: the first opener owns it
+	// and serves it to the others, which read and commit through the owner. Where the platform
+	// cannot serve a file, LockingAuto behaves as LockingExclusive.
 	LockingAuto Locking = iota
+	// LockingExclusive gives the file to one process at a time: a second opener waits up to its
+	// FileLockTimeout, then fails with SQLSTATE 55006.
 	LockingExclusive
+	// LockingNone skips coordination entirely. It is unsafe if another process opens the file
+	// at the same time; use it only when something else guarantees exclusive access.
 	LockingNone
 )
 
-// Synchronous is the durability mode of a file-backed handle (spec/design/transactions.md §9, api.md
-// §2.1): when a commit's durable barrier runs.
+// Synchronous is the durability mode of a file-backed handle: whether a commit waits until it is
+// durable on disk before returning. It is a handle setting, not stored in the file.
 type Synchronous uint8
 
+// The durability modes.
 const (
-	// SynchronousOn (the default) makes every commit durable before it returns.
+	// SynchronousOn, the default, makes every commit durable before it returns.
 	SynchronousOn Synchronous = iota
-	// SynchronousOff acknowledges a commit once its pages and meta are written and batches the barrier:
-	// a later flush (the batch cap, Close, …) makes a run of commits durable together. A power loss or
-	// OS crash can lose the commits acknowledged since the last flush, never the file's integrity
-	// (spec/design/validated-cow.md §4).
+	// SynchronousOff returns from a commit once its data is written, without waiting for it to
+	// reach the disk, and makes a batch of commits durable together later: when FlushInterval
+	// passes, the batch grows large, or the handle closes. A power loss or OS crash can lose the
+	// commits acknowledged since the last flush, but never corrupts the file.
 	SynchronousOff
 )
 
-// DefaultFlushInterval is the default FlushInterval: how long a SynchronousOff batch may stay
-// pending before it is flushed (spec/design/validated-cow.md §4.1).
+// DefaultFlushInterval is the default FlushInterval: how long SynchronousOff commits may wait
+// before they are made durable.
 const DefaultFlushInterval = time.Second
 
 // flushIntervalMs resolves a FlushInterval option: nil is DefaultFlushInterval.
@@ -55,16 +62,18 @@ func flushIntervalMs(opt *time.Duration) uint64 {
 	return durationMillis(*opt)
 }
 
-// ScratchEncryption is whether a handle seals its scratch files — spill runs, hash partitions, row
-// spools and spilled temp domains (spec/design/encryption.md §6, spec/fileformat/encrypted.md §11).
-// Fixed at open/create for the handle's life.
+// ScratchEncryption selects whether a handle encrypts its scratch files: the temporary files that
+// sorts, hash joins, and large temporary tables spill to. It is fixed when the handle is opened
+// or created.
 type ScratchEncryption uint8
 
+// The scratch-file encryption modes.
 const (
-	// ScratchEncryptionAuto (the default) seals them when the main database is encrypted.
+	// ScratchEncryptionAuto, the default, encrypts scratch files when the main database is
+	// encrypted.
 	ScratchEncryptionAuto ScratchEncryption = iota
-	// ScratchEncryptionOn always seals them, so the handle may attach encrypted databases while
-	// keeping its scratch target.
+	// ScratchEncryptionOn always encrypts scratch files. Use it on a plaintext or in-memory
+	// database that will attach encrypted files.
 	ScratchEncryptionOn
 )
 
@@ -157,79 +166,85 @@ func createVia(files fileHost, path string, opts databaseOptions) (*engine, erro
 	return db, nil
 }
 
-// OpenOptions are open-time settings for a file-backed database (spec/design/api.md §2.1). Unlike
-// databaseOptions (create-time, fixed into the file), these are handle settings — not stored in the
-// file, so a different host may reopen the same file with different ones.
-// Duration fields reject negative values, even for modes that ignore them.
-// FileLockTimeout and FlushInterval round positive fractions of a millisecond up.
-// A nil duration pointer selects its documented default; a pointer to zero is explicit.
+// OpenOptions are the settings for opening a file database with [Open]. They belong to the
+// handle and are not stored in the file, so another process may open the same file with
+// different ones. The zero value selects every default.
+//
+// A nil duration pointer selects the field's default and a pointer to zero is an explicit zero.
+// Negative durations fail with SQLSTATE 22023, even in modes that ignore them, and positive
+// durations round up to whole milliseconds. Size and count limits follow the [Unlimited] rule.
 type OpenOptions struct {
-	// CacheBytes is the buffer-pool budget in bytes: roughly the maximum memory the resident leaf cache
-	// holds at once (spec/design/pager.md §3, P6.4b/c). Bytes, not a page count: the pool charges each
-	// resident leaf the heap it holds (its used payload and its structs) and evicts until a new leaf
-	// fits, keeping at least one. The bound that lets a database far larger than RAM be served (pager.md
-	// §1); it never changes what a query observes (§3/§5). 0 → DefaultCacheBytes (256 MiB).
+	// CacheBytes is the page-cache budget in bytes: roughly the most memory the handle uses to
+	// keep database pages in memory. It lets a database much larger than RAM be served and never
+	// changes query results. 0 selects the default, 256 MiB; Unlimited keeps every page it reads.
 	CacheBytes int
-	// ReadOnly opens the file read-only (api.md §2.1). The handle then behaves like PostgreSQL
-	// hot standby: every transaction defaults to READ ONLY, an explicit READ WRITE request and
-	// any write statement are 25006, and the file is opened without write access, so it is never
-	// written (works on a read-only filesystem).
+	// ReadOnly opens the file without write access, so it is never written and may sit on a
+	// read-only filesystem. Like a PostgreSQL hot standby, every transaction defaults to read-only,
+	// and a READ WRITE request or any write statement fails with SQLSTATE 25006.
 	ReadOnly bool
-	// WorkMem is the work-memory budget in bytes for a blocking operator before it spills to disk
-	// (spec/design/spill.md §3, api.md §2.1): the ORDER BY external merge sort holds at most roughly
-	// this many bytes of rows resident, then spills sorted runs. Like CacheBytes it is a handle
-	// setting that never changes what a query observes (spill.md §6). 0 → DefaultWorkMem (256 MiB).
+	// WorkMem is the default memory budget, in bytes, of a sort or other blocking operator before
+	// it spills to scratch files; a session can change its own with [Session.SetWorkMem]. It never
+	// changes query results. 0 selects the default, 256 MiB; Unlimited never spills.
 	WorkMem int
-	// SkipFsync turns off the per-commit fsync (the fsync=off host setting, api.md §2.1). A commit still
-	// writes the same bytes in the same order, but the fdatasync barrier becomes a no-op — much faster.
-	// DEV/TESTING ONLY: the data survives a process crash (the OS page cache still flushes) but NOT an
-	// OS crash / power loss. Never changes what a query observes or the on-disk bytes; default false.
+	// SkipFsync turns off the fsync after each commit, which makes commits much faster. It is for
+	// development and testing only: committed data survives a process crash but not an OS crash
+	// or power loss. It never changes the bytes written or query results. The default is false.
 	SkipFsync bool
-	// Synchronous is the durability mode (SynchronousOn, the default, or SynchronousOff — transactions.md
-	// §9). A handle setting, not stored in the file; the handle's file attachments follow it.
+	// Synchronous is the durability mode, SynchronousOn by default. The handle's file attachments
+	// use the same mode.
 	Synchronous Synchronous
-	// FlushInterval is how long a SynchronousOff batch may stay pending before it is
-	// flushed (spec/design/validated-cow.md §4.1), measured on the Environment's clock source. nil is
-	// DefaultFlushInterval (one second); &0 turns the time-based flush off. Ignored under SynchronousOn.
+	// FlushInterval is how long SynchronousOff commits may wait before they are made durable,
+	// measured on the Environment's clock. nil selects DefaultFlushInterval (one second); a pointer
+	// to zero turns the time-based flush off. It is ignored under SynchronousOn.
 	FlushInterval *time.Duration
-	Locking       Locking
-	// nil is the 5s default; a non-nil pointer (including &0) is an explicit deadline.
+	// Locking selects how the handle coordinates with other processes; LockingAuto by default.
+	Locking Locking
+	// FileLockTimeout is how long Open waits for another process that holds the file. When it
+	// passes, Open fails with SQLSTATE 55006. nil selects the default, five seconds; a pointer to
+	// zero tries once without waiting.
 	FileLockTimeout *time.Duration
-	// IdleInTransactionTimeout is a page-service owner's idle-in-transaction timeout for client write
-	// transactions (spec/design/page-service.md §11.1): a client holding the writer gate that sends
-	// nothing for this long is revoked (25P03 at its next request). nil is the 60 s default; &0
-	// disables it. Only the page service (LockingAuto) reads it.
+	// IdleInTransactionTimeout applies while this handle owns a shared file under LockingAuto: a
+	// client process that holds an open write transaction and sends nothing for this long loses
+	// the transaction, and its next request fails with SQLSTATE 25P03. nil selects the default,
+	// 60 seconds; a pointer to zero disables the timeout.
 	IdleInTransactionTimeout *time.Duration
-	// IdleSessionTimeout closes a page-service connection idle between transactions for this long
-	// (page-service.md §11.1); nil or &0 never does. YieldGrace and ShutdownGrace are how long a
-	// yielding or closing owner lets running transactions finish (nil: 5 s and 30 s). MaxConnections
-	// bounds an owner's connections (53300 beyond it); 0 is unlimited. Only the page service (LockingAuto) reads them,
-	// as an owner's limits; a client keeps them for the day it becomes owner.
+	// IdleSessionTimeout applies while this handle owns a shared file under LockingAuto: it closes
+	// a client connection that stays idle between transactions for this long. nil or a pointer to
+	// zero never closes one.
+	//
+	// IdleInTransactionTimeout, IdleSessionTimeout, YieldGrace, ShutdownGrace, and MaxConnections
+	// are kept by a handle that does not own the file, and take effect if it becomes the owner.
 	IdleSessionTimeout *time.Duration
-	YieldGrace         *time.Duration
-	ShutdownGrace      *time.Duration
-	MaxConnections     int
-	// Ownership is the opener's ownership preference under the page service (page-service.md §8.2):
-	// OwnershipPrefer (the default), OwnershipYield, or OwnershipNever. Only the page service (LockingAuto) reads it.
+	// YieldGrace is how long an owner handing the file to another process lets running
+	// transactions finish. nil selects the default, five seconds.
+	YieldGrace *time.Duration
+	// ShutdownGrace is how long a closing owner lets running transactions finish. nil selects the
+	// default, 30 seconds.
+	ShutdownGrace *time.Duration
+	// MaxConnections limits how many client connections an owner accepts; a connection beyond it
+	// fails with SQLSTATE 53300. 0 selects the default, no limit; Unlimited also sets none.
+	MaxConnections int
+	// Ownership is the handle's preference for owning the file under LockingAuto:
+	// OwnershipPrefer (the default), OwnershipYield, or OwnershipNever.
 	Ownership Ownership
-	// Environment is the handle's outside inputs (spec/design/environment.md): the loaded Unicode and
-	// time-zone data the file's references resolve against, the host functions, and the random + clock
-	// sources. Shared by the handle's sessions, attachments, and temp domains; not stored in the file,
-	// so a reopening host brings its own. nil ⇒ a fresh empty environment (no process-wide default).
+	// Environment supplies the loaded Unicode and time-zone data the file's collations and zones
+	// resolve against, the host functions, and the random and clock sources. Every session,
+	// attachment, and temporary table of the handle shares it. It is not stored in the file, so a
+	// host that reopens the file brings its own. nil uses a fresh, empty Environment.
 	Environment *Environment
-	// MaxStorageBytes is the committed-storage limit in bytes over the file's live pages
-	// (spec/design/memory.md §8.7): a commit that would grow livePages × pageSize past it fails 54P06.
-	// Zero or negative is unlimited (the default). A handle setting, not stored in the file;
-	// Database.SetMaxStorageBytes changes it.
+	// MaxStorageBytes limits the committed storage of the file, in bytes, counted as live pages
+	// times the page size: a commit that would grow it past the limit fails with SQLSTATE 54P06.
+	// 0 selects the default, no limit; Unlimited also sets none. It is not stored in the file;
+	// Database.SetMaxStorageBytes changes it later.
 	MaxStorageBytes int64
-	// Credential unlocks an encrypted file (spec/design/encryption.md §5): required for one (28P02
-	// without it, 28P01 when it does not unwrap the key), refused for a plaintext file (28P03). A handle
-	// argument only — never stored, never shown. Under the page service every process holds the data
-	// key: a page client unlocks with its own credential (spec/fileformat/encrypted.md §14).
+	// Credential unlocks an encrypted file. Opening an encrypted file without one fails with
+	// SQLSTATE 28P02, with one that does not match fails with 28P01, and passing one for a
+	// plaintext file fails with 28P03. It is never stored. When several processes share the file,
+	// each opens it with its own credential.
 	Credential *Credential
-	// ScratchEncryption is whether the handle seals its scratch files (spec/design/encryption.md §6):
-	// ScratchEncryptionAuto, the default, seals them when the database is encrypted. An encrypted file
-	// attachment needs a handle whose scratch files are sealed (55000 otherwise).
+	// ScratchEncryption selects whether the handle encrypts its scratch files; by default it does
+	// when the file is encrypted. Attaching an encrypted file needs a handle that encrypts its
+	// scratch files, or it fails with SQLSTATE 55000.
 	ScratchEncryption ScratchEncryption
 }
 

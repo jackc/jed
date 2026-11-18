@@ -10,38 +10,38 @@ import (
 // (the codegen "middle path", CLAUDE.md §5 — see sqlstate.go / spec/design/codegen.md).
 // The hand-written EngineError scaffolding below consumes it.
 
-// EngineError is an engine error: a SQLSTATE plus an informational (never-matched)
-// message, and optional structured diagnostic fields (spec/design/error-fields.md §3)
-// modeled on pgx's pgconn.PgError — the constraint / table / column / data-type name a
-// host would otherwise scrape from the message text. An empty string means "not set"
-// (pgx's own convention).
+// EngineError is an error reported by the database. It carries a SQLSTATE, a message, and
+// optional diagnostic fields like those of pgx's pgconn.PgError, so callers need not parse the
+// message. Match errors on State (or Code), never on Message. An empty string field, or a zero
+// Position, is not set. Use errors.As to get an *EngineError from a returned error.
 type EngineError struct {
-	State   SQLState
+	// State is the error's SQLSTATE.
+	State SQLState
+	// Message is the human-readable message. Its wording may change; do not match on it.
 	Message string
 	// cause preserves a host cancellation's Go error identity without changing SQLSTATE.
 	cause error
-	// ConstraintName is the violated constraint — set for 23505/23514/23503/23P01.
+	// ConstraintName is the violated constraint. It is set for SQLSTATEs 23505, 23514, 23503 and
+	// 23P01.
 	ConstraintName string
 	// TableName is the relation the failing write targeted.
 	TableName string
-	// DatabaseName is the database holding TableName — `main`, `temp`, or a host attachment's name.
-	// jed's analog of PostgreSQL's SchemaName: set whenever TableName is (spec/design/error-fields.md
-	// §12).
+	// DatabaseName is the database holding TableName: main, temp, or an attachment's name. It
+	// plays the role of PostgreSQL's schema name and is set whenever TableName is.
 	DatabaseName string
-	// ColumnName is the column at fault — set for 23502 (and 22001 truncation).
+	// ColumnName is the column at fault. It is set for SQLSTATEs 23502 and 22001.
 	ColumnName string
-	// DataTypeName is the data type at fault — set for 22003 / 22001.
+	// DataTypeName is the data type at fault. It is set for SQLSTATEs 22003 and 22001.
 	DataTypeName string
-	// Detail is PostgreSQL's DETAIL sentence naming the offending values (`Key (id)=(1) already
-	// exists.`) — set on the class-23 violations, subject to the session's SELECT privilege
-	// (spec/design/error-fields.md §9). Never part of the rendered message.
+	// Detail is PostgreSQL's DETAIL sentence, such as "Key (id)=(1) already exists.". It is set
+	// for constraint violations (class 23) when the session may read the offending values. Error
+	// does not include it.
 	Detail string
-	// Position is the 1-based **character** offset into the statement text of the offending token —
-	// set for lexer/parser errors and name-resolution errors (spec/design/error-fields.md §10). 0 means
-	// "not set" (pgx's convention).
+	// Position is the 1-based offset, in characters (not bytes), of the offending token in the
+	// statement text. It is set for syntax errors and unknown-name errors; 0 means not set.
 	Position int32
-	// Hint is PostgreSQL's HINT suggestion (`Perhaps you meant to reference the column "t.name".`) —
-	// spec/design/error-fields.md §11. Never part of the rendered message.
+	// Hint is PostgreSQL's HINT suggestion, such as `Perhaps you meant to reference the column
+	// "t.name".`. Error does not include it.
 	Hint string
 	// located is set once an expression node's resolution has decided this error's position (stamped
 	// or deliberately left absent), so an enclosing node never claims an error raised inside one of its
@@ -64,16 +64,15 @@ func newError(state SQLState, message string) *EngineError {
 	return &EngineError{State: state, Message: message}
 }
 
-// Code returns the error's SQLSTATE string.
+// Code returns the error's five-character SQLSTATE code, such as "23505".
 func (e *EngineError) Code() string { return e.State.Code() }
 
-// Unwrap returns the underlying host cancellation error, if any.
+// Unwrap returns the context error (context.Canceled or context.DeadlineExceeded) behind a
+// SQLSTATE 57014 cancellation, or nil.
 func (e *EngineError) Unwrap() error { return e.cause }
 
-// Error renders the error. The SQLSTATE is included in the text so that
-// `statement error <code>` also matches as a plain regex under the stock
-// sqllogictest runner (spec/design/conformance.md §2). The structured fields are
-// metadata, not part of the rendered line (spec/design/error-fields.md §3).
+// Error returns the SQLSTATE code and message, as "23505: duplicate key value violates unique
+// constraint: users_pkey". The diagnostic fields are not included.
 func (e *EngineError) Error() string {
 	return fmt.Sprintf("%s: %s", e.State.Code(), e.Message)
 }

@@ -1741,21 +1741,21 @@ func sharedCoreFromEngineCoordinated(e *engine, coordinator *fileCoordinator) *s
 	return c
 }
 
-// Database is the host-facing database handle (spec/design/session.md §2.1/§2.4): the goroutine-safe
-// shared core. It mints independent per-goroutine handles (ReadSession/WriteSession/Session); the
-// durable per-connection state (transactions across calls, session variables, the envelope) lives on
-// a Session, never on the *Database. It also offers bare convenience methods
-// (Execute/Query/ExecuteScript/View/Update) that mint a FRESH autocommit session per call and discard
-// it: committed data persists through the shared core, but no session-local state carries to the next
-// call. Create / OpenDatabase return it.
+// Database is a handle to an open database, returned by [Create], [Open], [OpenRemote], and
+// [Deserialize]. It is safe for concurrent use by multiple goroutines. Close it when done.
+//
+// The methods that run SQL directly on a Database (Exec, Query, QueryRow, ExecuteScript, and the
+// Prepared variants) each use a new autocommit session that is discarded afterwards: committed
+// data persists, but session state such as variables, the time zone, or privileges does not
+// carry over to the next call. Use [Database.Session] for a session whose state lasts, and
+// [Database.Begin] for a transaction. A Session is for one goroutine at a time; give each
+// goroutine its own.
 type Database struct {
 	core *sharedCore
 }
 
-// AttachSource selects the backing for a database attached via Database.Attach
-// (spec/design/attached-databases.md §4). A MEMORY source is a fresh, empty in-memory database
-// (Slice 1b); a FILE source opens an existing single-file jed database on disk (Slice 2). Build one
-// with AttachMemory() or AttachFile(path, AttachFileOptions{}).
+// AttachSource is the database that [Database.Attach] attaches: a new, empty in-memory database
+// ([AttachMemory]) or an existing database file ([AttachFile]).
 type AttachSource struct {
 	file            bool   // false = in-memory (Slice 1b); true = file-backed (Slice 2)
 	path            string // the file path, when file is true
@@ -1766,35 +1766,42 @@ type AttachSource struct {
 	credential *Credential
 }
 
-// AttachFileOptions controls one file attachment's independent coordination domain.
+// AttachFileOptions controls how an attached file coordinates with other processes that open
+// it. An attached file coordinates on its own, independent of the attaching handle.
 type AttachFileOptions struct {
+	// Locking selects how the file coordinates with other processes; LockingAuto by default.
 	Locking Locking
-	// FileLockTimeout is the open wait: nil uses five seconds; zero tries once.
-	// Attach rejects a negative value before opening the file.
+	// FileLockTimeout is how long Attach waits for another process that holds the file. nil
+	// selects the default, five seconds; a pointer to zero tries once without waiting. A negative
+	// value fails with SQLSTATE 22023 before the file is opened.
 	FileLockTimeout *time.Duration
 }
 
-// AttachMemory returns a source for a fresh, empty in-memory attachment (attached-databases.md §6).
+// AttachMemory returns a source for a new, empty in-memory database. Its contents are lost when
+// it is detached or the handle closes.
 func AttachMemory() AttachSource { return AttachSource{} }
 
-// AttachFile returns a source for an existing database file at path. The file keeps its own page
-// size. The zero AttachFileOptions uses the default locking.
+// AttachFile returns a source for the existing database file at path. The file keeps its own
+// page size. The zero AttachFileOptions selects the defaults.
 func AttachFile(path string, opts AttachFileOptions) AttachSource {
 	return AttachSource{file: true, path: path, locking: opts.Locking, fileLockTimeout: opts.FileLockTimeout}
 }
 
-// WithMaxStorageBytes returns the source with the attachment's committed-storage limit set to bytes
-// (spec/design/memory.md §8.1): an in-memory attachment's page high-water (§8.2), a file attachment's
-// live pages (§8.7). Zero or negative is unlimited.
+// WithMaxStorageBytes returns a copy of the source with the attachment's committed-storage limit
+// set to bytes: a commit that would grow the attached database past it fails with SQLSTATE 54P06.
+// An in-memory attachment counts its highest page count times its page size, a file attachment
+// its live pages times its page size. 0 selects the default, no limit; Unlimited also sets none;
+// any other negative value makes Attach fail with SQLSTATE 22023.
 func (s AttachSource) WithMaxStorageBytes(bytes int64) AttachSource {
 	s.maxStorageBytes = bytes
 	return s
 }
 
-// WithCredential returns the source unlocking an encrypted file attachment with credential
-// (spec/design/encryption.md §5): 28P02 without one, 28P01 when it does not unwrap the key, 28P03 for
-// a plaintext file, 55000 for an in-memory source (nothing is at rest) or on a handle whose scratch
-// files are not sealed (spec/design/encryption.md §6 — open or create it with ScratchEncryptionOn).
+// WithCredential returns a copy of the source that unlocks an encrypted file with credential.
+// Attach then fails with SQLSTATE 28P02 if the file is encrypted and credential is nil, 28P01 if
+// credential does not match, 28P03 if the file is not encrypted, and 55000 for an in-memory
+// source. Attaching an encrypted file also needs a handle that encrypts its scratch files (55000
+// otherwise): open or create the handle with ScratchEncryptionOn, or encrypt its main database.
 func (s AttachSource) WithCredential(credential *Credential) AttachSource {
 	s.credential = credential
 	return s
@@ -1811,66 +1818,72 @@ func errNotEncrypted() error {
 	return newError(CredentialNotApplicable, "the database is not encrypted")
 }
 
-// CreateOptions are the settings for creating a fresh database (spec/design/api.md §2.1). Path
-// selects the backing: the zero value "" builds an in-memory database (never touches the
-// filesystem); a non-empty path builds a single-file database on disk (58P02 if it already exists).
-// "" is the documented "unset" — there is no positional Create("") to be hit by an
-// uninitialized argument (api.md §2.1). PageSize (0 → DefaultPageSize) is locked into a file's meta
-// at creation and fixes an in-memory database's tree fan-out, so it is meaningful for both backings.
+// CreateOptions are the settings for [Create]. The zero value creates an in-memory database with
+// the default settings. Fields that also appear in [OpenOptions] mean the same thing here, and
+// like them are handle settings that are not stored in the file. Duration and limit fields follow
+// the same rules as in OpenOptions.
 type CreateOptions struct {
-	Path     string
+	// Path is the database file to create. The empty string, the default, creates an in-memory
+	// database that never touches the filesystem. If the file already exists, Create fails with
+	// SQLSTATE 58P02.
+	Path string
+	// PageSize is the page size in bytes, a power of two from 256 to 65536; another value fails
+	// with SQLSTATE 0A000. 0 selects DefaultPageSize. It is fixed for the life of a file and
+	// determines the bytes of a serialized in-memory database.
 	PageSize uint32
-	// SkipFsync turns off the per-commit fsync for this handle (the fsync=off host setting, api.md §2.1):
-	// commits write identical bytes in the same order but skip the fdatasync barrier. DEV/TESTING ONLY —
-	// durable across a process crash, not an OS crash / power loss. Ignored for an in-memory database
-	// (opts.Path == "") which never fsyncs. Byte/cost/result-neutral; default false.
+	// SkipFsync turns off the fsync after each commit, as for OpenOptions.SkipFsync. It is for
+	// development and testing only and is ignored for an in-memory database.
 	SkipFsync bool
-	// Synchronous is the durability mode (SynchronousOn, the default, or SynchronousOff — transactions.md
-	// §9). Ignored for an in-memory database. A handle setting, not stored in the file.
+	// Synchronous is the durability mode, SynchronousOn by default. It is ignored for an in-memory
+	// database.
 	Synchronous Synchronous
-	// FlushInterval is the OpenOptions field of the same name (validated-cow.md §4.1): nil is
-	// DefaultFlushInterval, &0 turns the time-based flush off.
+	// FlushInterval is how long SynchronousOff commits may wait before they are made durable.
+	// nil selects DefaultFlushInterval; a pointer to zero turns the time-based flush off.
 	FlushInterval *time.Duration
-	Locking       Locking
-	// nil is the 5s default; &0 requests one immediate acquisition attempt.
+	// Locking selects how the new file coordinates with other processes; LockingAuto by default.
+	Locking Locking
+	// FileLockTimeout is how long Create waits for the file's lock. nil selects the default, five
+	// seconds; a pointer to zero tries once without waiting.
 	FileLockTimeout *time.Duration
-	// IdleInTransactionTimeout, IdleSessionTimeout, YieldGrace, ShutdownGrace, MaxConnections,
-	// and Ownership are the OpenOptions fields of the same names, for a creator under the page service:
-	// it is the owner, and keeps them for later roles.
+	// IdleInTransactionTimeout is the OpenOptions field of the same name. Under LockingAuto the
+	// creating handle owns the new file, so the owner settings apply to it from the start.
 	IdleInTransactionTimeout *time.Duration
-	IdleSessionTimeout       *time.Duration
-	YieldGrace               *time.Duration
-	ShutdownGrace            *time.Duration
-	MaxConnections           int
-	Ownership                Ownership
-	// Environment is the handle's outside inputs (spec/design/environment.md): the loaded Unicode and
-	// time-zone data, the host functions, and the random + clock sources, shared by every session,
-	// attachment, and temp domain of the handle. Not stored in the file — a host reopens with its own.
-	// nil ⇒ a fresh empty environment (no process-wide default).
+	// IdleSessionTimeout is the OpenOptions field of the same name.
+	IdleSessionTimeout *time.Duration
+	// YieldGrace is the OpenOptions field of the same name.
+	YieldGrace *time.Duration
+	// ShutdownGrace is the OpenOptions field of the same name.
+	ShutdownGrace *time.Duration
+	// MaxConnections is the OpenOptions field of the same name.
+	MaxConnections int
+	// Ownership is the OpenOptions field of the same name.
+	Ownership Ownership
+	// Environment supplies the loaded Unicode and time-zone data, the host functions, and the
+	// random and clock sources. Every session, attachment, and temporary table of the handle
+	// shares it. It is not stored in the file. nil uses a fresh, empty Environment.
 	Environment *Environment
-	// MaxStorageBytes is the committed-storage limit in bytes (spec/design/memory.md §8): a commit that
-	// would grow the database past it fails 54P06. An in-memory database measures its page high-water
-	// (pageCount × pageSize, §8.2), a file-backed one its live pages (livePages × pageSize, §8.7). Zero
-	// or negative is unlimited (the default). Not stored anywhere; Database.SetMaxStorageBytes changes it.
+	// MaxStorageBytes limits the database's committed storage in bytes: a commit that would grow
+	// it past the limit fails with SQLSTATE 54P06. An in-memory database counts its highest page
+	// count times the page size, a file its live pages times the page size. 0 selects the
+	// default, no limit; Unlimited also sets none. It is not stored;
+	// Database.SetMaxStorageBytes changes it later.
 	MaxStorageBytes int64
-	// Credential creates the file ENCRYPTED under it (spec/design/encryption.md,
-	// spec/fileformat/encrypted.md): its pages are sealed under a random data key that only the
-	// credential unwraps. Needs a PageSize of at least 1024 (0A000 otherwise); an in-memory database
-	// with a credential is 55000. nil (the default) creates a plaintext file.
+	// Credential, when non-nil, creates an encrypted file that only this credential unlocks. An
+	// encrypted file needs a PageSize of at least 1024 (SQLSTATE 0A000 otherwise), and an
+	// in-memory database cannot be encrypted (55000). nil, the default, creates a plaintext file.
 	Credential *Credential
-	// KDF is the Argon2id parameters a passphrase credential is stretched with (the zero value is the
-	// default, RFC 9106's second recommendation; 22023 outside the format's bounds). Ignored for a host
-	// key or a plaintext file.
+	// KDF holds the Argon2id parameters that stretch a passphrase Credential. The zero value
+	// selects DefaultArgon2Params. It is ignored for a key credential or a plaintext file.
 	KDF Argon2Params
-	// ScratchEncryption is whether the handle seals its scratch files (spec/design/encryption.md §6):
-	// ScratchEncryptionAuto, the default, seals them when the database is encrypted.
+	// ScratchEncryption selects whether the handle encrypts its scratch files; by default it does
+	// when the database is encrypted.
 	ScratchEncryption ScratchEncryption
 }
 
-// Create makes a fresh database — in-memory (opts.Path == "") or file-backed (opts.Path set)
-// — and returns the host handle with its default session (spec/design/api.md §2.1). A file that
-// already exists is 58P02; the page size is locked into a file. Invalid duration
-// options return 22023 before creating storage, including for an in-memory database.
+// Create creates a new database and returns its handle: an in-memory database when opts.Path is
+// empty, otherwise a new database file at opts.Path. Creating a file that already exists fails
+// with SQLSTATE 58P02. Invalid options fail with SQLSTATE 22023 before anything is created. The
+// caller must Close the returned Database.
 func Create(opts CreateOptions) (*Database, error) {
 	if err := validateDurationOptions(opts.FlushInterval, opts.FileLockTimeout, opts.IdleInTransactionTimeout, opts.IdleSessionTimeout, opts.YieldGrace, opts.ShutdownGrace); err != nil {
 		return nil, err
@@ -1957,8 +1970,11 @@ func newInMemoryWithPageSize(pageSize uint32, env *Environment) *Database {
 	return databaseOver(sharedCoreFromEngine(e))
 }
 
-// Open opens the existing database file at path. The zero OpenOptions selects the defaults.
-// A missing file fails with SQLSTATE 58P01; use [Create] to make a new database.
+// Open opens the existing database file at path. The zero OpenOptions selects the defaults. A
+// missing file fails with SQLSTATE 58P01 (use [Create] to make a new database), a damaged file
+// with XX001, and invalid options with 22023. A process may hold only one handle per file:
+// opening a file that is already open in this process fails with SQLSTATE 55006, so share the
+// one Database instead. The caller must Close the returned Database.
 func Open(path string, opts OpenOptions) (*Database, error) {
 	if err := opts.validateDurations(); err != nil {
 		return nil, err
@@ -1996,20 +2012,20 @@ func databaseOver(c *sharedCore) *Database {
 	return &Database{core: c}
 }
 
-// Environment returns the handle's Environment (spec/design/environment.md §6) — the one every
-// session, attachment, and temp domain of this database uses.
+// Environment returns the handle's Environment, which every session, attachment, and temporary
+// table of the database uses.
 func (db *Database) Environment() *Environment { return db.core.env }
 
-// LoadedCollations introspects the handle Environment's loaded collation set (collation.md §4.2),
-// ascending by name. C is built in and not listed.
+// LoadedCollations returns the collations loaded into the handle's Environment, sorted by name.
+// The built-in C collation is not listed.
 func (db *Database) LoadedCollations() []CollationInfo { return db.core.env.LoadedCollations() }
 
-// LoadedTimeZones introspects the handle Environment's loaded zone set (timezones.md §3.3),
-// ascending by name. UTC and fixed offsets are built in and not listed.
+// LoadedTimeZones returns the time zones loaded into the handle's Environment, sorted by name.
+// UTC and fixed offsets are built in and not listed.
 func (db *Database) LoadedTimeZones() []TimeZoneInfo { return db.core.env.LoadedTimeZones() }
 
-// Version is the committed version currently published (the monotonic commit counter,
-// transactions.md §8). Advances by 1 on every WriteHandle.Commit.
+// Version returns the database's current committed version, a counter that increases by one
+// with every commit.
 func (db *Database) Version() uint64 { return db.core.roots.Load().committed.txid }
 
 // oldestLiveTxid is the oldest still-live snapshot version (transactions.md §8) — the Phase-6
@@ -2043,10 +2059,10 @@ func (db *Database) setMaxStorageBytesRaw(name string, bytes int64) error {
 	return nil
 }
 
-// StorageBytes is the committed storage of database name — `main` or an attachment — in bytes, the
-// measure max_storage_bytes limits: an in-memory database's logical page high-water times its page size
-// (spec/design/memory.md §8.2), a file-backed database's live pages times its page size (§8.7).
-// Deterministic; not RSS, and not the file length. A name that is not attached is 42704.
+// StorageBytes returns the committed storage of database name ("main" or an attachment) in
+// bytes: the measure that MaxStorageBytes limits. An in-memory database counts its highest page
+// count times its page size, a file its live pages times its page size. It is not the process's
+// memory use or the file's length. A name that is not attached fails with SQLSTATE 42704.
 func (db *Database) StorageBytes(name string) (int64, error) {
 	st, err := db.core.withStorage(name)
 	if err != nil {
@@ -2055,18 +2071,19 @@ func (db *Database) StorageBytes(name string) (int64, error) {
 	return st.storageBytes(), nil
 }
 
-// AttachOptions configures Database.Attach.
+// AttachOptions are the settings for [Database.Attach].
 type AttachOptions struct {
-	// ReadOnly rejects every write to the attached database with SQLSTATE 25006. A read-only
-	// attachment never competes for the writer slot, and a file is opened without write access.
+	// ReadOnly makes every write to the attached database fail with SQLSTATE 25006. A read-only
+	// attached file is opened without write access.
 	ReadOnly bool
 }
 
-// Attach makes source reachable as database name, so SQL can qualify its tables as name.table.
-// Attaching is only possible through the host API, never from SQL. The name must not be main,
-// temp, or an existing attachment (SQLSTATE 42710). Opening a file can fail as Open does
-// (58P01, XX001, …). ctx bounds the wait for the file's lock; a canceled wait returns SQLSTATE
-// 57014.
+// Attach makes source available to SQL as database name, so statements can refer to its tables
+// as name.table. Attaching is possible only through this method, never from SQL. name must not
+// be empty, "main", "temp", or an existing attachment (SQLSTATE 42710). Attaching a file can fail
+// as Open does (58P01, XX001, …). ctx is checked before Attach starts and while it waits for
+// another process that holds the file; a canceled wait fails with SQLSTATE 57014. Call
+// [Database.Detach] to remove the attachment; closing the Database also closes it.
 func (db *Database) Attach(ctx context.Context, name string, source AttachSource, opts AttachOptions) error {
 	done := contextDone(ctx)
 	if err := doneErr(done); err != nil {
@@ -2231,12 +2248,10 @@ func (db *Database) attach(name string, source AttachSource, readOnly bool, done
 	return nil
 }
 
-// Detach removes a previously attached database (spec/design/attached-databases.md §4/§8). A host-API
-// act. It is 55006 (object_in_use) while any live transaction / cursor still pins a committed snapshot
-// (the reader-liveness watermark, §5 — a reader pins the whole roots, so an open reader pins every
-// attachment), and 42704 if no database of that name is attached (`main` / `temp` are not detachable).
-// On success the attachment's root is dropped from the published roots and its storage released, under
-// the writer gate.
+// Detach removes the attached database name and releases its storage; an in-memory attachment's
+// contents are discarded. It never waits: it fails with SQLSTATE 55006 while a write transaction
+// is open or any session holds an open transaction or unfinished result, and with 42704 when no
+// database of that name is attached ("main" and "temp" cannot be detached).
 func (db *Database) Detach(name string) error {
 	lname := name
 	c := db.core
@@ -2291,13 +2306,13 @@ func (db *Database) Detach(name string) error {
 	return err
 }
 
-// Compact compacts database name — `main` or an attachment, exact name — returning its dead
-// space (spec/design/api.md §2.6): it rewrites the database as the garbage-free from-scratch image of
-// its committed snapshot at the next version and swaps the storage atomically (a file through temp
-// file + rename, an in-memory database by replacing its byte store). Rows, catalog, and later results
-// and costs are unchanged. Never waits: 42704 for a name that is not attached, 25006 for a read-only
-// database, and 55006 while a write transaction or reader is open on this handle or another process
-// has the file open. A host-API act — not metered and not reachable from SQL.
+// Compact reclaims the unused space of database name ("main" or an attachment) by rewriting it
+// from its committed state and replacing its storage atomically (a file through a temporary file
+// and a rename). Data, query results, and costs are unchanged. ctx is checked before
+// Compact starts. It never waits: it fails with SQLSTATE 55006 while a write transaction or any
+// reader is open on this handle or another process has the file open, 25006 for a read-only
+// database, and 42704 for a name that is not attached. Compact is not reachable from SQL and is
+// not charged to any cost limit.
 func (db *Database) Compact(ctx context.Context, name string) error {
 	if err := doneErr(contextDone(ctx)); err != nil {
 		return contextError(ctx, err)
@@ -2310,23 +2325,26 @@ type rekeyTarget struct {
 	codec *pageCodec
 }
 
-// Rekey rewrites the file database name — `main` or a file attachment — under a NEW data key
-// (spec/design/encryption.md §5, spec/fileformat/encrypted.md §12): encrypted for cred when it is
-// non-nil — rotating an encrypted file's key, or encrypting a plaintext one — and plaintext when it is
-// nil, decrypting an encrypted file. kdf stretches a passphrase credential (the zero value is the
-// default). Every tree is rebuilt under the target page layout and the result replaces the file as
-// Compact does, with its limits: it never waits, and a reader, a write transaction or another process
-// holding the file is 55006. When it returns, only cred unlocks the file. Any copy of the file made
-// before still opens with its old credential: rotation protects the file from here on, not old copies.
+// Rekey rewrites the database file name ("main" or a file attachment) under a new encryption
+// key. With a non-nil cred the result is encrypted for cred, which rotates the key of an
+// encrypted file or encrypts a plaintext one; with a nil cred the result is plaintext. kdf holds
+// the Argon2id parameters for a passphrase cred; the zero value selects the defaults. When Rekey
+// returns, only cred unlocks the file. Copies of the file made earlier still open with their old
+// credential.
 //
-// A row or index key the target layout cannot store (an encrypted page holds 40 bytes less, and its
-// pointers are wider) or a result over max_storage_bytes (54P06) fails before the file is replaced,
-// leaving it untouched. Other errors: 42704 for a name that is not attached, 25006 read-only, 55000 in
-// memory or when encrypting through a handle whose scratch files are plaintext (encryption.md §6),
-// 0A000 for a page size below 1024 under encryption, 22023 for Argon2id parameters out of range. Under
-// the page service only the owner rekeys, with no client pinning a snapshot; a client connected
-// meanwhile fails 28P04 at its next transaction (28P02 when the file was encrypted) and must reopen. A
-// host-API act — not reachable from SQL.
+// Rekey replaces the file as [Database.Compact] does and has the same limits: it never waits, and
+// fails with SQLSTATE 55006 while a reader or write transaction is open or another process holds
+// the file. ctx is checked before Rekey starts and again after the passphrase is stretched. A
+// row or index key that does not fit the new page layout (an encrypted page holds 40 bytes less)
+// or a result over the storage limit (54P06) fails before the file is replaced, leaving it
+// untouched. Other errors: 42704 for a name that is not attached, 25006 for a read-only
+// database, 55000 for an in-memory database or when encrypting through a handle whose scratch
+// files are not encrypted, 0A000 when encrypting a page size below 1024, and 22023 for Argon2id
+// parameters out of range.
+//
+// When the file is shared under LockingAuto, only the owning handle can rekey it, and only while
+// no client has a transaction open. Each client then fails at its next transaction with
+// SQLSTATE 28P04 (28P02 if the file was encrypted before) and must reopen the file.
 func (db *Database) Rekey(ctx context.Context, name string, cred *Credential, kdf Argon2Params) error {
 	done := contextDone(ctx)
 	if err := doneErr(done); err != nil {
@@ -2379,16 +2397,18 @@ func (db *Database) Rekey(ctx context.Context, name string, cred *Credential, kd
 	return db.compact(name, name, &rekeyTarget{codec: target})
 }
 
-// ChangeCredential changes the credential of the encrypted file database name — `main` or a file
-// attachment — to cred (spec/design/encryption.md §5): the data key is rewrapped in the key block and
-// no page is rewritten, so the change is quick apart from kdf's Argon2id for a passphrase (the zero
-// value is the default), which runs before the writer gate is taken. Once it returns, only cred unlocks
-// the file; if it fails partway, the handle must be reopened and exactly one of the two credentials
-// unlocks it.
+// ChangeCredential changes the credential that unlocks the encrypted database file name ("main"
+// or a file attachment) to cred. Only the small key block is rewritten, not the data, so it is
+// quick apart from stretching a passphrase cred; kdf holds the Argon2id parameters for that, and
+// the zero value selects the defaults. ctx is checked before ChangeCredential starts and again
+// after the passphrase is stretched. When it returns, only cred unlocks the file. If it fails
+// partway, the handle must be reopened, and exactly one of the previous and new credentials unlocks
+// the file.
 //
-// Never waits: 42704 for a name that is not attached, 25006 for a read-only database, 55000 for an
-// in-memory database, 28P03 for a plaintext file, 55006 while a write transaction is open, and 22023
-// for Argon2id parameters out of range. A host-API act — not reachable from SQL.
+// It never waits: it fails with SQLSTATE 55006 while a write transaction is open, 42704 for a
+// name that is not attached, 25006 for a read-only database, 55000 for an in-memory database or
+// a handle that does not own a file shared under LockingAuto, 28P03 for a plaintext file, and
+// 22023 for a nil cred or Argon2id parameters out of range. It is not reachable from SQL.
 func (db *Database) ChangeCredential(ctx context.Context, name string, cred *Credential, kdf Argon2Params) error {
 	done := contextDone(ctx)
 	if err := doneErr(done); err != nil {
@@ -2599,13 +2619,14 @@ func (db *Database) toImage(pageSize uint32, txid uint64) ([]byte, error) {
 // txid is the latest committed transaction id (the on-disk meta txid); equal to Version.
 func (db *Database) txid() uint64 { return db.core.roots.Load().committed.txid }
 
-// PageSize is the page payload size this database serializes at.
+// PageSize returns the database's page size in bytes.
 func (db *Database) PageSize() uint32 { return db.core.pageSize() }
 
 // pageHighWater is the on-disk page high-water for a file-backed database; 0 in-memory.
 func (db *Database) pageHighWater() uint32 { return db.core.pageCount() }
 
-// Path is the backing file path for a file-backed database; "" in-memory.
+// Path returns the database file's path, or "" for an in-memory database. For a database
+// opened with [OpenRemote] it returns the name given there.
 func (db *Database) Path() string { return db.core.path() }
 
 // setSpillDirForTest overrides the host scratch directory for per-core spill tests and the conformance
@@ -2624,7 +2645,8 @@ func (db *Database) setSpillDirForTest(dir string) {
 // (spec/design/temp-tables.md §6, spill.md §2). Conformance tooling, never a production setting.
 func setSpillDirForTooling(db *Database, dir string) { db.setSpillDirForTest(dir) }
 
-// ReadOnly reports whether this database was opened read-only. In-memory databases are writable.
+// ReadOnly reports whether the database was opened with OpenOptions.ReadOnly. In-memory
+// databases are always writable.
 func (db *Database) ReadOnly() bool { return db.core.readOnlyMode() }
 
 // ReadSession opens a READ ONLY session over a consistent snapshot (spec/design/session.md §2.4,
@@ -2672,13 +2694,12 @@ func (db *Database) writeSession() *Session {
 	return &Session{core: db.core, engine: engine, access: accessReadWrite, gateHeld: true, baseVersion: base.txid, roleGen: db.core.writerGen(), planEpoch: db.core.planEpochNow()}
 }
 
-// Session mints an ADDITIONAL configured session over this database (spec/design/session.md
-// §2.1/§2.4), with its own envelope from opts. The session shares committed storage with every other
-// session over this Database, and runs autocommit with the lazy gate: an autocommit read pins the
-// latest committed for that one statement (no gate); an autocommit write takes the gate per statement,
-// publishes, and releases it; BEGIN/COMMIT/ROLLBACK open and end an explicit block. (The old
-// Engine.NewSession swap → an independent owns-its-Engine session.)
-// An invalid TimeZone or negative LockTimeout returns 22023 and no session.
+// Session returns a new session configured by opts. A session keeps its state (variables, time
+// zone, privileges, limits, temporary tables, an open transaction) across calls, and sees the
+// data every other session of the Database commits. Outside an explicit transaction each
+// statement runs in its own transaction. A Session is for one goroutine at a time. Invalid
+// options, such as an unknown TimeZone, a negative LockTimeout, or a limit that breaks the
+// [Unlimited] rule, fail with SQLSTATE 22023. The caller must Close the session.
 func (db *Database) Session(opts SessionOptions) (*Session, error) {
 	state, err := newSessionWithOptions(opts, db.core.env)
 	if err != nil {
@@ -2725,8 +2746,9 @@ func (db *Database) queryValues(sql string, params []Value) (*Rows, error) {
 	return s.queryValues(sql, params)
 }
 
-// ExecuteScript runs a multi-statement script on a fresh autocommit session (spec/design/session.md
-// §4.2): the whole run is one implicit transaction (all-or-nothing).
+// ExecuteScript runs a script of semicolon-separated statements on a new session, discarding
+// any rows; see [Session.ExecuteScript]. The whole script runs as one transaction: either every
+// statement takes effect or none does.
 func (db *Database) ExecuteScript(ctx context.Context, sql string) (ScriptSummary, error) {
 	s := db.sessionWithState(newSession(db.core.env))
 	defer s.Close()
@@ -2735,7 +2757,7 @@ func (db *Database) ExecuteScript(ctx context.Context, sql string) (ScriptSummar
 
 // Begin starts a transaction on a new session that belongs to the transaction: Commit or
 // Rollback ends both. The transaction must be ended; defer Rollback after a successful Begin.
-// ctx bounds the wait for the writer slot of a read-write transaction.
+// ctx bounds the wait for the writer slot of a read-write transaction; see [Session.Begin].
 func (db *Database) Begin(ctx context.Context, opts TxOptions) (*Transaction, error) {
 	s := db.sessionWithState(newSession(db.core.env))
 	tx, err := s.Begin(ctx, opts)
@@ -2755,29 +2777,30 @@ func (db *Database) BeginFunc(ctx context.Context, opts TxOptions, fn func(tx *T
 	return s.BeginFunc(ctx, opts, fn)
 }
 
-// Prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4): a standalone
-// value bound to no session — run it with QueryPrepared / ExecPrepared / QueryRowPrepared on any
-// handle over this database (the statement outlives the transient session used to parse it). Parse
-// errors (42601, …) and the 54000 input-size limit surface here.
+// Prepare parses sql into a prepared statement that can be run many times, with
+// QueryPrepared, ExecPrepared, or QueryRowPrepared on this Database or any of its sessions or
+// transactions. The statement is not tied to a session. Syntax errors (SQLSTATE 42601, …) and
+// SQL text longer than the default MaxSQLLength (54000) fail here.
 func (db *Database) Prepare(sql string) (*PreparedStatement, error) {
 	s := db.sessionWithState(newSession(db.core.env))
 	defer s.Close()
 	return s.Prepare(sql)
 }
 
-// UpgradeCollations re-pins every collation whose stored version differs from the loaded Unicode
-// data and returns how many it re-pinned; see Session.UpgradeCollations.
+// UpgradeCollations records the loaded Unicode version for every collation whose stored version
+// differs and returns how many it updated; see [Session.UpgradeCollations].
 func (db *Database) UpgradeCollations(ctx context.Context) (int, error) {
 	s := db.sessionWithState(newSession(db.core.env))
 	defer s.Close()
 	return s.UpgradeCollations(ctx)
 }
 
-// Close closes the backing store (an in-memory store's close is a no-op). The bare convenience
-// methods autocommit, so there is never uncommitted work to discard; a session's open write
-// transaction is the session's to end (session.md §2.3), so Close never waits for the writer gate —
-// it would deadlock against a block open on this very goroutine — and fails 55006 while one is held
-// (api.md §2.3). Idempotent.
+// Close closes the database, its attached databases, and its file. It makes any SynchronousOff
+// commits durable first. When the handle owns a file shared under LockingAuto, Close lets the
+// clients' running transactions finish (up to ShutdownGrace) and hands the file on. Close does
+// not wait for this handle's own transactions: while any session has a write transaction open
+// it fails with SQLSTATE 55006 and closes nothing, so end the transaction and call Close again.
+// Calling Close again after it succeeds does nothing and returns nil.
 func (db *Database) Close() error {
 	c := db.core
 	if c.handoff != nil && c.handoff.closed.Load() {
@@ -2860,9 +2883,10 @@ const (
 	accessReadOnly
 )
 
-// Session is the unified per-caller handle (spec/design/session.md §2.4): the §3 envelope + a private
-// *Engine + an access mode. Safe to use from one goroutine; different goroutines use their own
-// sessions over the goroutine-safe *Database.
+// Session is a connection-like handle to a [Database], created with [Database.Session]. It keeps
+// state across calls: session variables, the time zone, privileges, limits, temporary tables,
+// and an open transaction. A Session is not safe for concurrent use; give each goroutine its own.
+// Close it when done.
 type Session struct {
 	core *sharedCore
 	// engine is a private executor handle; engine.session is this session's envelope (sessionState).
@@ -3061,11 +3085,11 @@ func (s *Session) refreshInitialRead() error {
 	return nil
 }
 
-// Prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4): a standalone
-// value bound to no session — this session only supplies the parse (its 54000 input-size limit).
-// Run it with QueryPrepared / ExecPrepared / QueryRowPrepared on any handle over this database; the
-// executing handle supplies the session each run observes (privileges, snapshot, temp domain).
-// Parse errors (42601, …) surface here.
+// Prepare parses sql into a prepared statement that can be run many times, with
+// QueryPrepared, ExecPrepared, or QueryRowPrepared on any session, transaction, or the Database
+// itself. The statement is not tied to this session: each run sees the privileges, data, and
+// temporary tables of the handle that runs it. Syntax errors (SQLSTATE 42601, …) and SQL text
+// longer than the session's MaxSQLLength (54000) fail here.
 func (s *Session) Prepare(sql string) (*PreparedStatement, error) {
 	stmt, err := s.engine.parse(sql)
 	if err != nil {
@@ -3364,9 +3388,9 @@ func (s *Session) rollbackBlock() error {
 	return nil
 }
 
-// Close closes the session (spec/design/session.md §2.3): roll back any open block and deregister its
-// snapshot pin (advancing the watermark). Idempotent; the caller must Close (Go has no destructor),
-// idiomatically `defer s.Close()`.
+// Close rolls back any open transaction, drops the session's temporary tables, and releases the
+// snapshot it holds. It returns the rollback's error, if any. Calling Close again does nothing.
+// The caller must Close every session, typically with defer s.Close().
 func (s *Session) Close() error {
 	var err error
 	if s.engine.session.tx != nil {
@@ -3463,11 +3487,12 @@ func (s *Session) finishCallerBlock(ctx context.Context) error {
 	return err
 }
 
-// ExecuteScript runs a multi-statement script on this session (spec/design/session.md §4.2): split
-// it, run each in order, discard rows, return the O(1) ScriptSummary. When the session is Idle the
-// whole run is one implicit transaction (all-or-nothing, published through the shared core); when it
-// is Open the run joins that transaction. In-script transaction control is 0A000.
-// ctx cancels writer acquisition, statement execution, and the pre-commit check.
+// ExecuteScript runs a script of semicolon-separated statements on the session, in order,
+// discarding any rows, and returns totals in a [ScriptSummary]. Outside a transaction the whole
+// script runs as one transaction: either every statement takes effect or none does. Inside a
+// transaction the script joins it. Transaction control statements (BEGIN, COMMIT, …) in the
+// script fail with SQLSTATE 0A000. ctx bounds the wait for the writer slot and cancels the
+// running statement, and is checked again before the commit.
 func (s *Session) ExecuteScript(ctx context.Context, sql string) (summary ScriptSummary, err error) {
 	defer func() { err = contextError(ctx, err) }()
 	done := contextDone(ctx)
@@ -3507,14 +3532,16 @@ func (s *Session) ExecuteScript(ctx context.Context, sql string) (summary Script
 	return summary, nil
 }
 
-// Version is the snapshot version this session is currently based on (a read session's pinned
-// version, or the latest base for a writable session).
+// Version returns the committed version of the database that the session currently sees: the
+// version its open read-only snapshot was taken at, or otherwise the latest version it has
+// observed.
 func (s *Session) Version() uint64 { return s.baseVersion }
 
-// Status reports this session's transaction status (Idle/Open/Failed, spec/design/session.md §2.2).
+// Status reports the session's transaction status: TxIdle outside a transaction, TxOpen inside
+// one, or TxFailed inside one that a failed statement aborted.
 func (s *Session) Status() TxStatus { return txStatusOf(s.engine.session.tx) }
 
-// InTransaction reports whether an explicit transaction block is open on this session.
+// InTransaction reports whether a transaction is open on the session.
 func (s *Session) InTransaction() bool { return s.engine.session.tx != nil }
 
 // --- Catalog / storage introspection (spec/design/api.md §6). Catalog reads delegate to the
@@ -3545,35 +3572,38 @@ func (s *Session) oldestLiveTxid() uint64 {
 	return oldest
 }
 
-// PageSize is the backing database's page payload size.
+// PageSize returns the database's page size in bytes.
 func (s *Session) PageSize() uint32 { return s.core.pageSize() }
 
 // pageHighWater is the backing file's on-disk page high-water (0 in-memory) — the shared storage state,
 // reflecting every committed write.
 func (s *Session) pageHighWater() uint32 { return s.core.pageCount() }
 
-// Path is the backing file path ("" in-memory).
+// Path returns the database file's path, or "" for an in-memory database.
 func (s *Session) Path() string { return s.core.path() }
 
-// ReadOnly reports whether the backing database was opened read-only.
+// ReadOnly reports whether the database was opened with OpenOptions.ReadOnly.
 func (s *Session) ReadOnly() bool { return s.core.readOnlyMode() }
 
-// DefaultCollation is the session's current default collation name.
+// DefaultCollation returns the name of the collation that new text columns use by default.
 func (s *Session) DefaultCollation() string { return s.engine.DefaultCollation() }
 
-// Collations are the collations available to this session (built-ins + any host-loaded set).
+// Collations returns the collations the database's schema uses (a column's COLLATE or the default
+// collation), sorted by name, each with its version verdict. The built-in C collation is not
+// listed; LoadedCollations lists what the Environment provides.
 func (s *Session) Collations() []CollationInfo { return s.engine.Collations() }
 
-// LoadedCollations are the host-loaded collations currently in effect (collation.md §9).
+// LoadedCollations returns the collations loaded into the session's Environment, sorted by name.
 func (s *Session) LoadedCollations() []CollationInfo { return s.engine.LoadedCollations() }
 
-// LoadedTimeZones are the host-loaded time zones currently in effect (timezones.md §3.3).
+// LoadedTimeZones returns the time zones loaded into the session's Environment, sorted by name.
 func (s *Session) LoadedTimeZones() []TimeZoneInfo { return s.engine.LoadedTimeZones() }
 
-// SetDefaultCollation sets the database's default collation for new text columns. An unknown
-// collation fails with SQLSTATE 2C000. The default is stored in the database, so outside a
-// transaction this commits a write: ctx bounds the wait for the writer slot. Inside a transaction
-// it takes effect when the transaction commits. A read-only session fails with SQLSTATE 25006.
+// SetDefaultCollation sets the database's default collation for new text columns. name is "C"
+// or a collation loaded into the Environment; any other name fails with SQLSTATE 42704. The
+// default is stored in the database, so outside a transaction this commits a write and ctx
+// bounds the wait for the writer slot. Inside a transaction it takes effect when the transaction
+// commits. A read-only session fails with SQLSTATE 25006.
 func (s *Session) SetDefaultCollation(ctx context.Context, name string) error {
 	done := contextDone(ctx)
 	if err := doneErr(done); err != nil {
@@ -3611,18 +3641,22 @@ func (s *Session) setMaxCostRaw(limit int64) { s.engine.session.maxCost = limit 
 func (s *Session) lifetimeMaxCostRaw() int64         { return s.engine.session.lifetimeMaxCost }
 func (s *Session) setLifetimeMaxCostRaw(limit int64) { s.engine.session.lifetimeMaxCost = limit }
 
-// LifetimeCost is the session's running cumulative execution cost so far (§5.4).
+// LifetimeCost returns the total execution cost of every statement the session has run, the
+// amount that LifetimeMaxCost limits.
 func (s *Session) LifetimeCost() int64 { return *s.engine.session.lifetimeTotal }
 
 // maxSQLLengthRaw / SetMaxSQLLength — the input-SQL byte limit (0 ⇒ unlimited).
 func (s *Session) maxSQLLengthRaw() int     { return s.engine.session.maxSQLLength }
 func (s *Session) setMaxSQLLengthRaw(b int) { s.engine.session.maxSQLLength = b }
 
-// LockTimeout returns the writer-lock timeout. Zero means no timeout.
+// LockTimeout returns how long the session waits for the writer slot before failing with
+// SQLSTATE 55P03. Zero means it waits without limit.
 func (s *Session) LockTimeout() time.Duration { return millisDuration(s.engine.session.lockTimeoutMs) }
 
-// SetLockTimeout sets the writer-lock timeout. Zero means no timeout; negative
-// values return 22023 without changing it. Positive fractions of a millisecond round up.
+// SetLockTimeout sets how long the session waits for the writer slot, at the start of a
+// read-write transaction or an autocommit write, before failing with SQLSTATE 55P03. Zero waits
+// without limit. A negative timeout fails with SQLSTATE 22023 and leaves the setting unchanged.
+// Positive fractions of a millisecond round up.
 func (s *Session) SetLockTimeout(timeout time.Duration) error {
 	if err := validateDuration("LockTimeout", timeout); err != nil {
 		return err
@@ -3635,54 +3669,71 @@ func (s *Session) SetLockTimeout(timeout time.Duration) error {
 func (s *Session) workMemRaw() int     { return s.engine.session.workMem }
 func (s *Session) setWorkMemRaw(b int) { s.engine.session.workMem = b }
 
-// SetDefaultPrivileges replaces the default table-privilege set — the GRANT … ON ALL TABLES default
-// (§5.3).
+// SetDefaultPrivileges replaces the set of privileges the session holds on every table, like
+// GRANT … ON ALL TABLES. A statement that needs a privilege the session lacks fails with
+// SQLSTATE 42501. Per-object Grant and Revoke still apply on top.
 func (s *Session) SetDefaultPrivileges(privs PrivilegeSet) {
 	s.engine.session.privileges.setDefaultTable(privs)
 }
 
-// Grant grants privs on a specific object (table or function), beyond the default (§5.3).
+// Grant gives the session privs on object, a table, view, or function named exactly as stored
+// in the catalog, in addition to the default set. A Revoke on the same object takes precedence.
 func (s *Session) Grant(privs PrivilegeSet, object string) {
 	s.engine.session.privileges.grantObject(privs, object)
 }
 
-// Revoke revokes privs from a specific object (revoke wins over grant and the default, §5.3).
+// Revoke takes privs on object away from the session. A revoke takes precedence over both the
+// default set and any Grant.
 func (s *Session) Revoke(privs PrivilegeSet, object string) {
 	s.engine.session.privileges.revokeObject(privs, object)
 }
 
-// Privileges is read-only access to this session's authorization envelope (§5.3).
+// Privileges returns the session's current privilege settings for inspection. Change them with
+// SetDefaultPrivileges, Grant, Revoke, and ResetPrivileges.
 func (s *Session) Privileges() *Privileges { return &s.engine.session.privileges }
 
-// AllowDDL / SetAllowDDL — whether DDL is permitted on this session (§5.3); a denied change is 42501.
-func (s *Session) AllowDDL() bool         { return s.engine.session.allowDDL }
+// AllowDDL reports whether the session may run DDL (CREATE, ALTER, DROP, …) on persistent
+// objects. It is true by default.
+func (s *Session) AllowDDL() bool { return s.engine.session.allowDDL }
+
+// SetAllowDDL sets whether the session may run DDL on persistent objects; while it is false such
+// a statement fails with SQLSTATE 42501. DDL on temporary objects is governed separately by
+// SetAllowTempDDL.
 func (s *Session) SetAllowDDL(allow bool) { s.engine.session.allowDDL = allow }
 
-// SetVar / ResetVar / Var — session variables (spec/design/session.md §6.1). A non-dotted name is
-// 42704; an unset name reads ok=false.
+// SetVar sets the session variable name to value, as SQL's set_config does. name must contain a
+// dot, such as "app.user_id" (names are case-insensitive); any other name fails with SQLSTATE
+// 42704. SQL reads the value with current_setting.
 func (s *Session) SetVar(name, value string) error { return s.engine.session.SetVar(name, value) }
-func (s *Session) ResetVar(name string) error      { return s.engine.session.ResetVar(name) }
-func (s *Session) Var(name string) (string, bool)  { return s.engine.session.Var(name) }
 
-// SetTimeZone sets the session time zone (§6.2); an unrecognized zone is 22023.
+// ResetVar unsets the session variable name. Unsetting a variable that is not set succeeds. A
+// name without a dot fails with SQLSTATE 42704.
+func (s *Session) ResetVar(name string) error { return s.engine.session.ResetVar(name) }
+
+// Var returns the value of the session variable name, and whether it is set.
+func (s *Session) Var(name string) (string, bool) { return s.engine.session.Var(name) }
+
+// SetTimeZone sets the session's time zone, which governs how timestamptz values are shown and
+// how local times convert. zone is "UTC", a fixed offset, or a zone loaded into the Environment;
+// an unrecognized zone fails with SQLSTATE 22023.
 func (s *Session) SetTimeZone(zone string) error { return s.engine.session.SetTimeZone(zone) }
 
-// Render renders v as PostgreSQL shows a result column (spec/design/timezones.md §9.5): exactly
-// Value.Render, except every timestamptz — at any depth inside an array, composite, or range —
-// renders in this session's **current** time zone (2024-01-15 07:00:00-05). Host-side and unmetered.
-// 22008 only for a finite instant within an offset of jed's i64 extremes, outside PostgreSQL's
-// range. Value.Render stays the zone-free (UTC) canonical form.
+// Render formats v as PostgreSQL shows it in a query result. It matches [Value.Render], except
+// that every timestamptz, including one nested in an array, composite, or range, is shown in the
+// session's current time zone (2024-01-15 07:00:00-05) instead of UTC. It fails with SQLSTATE
+// 22008 only for an instant at the very edge of jed's range, outside PostgreSQL's. Render is not
+// charged to any cost limit.
 func (s *Session) Render(v Value) (string, error) { return v.renderIn(s.engine.session.timeZone) }
 
-// Environment returns the Environment of this session's database handle (environment.md §6).
+// Environment returns the Environment of the session's Database.
 func (s *Session) Environment() *Environment { return s.engine.session.env }
 
-// ResetPrivileges resets this session's authorization envelope to fully permissive (every table
-// privilege, DDL + temp-DDL allowed) — the RESET-style hook for the privilege envelope (§5.3).
+// ResetPrivileges restores the session's default, fully permissive privileges: every table
+// privilege, no per-object grants or revokes, and DDL and temporary DDL allowed.
 func (s *Session) ResetPrivileges() { s.engine.ResetPrivileges() }
 
-// SetAllowTempDDL — the session-local temporary-table DDL gate (the temp-scoped split of AllowDDL,
-// spec/design/temp-tables.md §5); a denied temp DDL is 42501.
+// SetAllowTempDDL sets whether the session may run DDL on its temporary tables, views, and
+// sequences; while it is false such a statement fails with SQLSTATE 42501. It is true by default.
 func (s *Session) SetAllowTempDDL(allow bool) { s.engine.session.allowTempDDL = allow }
 
 // setTempBuffersRaw — the per-session temp-table RESIDENT budget in bytes (0 ⇒ never spill,
@@ -3694,12 +3745,14 @@ func (s *Session) setTempBuffersRaw(bytes int) { s.engine.session.tempBuffers = 
 // spec/design/temp-tables.md §7); an over-ceiling temp write aborts 54P03.
 func (s *Session) setMaxTempStorageBytesRaw(bytes int) { s.engine.session.maxTempStorageBytes = bytes }
 
-// ResetVars clears every session variable — PostgreSQL's RESET ALL for the variable map (§6.1).
+// ResetVars unsets every session variable, like PostgreSQL's RESET ALL.
 func (s *Session) ResetVars() { s.engine.session.ResetVars() }
 
-// UpgradeCollations re-pins every collation whose stored version differs from the loaded Unicode
-// data, so the objects that use it become writable again, and returns how many it re-pinned.
-// Outside a transaction it commits a write: ctx bounds the wait for the writer slot.
+// UpgradeCollations adopts the Unicode version loaded into the Environment for every collation
+// whose stored version differs, rebuilding the keys and indexes that use it, and returns how many
+// collations it updated. Tables that use an out-of-date collation are read-only until then.
+// Outside a transaction it commits a write and ctx bounds the wait for the writer slot; inside one
+// it takes effect when the transaction commits. A read-only session fails with SQLSTATE 25006.
 func (s *Session) UpgradeCollations(ctx context.Context) (int, error) {
 	done := contextDone(ctx)
 	if err := doneErr(done); err != nil {

@@ -19,43 +19,53 @@ import (
 	"unicode/utf8"
 )
 
-// JSONNodeKind tags a jsonb node (spec/design/json.md §2).
+// JSONNodeKind identifies the kind of a [JSONNode].
 type JSONNodeKind int
 
+// The JSON node kinds.
 const (
-	// JNull is JSON `null` — a concrete node, wholly distinct from a SQL NULL `jsonb` value.
+	// JNull is JSON null. It is a value inside a jsonb document, distinct from a SQL NULL jsonb
+	// value: 'null'::jsonb is a non-NULL Value whose node is JNull.
 	JNull JSONNodeKind = iota
-	// JBool is a JSON boolean (B holds the value).
+	// JBool is a JSON boolean, held in [JSONNode].B.
 	JBool
-	// JNumber is a JSON number, held EXACTLY as a Decimal (PG numeric); no binary float ever appears.
+	// JNumber is a JSON number, held exactly as a [Decimal] in [JSONNode].Num, never as a binary
+	// float.
 	JNumber
-	// JString is a JSON string (S holds the decoded UTF-8 content).
+	// JString is a JSON string, held as decoded UTF-8 in [JSONNode].S.
 	JString
-	// JArray is a JSON array (Arr holds its elements in order).
+	// JArray is a JSON array, with its elements in order in [JSONNode].Arr.
 	JArray
-	// JObject is a JSON object. For a jsonb node Obj is in canonical key order with unique keys (the
-	// canonicalizer's invariant); a `json`-on-demand parse (§4) keeps input order + dupes.
+	// JObject is a JSON object, with its members in [JSONNode].Obj.
 	JObject
 )
 
-// JSONNode is a jsonb node — the in-memory canonical tree (spec/design/json.md §2). Object members
-// are kept in canonical key order (shorter key first, ties bytewise) with duplicates removed
-// (last-wins), so structural equality (via the value key / Cmp == 0) IS the correct value-level
-// equality (§5). JSON `null` is the concrete JNull node, wholly distinct from a SQL NULL `jsonb`
-// value. Go has no sum types, so the kind discriminant selects which field is meaningful (the same
-// idiom Value uses). A JSONNode is held by pointer in Value so the flat struct stays comparable.
+// JSONNode is one node of a parsed jsonb document. Kind selects which other field holds the
+// node's content; the rest are zero.
+//
+// In a jsonb value, object members have unique keys (when the input repeats a key, the last
+// occurrence wins) and are sorted with shorter keys first and keys of equal length in byte order.
+// Two jsonb values built this way are equal exactly when their trees are.
 type JSONNode struct {
+	// Kind is the node's kind.
 	Kind JSONNodeKind
-	B    bool         // JBool
-	Num  Decimal      // JNumber
-	S    string       // JString
-	Arr  []JSONNode   // JArray
-	Obj  []JSONMember // JObject
+	// B is the value of a JBool node.
+	B bool
+	// Num is the value of a JNumber node.
+	Num Decimal
+	// S is the value of a JString node.
+	S string
+	// Arr holds the elements of a JArray node.
+	Arr []JSONNode
+	// Obj holds the members of a JObject node.
+	Obj []JSONMember
 }
 
-// JSONMember is one object member: a key string and its value node.
+// JSONMember is one member of a JSON object.
 type JSONMember struct {
+	// Key is the member's key.
 	Key string
+	// Val is the member's value.
 	Val JSONNode
 }
 

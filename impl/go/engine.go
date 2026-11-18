@@ -219,18 +219,24 @@ type SessionOptions struct {
 	TimeZone string
 }
 
-// TxStatus is the session transaction status (spec/design/session.md §2.2) — PostgreSQL's three
-// connection states made explicit on the session, derived from the open transaction: no
-// transaction ⇒ Idle (autocommit); an open clean block ⇒ Open; an open block a statement aborted ⇒
-// Failed (only ROLLBACK/COMMIT accepted, everything else 25P02).
+// TxStatus is a session's transaction state, as reported by [Session.Status]. It matches
+// PostgreSQL's idle, in-transaction and failed-transaction connection states.
 type TxStatus int
 
+// The transaction states.
 const (
+	// TxIdle means no transaction is open; each statement runs in its own transaction
+	// (autocommit).
 	TxIdle TxStatus = iota
+	// TxOpen means a transaction is open and no statement in it has failed.
 	TxOpen
+	// TxFailed means a statement failed inside the open transaction. Until the transaction ends,
+	// every statement except COMMIT and ROLLBACK fails with SQLSTATE 25P02; either one ends it
+	// and discards its changes.
 	TxFailed
 )
 
+// String returns "Idle", "Open" or "Failed".
 func (s TxStatus) String() string {
 	switch s {
 	case TxOpen:
@@ -1560,28 +1566,39 @@ func (db *engine) putTable(t *catTable) {
 	db.working().putTable(t, db.pageSize)
 }
 
-// CollationVerdict reports whether a referenced collation matches the loaded data.
+// CollationVerdict reports whether a collation the database uses matches the version loaded into
+// its [Environment].
 type CollationVerdict int
 
+// The collation verdicts.
 const (
-	// CollationFull means the loaded collation matches the database's pinned version.
+	// CollationFull means the loaded collation has the version the database recorded.
 	CollationFull CollationVerdict = iota
-	// CollationSkewed means versions differ. Reads remain available, but writes
-	// to affected objects fail until the host upgrades the collations.
+	// CollationSkewed means the loaded collation has a different Unicode or CLDR version than the
+	// database recorded. Reads still work, but writes to tables and indexes that use it fail until
+	// the host calls [Session.UpgradeCollations].
 	CollationSkewed
 )
 
-// CollationInfo describes an available collation. ContentHash is the CRC-32 of
-// its compiled table; Description records provenance and is excluded from that
-// hash. Verdict reports whether the loaded data matches the database's version.
+// CollationInfo describes a collation, as listed by [Session.Collations] and
+// [Environment.LoadedCollations].
 type CollationInfo struct {
-	Name           string
+	// Name is the collation's name, as used in COLLATE.
+	Name string
+	// UnicodeVersion is the Unicode version of the loaded collation data.
 	UnicodeVersion string
-	CLDRVersion    string
-	ContentHash    uint32
-	Description    string
-	IsDefault      bool
-	Verdict        CollationVerdict
+	// CLDRVersion is the CLDR (locale data) version of the loaded collation data.
+	CLDRVersion string
+	// ContentHash is a CRC-32 checksum of the collation's compiled sort table. Two collations
+	// with the same hash sort identically.
+	ContentHash uint32
+	// Description is free-form provenance text from the data bundle. It is not part of
+	// ContentHash.
+	Description string
+	// IsDefault reports whether this is the database's default collation for new text columns.
+	IsDefault bool
+	// Verdict reports whether the loaded data matches the version the database recorded.
+	Verdict CollationVerdict
 }
 
 // ImportCollation / ExportCollation are GONE (the reference-only pivot, spec/design/collation.md
