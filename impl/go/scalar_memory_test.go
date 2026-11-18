@@ -9,10 +9,10 @@ import (
 // ownership and budget changes while an older cursor is still alive.
 func TestScalarBudgetCursorOwnership(t *testing.T) {
 	s := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1), (2)")
-	if s.MaxScalarBytes() != defaultScalarBytes {
+	if s.maxScalarBytesRaw() != defaultScalarBytes {
 		t.Fatal("missing finite default")
 	}
-	s.SetMaxScalarBytes(3)
+	s.setMaxScalarBytesRaw(3)
 	old, err := s.queryValues("SELECT repeat('x', 3) FROM t ORDER BY id", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -22,7 +22,7 @@ func TestScalarBudgetCursorOwnership(t *testing.T) {
 		t.Fatal(old.Err())
 	}
 	// Another statement owns a fresh account, and changing the limit does not alter old.
-	s.SetMaxScalarBytes(100)
+	s.setMaxScalarBytesRaw(100)
 	if _, err := queryOutcome(s, "SELECT repeat('y', 9)", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -32,8 +32,8 @@ func TestScalarBudgetCursorOwnership(t *testing.T) {
 	if e, ok := old.Err().(*EngineError); !ok || e.Code() != "54P04" {
 		t.Fatalf("wanted 54P04: %v", old.Err())
 	}
-	s.SetMaxScalarBytes(0)
-	if s.MaxScalarBytes() != defaultScalarBytes {
+	s.setMaxScalarBytesRaw(0)
+	if s.maxScalarBytesRaw() != defaultScalarBytes {
 		t.Fatal("zero disabled the budget")
 	}
 }

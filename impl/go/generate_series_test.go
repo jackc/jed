@@ -103,11 +103,11 @@ func TestGenerateSeriesCostCeiling(t *testing.T) {
 		t.Errorf("cost = %d, want 8", c)
 	}
 	// A runaway series aborts deterministically once accrued cost reaches the ceiling (54P01).
-	db.SetMaxCost(50)
+	db.setMaxCostRaw(50)
 	if c := genErrCode(t, db, "SELECT * FROM generate_series(1, 1000000000)"); c != "54P01" {
 		t.Errorf("ceiling code = %s, want 54P01", c)
 	}
-	db.SetMaxCost(0)
+	db.setMaxCostRaw(0)
 }
 
 func TestGenerateSeriesMixedWidthPromotion(t *testing.T) {

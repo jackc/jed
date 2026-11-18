@@ -69,7 +69,7 @@ func BenchmarkSpecialization(b *testing.B) {
 				{name: "first_call", sql: "SELECT a+b FROM t ORDER BY id LIMIT 16", first: true},
 			} {
 				b.Run(q.name, func(b *testing.B) {
-					s.SetMaxCost(q.limit)
+					s.setMaxCostRaw(q.limit)
 					stmt, err := s.Prepare(q.sql)
 					if err != nil {
 						b.Fatal(err)

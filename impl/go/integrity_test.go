@@ -122,7 +122,7 @@ func TestIntegrityFixtures(t *testing.T) {
 			for _, run := range spec.Runs {
 				opts := IntegrityCheckOptions{MaxFindings: run.MaxFindings, Constraints: run.Constraints}
 				if run.MaxFindings == 0 {
-					opts.MaxFindings = IntegrityUnlimited
+					opts.MaxFindings = Unlimited
 				}
 				if run.Level == "quick" {
 					opts.Level = IntegrityQuick
@@ -200,7 +200,7 @@ func TestIntegrityGoldensClean(t *testing.T) {
 		}
 		for _, level := range []IntegrityLevel{IntegrityQuick, IntegrityFull} {
 			// The full run also re-checks constraints (§6): a valid golden satisfies them all.
-			report, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{Level: level, MaxFindings: IntegrityUnlimited, Constraints: level == IntegrityFull})
+			report, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{Level: level, MaxFindings: Unlimited, Constraints: level == IntegrityFull})
 			if err != nil {
 				t.Errorf("%s (level %d): %v", name, level, err)
 			} else if damaged {
@@ -287,7 +287,7 @@ func TestIntegrityKindsRegistered(t *testing.T) {
 	}
 	// Every Integrity* identifier integrity.go references is one checked above (or the API).
 	api := map[string]bool{
-		"Integrity": true, "IntegrityLevel": true, "IntegrityFull": true, "IntegrityQuick": true, "IntegrityUnlimited": true,
+		"Integrity": true, "IntegrityLevel": true, "IntegrityFull": true, "IntegrityQuick": true, "Unlimited": true,
 		"IntegrityCheckOptions": true, "IntegrityFinding": true, "IntegritySkip": true, "IntegrityReport": true, "IntegrityCheck": true,
 		"IntegrityKind": true, "IntegritySkipReason": true,
 	}
@@ -554,7 +554,7 @@ func TestIntegrityDepthCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pin.release()
-	k := newIntegrityChecker(context.Background(), "main", IntegrityCheckOptions{MaxFindings: IntegrityUnlimited}, pin.snap, pin.paging, pin.gen)
+	k := newIntegrityChecker(context.Background(), "main", IntegrityCheckOptions{MaxFindings: Unlimited}, pin.snap, pin.paging, pin.gen)
 	k.report.Findings = []IntegrityFinding{}
 	root := pin.snap.stores["t"].treeRoot().ref()
 	w := &integrityTree{k: k, object: "t", colTypes: pin.snap.stores["t"].colTypes, table: pin.snap.tables["t"], leafDepth: -1, readable: true}
@@ -601,7 +601,7 @@ func TestIntegrityEnvironmentSkips(t *testing.T) {
 			t.Fatalf("open %s: %v", file, err)
 		}
 		defer db.Close()
-		report, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{MaxFindings: IntegrityUnlimited})
+		report, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{MaxFindings: Unlimited})
 		if err != nil {
 			t.Fatalf("check %s: %v", file, err)
 		}
@@ -656,7 +656,7 @@ func TestIntegrityEveryIndexKindClean(t *testing.T) {
 			t.Fatalf("%s: %v", sql, err)
 		}
 	}
-	report, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{MaxFindings: IntegrityUnlimited})
+	report, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{MaxFindings: Unlimited})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -722,7 +722,7 @@ func TestIntegrityUniqueEntrySplit(t *testing.T) {
 			t.Fatalf("%s: %d entries, %v", def.Name, entries, err)
 		}
 	}
-	report, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{Constraints: true, MaxFindings: IntegrityUnlimited})
+	report, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{Constraints: true, MaxFindings: Unlimited})
 	if err != nil || !report.OK() || len(report.Skipped) != 0 {
 		t.Fatalf("%v: %+v", err, report)
 	}

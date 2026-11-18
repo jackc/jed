@@ -24,6 +24,9 @@ type DeserializeOptions struct {
 // Later commits change only the in-memory copy; serialize again to get them back as bytes. A
 // malformed image is XX001; an encrypted one is 55000 (an in-memory database cannot be encrypted).
 func Deserialize(data []byte, opts DeserializeOptions) (*Database, error) {
+	if err := opts.normalizeLimits(); err != nil {
+		return nil, err
+	}
 	env := opts.Environment
 	if env == nil {
 		env = NewEnvironment()

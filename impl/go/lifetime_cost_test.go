@@ -25,8 +25,8 @@ func TestDefaultSessionHasNoBudgetButTracksTheCumulative(t *testing.T) {
 	// A fresh session is unlimited (budget 0) yet still TRACKS the cumulative cost — the gauge is
 	// always readable (§5.4), it just never aborts.
 	db := mustSession(memDB(), SessionOptions{})
-	if db.LifetimeMaxCost() != 0 {
-		t.Fatalf("fresh budget: want 0, got %d", db.LifetimeMaxCost())
+	if db.lifetimeMaxCostRaw() != 0 {
+		t.Fatalf("fresh budget: want 0, got %d", db.lifetimeMaxCostRaw())
 	}
 	if db.LifetimeCost() != 0 {
 		t.Fatalf("fresh cumulative: want 0, got %d", db.LifetimeCost())
@@ -46,9 +46,9 @@ func TestBudgetAbortsInFlightThenRejectsAtAdmission(t *testing.T) {
 	// Set a budget of 3. The cumulative builds across statements; the one that drives it to the budget
 	// aborts 54P02 mid-flight, and every further statement is then rejected 54P02 at admission.
 	db := mustSession(memDB(), SessionOptions{})
-	db.SetLifetimeMaxCost(3)
-	if db.LifetimeMaxCost() != 3 {
-		t.Fatalf("budget: want 3, got %d", db.LifetimeMaxCost())
+	db.setLifetimeMaxCostRaw(3)
+	if db.lifetimeMaxCostRaw() != 3 {
+		t.Fatalf("budget: want 3, got %d", db.lifetimeMaxCostRaw())
 	}
 	sessExec(t, db, "SELECT 1") // cumulative 1
 	sessExec(t, db, "SELECT 1") // cumulative 2
@@ -74,7 +74,7 @@ func TestPartialCostOfAnAbortedStatementCounts(t *testing.T) {
 	// A single statement larger than the whole budget aborts mid-flight, and the partial work it did
 	// (up to the budget) still counts — the cumulative lands exactly at the budget (unit charges are 1).
 	db := mustSession(memDB(), SessionOptions{})
-	db.SetLifetimeMaxCost(3)
+	db.setLifetimeMaxCostRaw(3)
 	if got := lifeCode(t, db, cost5); got != "54P02" { // would cost 5; aborts at 3
 		t.Fatalf("want 54P02, got %s", got)
 	}
@@ -118,8 +118,8 @@ func TestAStatementAbortsAtWhicheverCeilingItReachesFirst(t *testing.T) {
 	// reaches first. With the per-statement ceiling tight and the budget far, the per-statement ceiling
 	// wins (54P01) — and its partial cost still counts toward the session budget.
 	db := mustSession(memDB(), SessionOptions{})
-	db.SetLifetimeMaxCost(1000)
-	db.SetMaxCost(3)
+	db.setLifetimeMaxCostRaw(1000)
+	db.setMaxCostRaw(3)
 	if got := lifeCode(t, db, cost5); got != "54P01" { // max_cost 3 before the far budget
 		t.Fatalf("want 54P01, got %s", got)
 	}
@@ -129,8 +129,8 @@ func TestAStatementAbortsAtWhicheverCeilingItReachesFirst(t *testing.T) {
 
 	// Now the session budget is the nearer ceiling: a tight budget, the per-statement ceiling far.
 	db2 := mustSession(memDB(), SessionOptions{})
-	db2.SetLifetimeMaxCost(3)
-	db2.SetMaxCost(1000)
+	db2.setLifetimeMaxCostRaw(3)
+	db2.setMaxCostRaw(1000)
 	if got := lifeCode(t, db2, cost5); got != "54P02" { // the budget is reached first
 		t.Fatalf("want 54P02, got %s", got)
 	}
@@ -141,8 +141,8 @@ func TestAnExactTieBreaksToThePerStatementCeiling(t *testing.T) {
 	// When both ceilings are reached at the very same accrued value, the inner per-statement ceiling
 	// wins the tie (54P01) — the documented, deterministic, cross-core tie rule (§5.4, cost.go Guard).
 	db := mustSession(memDB(), SessionOptions{})
-	db.SetLifetimeMaxCost(3)
-	db.SetMaxCost(3)
+	db.setLifetimeMaxCostRaw(3)
+	db.setMaxCostRaw(3)
 	if got := lifeCode(t, db, cost5); got != "54P01" {
 		t.Fatalf("tie: want 54P01, got %s", got)
 	}
@@ -189,7 +189,7 @@ func TestAdmissionIsCheckedBeforeExistenceAndPrivileges(t *testing.T) {
 	// The budget admission check runs ahead of privileges AND existence (§5.4): once a session is
 	// exhausted, even a query naming a missing table is 54P02, not 42P01 — nothing runs.
 	db := mustSession(memDB(), SessionOptions{})
-	db.SetLifetimeMaxCost(1)
+	db.setLifetimeMaxCostRaw(1)
 	// SELECT 1 costs 1, reaching the budget — it aborts 54P02 (and spends the budget).
 	if got := lifeCode(t, db, "SELECT 1"); got != "54P02" {
 		t.Fatalf("spend: want 54P02, got %s", got)

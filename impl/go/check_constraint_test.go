@@ -293,12 +293,12 @@ func TestCheckEvaluationIsMetered(t *testing.T) {
 		t.Fatalf("update cost = %d (%v), want 10", out.Cost, err)
 	}
 	// The ceiling aborts mid-validation deterministically.
-	db.SetMaxCost(2)
+	db.setMaxCostRaw(2)
 	if _, err := queryOutcome(db, "INSERT INTO c VALUES (4), (5), (6)", nil); err == nil ||
 		err.(*EngineError).Code() != "54P01" {
 		t.Fatalf("ceiling = %v, want 54P01", err)
 	}
-	db.SetMaxCost(0)
+	db.setMaxCostRaw(0)
 	if rows := db.rowsInKeyOrder("c"); len(rows) != 3 {
 		t.Fatalf("aborted insert stored rows: %d, want 3", len(rows))
 	}

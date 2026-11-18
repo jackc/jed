@@ -50,8 +50,8 @@ func assertAborts(t *testing.T, db dbHandle, sql string) {
 func TestCostLimitUnlimitedByDefault(t *testing.T) {
 	t.Parallel()
 	db := rowTable(t, 100)
-	if db.MaxCost() != 0 {
-		t.Fatalf("default max_cost = %d, want 0 (unlimited)", db.MaxCost())
+	if db.maxCostRaw() != 0 {
+		t.Fatalf("default max_cost = %d, want 0 (unlimited)", db.maxCostRaw())
 	}
 	mustCost(t, db, "SELECT * FROM t") // runs to completion, no ceiling
 }
@@ -64,15 +64,15 @@ func TestCostLimitAboveSucceedsBelowAborts(t *testing.T) {
 		t.Fatalf("expected a non-trivial full-scan cost, got %d", full)
 	}
 
-	db.SetMaxCost(full + 100) // comfortably above → unchanged
+	db.setMaxCostRaw(full + 100) // comfortably above → unchanged
 	if got := mustCost(t, db, "SELECT v FROM t"); got != full {
 		t.Errorf("under a high ceiling cost = %d, want %d", got, full)
 	}
 
-	db.SetMaxCost(full / 2) // below → aborts
+	db.setMaxCostRaw(full / 2) // below → aborts
 	assertAborts(t, db, "SELECT v FROM t")
 
-	db.SetMaxCost(0) // cleared → unlimited again
+	db.setMaxCostRaw(0) // cleared → unlimited again
 	if got := mustCost(t, db, "SELECT v FROM t"); got != full {
 		t.Errorf("after clearing the ceiling cost = %d, want %d", got, full)
 	}
@@ -83,9 +83,9 @@ func TestCostLimitExactBoundaryAborts(t *testing.T) {
 	db := rowTable(t, 20)
 	full := mustCost(t, db, "SELECT v FROM t")
 	// The ceiling is the first DISALLOWED value: accrued reaching it aborts (CLAUDE.md §13).
-	db.SetMaxCost(full)
+	db.setMaxCostRaw(full)
 	assertAborts(t, db, "SELECT v FROM t")
-	db.SetMaxCost(full + 1)
+	db.setMaxCostRaw(full + 1)
 	if got := mustCost(t, db, "SELECT v FROM t"); got != full {
 		t.Errorf("one above the true cost should succeed: got %d, want %d", got, full)
 	}
@@ -101,7 +101,7 @@ func TestCostLimitPointLookupSurvivesScanCeiling(t *testing.T) {
 	}
 	// A ceiling between the two lets the keyed lookup through but stops the scan. The bound is on
 	// real accrued cost, not table size.
-	db.SetMaxCost((lookup + full) / 2)
+	db.setMaxCostRaw((lookup + full) / 2)
 	if got := mustCost(t, db, "SELECT v FROM t WHERE id = 100"); got != lookup {
 		t.Errorf("point lookup under the ceiling cost = %d, want %d", got, lookup)
 	}
@@ -112,13 +112,13 @@ func TestCostLimitThreadsThroughDeleteAndUpdate(t *testing.T) {
 	t.Parallel()
 	db := rowTable(t, 50)
 	scanCost := mustCost(t, db, "SELECT v FROM t")
-	db.SetMaxCost(scanCost / 2)
+	db.setMaxCostRaw(scanCost / 2)
 
 	assertAborts(t, db, "DELETE FROM t WHERE v > 0")
 	assertAborts(t, db, "UPDATE t SET v = v + 1 WHERE v > 0")
 
 	// The aborts rolled back (autocommit): the table is untouched.
-	db.SetMaxCost(0)
+	db.setMaxCostRaw(0)
 	out, err := queryOutcome(db, "SELECT v FROM t", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -138,7 +138,7 @@ func TestCostLimitPathologicalExpressionAbortsOnOneRow(t *testing.T) {
 	}
 	sql := "SELECT " + strings.Join(parts, " + ") + " FROM t"
 	big := mustCost(t, db, sql)
-	db.SetMaxCost(big / 2)
+	db.setMaxCostRaw(big / 2)
 	assertAborts(t, db, sql)
 }
 
@@ -147,7 +147,7 @@ func TestCostLimitEmptyBoundUnderTinyCeiling(t *testing.T) {
 	// A provably-empty primary-key bound reads no page and no row, so it accrues 0 and survives even
 	// a ceiling of 1 (a point-lookup MISS differs — it still visits a leaf, charging one page_read).
 	db := rowTable(t, 10)
-	db.SetMaxCost(1)
+	db.setMaxCostRaw(1)
 	out, err := queryOutcome(db, "SELECT v FROM t WHERE id > 5 AND id < 5", nil)
 	if err != nil {
 		t.Fatal(err)

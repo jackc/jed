@@ -88,11 +88,11 @@ func TestAdditionalSessionSharesStorageWithIndependentSettings(t *testing.T) {
 
 	// A second session with its own cost ceiling — a's is untouched.
 	s := mustSession(db, SessionOptions{MaxCost: 5})
-	if s.MaxCost() != 5 {
-		t.Fatalf("session MaxCost: want 5, got %d", s.MaxCost())
+	if s.maxCostRaw() != 5 {
+		t.Fatalf("session MaxCost: want 5, got %d", s.maxCostRaw())
 	}
-	if a.MaxCost() != 0 {
-		t.Fatalf("a MaxCost: want 0, got %d", a.MaxCost())
+	if a.maxCostRaw() != 0 {
+		t.Fatalf("a MaxCost: want 0, got %d", a.maxCostRaw())
 	}
 
 	// It sees a's committed data (committed storage is shared via the core).
@@ -117,8 +117,8 @@ func TestAdditionalSessionSharesStorageWithIndependentSettings(t *testing.T) {
 	}
 
 	// Each session keeps its own state/settings: a is still Idle and unlimited.
-	if a.Status() != TxIdle || a.MaxCost() != 0 {
-		t.Fatalf("session a not as expected: status=%v maxCost=%d", a.Status(), a.MaxCost())
+	if a.Status() != TxIdle || a.maxCostRaw() != 0 {
+		t.Fatalf("session a not as expected: status=%v maxCost=%d", a.Status(), a.maxCostRaw())
 	}
 }
 
@@ -147,8 +147,8 @@ func TestAdditionalSessionCostCeilingEnforced(t *testing.T) {
 	if _, err := queryOutcome(a, "SELECT * FROM t", nil); err != nil { // a unaffected
 		t.Fatal(err)
 	}
-	if a.MaxCost() != 0 {
-		t.Fatalf("a MaxCost changed: %d", a.MaxCost())
+	if a.maxCostRaw() != 0 {
+		t.Fatalf("a MaxCost changed: %d", a.maxCostRaw())
 	}
 }
 

@@ -1139,7 +1139,7 @@ func runFile(text string, disk bool) error {
 			return err
 		}
 		db = reDB
-		if err := db.SetMaxStorageBytes("main", mainStorageLimit); err != nil {
+		if err := db.SetMaxStorageBytes("main", specLimit(mainStorageLimit)); err != nil {
 			return fmt.Errorf("disk reopen: max_storage_bytes: %w", err)
 		}
 		sess, err = db.Session(jed.SessionOptions{})
@@ -1240,7 +1240,7 @@ func runFile(text string, disk bool) error {
 			// `# max_storage_bytes: N [database]` (file-level) sets the committed-storage limit of main or
 			// an attachment on the running handle (memory.md §8.1), sticky from this point of the file on.
 			if bytes, name, ok := parseMaxStorageBytesDirective(line); ok {
-				if err := db.SetMaxStorageBytes(name, bytes); err != nil {
+				if err := db.SetMaxStorageBytes(name, specLimit(bytes)); err != nil {
 					return fmt.Errorf("max_storage_bytes %q: %w", name, err)
 				}
 				if name == "main" {
@@ -1296,7 +1296,7 @@ func runFile(text string, disk bool) error {
 				// Sticky (spec/design/session.md §5.4): apply immediately and persistently — the
 				// session cumulative builds across records, so a later record can assert the 54P02
 				// abort. Not a pending per-record directive (it must NOT reset between records).
-				sess.SetLifetimeMaxCost(n)
+				mustLimit(sess.SetLifetimeMaxCost(specLimit(n)))
 			} else if n, ok := parseMaxCostDirective(line); ok {
 				pendingMaxCost = &n
 			} else if n, ok := parseMaxSQLLengthDirective(line); ok {
@@ -1369,13 +1369,13 @@ func runFile(text string, disk bool) error {
 			}
 			workMem = budget
 		}
-		sess.SetWorkMem(workMem)
+		mustLimit(sess.SetWorkMem(specLimit(workMem)))
 		// The temp-table resident budget: the forced-spill override (JED_CONFORMANCE_TEMP_BUFFERS),
 		// otherwise the default. Residency only — results, cost, and 54P03 never depend on it.
 		if forcedTemp >= 0 {
-			sess.SetTempBuffers(forcedTemp)
+			mustLimit(sess.SetTempBuffers(specLimit(forcedTemp)))
 		} else {
-			sess.SetTempBuffers(jed.DefaultTempBuffers)
+			mustLimit(sess.SetTempBuffers(jed.DefaultTempBuffers))
 		}
 		expectedCost := pendingCost
 		expectedNames := pendingNames
@@ -1390,7 +1390,7 @@ func runFile(text string, disk bool) error {
 		if pendingMaxCost != nil {
 			maxCost = *pendingMaxCost
 		}
-		sess.SetMaxCost(maxCost)
+		mustLimit(sess.SetMaxCost(specLimit(maxCost)))
 		pendingMaxCost = nil
 		// Apply the per-record input-size cap; absent ⇒ the engine default (1 MiB), so a
 		// `# max_sql_length:` directive never leaks past its record (cost.md §7, api.md §8).
@@ -1398,7 +1398,7 @@ func runFile(text string, disk bool) error {
 		if pendingMaxSQLLength != nil {
 			maxSQLLength = *pendingMaxSQLLength
 		}
-		sess.SetMaxSQLLength(maxSQLLength)
+		mustLimit(sess.SetMaxSQLLength(specLimit(maxSQLLength)))
 		pendingMaxSQLLength = nil
 		// Apply the per-record entropy seed + statement clock for the uuid generators (entropy.md
 		// §6) by switching the environment's harness sources; absent ⇒ OS entropy / the wall clock, so
@@ -1446,7 +1446,7 @@ func runFile(text string, disk bool) error {
 		if pendingScalarBytes != nil {
 			scalarBytes = *pendingScalarBytes
 		}
-		sess.SetMaxScalarBytes(scalarBytes)
+		mustLimit(sess.SetMaxScalarBytes(max(scalarBytes, 0))) // non-positive: the default
 		pendingScalarBytes = nil
 		// `# max_query_memory_bytes:` (memory.md §2) decorates only its record; absent ⇒ unlimited, or
 		// the whole-corpus accounting budget of JED_CONFORMANCE_QUERY_MEMORY.
@@ -1454,12 +1454,12 @@ func runFile(text string, disk bool) error {
 		if pendingQueryMemory != nil {
 			queryMemory = *pendingQueryMemory
 		}
-		sess.SetMaxQueryMemoryBytes(queryMemory)
+		mustLimit(sess.SetMaxQueryMemoryBytes(specLimit(queryMemory)))
 		pendingQueryMemory = nil
 		underflowsBefore := jed.QueryMemoryUnderflows()
 		jed.ResetQueryMemoryPeak()
 		recordOrdinal++
-		sess.SetMaxTempStorageBytes(maxTempStorage)
+		mustLimit(sess.SetMaxTempStorageBytes(specLimit(maxTempStorage)))
 		pendingMaxTempStorage = nil
 		// Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
 		// pending # set: pair, so a directive decorates only its record and never leaks forward.
@@ -1754,4 +1754,20 @@ func parseFloatCell(s string) (float64, error) {
 		return math.NaN(), nil
 	}
 	return strconv.ParseFloat(strings.TrimSpace(s), 64)
+}
+
+// specLimit maps a directive's limit, where the spec spells "no limit" as 0 (or any non-positive
+// value), to the Go API's form, where 0 is the default and Unlimited is no limit.
+func specLimit[T int | int64](n T) T {
+	if n <= 0 {
+		return jed.Unlimited
+	}
+	return n
+}
+
+// mustLimit fails the run on a limit the Go API rejected: the harness only sets valid ones.
+func mustLimit(err error) {
+	if err != nil {
+		panic("conformance: invalid limit: " + err.Error())
+	}
 }

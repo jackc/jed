@@ -129,7 +129,7 @@ func TestRowReuseRetainedResults(t *testing.T) {
 					mustCreate(t, s, "BEGIN")
 					// Give the writer a budget for its pending versions, then hold it
 					// fixed throughout the scan (Q3 must not be released by scratch).
-					s.SetMaxQueryMemoryBytes(1 << 20)
+					s.setMaxQueryMemoryBytesRaw(1 << 20)
 					mustCreate(t, s, "UPDATE t SET txt='changed' WHERE id=2")
 				}
 				rows, err := s.Query(context.Background(), "SELECT id,a,txt,bytes,arr,j,ROW(id,txt),ARRAY[id,a],(SELECT t.txt) FROM t ORDER BY id")

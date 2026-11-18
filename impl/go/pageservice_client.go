@@ -598,9 +598,7 @@ func openPageClient(cl *psClient, opts OpenOptions, env *Environment, held *page
 	cl.releasePin(rb.txid)
 	db.path = cl.dbPath
 	db.readOnly = cl.readOnly
-	if opts.WorkMem != 0 {
-		db.session.workMem = opts.WorkMem
-	}
+	applyOpenWorkMem(db, opts.WorkMem)
 	return db, nil
 }
 

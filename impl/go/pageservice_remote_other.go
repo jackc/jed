@@ -9,5 +9,8 @@ func OpenRemote(command []string, name string, opts OpenOptions) (*Database, err
 	if err := opts.validateDurations(); err != nil {
 		return nil, err
 	}
+	if err := opts.normalizeLimits(); err != nil {
+		return nil, err
+	}
 	return nil, newError(FeatureNotSupported, "remote databases are unavailable on this platform")
 }

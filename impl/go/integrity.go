@@ -34,9 +34,6 @@ const (
 	IntegrityQuick
 )
 
-// IntegrityUnlimited is the IntegrityCheckOptions.MaxFindings value that sets no limit.
-const IntegrityUnlimited = -1
-
 // defaultIntegrityMaxFindings is the finding limit of the zero options (§2; SQLite's limit too).
 const defaultIntegrityMaxFindings = 100
 
@@ -49,9 +46,9 @@ type IntegrityCheckOptions struct {
 	// Level: NOT NULL and column typmods, CHECK, uniqueness of every unique B-tree index, and foreign
 	// keys. Off by default: a CHECK may need a host function or loaded data the handle lacks.
 	Constraints bool
-	// MaxFindings stops the check after this many findings, setting IntegrityReport.Truncated. Zero is
-	// the default limit of 100; a negative value (IntegrityUnlimited) sets no limit. (The design's
-	// max_findings spells "no limit" as 0; Go keeps the zero value for the default.)
+	// MaxFindings stops the check after this many findings, setting IntegrityReport.Truncated.
+	// It follows the Unlimited rule: 0 selects the default of 100, and Unlimited checks
+	// everything.
 	MaxFindings int
 }
 
@@ -120,6 +117,9 @@ func (db *Database) IntegrityCheck(ctx context.Context, name string, opts Integr
 	}
 	if err := ctx.Err(); err != nil {
 		return IntegrityReport{}, errIntegrityCanceled()
+	}
+	if _, err := hostLimitInt("MaxFindings", opts.MaxFindings, defaultIntegrityMaxFindings, 0); err != nil {
+		return IntegrityReport{}, err
 	}
 	c := db.core
 	var att *attachment

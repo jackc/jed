@@ -36,7 +36,7 @@ func simIntegrity(image []byte, want uint64, cred *Credential) (live, pages, fre
 		return 0, 0, 0, fmt.Errorf("the image holds version %d, want %d", mt.txid, want)
 	}
 	gen := integrityGeneration{meta: mt, file: true, protected: p.manifestProtected}
-	k := newIntegrityChecker(context.Background(), "main", IntegrityCheckOptions{MaxFindings: IntegrityUnlimited}, e.committed, e.paging, gen)
+	k := newIntegrityChecker(context.Background(), "main", IntegrityCheckOptions{MaxFindings: Unlimited}, e.committed, e.paging, gen)
 	report, err := k.run(nil)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("integrity check: %w", err)

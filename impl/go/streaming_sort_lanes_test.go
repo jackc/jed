@@ -89,9 +89,9 @@ func checkTopN(t *testing.T, s *Session, budgets bool) {
 				// Budgets on the two windows a heap serves; tiny ones make the sorter spill row by row.
 				if budgets && limit > 1 && limit < 100 {
 					for _, budget := range []int64{4096, 1024 * 1024} {
-						s.SetMaxQueryMemoryBytes(budget)
+						s.setMaxQueryMemoryBytesRaw(budget)
 						check(fmt.Sprintf("budget %d: ", budget))
-						s.SetMaxQueryMemoryBytes(0)
+						s.setMaxQueryMemoryBytesRaw(0)
 					}
 				}
 			}
@@ -106,7 +106,7 @@ func topNMatchesFullSort(t *testing.T, file string) {
 		workMems = []int{40_000, defaultWorkMem} // the smaller one makes the external sorter spill
 	}
 	for _, workMem := range workMems {
-		s.SetWorkMem(workMem)
+		s.setWorkMemRaw(workMem)
 		checkTopN(t, s, true)
 	}
 	// A writer's uncommitted (Decoded) leaves. A budget failure would abort the open transaction, so

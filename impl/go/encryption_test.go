@@ -756,12 +756,12 @@ func TestEncryptedDatabaseSpillsToSealedScratch(t *testing.T) {
 		"SELECT k, count(DISTINCT s), max(s) FROM t GROUP BY k ORDER BY k",
 		"SELECT a.id, b.id FROM t a JOIN t b ON a.s = b.s ORDER BY a.id, b.id",
 	} {
-		session.SetWorkMem(0)
+		session.setWorkMemRaw(0)
 		resident, err := queryOutcome(session, sql, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		session.SetWorkMem(256)
+		session.setWorkMemRaw(256)
 		rows, err := session.Query(t.Context(), sql)
 		if err != nil {
 			t.Fatal(err)
@@ -789,8 +789,8 @@ func TestEncryptedDatabaseSpillsToSealedScratch(t *testing.T) {
 	}
 	// A temp table past temp_buffers spills its pages to a sealed scratch store.
 	spills := tempSpillsForTooling()
-	session.SetTempBuffers(8192)
-	session.SetMaxTempStorageBytes(0)
+	session.setTempBuffersRaw(8192)
+	session.setMaxTempStorageBytesRaw(0)
 	if _, err := session.ExecuteScript(context.Background(), "CREATE TEMP TABLE tt AS SELECT id, s FROM t"); err != nil {
 		t.Fatal(err)
 	}

@@ -1875,6 +1875,9 @@ func Create(opts CreateOptions) (*Database, error) {
 	if err := validateDurationOptions(opts.FlushInterval, opts.FileLockTimeout, opts.IdleInTransactionTimeout, opts.IdleSessionTimeout, opts.YieldGrace, opts.ShutdownGrace); err != nil {
 		return nil, err
 	}
+	if err := opts.normalizeLimits(); err != nil {
+		return nil, err
+	}
 	pageSize := opts.PageSize
 	if pageSize == 0 {
 		pageSize = DefaultPageSize
@@ -1960,6 +1963,9 @@ func Open(path string, opts OpenOptions) (*Database, error) {
 	if err := opts.validateDurations(); err != nil {
 		return nil, err
 	}
+	if err := opts.normalizeLimits(); err != nil {
+		return nil, err
+	}
 	mode, err := resolvedLocking(opts.Locking)
 	if err != nil {
 		return nil, err
@@ -2022,11 +2028,11 @@ func (s *Database) OldestLiveTxid() uint64 {
 	return oldest
 }
 
-// SetMaxStorageBytes sets the committed-storage limit of database name — `main` or an attachment — in
+// setMaxStorageBytesRaw sets the committed-storage limit of database name — `main` or an attachment — in
 // bytes (spec/design/memory.md §8.1); zero or negative is unlimited. Shared by every session on the
 // handle and checked at each later commit: an in-memory database's page high-water (§8.2), a
 // file-backed database's live pages (§8.7). A name that is not attached is 42704.
-func (db *Database) SetMaxStorageBytes(name string, bytes int64) error {
+func (db *Database) setMaxStorageBytesRaw(name string, bytes int64) error {
 	st, err := db.core.withStorage(name)
 	if err != nil {
 		return err
@@ -2071,6 +2077,11 @@ func (db *Database) Attach(ctx context.Context, name string, source AttachSource
 
 // attach is Attach after its entry check; done abandons the file-lock wait.
 func (db *Database) attach(name string, source AttachSource, readOnly bool, done <-chan struct{}) error {
+	limit, err := hostLimit("MaxStorageBytes", source.maxStorageBytes, 0, 0)
+	if err != nil {
+		return err
+	}
+	source.maxStorageBytes = limit
 	if source.fileLockTimeout != nil {
 		if err := validateDuration("FileLockTimeout", *source.fileLockTimeout); err != nil {
 			return err
@@ -3592,20 +3603,20 @@ func (s *Session) SetDefaultCollation(ctx context.Context, name string) error {
 // --- The relocated envelope (spec/design/session.md §3): each setter/getter delegates to the
 // private engine's sessionState. ---
 
-// MaxCost / SetMaxCost — the per-statement execution-cost ceiling (0 ⇒ unlimited).
-func (s *Session) MaxCost() int64         { return s.engine.session.maxCost }
-func (s *Session) SetMaxCost(limit int64) { s.engine.session.maxCost = limit }
+// maxCostRaw / SetMaxCost — the per-statement execution-cost ceiling (0 ⇒ unlimited).
+func (s *Session) maxCostRaw() int64         { return s.engine.session.maxCost }
+func (s *Session) setMaxCostRaw(limit int64) { s.engine.session.maxCost = limit }
 
-// LifetimeMaxCost / SetLifetimeMaxCost — the per-session cumulative cost budget (0 ⇒ unlimited, §5.4).
-func (s *Session) LifetimeMaxCost() int64         { return s.engine.session.lifetimeMaxCost }
-func (s *Session) SetLifetimeMaxCost(limit int64) { s.engine.session.lifetimeMaxCost = limit }
+// lifetimeMaxCostRaw / SetLifetimeMaxCost — the per-session cumulative cost budget (0 ⇒ unlimited, §5.4).
+func (s *Session) lifetimeMaxCostRaw() int64         { return s.engine.session.lifetimeMaxCost }
+func (s *Session) setLifetimeMaxCostRaw(limit int64) { s.engine.session.lifetimeMaxCost = limit }
 
 // LifetimeCost is the session's running cumulative execution cost so far (§5.4).
 func (s *Session) LifetimeCost() int64 { return *s.engine.session.lifetimeTotal }
 
-// MaxSQLLength / SetMaxSQLLength — the input-SQL byte limit (0 ⇒ unlimited).
-func (s *Session) MaxSQLLength() int     { return s.engine.session.maxSQLLength }
-func (s *Session) SetMaxSQLLength(b int) { s.engine.session.maxSQLLength = b }
+// maxSQLLengthRaw / SetMaxSQLLength — the input-SQL byte limit (0 ⇒ unlimited).
+func (s *Session) maxSQLLengthRaw() int     { return s.engine.session.maxSQLLength }
+func (s *Session) setMaxSQLLengthRaw(b int) { s.engine.session.maxSQLLength = b }
 
 // LockTimeout returns the writer-lock timeout. Zero means no timeout.
 func (s *Session) LockTimeout() time.Duration { return millisDuration(s.engine.session.lockTimeoutMs) }
@@ -3620,9 +3631,9 @@ func (s *Session) SetLockTimeout(timeout time.Duration) error {
 	return nil
 }
 
-// WorkMem / SetWorkMem — the work-memory budget in bytes (0 ⇒ unlimited).
-func (s *Session) WorkMem() int     { return s.engine.session.workMem }
-func (s *Session) SetWorkMem(b int) { s.engine.session.workMem = b }
+// workMemRaw / SetWorkMem — the work-memory budget in bytes (0 ⇒ unlimited).
+func (s *Session) workMemRaw() int     { return s.engine.session.workMem }
+func (s *Session) setWorkMemRaw(b int) { s.engine.session.workMem = b }
 
 // SetDefaultPrivileges replaces the default table-privilege set — the GRANT … ON ALL TABLES default
 // (§5.3).
@@ -3674,14 +3685,14 @@ func (s *Session) ResetPrivileges() { s.engine.ResetPrivileges() }
 // spec/design/temp-tables.md §5); a denied temp DDL is 42501.
 func (s *Session) SetAllowTempDDL(allow bool) { s.engine.session.allowTempDDL = allow }
 
-// SetTempBuffers — the per-session temp-table RESIDENT budget in bytes (0 ⇒ never spill,
+// setTempBuffersRaw — the per-session temp-table RESIDENT budget in bytes (0 ⇒ never spill,
 // spec/design/temp-tables.md §6): past it a host with a spill directory moves the temp domain to a
 // scratch file whose page cache it bounds. Residency only — never results, cost, or the 54P03 point.
-func (s *Session) SetTempBuffers(bytes int) { s.engine.session.tempBuffers = bytes }
+func (s *Session) setTempBuffersRaw(bytes int) { s.engine.session.tempBuffers = bytes }
 
-// SetMaxTempStorageBytes — the per-session temp-table storage CEILING in bytes (0 ⇒ unlimited,
+// setMaxTempStorageBytesRaw — the per-session temp-table storage CEILING in bytes (0 ⇒ unlimited,
 // spec/design/temp-tables.md §7); an over-ceiling temp write aborts 54P03.
-func (s *Session) SetMaxTempStorageBytes(bytes int) { s.engine.session.maxTempStorageBytes = bytes }
+func (s *Session) setMaxTempStorageBytesRaw(bytes int) { s.engine.session.maxTempStorageBytes = bytes }
 
 // ResetVars clears every session variable — PostgreSQL's RESET ALL for the variable map (§6.1).
 func (s *Session) ResetVars() { s.engine.session.ResetVars() }
@@ -3720,16 +3731,16 @@ func (s *Session) UpgradeCollations(ctx context.Context) (int, error) {
 	return n, err
 }
 
-// MaxScalarBytes is the cumulative scalar-allocation budget per statement.
-func (s *Session) MaxScalarBytes() int64 { return s.engine.MaxScalarBytes() }
+// maxScalarBytesRaw is the cumulative scalar-allocation budget per statement.
+func (s *Session) maxScalarBytesRaw() int64 { return s.engine.MaxScalarBytes() }
 
-// SetMaxScalarBytes sets that budget; non-positive values restore the finite default.
-func (s *Session) SetMaxScalarBytes(b int64) { s.engine.SetMaxScalarBytes(b) }
+// setMaxScalarBytesRaw sets that budget; non-positive values restore the finite default.
+func (s *Session) setMaxScalarBytesRaw(b int64) { s.engine.SetMaxScalarBytes(b) }
 
-// MaxQueryMemoryBytes is the live query-memory budget per statement (spec/design/memory.md §2), or
+// maxQueryMemoryBytesRaw is the live query-memory budget per statement (spec/design/memory.md §2), or
 // 0 for unlimited (the default).
-func (s *Session) MaxQueryMemoryBytes() int64 { return s.engine.MaxQueryMemoryBytes() }
+func (s *Session) maxQueryMemoryBytesRaw() int64 { return s.engine.MaxQueryMemoryBytes() }
 
-// SetMaxQueryMemoryBytes sets the live query-memory budget per statement; non-positive restores the
+// setMaxQueryMemoryBytesRaw sets the live query-memory budget per statement; non-positive restores the
 // default, unlimited. Over-budget fails 54P05. An open cursor keeps the budget it opened with.
-func (s *Session) SetMaxQueryMemoryBytes(b int64) { s.engine.SetMaxQueryMemoryBytes(b) }
+func (s *Session) setMaxQueryMemoryBytesRaw(b int64) { s.engine.SetMaxQueryMemoryBytes(b) }

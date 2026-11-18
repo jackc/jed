@@ -13,15 +13,15 @@ import (
 
 func TestQueryMemorySettingDefaultsToUnlimited(t *testing.T) {
 	s := dbWith(t)
-	if got := s.MaxQueryMemoryBytes(); got != 0 {
+	if got := s.maxQueryMemoryBytesRaw(); got != 0 {
 		t.Fatalf("default budget %d, want 0 (unlimited)", got)
 	}
-	s.SetMaxQueryMemoryBytes(4096)
-	if got := s.MaxQueryMemoryBytes(); got != 4096 {
+	s.setMaxQueryMemoryBytesRaw(4096)
+	if got := s.maxQueryMemoryBytesRaw(); got != 4096 {
 		t.Fatalf("budget %d, want 4096", got)
 	}
-	s.SetMaxQueryMemoryBytes(-1)
-	if got := s.MaxQueryMemoryBytes(); got != 0 {
+	s.setMaxQueryMemoryBytesRaw(-1)
+	if got := s.maxQueryMemoryBytesRaw(); got != 0 {
 		t.Fatalf("negative budget reads %d, want 0 (unlimited)", got)
 	}
 	// Unlimited never aborts, even for a large materialized result.
@@ -33,7 +33,7 @@ func TestQueryMemorySettingDefaultsToUnlimited(t *testing.T) {
 		t.Fatalf("got %d rows, want 2000", len(out.Rows))
 	}
 	opts := mustSession(memDB(), SessionOptions{MaxQueryMemoryBytes: 1 << 20})
-	if got := opts.MaxQueryMemoryBytes(); got != 1<<20 {
+	if got := opts.maxQueryMemoryBytesRaw(); got != 1<<20 {
 		t.Fatalf("SessionOptions budget %d, want %d", got, 1<<20)
 	}
 }
@@ -43,16 +43,16 @@ func TestQueryMemoryBufferedRowsReleasedOnYield(t *testing.T) {
 	s := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1), (2)")
 	// The columnar projection lane gathers the id column (2 values × 32 = 64 bytes of lane state,
 	// memory.md §6.5), held until its emission completes; the yielded rows are the host's own memory.
-	s.SetMaxQueryMemoryBytes(64)
+	s.setMaxQueryMemoryBytesRaw(64)
 	if out, err := queryOutcome(s, "SELECT id FROM t", nil); err != nil || len(out.Rows) != 2 {
 		t.Fatalf("columnar scan under its lane budget: %v", err)
 	}
-	s.SetMaxQueryMemoryBytes(63)
+	s.setMaxQueryMemoryBytesRaw(63)
 	if _, err := queryOutcome(s, "SELECT id FROM t", nil); err == nil || err.(*EngineError).Code() != "54P05" {
 		t.Fatalf("columnar scan one byte under its lane budget: want 54P05, got %v", err)
 	}
 	// EXPLAIN's rows are a materialized result admitted against the statement's account.
-	s.SetMaxQueryMemoryBytes(1 << 20)
+	s.setMaxQueryMemoryBytesRaw(1 << 20)
 	rows, err := s.queryValues("EXPLAIN SELECT id FROM t ORDER BY -id", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -87,7 +87,7 @@ func TestQueryMemoryBudgetStaysWithCursor(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer old.Close()
-	s.SetMaxQueryMemoryBytes(1)
+	s.setMaxQueryMemoryBytesRaw(1)
 	_, err = queryOutcome(s, "SELECT id FROM t ORDER BY -id", nil)
 	if e, ok := err.(*EngineError); !ok || e.Code() != "54P05" {
 		t.Fatalf("want 54P05 under a 1-byte budget, got %v", err)
@@ -123,8 +123,8 @@ func TestQueryMemorySpillingOperatorStateReleasesItsCharge(t *testing.T) {
 	mustExec(t, s, "INSERT INTO t SELECT g, repeat('x', g) FROM generate_series(1, 300) g")
 	const sql = "SELECT DISTINCT s FROM t"
 	peak := func(workMem int) int64 {
-		s.SetWorkMem(workMem)
-		s.SetMaxQueryMemoryBytes(1 << 40)
+		s.setWorkMemRaw(workMem)
+		s.setMaxQueryMemoryBytesRaw(1 << 40)
 		resetQueryMemoryPeak()
 		if _, err := queryOutcome(s, sql, nil); err != nil {
 			t.Fatal(err)
@@ -137,19 +137,19 @@ func TestQueryMemorySpillingOperatorStateReleasesItsCharge(t *testing.T) {
 		t.Fatalf("spilling peak %d vs resident %d", spilling, resident)
 	}
 	// The spilling run fits a budget the resident run exceeds.
-	s.SetMaxQueryMemoryBytes(spilling)
-	s.SetWorkMem(4096)
+	s.setMaxQueryMemoryBytesRaw(spilling)
+	s.setWorkMemRaw(4096)
 	out, err := queryOutcome(s, sql, nil)
 	if err != nil || len(out.Rows) != 300 {
 		t.Fatalf("spilling DISTINCT under its peak budget: %d rows, %v", len(out.Rows), err)
 	}
 	// With a work_mem the resident DISTINCT fits, the rejected reservation spills it instead.
-	s.SetWorkMem(1 << 30)
+	s.setWorkMemRaw(1 << 30)
 	out, err = queryOutcome(s, sql, nil)
 	if err != nil || len(out.Rows) != 300 {
 		t.Fatalf("resident-work_mem DISTINCT under the spilling budget: %d rows, %v", len(out.Rows), err)
 	}
-	s.SetWorkMem(0)
+	s.setWorkMemRaw(0)
 	if _, err := queryOutcome(s, sql, nil); err == nil || err.(*EngineError).Code() != "54P05" {
 		t.Fatalf("never-spill DISTINCT under the spilling budget: want 54P05, got %v", err)
 	}

@@ -63,9 +63,9 @@ func TestRowMaterializationTrace(t *testing.T) {
 					for prefix := int64(0); prefix <= 96; prefix++ {
 						s := mustSession(db, SessionOptions{MaxQueryMemoryBytes: budget})
 						if mode == 0 {
-							s.SetMaxCost(prefix)
+							s.setMaxCostRaw(prefix)
 						} else if mode == 1 {
-							s.SetLifetimeMaxCost(prefix)
+							s.setLifetimeMaxCostRaw(prefix)
 						}
 						pulls := int64(0)
 						resetQueryMemoryPeak()

@@ -80,11 +80,11 @@ func TestDepthAbortIndependentOfMaxCost(t *testing.T) {
 	// The overflow this guards strikes during PARSE, before the meter runs — so even an unlimited
 	// (or tiny) ceiling cannot let a stack-busting statement through (CLAUDE.md §13).
 	db := depthDB(t)
-	db.SetMaxCost(0) // unlimited
+	db.setMaxCostRaw(0) // unlimited
 	if c := codeOf(db, depthChain(maxExprDepth*8)); c != "54001" {
 		t.Fatalf("unlimited: %s, want 54001", c)
 	}
-	db.SetMaxCost(1) // tightest possible ceiling
+	db.setMaxCostRaw(1) // tightest possible ceiling
 	if c := codeOf(db, depthChain(maxExprDepth*8)); c != "54001" {
 		t.Fatalf("max_cost=1: %s, want 54001", c)
 	}

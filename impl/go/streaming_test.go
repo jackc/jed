@@ -675,7 +675,7 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 	// after the blocking first pull there is no live spill run. Lowering the budget below K's
 	// estimate falls back to the existing sorter, whose undrained merge keeps runs live.
 	fit := mustSession(db, SessionOptions{})
-	fit.SetWorkMem(512) // K=5 × (8 + 2×40) = 440 bytes
+	fit.setWorkMemRaw(512) // K=5 × (8 + 2×40) = 440 bytes
 	fitRows, err := fit.queryValues(sql+" LIMIT 5", nil)
 	if err != nil || !fitRows.Next() {
 		t.Fatalf("top-k first pull: %v", err)
@@ -687,7 +687,7 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 	fit.Close()
 
 	fallback := mustSession(db, SessionOptions{})
-	fallback.SetWorkMem(128)
+	fallback.setWorkMemRaw(128)
 	fallbackRows, err := fallback.queryValues(sql+" LIMIT 5", nil)
 	if err != nil || !fallbackRows.Next() {
 		t.Fatalf("fallback first pull: %v", err)
@@ -703,7 +703,7 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 
 	// Full lazy drain under a tiny workMem (forces spill + merge): rows + cost match the oracle.
 	s := mustSession(db, SessionOptions{})
-	s.SetWorkMem(128) // ~2-3 rows per run → dozens of runs + a deep merge
+	s.setWorkMemRaw(128) // ~2-3 rows per run → dozens of runs + a deep merge
 	sr, sc := streamResult(t, s, sql)
 	if !rowsEqual(sr, er) {
 		t.Fatalf("spilling lazy drain rows must match eager")
@@ -719,7 +719,7 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 	// Early exit over the merge: pull a prefix, then close the cursor. close releases the undrained
 	// merge's run files, so none leak.
 	s2 := mustSession(db, SessionOptions{})
-	s2.SetWorkMem(128)
+	s2.setWorkMemRaw(128)
 	rows, err := s2.queryValues(sql, nil)
 	if err != nil {
 		t.Fatal(err)

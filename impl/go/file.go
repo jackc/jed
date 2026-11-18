@@ -309,9 +309,7 @@ func openViaHeld(files fileHost, path string, opts OpenOptions, held *pageCodec)
 	// An encrypted database seals its scratch files (spec/design/encryption.md §6).
 	db.spill = scratchHost(db.encrypted() || opts.ScratchEncryption == ScratchEncryptionOn, env)
 	db.readOnly = opts.ReadOnly
-	if opts.WorkMem != 0 {
-		db.session.workMem = opts.WorkMem
-	}
+	applyOpenWorkMem(db, opts.WorkMem)
 	return db, nil
 }
 

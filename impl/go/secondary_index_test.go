@@ -321,11 +321,11 @@ func TestIndexFileBackedPagedReopen(t *testing.T) {
 func TestCreateIndexHonorsTheCostCeiling(t *testing.T) {
 	t.Parallel()
 	db := siDB20(t)
-	db.SetMaxCost(10) // the build scan costs 21
+	db.setMaxCostRaw(10) // the build scan costs 21
 	if got := siErr(t, db, "CREATE INDEX t_v_idx ON t (v)"); got != "54P01" {
 		t.Fatalf("ceiling abort: %s", got)
 	}
-	db.SetMaxCost(0)
+	db.setMaxCostRaw(0)
 	tab, _ := db.table("t")
 	if len(tab.Indexes) != 0 {
 		t.Fatalf("aborted CREATE INDEX registered: %+v", tab.Indexes)

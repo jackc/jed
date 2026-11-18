@@ -165,58 +165,57 @@ type estimatorTouchedRelation struct {
 	table    string
 }
 
-// SessionOptions are the relocatable session settings (spec/design/session.md §3 — the bucket-A
-// envelope subset landed in S1): the cost ceiling, the input-size limit, and the work-memory
-// budget. Passed to Database.Session. A zero MaxSQLLength or WorkMem takes its default at
-// construction (use the setter for the 0 ⇒ unlimited form); a zero MaxCost IS unlimited (the
-// genuine default). The entropy/clock sources come from the handle's Environment.
+// SessionOptions configures a Session made by Database.Session. The zero value is a session
+// with every default: unrestricted privileges, DDL allowed, UTC, and the default limits.
+//
+// The size and count limits follow the Unlimited rule: a positive value is the limit, 0 selects
+// the default, Unlimited sets no limit, and any other negative value makes Database.Session fail
+// with SQLSTATE 22023. Each limit has a Session setter of the same name.
 type SessionOptions struct {
-	// MaxScalarBytes bounds cumulative covered scalar allocations per statement; non-positive
-	// values restore the finite 64 MiB default (spec/design/memory.md).
-	MaxScalarBytes int64
-	// MaxQueryMemoryBytes is the live logical query-memory budget per statement
-	// (spec/design/memory.md §2); non-positive ⇒ unlimited (the default). Over-budget fails 54P05.
-	MaxQueryMemoryBytes int64
-	MaxCost             int64
-	// LifetimeMaxCost is the per-session cumulative cost budget (spec/design/session.md §5.4); 0 ⇒
-	// unlimited (the default). Bounds the whole session: the instant the session's running total
-	// reaches it, the in-flight statement aborts 54P02 (and once spent, every further statement is
-	// rejected at admission). Sibling to MaxCost, which bounds one statement.
+	// MaxCost limits each statement's deterministic execution cost (SQLSTATE 54P01 past it).
+	// Default: Unlimited.
+	MaxCost int64
+	// LifetimeMaxCost limits the session's cumulative execution cost (SQLSTATE 54P02 once it is
+	// reached). Default: Unlimited.
 	LifetimeMaxCost int64
-	MaxSQLLength    int
-	// LockTimeout bounds writer-lock waits. Zero is unlimited. Negative values
-	// are invalid; positive fractions of a millisecond round up.
+	// MaxSQLLength limits the bytes of SQL text a statement or script may have (SQLSTATE 54000).
+	// Default: DefaultMaxSQLLength.
+	MaxSQLLength int
+	// MaxScalarBytes limits the bytes of values each statement computes (SQLSTATE 54P04).
+	// Default: 64 MiB.
+	MaxScalarBytes int64
+	// MaxQueryMemoryBytes limits the memory each statement holds at once (SQLSTATE 54P05).
+	// Default: Unlimited.
+	MaxQueryMemoryBytes int64
+	// WorkMem is the memory, in bytes, a sort or other blocking operator holds before it spills
+	// to scratch storage. It never changes results or cost. Default: 256 MiB; Unlimited never
+	// spills.
+	WorkMem int
+	// TempBuffers is the memory, in bytes, the session's temporary tables keep resident before
+	// they move to a scratch file. It never changes results or cost. Default: DefaultTempBuffers;
+	// Unlimited keeps them resident.
+	TempBuffers int
+	// MaxTempStorageBytes limits the storage of the session's temporary tables (SQLSTATE 54P03).
+	// Default: DefaultMaxTempStorageBytes.
+	MaxTempStorageBytes int
+	// LockTimeout bounds each wait for the writer slot (SQLSTATE 55P03 when it expires). Zero
+	// waits without limit; a negative value is invalid. Positive fractions of a millisecond round
+	// up.
 	LockTimeout time.Duration
-	WorkMem     int
-	// DefaultPrivileges is the table-privilege set granted to every table — the GRANT … ON ALL TABLES
-	// default (spec/design/session.md §5.3). nil ⇒ all four (the default), so a fresh session is
-	// unrestricted; PrivSetEmpty.With(PrivSelect) is a read-only session. A pointer so the zero
-	// SessionOptions stays permissive (the empty set is a meaningful, distinct value).
+	// DefaultPrivileges is the set of table privileges every table grants the session. nil grants
+	// all four; PrivSetEmpty.With(PrivSelect) makes a read-only session. Session.Grant and
+	// Session.Revoke adjust single objects.
 	DefaultPrivileges *PrivilegeSet
-	// AllowDDL governs whether PERSISTENT DDL (CREATE/DROP/ALTER of persistent relations) is permitted;
-	// a denied schema change is 42501 (§5.3). nil ⇒ on (the default). A pointer so the zero
-	// SessionOptions allows DDL. Its scope narrows with temporary tables (temp-tables.md §5): AllowTempDDL
-	// is the temp-scoped sibling gate.
+	// AllowDDL permits schema changes to persistent objects (SQLSTATE 42501 when denied).
+	// nil allows them.
 	AllowDDL *bool
-	// AllowTempDDL governs whether SESSION-LOCAL temporary-table DDL is permitted
-	// (spec/design/temp-tables.md §5); a denied temp DDL is 42501. nil ⇒ INHERIT AllowDDL's value
-	// (back-compat: a session left as-is behaves as before, one gate governing all DDL). The
-	// untrusted-scratch pattern is AllowDDL=false + AllowTempDDL=&true — private scratch tables only.
+	// AllowTempDDL permits creating and dropping the session's temporary tables. nil follows
+	// AllowDDL. AllowDDL: new(false) with AllowTempDDL: new(true) lets an untrusted session use
+	// private scratch tables only.
 	AllowTempDDL *bool
-	// TempBuffers is the per-session RESIDENT budget for session-local temp tables, in BYTES
-	// (spec/design/temp-tables.md §6); 0 ⇒ never spill; nil ⇒ the engine default (DefaultTempBuffers).
-	// Past it a host with a spill directory moves the temp domain to a scratch file with a page cache
-	// this size. Residency only — it never changes results, cost, or the 54P03 point.
-	TempBuffers *int
-	// MaxTempStorageBytes is the per-session storage CEILING for session-local temp tables, in BYTES
-	// (spec/design/temp-tables.md §7); 0 ⇒ unlimited; nil ⇒ the engine default
-	// (DefaultMaxTempStorageBytes). Bounds the RETAINED temp storage neither cost ceiling covers — an
-	// over-ceiling temp write aborts 54P03, whether the domain is resident or spilled.
-	MaxTempStorageBytes *int
-	// TimeZone is the session time zone (spec/design/session.md §6.2, timezones.md §9.4): the zone a
-	// timestamptz is decomposed in by date_trunc / EXTRACT / the cross-family casts. "" ⇒ UTC. Accepts
-	// UTC, a fixed ±HH:MM offset, or a named IANA zone a loaded JTZ bundle provides; an invalid value
-	// returns an error (22023) from Database.Session.
+	// TimeZone is the session time zone: UTC, a fixed offset such as "+05:30", or a named zone
+	// the database's Environment loads. "" selects UTC. Anything else makes Database.Session fail
+	// with SQLSTATE 22023.
 	TimeZone string
 }
 
@@ -423,11 +422,9 @@ func newSessionWithOptions(opts SessionOptions, env *Environment) (sessionState,
 	if !ok {
 		return sessionState{}, newError(InvalidParameterValue, fmt.Sprintf("time zone %q not recognized", tzName))
 	}
-	if opts.MaxSQLLength == 0 {
-		opts.MaxSQLLength = DefaultMaxSQLLength
-	}
-	if opts.WorkMem == 0 {
-		opts.WorkMem = defaultWorkMem
+	opts, err := opts.sessionLimits()
+	if err != nil {
+		return sessionState{}, err
 	}
 	s := sessionState{
 		maxCost:             opts.MaxCost,
@@ -441,8 +438,8 @@ func newSessionWithOptions(opts SessionOptions, env *Environment) (sessionState,
 		workMem:             opts.WorkMem,
 		privileges:          newPrivileges(),
 		allowDDL:            true,
-		tempBuffers:         DefaultTempBuffers,
-		maxTempStorageBytes: DefaultMaxTempStorageBytes,
+		tempBuffers:         opts.TempBuffers,
+		maxTempStorageBytes: opts.MaxTempStorageBytes,
 		tempCommitted:       newSnapshot(env),
 		vars:                map[string]string{},
 		env:                 env,
@@ -459,12 +456,6 @@ func newSessionWithOptions(opts SessionOptions, env *Environment) (sessionState,
 	s.allowTempDDL = s.allowDDL
 	if opts.AllowTempDDL != nil {
 		s.allowTempDDL = *opts.AllowTempDDL
-	}
-	if opts.TempBuffers != nil {
-		s.tempBuffers = *opts.TempBuffers
-	}
-	if opts.MaxTempStorageBytes != nil {
-		s.maxTempStorageBytes = *opts.MaxTempStorageBytes
 	}
 	s.timeZone = zr
 	return s, nil

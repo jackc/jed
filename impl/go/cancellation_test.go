@@ -374,9 +374,9 @@ func TestCancellationPreservesCostLimits(t *testing.T) {
 				s := mustSession(db, SessionOptions{})
 				if setting != "" {
 					if setting == "SET max_cost = 50" {
-						s.SetMaxCost(50)
+						s.setMaxCostRaw(50)
 					} else {
-						s.SetLifetimeMaxCost(50)
+						s.setLifetimeMaxCostRaw(50)
 					}
 				}
 				r, err := s.Query(c, sql)

@@ -59,7 +59,7 @@ func scheduleDB(header []string) *jed.Database {
 				panic("concurrency # attach: " + name + ": " + err.Error())
 			}
 		} else if bytes, name, ok := parseMaxStorageBytesDirective(line); ok {
-			if err := db.SetMaxStorageBytes(name, bytes); err != nil {
+			if err := db.SetMaxStorageBytes(name, specLimit(bytes)); err != nil {
 				panic("concurrency # max_storage_bytes: " + name + ": " + err.Error())
 			}
 		}

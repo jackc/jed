@@ -58,7 +58,7 @@ func TestStorageLimitOptionsAndGauge(t *testing.T) {
 		t.Fatalf("storage %d did not grow past %d", full, fresh)
 	}
 	// Lowering the limit below the current size blocks growth, not the database.
-	if err := db.SetMaxStorageBytes("main", fresh); err != nil {
+	if err := db.setMaxStorageBytesRaw("main", fresh); err != nil {
 		t.Fatal(err)
 	}
 	if code := storageExecCode(s, storageBatch(200, 200)); code != "54P06" {
@@ -67,7 +67,7 @@ func TestStorageLimitOptionsAndGauge(t *testing.T) {
 	if got := mustStorageBytes(t, db, "main"); got != full {
 		t.Fatalf("a rejected commit writes nothing: storage %d, want %d", got, full)
 	}
-	if err := db.SetMaxStorageBytes("main", -1); err != nil {
+	if err := db.setMaxStorageBytesRaw("main", -1); err != nil {
 		t.Fatal(err)
 	}
 	storageExec(t, s, storageBatch(200, 200))
@@ -90,7 +90,7 @@ func TestStorageLimitOptionsAndGauge(t *testing.T) {
 	if code := storageExecCode(s, "CREATE TABLE aux.a (id i32 PRIMARY KEY, v text)"); code != "54P06" {
 		t.Fatalf("attach-option limit: want 54P06, got %q", code)
 	}
-	if err := db.SetMaxStorageBytes("aux", 0); err != nil {
+	if err := db.setMaxStorageBytesRaw("aux", 0); err != nil {
 		t.Fatal(err)
 	}
 	storageExec(t, s, "CREATE TABLE aux.a (id i32 PRIMARY KEY, v text)")
@@ -102,7 +102,7 @@ func TestStorageLimitOptionsAndGauge(t *testing.T) {
 	if _, err := db.StorageBytes("nope"); errCodeOf(err) != "42704" {
 		t.Fatalf("unknown database: want 42704, got %v", err)
 	}
-	if err := db.SetMaxStorageBytes("temp", storagePage); errCodeOf(err) != "42704" {
+	if err := db.setMaxStorageBytesRaw("temp", storagePage); errCodeOf(err) != "42704" {
 		t.Fatalf("temp: want 42704, got %v", err)
 	}
 }
@@ -146,7 +146,7 @@ func TestFileStorageLimitMeasuresLivePages(t *testing.T) {
 	}
 
 	// The setter limits the file from the next commit; a rejected commit writes nothing.
-	if err := db.SetMaxStorageBytes("main", half); err != nil {
+	if err := db.setMaxStorageBytesRaw("main", half); err != nil {
 		t.Fatal(err)
 	}
 	if code := storageExecCode(s, storageBatch(100, 100)); code != "54P06" {
@@ -185,7 +185,7 @@ func TestFileStorageLimitMeasuresLivePages(t *testing.T) {
 	if code := storageExecCode(s, storageBatch(100, 100)); code != "54P06" {
 		t.Fatalf("open-option limit: want 54P06, got %q", code)
 	}
-	if err := db.SetMaxStorageBytes("main", 0); err != nil {
+	if err := db.setMaxStorageBytesRaw("main", 0); err != nil {
 		t.Fatal(err)
 	}
 	storageExec(t, s, storageBatch(100, 100))
@@ -301,7 +301,7 @@ func TestStorageLimitMultiRootRejectionPacksNoAttachment(t *testing.T) {
 	storageExec(t, s, "CREATE TABLE aux.a (id i32 PRIMARY KEY, v text)")
 	main := mustStorageBytes(t, db, "main")
 	aux := mustStorageBytes(t, db, "aux")
-	if err := db.SetMaxStorageBytes("main", main); err != nil {
+	if err := db.setMaxStorageBytesRaw("main", main); err != nil {
 		t.Fatal(err)
 	}
 	storageExec(t, s, "BEGIN")
@@ -331,7 +331,7 @@ func TestStorageLimitPinnedReaderBlocksForcedCompaction(t *testing.T) {
 	w := mustSession(db, SessionOptions{})
 	storageExec(t, w, "CREATE TABLE t (id i32 PRIMARY KEY, v text)")
 	storageExec(t, w, storageBatch(0, 100))
-	if err := db.SetMaxStorageBytes("main", mustStorageBytes(t, db, "main")); err != nil {
+	if err := db.setMaxStorageBytesRaw("main", mustStorageBytes(t, db, "main")); err != nil {
 		t.Fatal(err)
 	}
 	// A reader pinned at the current version keeps every page a compaction would keep: the delete

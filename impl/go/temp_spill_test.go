@@ -52,8 +52,8 @@ func spillDB(dir string) *Database {
 // statement's rows and cost, whether the domain spilled, and the session (still open).
 func runTempSpill(t *testing.T, db *Database, tempBuffers int) ([]tempSpillResult, bool, *Session) {
 	t.Helper()
-	unlimited := 0
-	sess := mustSession(db, SessionOptions{TempBuffers: &tempBuffers, MaxTempStorageBytes: &unlimited})
+	unlimited := Unlimited
+	sess := mustSession(db, SessionOptions{TempBuffers: tempBuffers, MaxTempStorageBytes: unlimited})
 	var out []tempSpillResult
 	for _, sql := range tempSpillWorkload {
 		o, err := queryOutcome(sess, sql, nil)
@@ -87,7 +87,7 @@ func dirEntries(t *testing.T, dir string) int {
 func TestSpilledTempDomainMatchesResidentRowsAndCost(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	resident, residentSpilled, a := runTempSpill(t, spillDB(dir), 0)
+	resident, residentSpilled, a := runTempSpill(t, spillDB(dir), Unlimited)
 	defer a.Close()
 	if residentSpilled {
 		t.Fatal("tempBuffers = 0 must never spill")
@@ -149,7 +149,7 @@ func TestTempSpillDoesNotMoveThe54P03Point(t *testing.T) {
 	dir := t.TempDir()
 	abortAt := func(tempBuffers int) (int, bool) {
 		ceiling := 40 * 256
-		sess := mustSession(spillDB(dir), SessionOptions{TempBuffers: &tempBuffers, MaxTempStorageBytes: &ceiling})
+		sess := mustSession(spillDB(dir), SessionOptions{TempBuffers: tempBuffers, MaxTempStorageBytes: ceiling})
 		defer sess.Close()
 		sessExec(t, sess, "CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)")
 		pad := strings.Repeat("z", 40)
@@ -165,7 +165,7 @@ func TestTempSpillDoesNotMoveThe54P03Point(t *testing.T) {
 		t.Fatal("never hit 54P03")
 		return 0, false
 	}
-	residentAt, residentSpilled := abortAt(0)
+	residentAt, residentSpilled := abortAt(Unlimited)
 	spilledAt, didSpill := abortAt(2 * 256)
 	if residentSpilled {
 		t.Fatal("tempBuffers = 0 must never spill")
@@ -185,7 +185,7 @@ func TestTempPoolCapacityFollowsALaterTempBuffersChange(t *testing.T) {
 	if !didSpill {
 		t.Fatal("a temp domain past tempBuffers should spill")
 	}
-	sess.SetTempBuffers(16 * 256)
+	sess.setTempBuffersRaw(16 * 256)
 	sessExec(t, sess, "INSERT INTO s VALUES (100000, 1, 'x')")
 	if got := sess.engine.tempStorage.paging.capacity(); got != 16*256 {
 		t.Fatalf("spilled pool budget = %d after the change, want %d", got, 16*256)

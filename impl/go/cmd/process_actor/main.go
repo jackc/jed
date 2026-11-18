@@ -198,6 +198,9 @@ func run() error {
 			if parseErr != nil {
 				panic("MAX_STORAGE_BYTES bytes: " + parseErr.Error())
 			}
+			if bytes <= 0 {
+				bytes = jed.Unlimited // the spec's "no limit"
+			}
 			err = db.SetMaxStorageBytes("main", bytes)
 		case "STORAGE_BYTES":
 			var bytes int64

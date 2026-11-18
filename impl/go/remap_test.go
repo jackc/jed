@@ -167,7 +167,7 @@ func TestRemapEndToEnd(t *testing.T) {
 	}
 	check := func(what string) {
 		t.Helper()
-		report, err := db.IntegrityCheck(ctx, "main", IntegrityCheckOptions{Level: IntegrityFull, MaxFindings: IntegrityUnlimited, Constraints: true})
+		report, err := db.IntegrityCheck(ctx, "main", IntegrityCheckOptions{Level: IntegrityFull, MaxFindings: Unlimited, Constraints: true})
 		if err != nil || !report.OK() {
 			t.Fatalf("%s: integrity %v %+v", what, err, report.Findings)
 		}
@@ -266,7 +266,7 @@ func TestRemapRubyHistories(t *testing.T) {
 					t.Errorf("row %d: %v, want %s", id, row, want)
 				}
 			}
-			report, err := db.IntegrityCheck(ctx, "main", IntegrityCheckOptions{Level: IntegrityFull, MaxFindings: IntegrityUnlimited, Constraints: true})
+			report, err := db.IntegrityCheck(ctx, "main", IntegrityCheckOptions{Level: IntegrityFull, MaxFindings: Unlimited, Constraints: true})
 			if err != nil || !report.OK() {
 				t.Fatalf("integrity: %v %+v", err, report.Findings)
 			}
@@ -291,7 +291,7 @@ func TestRemapRubyEncryptedHistory(t *testing.T) {
 	if got[0][0].Int != 300 || got[0][1].Int != 45150 || got[0][2].Int != 1001 {
 		t.Fatalf("got %v, want 300 rows, sum 45150, v 1001", got)
 	}
-	report, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{Level: IntegrityFull, MaxFindings: IntegrityUnlimited, Constraints: true})
+	report, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{Level: IntegrityFull, MaxFindings: Unlimited, Constraints: true})
 	if err != nil || !report.OK() {
 		t.Fatalf("integrity: %v %+v", err, report.Findings)
 	}

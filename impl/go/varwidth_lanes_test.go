@@ -117,15 +117,15 @@ func varwidthRun(t *testing.T, s *Session, sql string, params []Value) (string, 
 // rows and cost.
 func varwidthCheck(t *testing.T, s *Session, sql string, params []Value) {
 	t.Helper()
-	s.SetMaxCost(0)
+	s.setMaxCostRaw(0)
 	laneRows, laneCost := varwidthRun(t, s, sql, params)
-	s.SetMaxCost(1 << 60)
+	s.setMaxCostRaw(1 << 60)
 	// Under a ceiling the aggregate lane runs as an attempt (cost.md §6.1); the oracle is the row
 	// path alone.
 	s.engine.session.lane.ceilingOff = true
 	rowRows, rowCost := varwidthRun(t, s, sql, params)
 	s.engine.session.lane.ceilingOff = false
-	s.SetMaxCost(0)
+	s.setMaxCostRaw(0)
 	if laneRows != rowRows || laneCost != rowCost {
 		t.Fatalf("lane vs row path for %q:\n lane cost %d rows\n%s\n row cost %d rows\n%s", sql, laneCost, laneRows, rowCost, rowRows)
 	}
@@ -345,13 +345,13 @@ func laneOutcome(s *Session, sql string) string {
 // off) agree on rows and cost.
 func laneCheck(t *testing.T, s *Session, sql string) {
 	t.Helper()
-	s.SetMaxCost(0)
+	s.setMaxCostRaw(0)
 	lane := laneOutcome(s, sql)
-	s.SetMaxCost(1 << 60)
+	s.setMaxCostRaw(1 << 60)
 	s.engine.session.lane.ceilingOff = true
 	row := laneOutcome(s, sql)
 	s.engine.session.lane.ceilingOff = false
-	s.SetMaxCost(0)
+	s.setMaxCostRaw(0)
 	if strings.HasPrefix(lane, "error") || lane != row {
 		t.Fatalf("lane vs row path for %q:\n lane %s\n row  %s", sql, lane, row)
 	}
@@ -365,18 +365,18 @@ func laneCheck(t *testing.T, s *Session, sql string) {
 // attempt off (the row path).
 func laneCheckUnderBudgets(t *testing.T, s *Session, sql string) {
 	t.Helper()
-	s.SetMaxCost(0)
+	s.setMaxCostRaw(0)
 	want := laneOutcome(s, sql)
 	if strings.HasPrefix(want, "error") {
 		t.Fatalf("unbudgeted %q: %s", sql, want)
 	}
 	for _, budget := range []int64{64, 4096, 64 * 1024, 1024 * 1024, 64 * 1024 * 1024} {
-		s.SetMaxQueryMemoryBytes(budget)
+		s.setMaxQueryMemoryBytesRaw(budget)
 		for _, c := range []struct {
 			maxCost int64
 			off     bool
 		}{{0, false}, {1 << 60, false}, {1 << 60, true}} {
-			s.SetMaxCost(c.maxCost)
+			s.setMaxCostRaw(c.maxCost)
 			s.engine.session.lane.ceilingOff = c.off
 			got := laneOutcome(s, sql)
 			s.engine.session.lane.ceilingOff = false
@@ -384,8 +384,8 @@ func laneCheckUnderBudgets(t *testing.T, s *Session, sql string) {
 				t.Fatalf("budget %d, max_cost %d, attempt off %v: %q: %s", budget, c.maxCost, c.off, sql, got)
 			}
 		}
-		s.SetMaxCost(0)
-		s.SetMaxQueryMemoryBytes(0)
+		s.setMaxCostRaw(0)
+		s.setMaxQueryMemoryBytesRaw(0)
 	}
 }
 
@@ -507,7 +507,7 @@ func TestGroupedLaneHandsOverToSpill(t *testing.T) {
 	// work_mem of 1 hands over after the first survivor; the middle budgets after a handful of groups
 	// and part-way through the many-group scans; the default never.
 	for _, workMem := range []int{1, 400, 3_000, 40_000, 300_000, defaultWorkMem} {
-		s.SetWorkMem(workMem)
+		s.setWorkMemRaw(workMem)
 		for _, q := range groupedHandoverQueries {
 			before := handovers()
 			laneCheck(t, s, q)
@@ -520,7 +520,7 @@ func TestGroupedLaneHandsOverToSpill(t *testing.T) {
 	// An ORDER BY over the groups: sorted by the bounded-spill lane's own stage, whether or not the
 	// fold handed over.
 	for _, workMem := range []int{1, 400, 3_000, 40_000, defaultWorkMem} {
-		s.SetWorkMem(workMem)
+		s.setWorkMemRaw(workMem)
 		for _, q := range orderedGroupQueries {
 			before := handovers()
 			laneCheck(t, s, q)
@@ -530,7 +530,7 @@ func TestGroupedLaneHandsOverToSpill(t *testing.T) {
 		}
 	}
 	// LIMIT/OFFSET over a handed-over result: the same window of the same emission order.
-	s.SetWorkMem(3_000)
+	s.setWorkMemRaw(3_000)
 	for _, q := range []string{
 		"SELECT big, sum(d) FROM gt GROUP BY big LIMIT 7",
 		"SELECT big, count(*) FROM gt GROUP BY big LIMIT 5 OFFSET 2990",
@@ -538,16 +538,16 @@ func TestGroupedLaneHandsOverToSpill(t *testing.T) {
 		"SELECT n, max(s) FROM gt GROUP BY n LIMIT 0",
 	} {
 		// No ORDER BY: emission order is scan-order-of-first-appearance on both paths.
-		s.SetMaxCost(0)
+		s.setMaxCostRaw(0)
 		lane, err := queryOutcome(s, q, nil)
 		if err != nil {
 			t.Fatalf("%q: %v", q, err)
 		}
-		s.SetMaxCost(1 << 60)
+		s.setMaxCostRaw(1 << 60)
 		s.engine.session.lane.ceilingOff = true
 		row, err := queryOutcome(s, q, nil)
 		s.engine.session.lane.ceilingOff = false
-		s.SetMaxCost(0)
+		s.setMaxCostRaw(0)
 		if err != nil {
 			t.Fatalf("%q: %v", q, err)
 		}
@@ -560,14 +560,14 @@ func TestGroupedLaneHandsOverToSpill(t *testing.T) {
 	mustExec(t, s, "INSERT INTO gt VALUES (5000, 9, 9, 42, 123.45, 1e40, 'zz', 3.5, 7)")
 	mustExec(t, s, "UPDATE gt SET d = d + 1, s = s || '!' WHERE n = 3")
 	for _, workMem := range []int{1, 3_000, defaultWorkMem} {
-		s.SetWorkMem(workMem)
+		s.setWorkMemRaw(workMem)
 		for _, q := range groupedHandoverQueries {
 			laneCheck(t, s, q)
 		}
 	}
 	mustExec(t, s, "ROLLBACK")
 	// Under a query-memory budget: the same rows and cost, or 54P05.
-	s.SetWorkMem(3_000)
+	s.setWorkMemRaw(3_000)
 	for _, q := range append(append([]string{}, groupedHandoverQueries...), orderedGroupQueries...) {
 		laneCheckUnderBudgets(t, s, q)
 	}
@@ -657,9 +657,9 @@ func laneMatchesRowPath(t *testing.T, s *Session, sql, what string) {
 // error, if it raises one): the top of the range of ceilings worth sweeping.
 func laneRowPathSpend(s *Session, sql string) int64 {
 	s.engine.session.lane.ceilingOff = true
-	s.SetMaxCost(1 << 60)
+	s.setMaxCostRaw(1 << 60)
 	_, spent := laneMeteredOutcome(s, sql)
-	s.SetMaxCost(0)
+	s.setMaxCostRaw(0)
 	s.engine.session.lane.ceilingOff = false
 	return spent
 }
@@ -682,10 +682,10 @@ func laneCeilings(top int64, step int64) []int64 {
 func laneSweepMaxCost(t *testing.T, s *Session, sql string, step int64) {
 	t.Helper()
 	for _, limit := range laneCeilings(laneRowPathSpend(s, sql), step) {
-		s.SetMaxCost(limit)
+		s.setMaxCostRaw(limit)
 		laneMatchesRowPath(t, s, sql, fmt.Sprintf("max_cost %d", limit))
 	}
-	s.SetMaxCost(0)
+	s.setMaxCostRaw(0)
 }
 
 // laneSweepLifetime runs sql under a lifetime budget with `left` units remaining, alone and beside a
@@ -701,16 +701,16 @@ func laneSweepLifetime(t *testing.T, s *Session, sql string, step int64) {
 			// Each run draws on the budget, so it is re-armed `left` above the running total.
 			run := func(off bool) (string, int64) {
 				tools.ceilingOff = off
-				s.SetLifetimeMaxCost(s.LifetimeCost() + left)
-				s.SetMaxCost(maxCost)
+				s.setLifetimeMaxCostRaw(s.LifetimeCost() + left)
+				s.setMaxCostRaw(maxCost)
 				out, spent := laneMeteredOutcome(s, sql)
 				// The lifetime error's text carries the session's absolute totals, which differ between
 				// the two runs; its code and the cost it left accrued are what must match.
 				if strings.HasPrefix(out, "54P02") {
 					out = "54P02"
 				}
-				s.SetLifetimeMaxCost(0)
-				s.SetMaxCost(0)
+				s.setLifetimeMaxCostRaw(0)
+				s.setMaxCostRaw(0)
 				tools.ceilingOff = false
 				return out, spent
 			}
@@ -795,13 +795,13 @@ var plainLaneFailures = []string{
 func laneUnmeteredMatchesRowPath(t *testing.T, s *Session, sql string) {
 	t.Helper()
 	tools := s.engine.session.lane
-	s.SetMaxCost(0)
+	s.setMaxCostRaw(0)
 	lane, laneSpent := laneMeteredOutcome(s, sql)
-	s.SetMaxCost(1 << 60)
+	s.setMaxCostRaw(1 << 60)
 	tools.ceilingOff = true
 	row, rowSpent := laneMeteredOutcome(s, sql)
 	tools.ceilingOff = false
-	s.SetMaxCost(0)
+	s.setMaxCostRaw(0)
 	if lane != row || laneSpent != rowSpent {
 		t.Fatalf("unmetered lane vs row path: %q:\n lane     (spent %d) %s\n row path (spent %d) %s", sql, laneSpent, lane, rowSpent, row)
 	}
@@ -816,7 +816,7 @@ func unmeteredLaneMatchesRowPath(t *testing.T, file string) {
 		workMems = []int{1, 400, defaultWorkMem}
 	}
 	for _, workMem := range workMems {
-		s.SetWorkMem(workMem)
+		s.setWorkMemRaw(workMem)
 		for _, list := range [][]string{ceilingQueries, projectionQueries, plainLaneFailures} {
 			for _, q := range list {
 				laneUnmeteredMatchesRowPath(t, s, q)
@@ -884,14 +884,14 @@ func laneUnderACeilingMatchesRowPath(t *testing.T, file string) {
 	// The grouped fold handing over to the spill structures part-way (file only).
 	if file != "" {
 		for _, workMem := range []int{1, 400, 3_000} {
-			s.SetWorkMem(workMem)
+			s.setWorkMemRaw(workMem)
 			for _, q := range ceilingQueries {
 				if strings.Contains(q, "GROUP BY") {
 					laneSweepMaxCost(t, s, q, 47)
 				}
 			}
 		}
-		s.SetWorkMem(defaultWorkMem)
+		s.setWorkMemRaw(defaultWorkMem)
 	}
 	// Not safe to discard — entropy, the per-call clock, a correlated subquery, a regex — so never
 	// attempted.
@@ -910,7 +910,7 @@ func laneUnderACeilingMatchesRowPath(t *testing.T, file string) {
 		}
 	}
 	// With a query-memory budget too (one nothing here reaches), the attempt is still made.
-	s.SetMaxQueryMemoryBytes(64 * 1024 * 1024)
+	s.setMaxQueryMemoryBytesRaw(64 * 1024 * 1024)
 	before := attempts()
 	for _, q := range ceilingQueries {
 		laneSweepMaxCost(t, s, q, 97)
@@ -918,7 +918,7 @@ func laneUnderACeilingMatchesRowPath(t *testing.T, file string) {
 	if attempts()[0] == before[0] {
 		t.Fatal("no attempt under a query-memory budget")
 	}
-	s.SetMaxQueryMemoryBytes(0)
+	s.setMaxQueryMemoryBytesRaw(0)
 	// A writer's uncommitted leaves, at a ceiling the statement fits under (an abort would end the
 	// transaction).
 	mustExec(t, s, "BEGIN")
@@ -929,9 +929,9 @@ func laneUnderACeilingMatchesRowPath(t *testing.T, file string) {
 			continue
 		}
 		top := laneRowPathSpend(s, q)
-		s.SetMaxCost(top + 1)
+		s.setMaxCostRaw(top + 1)
 		laneMatchesRowPath(t, s, q, "uncommitted writer")
-		s.SetMaxCost(0)
+		s.setMaxCostRaw(0)
 	}
 	mustExec(t, s, "ROLLBACK")
 }
@@ -951,7 +951,7 @@ func TestLaneUnderACeilingMatchesRowPathOnALargerTable(t *testing.T) {
 	t.Parallel()
 	s := laneSession(t, "ceiling_lanes_large.jed", gtSeed)
 	for _, workMem := range []int{3_000, defaultWorkMem} {
-		s.SetWorkMem(workMem)
+		s.setWorkMemRaw(workMem)
 		for _, q := range []string{
 			"SELECT count(*), sum(wide), avg(big), max(s) FROM gt WHERE d <> 0",
 			"SELECT big, sum(d), max(s), count(*) FROM gt GROUP BY big",
@@ -1038,12 +1038,12 @@ func TestTopKAdmitsABoundedDecimal(t *testing.T) {
 		{text, defaultWorkMem, 1, false},
 		{text, 0, 1 << 40, true}, // work_mem 0 never spills: always the heap
 	} {
-		s.SetWorkMem(c.workMem)
+		s.setWorkMemRaw(c.workMem)
 		if got := db.streamingTopKFits(c.plan, c.k); got != c.want {
 			t.Fatalf("work_mem %d, k %d, mask %v: fits = %v", c.workMem, c.k, c.plan.relMasks[0], got)
 		}
 	}
-	s.SetWorkMem(defaultWorkMem)
+	s.setWorkMemRaw(defaultWorkMem)
 	// And the answers agree whichever structure sorts: every window is that slice of the full sort.
 	for _, key := range []string{"d DESC, id", "d NULLS FIRST, id DESC", "n, d DESC NULLS LAST, id"} {
 		full, err := queryOutcome(s, "SELECT id, d, big, n FROM gt ORDER BY "+key, nil)

@@ -198,7 +198,7 @@ func TestBlockingSpillFailuresAndEarlyCursorClose(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		mustExec(t, s, fmt.Sprintf("INSERT INTO a VALUES (%d,%d)", i, i%7))
 	}
-	s.SetWorkMem(128)
+	s.setWorkMemRaw(128)
 	for _, q := range []string{"SELECT DISTINCT id FROM a", "SELECT id,percentile_cont(.5) WITHIN GROUP (ORDER BY k) FROM a GROUP BY id", "SELECT id,rank(3) WITHIN GROUP (ORDER BY k) FROM a GROUP BY id", "SELECT id,jsonb_agg(k) FROM a GROUP BY id"} {
 		rows, err := s.queryValues(q, nil)
 		if err != nil {
@@ -240,7 +240,7 @@ func TestBlockingSpillFailuresAndEarlyCursorClose(t *testing.T) {
 	}
 	limited := mustSession(db, SessionOptions{MaxCost: 50})
 	defer limited.Close()
-	limited.SetWorkMem(128)
+	limited.setWorkMemRaw(128)
 	_, err = queryOutcome(limited, "SELECT DISTINCT id FROM a", nil)
 	if err == nil || !strings.Contains(err.Error(), "54P01") {
 		t.Fatalf("cost abort: %v", err)

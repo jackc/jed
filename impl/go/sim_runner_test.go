@@ -974,7 +974,7 @@ func (r *simRunner) openDatabase(env *Environment, coord *fileCoordinator) (*Dat
 	db.core.storage.setSynchronous(r.relaxed, r.flushIntervalMs, env)
 	db.core.storage.inlineFlush = true // every flush lands in the step that caused it (and no idle flusher runs)
 	if r.maxStorageBytes > 0 {
-		if err := db.SetMaxStorageBytes("main", r.maxStorageBytes); err != nil {
+		if err := db.setMaxStorageBytesRaw("main", r.maxStorageBytes); err != nil {
 			return nil, err
 		}
 	}
@@ -1402,13 +1402,13 @@ func (r *simRunner) stepOpen(i int, st simStep) {
 		return
 	}
 	if r.workMem > 0 {
-		s.SetWorkMem(r.workMem)
+		s.setWorkMemRaw(r.workMem)
 	}
 	if r.tempBuffers > 0 {
-		s.SetTempBuffers(r.tempBuffers)
+		s.setTempBuffersRaw(r.tempBuffers)
 	}
 	if r.maxQueryMemory > 0 {
-		s.SetMaxQueryMemoryBytes(r.maxQueryMemory)
+		s.setMaxQueryMemoryBytesRaw(r.maxQueryMemory)
 	}
 	if r.service {
 		// A session that finds its process's data key stale fails to open, and the host reopens the
@@ -1550,9 +1550,9 @@ func (r *simRunner) digest(s *Session, d *simDB) (string, bool) {
 	r.fs.oracle = true
 	defer func() { r.fs.oracle = false }()
 	// The oracle's own reads must not trip a trace session's memory limit.
-	if limit := s.MaxQueryMemoryBytes(); limit > 0 {
-		s.SetMaxQueryMemoryBytes(0)
-		defer s.SetMaxQueryMemoryBytes(limit)
+	if limit := s.maxQueryMemoryBytesRaw(); limit > 0 {
+		s.setMaxQueryMemoryBytesRaw(0)
+		defer s.setMaxQueryMemoryBytesRaw(limit)
 	}
 	q := simQualifier(d)
 	var b strings.Builder

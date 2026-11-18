@@ -316,7 +316,7 @@ func TestDecimalCostCeilingAbortsAheadOfBigMultiply(t *testing.T) {
 	t.Parallel()
 	db := decDB(t, "CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1)")
 	big := strings.Repeat("9", 20000) + ".5"
-	db.SetMaxCost(1000)
+	db.setMaxCostRaw(1000)
 	_, err := queryOutcome(db, "SELECT "+big+" * "+big+" FROM t", nil)
 	if err == nil {
 		t.Fatal("expected the cost ceiling to abort the multiply")

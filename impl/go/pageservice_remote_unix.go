@@ -46,6 +46,9 @@ func OpenRemote(command []string, name string, opts OpenOptions) (*Database, err
 	if err := opts.validateDurations(); err != nil {
 		return nil, err
 	}
+	if err := opts.normalizeLimits(); err != nil {
+		return nil, err
+	}
 	if len(command) == 0 {
 		return nil, newError(ConnectionFailure, "empty transport command")
 	}

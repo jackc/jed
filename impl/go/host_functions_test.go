@@ -218,7 +218,7 @@ func TestDeclaredCostGatesMaxCostCeiling(t *testing.T) {
 		func(args []Value) (Value, error) { return IntValue(0), nil }).WithCost(1_000_000)
 	db, _ := Create(CreateOptions{Environment: envWith(t, heavy)})
 	s := mustSession(db, SessionOptions{})
-	s.SetMaxCost(1000)
+	s.setMaxCostRaw(1000)
 	_, err := queryOutcome(s, "SELECT host_heavy()", nil)
 	if ee, ok := err.(*EngineError); !ok || ee.Code() != "54P01" {
 		t.Fatalf("over-ceiling host call = %v, want 54P01", err)
@@ -715,8 +715,8 @@ func TestHostBatchCostAbortMatchesRowKernelAndBoundsSpeculation(t *testing.T) {
 	batched := batchDB(t, twiceBatched(calls, VolatilityImmutable, -1), 2000)
 	single := batchDB(t, twiceRow(&hostCalls{}, -1), 2000)
 	const budget = 200
-	batched.SetMaxCost(budget)
-	single.SetMaxCost(budget)
+	batched.setMaxCostRaw(budget)
+	single.setMaxCostRaw(budget)
 	const sql = "SELECT id, host_twice(a) FROM t"
 	b, r := batchRun(batched, sql), batchRun(single, sql)
 	if !strings.HasPrefix(b, "error 54P01") || b != r {
@@ -1129,8 +1129,8 @@ func TestHostBatchPulledCostAbortMatchesRowKernel(t *testing.T) {
 			batched := batchDB(t, twiceBatched(calls, VolatilityImmutable, -1), 2000)
 			single := batchDB(t, twiceRow(&hostCalls{}, -1), 2000)
 			const budget = 300
-			batched.SetMaxCost(budget)
-			single.SetMaxCost(budget)
+			batched.setMaxCostRaw(budget)
+			single.setMaxCostRaw(budget)
 			b, r := batchRunVia(batched, sql, materialized), batchRunVia(single, sql, materialized)
 			if !strings.HasPrefix(b, "error 54P01") || b != r {
 				t.Fatalf("%s materialized=%v:\nbatched %.200s\nsingle  %.200s", sql, materialized, b, r)

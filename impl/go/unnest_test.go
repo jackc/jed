@@ -149,7 +149,7 @@ func TestUnnestGeneratedRowCostAndCeiling(t *testing.T) {
 		parts[i] = strconv.Itoa(i + 1)
 	}
 	sql := "SELECT * FROM unnest('{" + strings.Join(parts, ",") + "}'::i32[])"
-	db.SetMaxCost(50)
+	db.setMaxCostRaw(50)
 	if code := genErrCode(t, db, sql); code != "54P01" {
 		t.Errorf("ceiling abort code = %s, want 54P01", code)
 	}

@@ -585,7 +585,7 @@ func TestRelaxedStoragePrecheckIgnoresTheDeadline(t *testing.T) {
 		}
 		mustExecDB(t, db, "CREATE TABLE t (id i64 PRIMARY KEY, v text)")
 		mustExecDB(t, db, "CREATE TABLE m.log (id i64 PRIMARY KEY)")
-		if err := db.SetMaxStorageBytes("main", 40*512); err != nil {
+		if err := db.setMaxStorageBytesRaw("main", 40*512); err != nil {
 			t.Fatal(err)
 		}
 		var outcomes []string

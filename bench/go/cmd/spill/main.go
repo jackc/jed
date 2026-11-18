@@ -50,10 +50,10 @@ func run() error {
 	defer sess.Close()
 	if os.Args[1] == "temp" {
 		// Temp-table spill (spec/design/temp-tables.md §6): the budget is the resident temp_buffers.
-		sess.SetTempBuffers(budget)
-		sess.SetMaxTempStorageBytes(0)
+		_ = sess.SetTempBuffers(budget)
+		_ = sess.SetMaxTempStorageBytes(jed.Unlimited)
 	} else {
-		sess.SetWorkMem(budget)
+		_ = sess.SetWorkMem(budget)
 	}
 	f, err := os.Open(os.Args[4])
 	if err != nil {

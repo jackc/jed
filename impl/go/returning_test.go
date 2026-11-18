@@ -261,11 +261,11 @@ func TestReturningCeilingAbortIsAllOrNothing(t *testing.T) {
 	db := retSetup(t)
 	// The two-row insert with RETURNING costs 4 (pinned above). A ceiling of 2 aborts
 	// during the projection pass — BEFORE phase 2 — so nothing is inserted.
-	db.SetMaxCost(2)
+	db.setMaxCostRaw(2)
 	if got := retErrCode(t, db, "INSERT INTO t VALUES (70, 1, 1), (71, 2, 2) RETURNING v + 1"); got != "54P01" {
 		t.Fatalf("got %s want 54P01", got)
 	}
-	db.SetMaxCost(0)
+	db.setMaxCostRaw(0)
 	if g := retGrid(retRows(t, db, "SELECT count(*) FROM t")); g != "3" {
 		t.Fatalf("ceiling abort must write nothing; got %s rows", g)
 	}

@@ -64,7 +64,7 @@ func TestCteMaterializedHintForcesBuffering(t *testing.T) {
 func TestCteRecursiveUnboundedAbortsAtCostCeiling(t *testing.T) {
 	t.Parallel()
 	db := mustSession(memDB(), SessionOptions{})
-	db.SetMaxCost(1000)
+	db.setMaxCostRaw(1000)
 	_, err := queryOutcome(db, "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT n FROM c", nil)
 	if err == nil {
 		t.Fatal("an unbounded recursion must abort, not loop forever")
@@ -80,7 +80,7 @@ func TestCteRecursiveUnboundedAbortsAtCostCeiling(t *testing.T) {
 func TestCteRecursiveUnderCeilingSucceeds(t *testing.T) {
 	t.Parallel()
 	db := mustSession(memDB(), SessionOptions{})
-	db.SetMaxCost(1000)
+	db.setMaxCostRaw(1000)
 	if got := cteCost(t, db,
 		"WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 5) SELECT n FROM c"); got != 29 {
 		t.Errorf("recursive cost got %d want 29", got)

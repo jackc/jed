@@ -55,7 +55,7 @@ func TestOpenOptionsWorkMemZeroIsDefaultBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	(&Session{engine: db}).SetWorkMem(0)
+	(&Session{engine: db}).setWorkMemRaw(0)
 	if got := db.session.workMem; got != 0 {
 		t.Fatalf("SetWorkMem(0): runtime workMem = %d, want 0 (unlimited)", got)
 	}

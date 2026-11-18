@@ -99,7 +99,7 @@ func TestTempOnCommitDeleteRowsStaysUnderBudget(t *testing.T) {
 	t.Parallel()
 	db := newInMemoryWithPageSize(256, NewEnvironment())
 	budget := 20 * 256
-	sess := mustSession(db, SessionOptions{MaxTempStorageBytes: &budget})
+	sess := mustSession(db, SessionOptions{MaxTempStorageBytes: budget})
 	defer sess.Close()
 	sessExec(t, sess, "CREATE TEMP TABLE d (id i32 PRIMARY KEY, pad text) ON COMMIT DELETE ROWS")
 	pad := strings.Repeat("z", 40)
