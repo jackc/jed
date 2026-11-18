@@ -225,6 +225,12 @@ test("regex SIMILAR vectors match spec/regex/similar_vectors.toml", () => {
 test("literal prefix transitions preserve partial cost, captures and every cancellation poll", () => {
   for (const [pattern, text] of [
     ["needle", "xxxneedxneedle"],
+    ["needle[0-9]+", "nxxxxxnxxxxxn"],
+    ["(needle)([0-9]+)", "needle!needlxneednneedle42"],
+    ["(?:needle)+z", "needleneedlxneedleneedlez"],
+    ["((猫犬鳥))[0-9]+", "😀猫犬鹿猫犬猫猫犬鳥42"],
+    ["((((((((needle))))))))", "nxxxxx".repeat(683) + "needle"],
+    ["needle[0-9]+", "nxxxxx".repeat(1400) + "needle42"],
     ["((猫猫猫犬))", "😀猫猫猫猫猫猫犬"],
     ["(?:aaab)+c", "aaabaaaaabaaabc"],
     ["((((((((aaab))))))))", "a".repeat(8200) + "b"],
@@ -265,6 +271,15 @@ test("literal prefix transitions preserve partial cost, captures and every cance
     check(0n, 0n);
     check(0n, 0n, -1);
     check(0n, 0n, 7);
+    if (pattern === "needle[0-9]+" && input.length > 4096) {
+      for (const block of [682n, 683n, 1365n]) {
+        for (const offset of [5n, 6n, 7n]) {
+          const cost = 4n + 31n * block + offset;
+          check(cost, 0n);
+          check(0n, cost + 12n);
+        }
+      }
+    }
     if (input.length < 100) {
       const full = run(slow, 0n, 0n, -1);
       for (let limit = 1n; limit <= full.cost + 1n; limit++) {

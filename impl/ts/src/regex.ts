@@ -1114,7 +1114,41 @@ export function regexMatchEnds(
   return ends;
 }
 
-// Advance the two-thread prefix miss (width zero), or the saturated overlap frontier (regex.md §4).
+// Consume only spans that return to [prefixPC, 1]. A failed candidate reached one
+// extra Char per matched rune; a candidate still alive at the limit stays with the VM.
+function skipFalseStarts(
+  p: RegexProgram,
+  input: number[],
+  sp: number,
+  limit: number,
+  m: Meter,
+  units: bigint,
+): number {
+  const pc = p.prefixPC;
+  const first = p.chs[pc];
+  let n = 0;
+  let advances = 0;
+  scan: while (n < limit) {
+    if (input[sp + n] !== first) {
+      n++;
+      continue;
+    }
+    for (let matched = 1; ; matched++) {
+      if (n + matched === limit || p.ops[pc + matched] !== OP_CHAR) break scan;
+      const next = input[sp + n + matched];
+      if (next === first) break scan;
+      if (next !== p.chs[pc + matched]) {
+        advances += matched;
+        n += matched + 1;
+        break;
+      }
+    }
+  }
+  if (n > 0) m.charge(BigInt(n) * units + BigInt(advances) * COSTS.regexStep);
+  return n;
+}
+
+// Advance proven misses from the two-thread frontier, or the saturated overlap frontier (regex.md §4).
 function skipPrefix(
   p: RegexProgram,
   seen: RegexSeen,
@@ -1130,30 +1164,38 @@ function skipPrefix(
   const pc = p.prefixPC;
   const literal = p.chs[pc];
   const same = input[sp] === literal;
-  const width = same ? p.overlapWidth : 0;
-  if ((same && width === 0) || count !== width + 2 || seen.buf[cl + width + 1] !== 1) return 0;
+  const falseStarts = same && count === 2;
+  const width = same && !falseStarts ? p.overlapWidth : 0;
+  if (count !== width + 2 || seen.buf[cl + width + 1] !== 1) return 0;
   for (let i = 0; i <= width; i++) {
     if (seen.buf[cl + i] !== pc + width - i) return 0;
   }
 
+  if (falseStarts && (!bulk || p.ops[pc + 1] !== OP_CHAR)) return 0;
   const units = BigInt(pc + width + 1) * COSTS.regexStep;
+  const maxUnits = falseStarts ? units + COSTS.regexStep : units;
   let limit = Math.min(4096, input.length - sp);
   if (bulk) {
     const room = m.headroom();
     if (room !== undefined) {
-      if (room <= units) return 0; // the ordinary VM executes the boundary position
-      limit = Math.min(limit, Number((room - 1n) / units));
+      if (room <= maxUnits) return 0; // the ordinary VM executes the boundary position
+      limit = Math.min(limit, Number((room - 1n) / maxUnits));
     }
   }
   let n = 0;
-  while (n < limit && (input[sp + n] === literal) === same) {
-    if (!bulk) {
-      m.charge(units);
-      m.guard();
+  if (falseStarts) {
+    n = skipFalseStarts(p, input, sp, limit, m, units);
+    if (n === 0) return 0;
+  } else {
+    while (n < limit && (input[sp + n] === literal) === same) {
+      if (!bulk) {
+        m.charge(units);
+        m.guard();
+      }
+      n++;
     }
-    n++;
+    if (bulk) m.charge(BigInt(n) * units);
   }
-  if (bulk) m.charge(BigInt(n) * units);
   if (initialCaps !== NO_CAPTURES) {
     // Oldest starts come first. The new starts have consumed width-i code points.
     for (let i = 0; i <= width; i++) {

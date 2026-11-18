@@ -175,6 +175,23 @@ before and after. The `regex_false_starts` SQL lane reads both long subjects fro
 table and returns the id of the match. One 100-iteration run per revision measured 1.807 →
 0.344 ms per query with matching checksums.
 
+**Rust and TypeScript false starts (2026-11-18).** The same precompiled `needle[0-9]+`
+predicate ran on the four Go inputs above. Subjects were already in each VM’s code-point
+representation, and each match accrued statement and lifetime cost. Median µs per match over
+three timed samples after warmup, Core Ultra 9 285K, release Rust 1.99.0 and Node 26.10.0:
+
+| Input | Rust before → after | TypeScript before → after | Cost per match |
+|---|---:|---:|---:|
+| 341 × `nxxxxx`, then `needle42` | 14.37 → 1.29 | 35.79 → 1.91 | 10,624 |
+| 10,923 × `nxxxxx`, miss | 456.1 → 12.76 | 1,134.9 → 40.90 | 338,617 |
+| 10,923 × `nxxxxx`, then `needle42` | 457.3 → 12.96 | 1,137.9 → 38.85 | 338,666 |
+| 341 × `needlx`, then `needle42` | 43.58 → 0.838 | 87.98 → 2.15 | 11,988 |
+
+All four costs agreed across cores and revisions. Over 100 timed queries in
+`regex_false_starts`, Rust went from 1.035 to 0.122 ms per query and TypeScript from 3.015
+to 0.624 ms. Both returned the same matching row and checksum as before. These timings use
+the default unlimited budget and an unarmed cancellation check.
+
 **Variable-width scan result (2026-10-13).** Track A4 ([packed-leaf.md §11](packed-leaf.md)) lets the
 columnar lanes read text, bytea, and array columns in place. The seven `varscan_*` lanes run over a
 100k-row scratch table (nullable text, `text[]`, `bytea`; no secondary index); `gin_stats_common_tag`

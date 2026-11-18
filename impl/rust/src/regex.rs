@@ -915,6 +915,36 @@ struct LiteralPrefix {
 }
 
 impl LiteralPrefix {
+    /// Count consumed runes and extra Char advances for proven failures (regex.md §4).
+    /// An incomplete or overlapping candidate remains at the head of the unconsumed input.
+    fn false_starts(self, insts: &[Inst], input: &[char]) -> (usize, usize) {
+        let mut n = 0;
+        let mut advances = 0;
+        'scan: while n < input.len() {
+            if input[n] != self.ch {
+                n += 1;
+                continue;
+            }
+            for matched in 1.. {
+                let Some(&next) = input.get(n + matched) else {
+                    break 'scan;
+                };
+                let Inst::Char(expected) = insts[self.pc + matched] else {
+                    break 'scan;
+                };
+                if next == self.ch {
+                    break 'scan;
+                }
+                if next != expected {
+                    advances += matched;
+                    n += matched + 1;
+                    break;
+                }
+            }
+        }
+        (n, advances)
+    }
+
     fn from_program(insts: &[Inst], wrapper: Wrapper) -> Option<Self> {
         if wrapper != Wrapper::Search {
             return None;
@@ -1290,7 +1320,7 @@ impl Program {
         Ok(ends)
     }
 
-    /// Advance the two-thread prefix miss (width zero), or the saturated overlap frontier.
+    /// Advance proven misses from the two-thread frontier, or the saturated overlap frontier.
     fn skip_prefix<R: CapRep>(
         &self,
         prefix: LiteralPrefix,
@@ -1300,9 +1330,13 @@ impl Program {
         m: &mut Meter,
     ) -> Result<usize> {
         let same = input[sp] == prefix.ch;
-        let width = if same { prefix.overlap } else { 0 };
-        if (same && width == 0)
-            || list.len() != width + 2
+        let false_starts = same && list.len() == 2;
+        let width = if same && !false_starts {
+            prefix.overlap
+        } else {
+            0
+        };
+        if list.len() != width + 2
             || list[width + 1].pc != 1
             || !(0..=width).all(|i| list[i].pc == prefix.pc + width - i)
         {
@@ -1311,27 +1345,46 @@ impl Program {
 
         let units = (prefix.pc + width + 1) as i64 * COSTS.regex_step;
         let bulk = !m.has_cancellation();
+        if false_starts && (!bulk || !matches!(self.insts[prefix.pc + 1], Inst::Char(_))) {
+            return Ok(0); // proving a failure requires looking beyond the first literal
+        }
+        let max_units = if false_starts {
+            units + COSTS.regex_step
+        } else {
+            units
+        };
         let mut limit = (input.len() - sp).min(4096);
         if bulk && let Some(room) = m.headroom() {
-            if room <= units {
+            if room <= max_units {
                 return Ok(0); // let the ordinary VM execute the boundary position
             }
-            limit = (limit as i64).min((room - 1) / units) as usize;
+            limit = (limit as i64).min((room - 1) / max_units) as usize;
         }
-        let mut n = 0;
-        for &ch in &input[sp..sp + limit] {
-            if (ch == prefix.ch) != same {
-                break;
+        let window = &input[sp..sp + limit];
+        let n = if false_starts {
+            let (n, advances) = prefix.false_starts(&self.insts, window);
+            if n == 0 {
+                return Ok(0);
             }
-            if !bulk {
-                m.charge(units);
-                m.checkpoint()?;
+            m.charge(n as i64 * units + advances as i64 * COSTS.regex_step);
+            n
+        } else {
+            let mut n = 0;
+            for &ch in window {
+                if (ch == prefix.ch) != same {
+                    break;
+                }
+                if !bulk {
+                    m.charge(units);
+                    m.checkpoint()?;
+                }
+                n += 1;
             }
-            n += 1;
-        }
-        if bulk {
-            m.charge(n as i64 * units);
-        }
+            if bulk {
+                m.charge(n as i64 * units);
+            }
+            n
+        };
         // Oldest starts come first. Keep each surviving history, then seed the new starts.
         for i in 0..=width {
             list[i].caps = if i + n <= width {
@@ -2031,6 +2084,12 @@ mod tests {
 
         for (pattern, text) in [
             ("needle", "xxxneedxneedle".to_owned()),
+            ("needle[0-9]+", "nxxxxxnxxxxxn".to_owned()),
+            ("(needle)([0-9]+)", "needle!needlxneednneedle42".to_owned()),
+            ("(?:needle)+z", "needleneedlxneedleneedlez".to_owned()),
+            ("((猫犬鳥))[0-9]+", "😀猫犬鹿猫犬猫猫犬鳥42".to_owned()),
+            ("((((((((needle))))))))", "nxxxxx".repeat(683) + "needle"),
+            ("needle[0-9]+", "nxxxxx".repeat(1400) + "needle42"),
             ("((猫猫猫犬))", "😀猫猫猫猫猫猫犬".to_owned()),
             ("(?:aaab)+c", "aaabaaaaabaaabc".to_owned()),
             ("((((((((aaab))))))))", "a".repeat(8200) + "b"),
@@ -2060,6 +2119,17 @@ mod tests {
             let cancelled = CancellationToken::new();
             cancelled.cancel();
             check(1, 13, Some(cancelled));
+            if pattern == "needle[0-9]+" && input.len() > 4096 {
+                // Four seed states, then 31 per full block. Trip just before,
+                // at, or just after its first literal advances.
+                for block in [682, 683, 1365] {
+                    for offset in [5, 6, 7] {
+                        let cost = 4 + 31 * block + offset;
+                        check(cost, 0, None);
+                        check(0, cost + 12, None);
+                    }
+                }
+            }
             if input.len() < 100 {
                 for limit in 1..=run(&slow, 0, 0, None).1 + 1 {
                     for delta in [11, 12, 13] {

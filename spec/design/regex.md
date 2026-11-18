@@ -362,6 +362,8 @@ overlapping start, a nonliteral instruction, or the scan boundary before proving
 the ordinary VM resumes at that candidate's start with its capture history intact.
 Only the final candidate in a batch may be inspected without being consumed. Its inspected
 interior contains no other start, so the additional lookahead is linear in the input length.
+Rust and TypeScript resume ordinary candidate execution when a cancellation poll is due
+at every position. This keeps speculative reads within the current polling interval.
 
 The overlap shortcut applies when `w` consecutive copies of the same literal start at pc `k`,
 followed by a different literal at `k+w`. Suppose the parked pcs are exactly `k+w, …, k, 1`
