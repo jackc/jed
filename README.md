@@ -39,11 +39,11 @@ import (
 )
 
 func main() {
-	// Open a database. CreateDatabase/OpenDatabase return a *Database — the handle you run SQL
-	// through. A path gives a single-file database on disk; jed.CreateDatabase(jed.CreateOptions{}) (no path) is a transient
+	// Create and Open return a *Database — the handle you run SQL through. A path gives a
+	// single-file database on disk; jed.Create(jed.CreateOptions{}) (no path) is a transient
 	// in-memory one. Each bare Exec autocommits durably (it runs on a fresh session); for a
-	// multi-statement transaction use db.Update(ctx, ...) or mint a Session.
-	db, err := jed.CreateDatabase(jed.CreateOptions{Path: "people.jed"})
+	// multi-statement transaction use db.BeginFunc(ctx, jed.TxOptions{}, ...) or mint a Session.
+	db, err := jed.Create(jed.CreateOptions{Path: "people.jed"})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func main() {
 	}
 	defer rows.Close()
 	for rows.Next() {
-		fmt.Println(rows.Row()[0].Render())
+		fmt.Println(rows.Row()[0].String())
 	}
 	if err := rows.Err(); err != nil {
 		log.Fatal(err)

@@ -66,7 +66,7 @@ func main() {
 			log.Fatal(err)
 		}
 		fmt.Println(text)        // 2024-01-15 07:00:00-05
-		fmt.Println(at.Render()) // 2024-01-15 12:00:00+00 — a Value's own render is always UTC
+		fmt.Println(at.String()) // 2024-01-15 12:00:00+00 — a Value's own text is always UTC
 	}
 	if err := rows.Err(); err != nil {
 		log.Fatal(err)

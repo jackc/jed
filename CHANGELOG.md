@@ -8,6 +8,25 @@ All notable changes to jed are documented here. The format follows
 > There is no stability or compatibility guarantee until `1.0`. Treat a database
 > file as readable only by the jed version that wrote it.
 
+## [Unreleased]
+
+### Changed
+
+- **Go API (breaking).** The Go package follows Go conventions ([api.md §11.8](spec/design/api.md)):
+  - `Open(path, OpenOptions)` replaces `OpenDatabase` and `OpenDatabaseWithOptions`;
+    `Create` and `Deserialize` replace `CreateDatabase` and `DeserializeDatabase`.
+  - `Begin(ctx, TxOptions) (*Transaction, error)` and `BeginFunc(ctx, TxOptions, fn)` on
+    `Database` and `Session` replace `View`, `Update`, `ReadSession`, `WriteSession` and
+    `Session.Begin(ctx, writable)`. `Transaction.Commit` and `Rollback` take a context, and
+    `Session.Close` returns an error.
+  - Size and count limits share one rule: `0` is the default and `jed.Unlimited` removes the
+    limit. Session setters return an error; `IntegrityUnlimited` is now `Unlimited`.
+  - `Attach`, `Compact`, `Rekey`, `ChangeCredential`, `Serialize`, `UpgradeCollations` and
+    `SetDefaultCollation` take a context; `Attach` takes `AttachOptions`.
+  - Initialisms are spelled in one case (`SQLState`, `JSONNode`, `UUIDValue`, …).
+  - `Value` hides its fields: use `Kind()`, `Scan` and `String` (was `Render`). `Decimal`,
+    `Interval` and `Value` no longer export engine internals.
+
 ## [0.3.0] — 2026-11-14
 
 Third public preview, covering the changes since July's v0.2.0. This release breaks

@@ -22,9 +22,10 @@ func main() {
 	// {SELECT} (a read-only envelope) with DDL disabled. A session is a handle minted from the
 	// database that shares its committed state. The engine enforces the envelope at name resolution —
 	// any write or schema change resolves to 42501, with no in-database role catalog.
-	readOnly := jed.PrivSetEmpty.With(jed.PrivSelect)
-	noDDL := false
-	untrusted, err := db.Session(jed.SessionOptions{DefaultPrivileges: &readOnly, AllowDDL: &noDDL})
+	untrusted, err := db.Session(jed.SessionOptions{
+		DefaultPrivileges: new(jed.PrivSetEmpty.With(jed.PrivSelect)),
+		AllowDDL:          new(false),
+	})
 	if err != nil {
 		log.Fatal(err)
 	}

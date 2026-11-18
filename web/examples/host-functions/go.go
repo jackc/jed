@@ -22,7 +22,13 @@ func main() {
 	err := builder.RegisterFunction(
 		jed.NewHostFunction("discount", []string{"i64", "i64"}, "i64",
 			func(args []jed.Value) (jed.Value, error) {
-				cents, pct := args[0].Int, args[1].Int
+				var cents, pct int64
+				if err := args[0].Scan(&cents); err != nil {
+					return jed.Value{}, err
+				}
+				if err := args[1].Scan(&pct); err != nil {
+					return jed.Value{}, err
+				}
 				return jed.IntValue(cents - cents*pct/100), nil
 			}).
 			WithVolatility(jed.VolatilityImmutable).      // same inputs ⇒ same output
@@ -42,7 +48,11 @@ func main() {
 		jed.NewHostBatchFunction("with_tax", []string{"i64"}, "i64",
 			func(args [][]jed.Value, out []jed.Value) ([]jed.Value, error) {
 				for _, v := range args[0] {
-					out = append(out, jed.IntValue(v.Int+v.Int*8/100))
+					var cents int64
+					if err := v.Scan(&cents); err != nil {
+						return out, err // the rows before this one succeeded
+					}
+					out = append(out, jed.IntValue(cents+cents*8/100))
 				}
 				return out, nil
 			}).
@@ -76,7 +86,7 @@ func main() {
 	for rows.Next() {
 		r := rows.Row()
 		// Mug -> 1063 / 1350, Notebook -> 340 / 432
-		fmt.Printf("%s -> %s / %s\n", r[0].Render(), r[1].Render(), r[2].Render())
+		fmt.Printf("%s -> %s / %s\n", r[0], r[1], r[2])
 	}
 	if err := rows.Err(); err != nil {
 		log.Fatal(err)

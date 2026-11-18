@@ -211,7 +211,8 @@ always runs, including when no publication is needed.
 - **`db.read_session()` (READ ONLY)** — pins a stable snapshot for its life, registers in the
   watermark, **never** takes the gate; a write through it is `25006`. `db.write_session()` /
   `db.session()` default to READ WRITE (lazy gate as above). The access mode is the §3 read-only
-  property, now carried by the session.
+  property, now carried by the session. Go spells both as a `Session` with a read-only or read-write
+  `Begin` ([api.md](api.md) §11.8).
 - **Second concurrent writer** — **blocks** until the holder releases (Rust/Go true threads) or is
   rejected **`25001`** (TS, which cannot block its one thread). Unchanged from api.md §2.5.
 

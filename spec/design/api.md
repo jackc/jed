@@ -519,6 +519,9 @@ threads** — it holds the committed-roots cell, the single-writer gate, and the
 (transactions.md §8/§10). Its **default session** (§2.4) is the simple, fast single-handle path.
 For **concurrent readers running alongside a writer**, a host mints **additional sessions**:
 
+(Go has no `ReadSession` / `WriteSession`: a `Session` with `Begin(ctx, TxOptions{AccessMode:
+ReadOnly})` or `Begin(ctx, TxOptions{})` is each one, §11.8.)
+
 - **`db.read_session(opts) -> Session`** opens a **READ ONLY** session: it pins the committed
   snapshot *now* and serves reads from that one stable, immutable version for its life — never
   blocked by, and never blocking, the writer. A write through it is `25006`. It registers in the
@@ -649,7 +652,7 @@ of a fixture. Both are host-API acts: not metered, not reachable from SQL.
 | | Rust | Go | TS (core) | TS (async, Node and browser) |
 |---|---|---|---|---|
 | export | `db.serialize(name) -> Result<Vec<u8>>` | `db.Serialize(name) ([]byte, error)` | `db.serialize(name): Uint8Array` | `await db.serialize(name)` |
-| import | `Database::deserialize(&bytes, DeserializeOptions)` | `DeserializeDatabase(data, DeserializeOptions)` | `Database.deserialize(bytes, options?)` | `await deserializeDatabase(bytes, options?)` |
+| import | `Database::deserialize(&bytes, DeserializeOptions)` | `Deserialize(data, DeserializeOptions)` | `Database.deserialize(bytes, options?)` | `await deserializeDatabase(bytes, options?)` |
 
 **Export.** `serialize(name)` returns the from-scratch image (format.md) of database `name` — `main`
 or an attachment, matched exactly — at its page size, with its **committed version** as the txid in
@@ -869,16 +872,16 @@ the values unknown.
 
 | Concept / op | Rust | Go | TS |
 |---|---|---|---|
-| create (in-memory or file) | `Database::create(opts) -> Result<Database>` (`opts.path: Option<PathBuf>`) | `CreateDatabase(opts) (*Database, error)` (`opts.Path string`) | `createDatabase(opts): Database` (`opts.path?`) |
-| open file | `Database::open(path) -> Result<Database>` | `OpenDatabase(path) (*Database, error)` | `openDatabase(path): Database` |
-| open file with options | `Database::open_with_options(path, OpenOptions) -> Result<Database>` | `OpenDatabaseWithOptions(path, OpenOptions) (*Database, error)` | `openDatabase(path, OpenOptions): Database` |
-| in-memory (no path) | `Database::create(CreateOptions::default())` | `CreateDatabase(CreateOptions{})` | `createDatabase({})` |
-| infallible in-memory (test/host helper) | `fn mem_db()` wrapping `create` | `memDB()` wrapping `CreateDatabase` | `memDb()` wrapping `createDatabase` |
-| commit (current tx) | `db.commit() -> Result<()>` | `db.Commit() error` | `commit(db): void` |
-| rollback (current tx) | `db.rollback() -> Result<()>` | `db.Rollback() error` | `rollback(db): void` |
-| begin | `db.begin(writable) -> Result<Transaction>` | `session.Begin(ctx, writable) error` | `begin(db, writable): Transaction` |
-| view / update (closures) | `db.view(\|tx\| …)` / `db.update(\|tx\| …)` | `db.View(ctx, fn) error` / `db.Update(ctx, fn) error` | `view(db, fn)` / `update(db, fn)` |
-| tx commit / rollback | `tx.commit()` / `tx.rollback()` | `tx.Commit()` / `tx.Rollback() error` | `tx.commit()` / `tx.rollback()` |
+| create (in-memory or file) | `Database::create(opts) -> Result<Database>` (`opts.path: Option<PathBuf>`) | `Create(opts) (*Database, error)` (`opts.Path string`) | `createDatabase(opts): Database` (`opts.path?`) |
+| open file | `Database::open(path) -> Result<Database>` | `Open(path, OpenOptions{}) (*Database, error)` | `openDatabase(path): Database` |
+| open file with options | `Database::open_with_options(path, OpenOptions) -> Result<Database>` | `Open(path, OpenOptions) (*Database, error)` | `openDatabase(path, OpenOptions): Database` |
+| in-memory (no path) | `Database::create(CreateOptions::default())` | `Create(CreateOptions{})` | `createDatabase({})` |
+| infallible in-memory (test/host helper) | `fn mem_db()` wrapping `create` | `memDB()` wrapping `Create` | `memDb()` wrapping `createDatabase` |
+| commit (current tx) | `db.commit() -> Result<()>` | — (end the `Transaction`, §11.8) | `commit(db): void` |
+| rollback (current tx) | `db.rollback() -> Result<()>` | — (end the `Transaction`, §11.8) | `rollback(db): void` |
+| begin | `db.begin(writable) -> Result<Transaction>` | `db.Begin(ctx, TxOptions) (*Transaction, error)` (also on `Session`) | `begin(db, writable): Transaction` |
+| view / update (closures) | `db.view(\|tx\| …)` / `db.update(\|tx\| …)` | `db.BeginFunc(ctx, TxOptions{AccessMode: ReadOnly}, fn)` / `db.BeginFunc(ctx, TxOptions{}, fn)` | `view(db, fn)` / `update(db, fn)` |
+| tx commit / rollback | `tx.commit()` / `tx.rollback()` | `tx.Commit(ctx) error` / `tx.Rollback(ctx) error` | `tx.commit()` / `tx.rollback()` |
 | close | `db.close()` + `Drop` | `db.Close() error` | `close(db): void` |
 | prepare | `db.prepare(sql) -> Result<PreparedStatement>` | `db.Prepare(sql) (*PreparedStatement, error)` | `db.prepareStatement(sql): PreparedStatement` |
 | stmt execute (tag) | `db.execute_prepared(&stmt, &params) -> Result<u64>` | `db.ExecPrepared(ctx, stmt, args…) (Result, error)` | `db.executePrepared(stmt, params): RunResult` |
@@ -891,18 +894,18 @@ the values unknown.
 | rows cost | `rows.cost()` | `rows.Cost()` | `rows.cost` |
 | rows close ([streaming.md §5](streaming.md)) | `rows.close()` + `Drop` | `rows.Close()` | `rows.close()` |
 | rows affected (§4) | `rows.rows_affected() -> Option<i64>` | `rows.RowsAffected() (int64, bool)` | `rows.rowsAffected: number \| null` |
-| set cost ceiling (§8) | `db.set_max_cost(limit)` | `db.SetMaxCost(limit)` | `db.setMaxCost(limit)` |
-| set input-size limit (§8) | `db.set_max_sql_length(bytes)` | `db.SetMaxSQLLength(bytes)` | `db.setMaxSqlLength(bytes)` |
+| set cost ceiling (§8) | `db.set_max_cost(limit)` | `session.SetMaxCost(limit) error` (§11.8 limit rule) | `db.setMaxCost(limit)` |
+| set input-size limit (§8) | `db.set_max_sql_length(bytes)` | `session.SetMaxSQLLength(bytes) error` | `db.setMaxSqlLength(bytes)` |
 | build an environment (§10, environment.md) | `Environment::builder()…build()` | `NewEnvironmentBuilder()` … `b.Build()` | `Environment.builder()…build()` |
 | install an environment | `CreateOptions { environment, .. }` / `OpenOptions { environment, .. }` | `CreateOptions{Environment: env}` / `OpenOptions{Environment: env}` | `createDatabase({ environment })` / `openDatabase(path, { environment })` |
 | read the handle's environment | `db.environment()` | `db.Environment()` | `db.environment()` |
 | load Unicode / time-zone data (collation.md §4, timezones.md §3.3) | `builder.load_unicode_data(&b)?` / `.load_time_zone_data(&b)?` | `b.LoadUnicodeData(data)` / `b.LoadTimeZoneData(data)` | `builder.loadUnicodeData(bytes)` / `.loadTimeZoneData(bytes)` |
 | install random / clock source (§10) | `builder.random_source(s)` / `.clock_source(c)` | `b.SetRandomSource(s)` / `b.SetClockSource(c)` | `builder.randomSource(s)` / `.clockSource(c)` |
 | upgrade collations — clear a version-skew (collation.md §12) | `db.upgrade_collations() -> usize` | `db.UpgradeCollations() (int, error)` | `db.upgradeCollations(): number` |
-| attach a database (attached-databases.md §4) | `db.attach(name, source, read_only) -> Result<()>` | `db.Attach(name, source, readOnly) error` | `db.attach(name, source, readOnly): void` |
+| attach a database (attached-databases.md §4) | `db.attach(name, source, read_only) -> Result<()>` | `db.Attach(ctx, name, source, AttachOptions{ReadOnly}) error` | `db.attach(name, source, readOnly): void` |
 | detach a database | `db.detach(name) -> Result<()>` | `db.Detach(name) error` | `db.detach(name): void` |
 | attach source | `AttachSource::memory()` / `AttachSource::file(path, opts)` | `AttachMemory()` / `AttachFile(path, opts)` | `attachMemory()` / `attachFile(path, opts)` |
-| export / import bytes (§2.8) | `db.serialize(name)` / `Database::deserialize(&b, opts)` | `db.Serialize(name)` / `DeserializeDatabase(b, opts)` | `db.serialize(name)` / `Database.deserialize(b, opts)` |
+| export / import bytes (§2.8) | `db.serialize(name)` / `Database::deserialize(&b, opts)` | `db.Serialize(ctx, name)` / `Deserialize(b, opts)` | `db.serialize(name)` / `Database.deserialize(b, opts)` |
 | table lookup (catalog — doc-hidden tooling, §6) | `db.table(name) -> Option<&Table>` | `db.Table(name) (*catTable, bool)` | `db.table(name): Table \| undefined` |
 
 **Per-language divergences, deliberate and documented:**
@@ -1298,11 +1301,12 @@ deadline. Replies are consumed before retry/return, so cancellation cannot orpha
 a pending writer request or close the shared connection and invalidate other
 readers. Transport I/O and ownership recovery remain best effort, not preemptible.
 
-Go `Database.View`, `Database.Update`, `Database.ExecuteScript` and the matching
-`Session` methods, plus `Session.Begin`, take `context.Context` first. `Begin`'s
-context covers admission and acquisition only, like pgx: it does not automatically
-end a transaction after return. Individual statements take their own contexts.
-`View`/`Update` check cancellation before beginning and before committing; callers
+Go `Database.BeginFunc`, `Database.ExecuteScript` and the matching `Session` methods,
+plus `Begin`, take `context.Context` first. `Begin`'s context covers admission and
+acquisition only, like pgx: it does not automatically end a transaction after return.
+Individual statements take their own contexts, and `Transaction.Commit(ctx)` checks its
+own before committing. `BeginFunc` checks cancellation before beginning and before
+committing; callers
 pass the same context to statements in the callback to cancel their execution.
 The callback itself is synchronous and is never forcibly interrupted. Scripts
 poll between statements and through ordinary execution checkpoints, and check
@@ -1488,6 +1492,50 @@ and memory/storage invariant instrumentation. Ordinary builds export none of tho
 The standard Go unit task checks both the ordinary library and tagged command packages; corpus,
 mutation, reducer, and page-service tools explicitly build with the tag.
 
+
+### 11.8 Go transactions, limits, values, and host operations
+
+The Go API follows Go and pgx conventions where they differ from the shared concept names. The
+behavior, SQL results, errors and costs are unchanged; only the Go host surface is.
+
+- **Transactions.** `Database` and `Session` have `Begin(ctx, TxOptions) (*Transaction, error)`
+  and `BeginFunc(ctx, TxOptions, fn) error`. `TxOptions.AccessMode` is `ReadWrite` (the zero value,
+  PostgreSQL's default) or `ReadOnly`; another value is `22023`. `BeginFunc` is the closure form of
+  §2.2 (`view`/`update` in Rust and TS). `Database.Begin` mints a session the transaction owns and
+  closes when it ends. There is no `ReadSession` / `WriteSession`: §2.5's read and write sessions are
+  a `Session` with a read-only or read-write `Begin`. The conformance harness reaches the exact
+  forms through `jedtooling` hooks.
+- **Ending a `Transaction`.** `Commit(ctx)` and `Rollback(ctx)`; both return nil once the
+  transaction has ended, so a deferred `Rollback` is safe. `Commit` with a canceled context rolls
+  back and returns the cancellation error. `Commit` of a block a statement failed rolls back and
+  returns `25P02`, as `BeginFunc` does, instead of SQL `COMMIT`'s silent `ROLLBACK`. SQL
+  `COMMIT`/`ROLLBACK` through any `Transaction` is `2D000`, and a statement through an ended one is
+  `25P01` rather than running in autocommit. `Session.Close` returns an error.
+- **Limits.** Every size and count limit takes one rule: a positive value is the limit, `0` the
+  documented default, `Unlimited` (`-1`) no limit, and any other negative value `22023`. It covers
+  `SessionOptions`, the `Session` setters (which return an error) and getters (which report a
+  default as its number and no limit as `Unlimited`), `CreateOptions` / `OpenOptions` /
+  `DeserializeOptions` (`MaxStorageBytes`, `CacheBytes`, `WorkMem`, `MaxConnections`),
+  `AttachSource.WithMaxStorageBytes`, `Database.SetMaxStorageBytes` and
+  `IntegrityCheckOptions.MaxFindings`. The defaults are the shared ones, so `MaxCost: 0` is still
+  unlimited; only "no limit" for a limit whose default is finite changes spelling, from `0` to
+  `Unlimited`.
+- **Values.** `Value`'s representation is private. `Kind()` reports its type; `Scan(dest)` converts
+  it as `Rows.Scan` converts a column, adding `*ArrayVal`, `*RangeVal`, `*JSONNode` and `*[]Value`
+  (a composite's fields) as copies; `String()` is the canonical text. `Decimal` exposes
+  `ParseDecimal`, `String`, `Cmp` and `IsZero`; its arithmetic, key encoding and codec stay inside
+  the core, as do `Interval`'s and the three-valued comparisons.
+- **Host operations.** `Attach`, `Compact`, `Rekey`, `ChangeCredential`, `Serialize`,
+  `UpgradeCollations` and `SetDefaultCollation` take a context first. `Attach` polls it during its
+  file-lock wait and page-service election; the collation writes use it for the writer-slot wait;
+  the others check it before starting (and after the key derivation). `Attach` takes
+  `AttachOptions{ReadOnly}` instead of a bool, and `AttachFile(path, AttachFileOptions)` replaces
+  `AttachFileWithOptions`.
+- **Names.** Exported names write initialisms in one case (`SQLState`, `JSONNode`, `UUIDValue`,
+  `IOError`, `ActiveSQLTransaction`, …): the error-code generator uses a Go-only spelling.
+  `IntegrityFinding.Kind` and `IntegritySkip.Reason` are the generated `IntegrityKind` and
+  `IntegritySkipReason` string types.
+
 ---
 
 ## 12. Host extensions — scalar functions (on the environment)
@@ -1563,7 +1611,7 @@ cost** — the defaults match):
 | register | `let b = b.register_function(HostFunction::new("f", vec![ScalarType::Int64, ScalarType::Int64], ScalarType::Int64, Box::new(\|a\| Ok(...))).cost(3))?` | `b.RegisterFunction(NewHostFunction("f", []string{"i64","i64"}, "i64", func(a []Value) (Value, error) { ... }).WithCost(3))` | `b.registerFunction({ name: "f", argTypes: ["i64","i64"], result: "i64", kernel: (a) => ..., cost: 3n })` |
 | batch kernel | `HostFunction::batched("f", vec![ScalarType::Int64], ScalarType::Int64, Box::new(\|args, out\| { out.extend(…); Ok(()) }))` | `NewHostBatchFunction("f", []string{"i64"}, "i64", func(args [][]Value, out []Value) ([]Value, error) { …; return out, nil })` | `b.registerFunction({ name: "f", argTypes: ["i64"], result: "i64", batchKernel: (args, out) => { out.push(…) } })` |
 | index-backing | `HostFunction::new(…).volatility(Volatility::Immutable).component_id("com.example/f").semantic_version(1)` | `NewHostFunction(…).WithVolatility(VolatilityImmutable).WithComponentID("com.example/f").WithSemanticVersion(1)` | `{ …, volatility: "immutable", componentId: "com.example/f", semanticVersion: 1 }` |
-| install | `Database::create(CreateOptions { environment: b.build(), ..Default::default() })` | `CreateDatabase(CreateOptions{Environment: b.Build()})` | `createDatabase({ environment: b.build() })` |
+| install | `Database::create(CreateOptions { environment: b.build(), ..Default::default() })` | `Create(CreateOptions{Environment: b.Build()})` | `createDatabase({ environment: b.build() })` |
 
 Then a query calls the function by name: `SELECT f(a, b) FROM t`. The kernel receives the evaluated
 argument values (never NULL) and returns a `Value` (or raises an `EngineError` — a Rust `Result`, a

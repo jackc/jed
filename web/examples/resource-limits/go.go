@@ -21,6 +21,8 @@ func main() {
 	//   MaxCost         — a per-STATEMENT ceiling: one runaway query aborts 54P01.
 	//   LifetimeMaxCost — a per-SESSION budget: the session's cumulative cost is capped, so a flood
 	//                     of cheap queries can't burn unbounded CPU. It aborts 54P02.
+	// Every limit follows one rule: a positive value is the limit, 0 the default, and jed.Unlimited
+	// no limit. The Session setters of the same names change them later.
 	untrusted, err := db.Session(jed.SessionOptions{
 		MaxCost:             10000,
 		LifetimeMaxCost:     3,

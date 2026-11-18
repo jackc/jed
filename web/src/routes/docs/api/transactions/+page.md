@@ -13,11 +13,12 @@ jed has a **single writer**: at most one write transaction at a time, with reade
 except during the brief commit. A transaction's changes apply all-or-nothing.
 
 The `update` helper runs a read-write transaction that commits on success and rolls back if your code
-signals an error — the safest default; there's a read-only `view` helper too. Both are available in
-every language (Rust, Go, **and** TypeScript), on the `Database` handle (where each call mints a fresh
-session) or on a session you've minted. For finer control, the explicit `begin` / `commit` /
+signals an error — the safest default; there's a read-only `view` helper too. Rust and TypeScript
+spell them `update` and `view`; Go has one `BeginFunc` that takes `TxOptions` choosing read-write
+(the default) or read-only. Each is available on the `Database` handle (where each call mints a
+fresh session) or on a session you've minted. For finer control, the explicit `begin` / `commit` /
 `rollback` form lives on a **session** — mint one with `db.session(...)` and drive the block across
-calls. In TypeScript, await each operation: `await db.update(async (tx) => { ... })`,
+calls; Go's `Begin` also works on the `Database`. In TypeScript, await each operation: `await db.update(async (tx) => { ... })`,
 `await db.session(...)`, and `await session.begin()`. Use the transaction proxy returned by
 `begin()` throughout the block; it retains ownership across application awaits.
 
@@ -37,17 +38,19 @@ The read-only `view` helper remains useful for enforcing access restrictions and
 
 <CodeTabs topic="transactions" />
 
-In Go, call `db.Update(ctx, fn)` / `db.View(ctx, fn)` or the same methods on a session.
-Both roll back and release their locks and snapshot pins before propagating a panic.
-The context controls transaction admission and the check before commit; pass it to
-`tx.Exec` / `tx.Query` inside the callback to cancel those statements too. Callbacks
-run synchronously and are never forcibly interrupted.
+In Go, call `db.BeginFunc(ctx, jed.TxOptions{}, fn)` for a read-write transaction or
+`db.BeginFunc(ctx, jed.TxOptions{AccessMode: jed.ReadOnly}, fn)` for a read-only one, or the same
+method on a session. It rolls back and releases its locks and snapshot pins before propagating a
+panic. The context controls transaction admission and the check before commit; pass it to
+`tx.Exec` / `tx.Query` inside the callback to cancel those statements too. Callbacks run
+synchronously and are never forcibly interrupted.
 
-For a manual block, `session.Begin(ctx, true)` starts a writable transaction and
-`session.Begin(ctx, false)` starts a read-only one. That context controls beginning
-the transaction only; after it returns, use each statement's context and explicitly
-call `session.Commit()` or `session.Rollback()`. A deferred `session.Rollback()` is
-safe after commit. Cancellation does not disable rollback or session cleanup.
+For a manual block, `db.Begin(ctx, opts)` or `session.Begin(ctx, opts)` returns a
+`*jed.Transaction`. The context bounds the wait to begin; after that, each statement takes its own
+context. End the transaction with `tx.Commit(ctx)` or `tx.Rollback(ctx)`; a deferred
+`tx.Rollback(ctx)` does nothing after a commit. `Commit` with a canceled context rolls back instead,
+and `Commit` of a transaction a statement failed rolls back and returns `25P02`. Running `COMMIT` or
+`ROLLBACK` as SQL through a `Transaction` is `2D000`.
 
 ## Savepoints
 

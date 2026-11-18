@@ -192,7 +192,7 @@ jed reuses the pages that deletes and updates free. When the free pages are at t
 later commit cuts them off and the file gets shorter by itself, but free pages in the middle of the
 file stay there, so after a big delete the file can stay close to its peak size. To give all of that
 space back, compact the database:
-`db.compact("main")` (Rust), `db.Compact("main")` (Go) or `await db.compact("main")` (TypeScript).
+`db.compact("main")` (Rust), `db.Compact(ctx, "main")` (Go) or `await db.compact("main")` (TypeScript).
 Pass an attachment's name to compact that database instead. The name is matched exactly, as given
 when the database was attached.
 
@@ -288,7 +288,7 @@ it cannot protect a process that is already running with the key.
 
 ### Changing the credential
 
-`db.change_credential("main", new_credential, kdf)` (Rust), `db.ChangeCredential("main", cred, kdf)`
+`db.change_credential("main", new_credential, kdf)` (Rust), `db.ChangeCredential(ctx, "main", cred, kdf)`
 (Go) or `await db.changeCredential("main", credential, kdf)` (TypeScript, Node and the browser) rewraps the data key for a new credential. Only the small key block is rewritten, so it is quick
 apart from Argon2id for a new passphrase. When it returns, only the new credential opens the file; if
 the process dies partway, exactly one of the two does, and the next writable open finishes the job.
@@ -296,7 +296,7 @@ Pass an attachment's name to change that file's credential instead.
 
 ### Rotating the key, encrypting, decrypting
 
-`db.rekey("main", Some(credential), kdf)` (Rust), `db.Rekey("main", cred, kdf)` (Go) or
+`db.rekey("main", Some(credential), kdf)` (Rust), `db.Rekey(ctx, "main", cred, kdf)` (Go) or
 `await db.rekey("main", credential, kdf)` (TypeScript) rewrites the
 file under a **new data key**: it rotates an encrypted file's key, or encrypts a plaintext file. Pass
 no credential (`None` / `nil` / `null`) to decrypt. Every page is rebuilt, so it takes about as long as
@@ -333,7 +333,7 @@ no key.
 
 Every example on the **SQL** pages of these docs runs against an in-memory database, right in your
 browser — the same engine, no file. Create one by calling the unified create constructor with no path:
-`Database::create(CreateOptions::default())` (Rust), `jed.CreateDatabase(jed.CreateOptions{})` (Go), or
+`Database::create(CreateOptions::default())` (Rust), `jed.Create(jed.CreateOptions{})` (Go), or
 `await createDatabase({})` (TypeScript).
 
 <span id="a-database-as-bytes"></span>
@@ -345,14 +345,14 @@ A database can be exported to a byte buffer and loaded back from one, jed's vers
 web page, to save a browser's in-memory database somewhere of your choosing, or to give each test
 its own copy of a fixture.
 
-`db.serialize("main")` (Rust), `await db.serialize("main")` (TypeScript), or `db.Serialize("main")` (Go) returns the committed state
+`db.serialize("main")` (Rust), `await db.serialize("main")` (TypeScript), or `db.Serialize(ctx, "main")` (Go) returns the committed state
 as the bytes of a clean database file: it holds no free pages, and the same committed data gives the
 same bytes in every language. Write them to disk and you have a file `open` accepts. Pass an
 attachment's name to export that database instead. The export reads a snapshot like any reader, so it
 never waits for or blocks a writer, and it never includes uncommitted changes.
 
 `Database::deserialize(&bytes, DeserializeOptions::default())` (Rust),
-`jed.DeserializeDatabase(data, jed.DeserializeOptions{})` (Go), `Database.deserialize(bytes)` (the
+`jed.Deserialize(data, jed.DeserializeOptions{})` (Go), `Database.deserialize(bytes)` (the
 TypeScript core) or `await deserializeDatabase(bytes)` (`jed-ts` and `jed-ts/browser`) builds a new
 **in-memory** database from the bytes of a database file or an export. The bytes are copied, so your
 buffer is never changed, and later commits change only the in-memory copy; serialize again to get
@@ -440,12 +440,10 @@ deterministic and identical across the Rust, Go, and TypeScript cores.
 Go uses `time.Duration` for timeouts and intervals. For example:
 
 ```go
-wait := 5 * time.Second
-flush := 250 * time.Millisecond
-db, err := jed.OpenDatabaseWithOptions("app.jed", jed.OpenOptions{
-    FileLockTimeout: &wait,
-    Synchronous: jed.SynchronousOff,
-    FlushInterval: &flush,
+db, err := jed.Open("app.jed", jed.OpenOptions{
+    FileLockTimeout: new(5 * time.Second),
+    Synchronous:     jed.SynchronousOff,
+    FlushInterval:   new(250 * time.Millisecond),
 })
 if err != nil {
     return err

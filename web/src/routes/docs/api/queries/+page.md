@@ -237,7 +237,9 @@ These ergonomic methods are **additive** — a thin, idiomatic layer over the lo
 speaks jed `Value`s directly. Rust and TypeScript expose that path as dedicated methods: `execute` /
 `query` taking `&[Value]` in Rust and `Value[]` in TypeScript. Go needs no separate method — a raw
 `jed.Value` passes straight through the same variadic `Query` / `Exec` / `QueryRow` args (mixed freely
-with native Go values), and `Rows.Value(i)` reads a column back as its engine `Value`. Either way the
+with native Go values), `Rows.Value(i)` reads a column back as its engine `Value`, and `Value.Scan`
+converts one the way `Rows.Scan` does (plus `*jed.ArrayVal`, `*jed.RangeVal`, `*jed.JSONNode`, and
+`*[]jed.Value` for a composite's fields). Either way the
 raw path stays available for full fidelity: a rich type with no clean native counterpart in your
 language (a `range`, a `jsonb`, a composite) round-trips losslessly as a `Value`, where the ergonomic
 layer renders it to its canonical text. Reach for the raw `Value` when you need the engine value

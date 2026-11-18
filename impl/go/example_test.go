@@ -72,6 +72,64 @@ func ExampleDatabase_Session() {
 	// Output: acme 2s
 }
 
+func ExampleDatabase_BeginFunc() {
+	ctx := context.Background()
+	db, err := jed.Create(jed.CreateOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(ctx, "CREATE TABLE account (id i64 PRIMARY KEY, balance i64)"); err != nil {
+		log.Fatal(err)
+	}
+	// The callback's statements commit together when it returns nil.
+	err = db.BeginFunc(ctx, jed.TxOptions{}, func(tx *jed.Transaction) error {
+		if _, err := tx.Exec(ctx, "INSERT INTO account VALUES ($1, $2)", 1, 100); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, "UPDATE account SET balance = balance + 25 WHERE id = $1", 1)
+		return err
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	var balance int64
+	if err := db.QueryRow(ctx, "SELECT balance FROM account WHERE id = $1", 1).Scan(&balance); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(balance)
+	// Output: 125
+}
+
+func ExampleDatabase_Begin() {
+	ctx := context.Background()
+	db, err := jed.Create(jed.CreateOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(ctx, "CREATE TABLE item (id i64 PRIMARY KEY)"); err != nil {
+		log.Fatal(err)
+	}
+	tx, err := db.Begin(ctx, jed.TxOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer tx.Rollback(ctx) // ends the transaction on every early return; a no-op after Commit
+	if _, err := tx.Exec(ctx, "INSERT INTO item VALUES (1), (2)"); err != nil {
+		log.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		log.Fatal(err)
+	}
+	var count int64
+	if err := db.QueryRow(ctx, "SELECT count(*) FROM item").Scan(&count); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(count)
+	// Output: 2
+}
+
 func ExampleDatabase_QueryRowPrepared() {
 	db, err := jed.Create(jed.CreateOptions{})
 	if err != nil {
@@ -149,7 +207,7 @@ func ExampleQueryer() {
 	if err := exampleInsert(ctx, session, 2); err != nil {
 		log.Fatal(err)
 	}
-	if err := exampleInsert(ctx, db, 3); err != nil {
+	if err := db.BeginFunc(ctx, jed.TxOptions{}, func(tx *jed.Transaction) error { return exampleInsert(ctx, tx, 3) }); err != nil {
 		log.Fatal(err)
 	}
 	var count int64

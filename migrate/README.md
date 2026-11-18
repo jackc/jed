@@ -45,7 +45,7 @@ single-integer high-water mark in a version table (default `schema_version`).
 **Go**
 
 ```go
-db, _ := jed.OpenDatabase("app.jed")
+db, _ := jed.Open("app.jed", jed.OpenOptions{})
 migrations, _ := migrate.LoadMigrations("migrations")
 m, _ := migrate.NewMigrator(db, migrations, migrate.Options{})
 defer m.Close()

@@ -77,7 +77,7 @@ the core's idiom:
 
 | concept | Rust | Go | TS |
 |---|---|---|---|
-| existing | `state: SqlState` | `State SqlState` | `state: SqlState` |
+| existing | `state: SqlState` | `State SQLState` | `state: SqlState` |
 | existing | `message: String` | `Message string` | `message` (via `Error`) |
 | constraint | `constraint_name: Option<String>` | `ConstraintName string` | `constraintName?: string` |
 | table | `table_name: Option<String>` | `TableName string` | `tableName?: string` |

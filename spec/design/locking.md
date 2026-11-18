@@ -178,7 +178,7 @@ means no deadline, matching PostgreSQL's `lock_timeout` default. The page-servic
 
 File attachment sources own attachment options; the boolean attachment mode still decides read-only vs
 read-write. The idiomatic spellings are Rust `AttachSource::file(path).locking(...)
-.file_lock_timeout_ms(...)`, Go `AttachFileWithOptions(path, AttachFileOptions{...})`, and TypeScript
+.file_lock_timeout_ms(...)`, Go `AttachFile(path, AttachFileOptions{...})`, and TypeScript
 `attachFile(path, { locking, fileLockTimeoutMs })`. An in-memory create ignores file-lock options.
 
 Go exposes `FileLockTimeout *time.Duration`: `nil` is the five-second default and a pointer

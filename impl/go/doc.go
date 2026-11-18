@@ -1,58 +1,54 @@
-// Package jed provides an embedded SQL database implemented in pure Go, without
-// cgo or an external database server. It uses strict static SQL types and stores
-// each durable database in a single file.
+// Package jed is an embedded SQL database written in pure Go, without cgo or a server. It
+// follows PostgreSQL's SQL behavior, uses strict static column types, and keeps each durable
+// database in a single file.
 //
 // # Opening a database
 //
-// Create creates a new database. Set CreateOptions.Path for a durable
-// file, or leave it empty for an in-memory database. OpenDatabase opens an
-// existing file; Open configures its cache, durability,
-// locking, and environment. Close the Database when it is no longer needed,
-// checking the returned error: closing can flush pending durable writes.
+// Create makes a new database: set CreateOptions.Path for a file, or leave it empty for an
+// in-memory database. Open opens an existing file. Close the Database when you are done and check
+// the error: closing can flush pending durable writes.
 //
 // # Queries and results
 //
-// Database.Exec executes a statement and returns a Result. Database.Query
-// returns Rows; iterate with Rows.Next, scan with Rows.Scan, and check Rows.Err.
-// Close the rows when finished, including when abandoning a query early.
-// Database.QueryRow combines a query with a single Scan and returns ErrNoRows
-// when no row exists. SQL parameters use $1, $2, and so on; pass arguments
-// separately from SQL text.
+// Database.Exec runs a statement and returns a Result. Database.Query returns Rows: call Next,
+// Scan each row, then check Err. Close the Rows when you stop early; a loop that runs to the end
+// closes them. QueryRow scans a single row and returns ErrNoRows when there is none. Parameters
+// are written $1, $2, … and passed after the SQL text.
 //
-// Scan supports Go values, Null[T], and custom Scanner implementations. Value
-// preserves SQL values that need the full database representation. MapRows
-// lazily maps rows through RowTo or RowToStructByName and yields (value, error);
-// once iteration begins, it closes the rows on completion or early exit.
-// PreparedStatement holds parsed SQL independently of a session; execute it
-// through a handle's QueryPrepared, QueryRowPrepared, or ExecPrepared methods.
+// Scan converts columns to Go values. Use Null[T] for a column that may be NULL, or implement
+// Scanner for your own types. Value holds any SQL value in full; Value.Scan converts one the way
+// Rows.Scan does. MapRows maps rows through RowTo or RowToStructByName as an iterator.
+// Prepare parses SQL once into a PreparedStatement that any Database, Session or Transaction can
+// run with QueryPrepared, QueryRowPrepared or ExecPrepared.
 //
 // # Sessions and transactions
 //
-// Database can be shared across goroutines. Its query and script methods each
-// use a fresh session, so session variables and temporary tables do not carry
-// between those calls. Database.Session creates an independent Session for
-// persistent connection state. Check its error for invalid settings and close
-// the session when done. A Session and its Rows must not be used concurrently.
-// Timeouts use time.Duration; a nil optional duration selects its default.
+// A Database is safe for concurrent use. Its query methods each run on a new session, so session
+// settings and temporary tables do not carry from one call to the next. Database.Session creates
+// a Session that keeps that state; a Session and its Rows must not be used concurrently.
 //
-// Database.View and Database.Update run callbacks inside read-only and writable
-// transactions. They commit on success and roll back on an error or panic.
-// Session offers the same helpers, or Begin, Commit, and Rollback for a block
-// spanning multiple calls. Only one writer is active at a time; concurrent
-// readers observe committed snapshots.
+// BeginFunc runs a function in a transaction that commits when the function returns nil and rolls
+// back when it returns an error or panics. Begin returns a Transaction to end with Commit or
+// Rollback. TxOptions selects a read-write (the default) or read-only transaction. There is one
+// writer at a time; read-only transactions read a consistent snapshot and never wait for it.
+//
+// # Limits
+//
+// Every size and count limit follows one rule: a positive value is the limit, 0 selects the
+// documented default, Unlimited removes the limit, and any other negative value fails with
+// SQLSTATE 22023. Durations use time.Duration; a nil duration option selects its default.
 //
 // # Cancellation and errors
 //
-// Query, Exec, transaction admission, and ExecuteScript take a context.Context.
-// Pass the same context to queries inside a transaction callback to cancel their
-// execution too. Cancellation is cooperative and stops before commit work;
-// a completed commit is not reported as canceled. Context cancellation errors
-// retain SQLSTATE 57014 and support errors.Is with context.Canceled or
-// context.DeadlineExceeded. Use errors.As to inspect an EngineError and its Code.
+// Methods that run SQL or wait take a context.Context. Pass the same context to the statements
+// inside a transaction to cancel them too. Cancellation is cooperative: work stops at the next
+// check, and a commit that has started finishes. A canceled operation returns an error with
+// SQLSTATE 57014 that also matches context.Canceled or context.DeadlineExceeded with errors.Is.
+// Use errors.As to get an *EngineError and its SQLSTATE.
 //
-// # Application interfaces
+// # Interfaces
 //
-// Applications can define small interfaces containing only the methods they
-// consume. Database, Session, and Transaction satisfy them implicitly. Queryer
-// is available when an application needs the complete query-method set.
+// Database, Session and Transaction share their query methods, so an application can define a
+// small interface with just the methods it calls and accept any of the three. Queryer is the full
+// method set, for code that needs all of it.
 package jed

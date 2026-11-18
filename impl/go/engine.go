@@ -1469,10 +1469,14 @@ func (s *sessionState) SetWorkMem(b int) { s.workMem = b }
 func (s *sessionState) SetDefaultPrivileges(privs PrivilegeSet) { s.privileges.setDefaultTable(privs) }
 
 // Grant grants privs on a specific object (table or function), beyond the default (§5.3).
-func (s *sessionState) Grant(privs PrivilegeSet, object string) { s.privileges.grantObject(privs, object) }
+func (s *sessionState) Grant(privs PrivilegeSet, object string) {
+	s.privileges.grantObject(privs, object)
+}
 
 // Revoke revokes privs from a specific object (revoke wins over grant and the default, §5.3).
-func (s *sessionState) Revoke(privs PrivilegeSet, object string) { s.privileges.revokeObject(privs, object) }
+func (s *sessionState) Revoke(privs PrivilegeSet, object string) {
+	s.privileges.revokeObject(privs, object)
+}
 
 // Privileges is read-only access to this session's authorization envelope (§5.3).
 func (s *sessionState) Privileges() *Privileges { return &s.privileges }

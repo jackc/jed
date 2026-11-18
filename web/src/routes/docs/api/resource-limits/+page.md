@@ -28,6 +28,12 @@ independent limits, with the coverage described below.
 
 Both default to `0` (unlimited). A statement aborts at whichever ceiling it reaches first.
 
+In Go, every size and count limit follows one rule instead: a positive value is the limit, `0`
+selects the documented default, `jed.Unlimited` removes the limit, and any other negative value
+fails with `22023`. That holds for `SessionOptions`, the `Session` setters (which return an error),
+the create and open options, and `SetMaxStorageBytes`. The defaults are the ones on this page, so
+`MaxCost: 0` is still unlimited.
+
 <CodeTabs topic="resource-limits" />
 
 ## How the budget behaves
@@ -48,7 +54,8 @@ budgeted over its lifetime.
 `max_scalar_bytes` defaults to **64 MiB per statement**. Set it through session options or
 `set_max_scalar_bytes(bytes)` (Rust), `SetMaxScalarBytes(bytes)` (Go), or
 `await session.configure({ maxScalarBytes: bytes })` (TypeScript).
-Non-positive values restore the finite default. A reservation above it fails with **`54P04`**;
+Non-positive values restore the finite default (in Go, `0` restores it and `jed.Unlimited` removes
+the budget). A reservation above it fails with **`54P04`**;
 exact equality is allowed. The budget resets for each statement and accumulates across nested
 calls, rows, subqueries and CTEs. A cursor keeps its original budget until it closes.
 
@@ -139,7 +146,8 @@ session, so every session shares it. Set it in the create options (`max_storage_
 on an attachment's source. Change it later with `set_max_storage_bytes(name, bytes)` (Rust),
 `SetMaxStorageBytes(name, bytes)` (Go), or `await db.setMaxStorageBytes(name, bytes)` (TypeScript),
 where `name` is `main` or an attachment. It is **unlimited by default**;
-non-positive values restore unlimited. It is a handle setting, not stored in the file.
+non-positive values restore unlimited (in Go, `0` or `jed.Unlimited`). It is a handle setting, not
+stored in the file.
 
 A commit that would grow the database past the limit fails with **`54P06`** and commits nothing. A
 commit that only deletes rows or drops objects always succeeds, so a full database can always be
