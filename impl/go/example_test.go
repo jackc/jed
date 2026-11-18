@@ -2,6 +2,7 @@ package jed_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -216,4 +217,156 @@ func ExampleQueryer() {
 	}
 	fmt.Println(count)
 	// Output: 3
+}
+
+func ExampleEngineError() {
+	ctx := context.Background()
+	db, err := jed.Create(jed.CreateOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(ctx, "CREATE TABLE person (email text PRIMARY KEY)"); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, "INSERT INTO person VALUES ($1)", "ada@example.com"); err != nil {
+		log.Fatal(err)
+	}
+	_, err = db.Exec(ctx, "INSERT INTO person VALUES ($1)", "ada@example.com")
+	var ee *jed.EngineError
+	if errors.As(err, &ee) && ee.State == jed.UniqueViolation {
+		fmt.Println(ee.Code(), ee.TableName, ee.Detail)
+	}
+	// Output: 23505 person Key (email)=(ada@example.com) already exists.
+}
+
+func ExampleNull() {
+	ctx := context.Background()
+	db, err := jed.Create(jed.CreateOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(ctx, "CREATE TABLE person (id i64 PRIMARY KEY, nickname text)"); err != nil {
+		log.Fatal(err)
+	}
+	// A Null[T] binds SQL NULL when Valid is false.
+	if _, err := db.Exec(ctx, "INSERT INTO person VALUES ($1, $2)", 1, jed.Null[string]{}); err != nil {
+		log.Fatal(err)
+	}
+	// Scanning into a Null[T] accepts NULL; a plain *string would fail.
+	var nickname jed.Null[string]
+	if err := db.QueryRow(ctx, "SELECT nickname FROM person WHERE id = 1").Scan(&nickname); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(nickname.Valid)
+	// Output: false
+}
+
+func ExampleSession_Begin() {
+	ctx := context.Background()
+	db, err := jed.Create(jed.CreateOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(ctx, "CREATE TABLE item (id i64 PRIMARY KEY)"); err != nil {
+		log.Fatal(err)
+	}
+	session, err := db.Session(jed.SessionOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer session.Close()
+	tx, err := session.Begin(ctx, jed.TxOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "INSERT INTO item VALUES (1)"); err != nil {
+		log.Fatal(err)
+	}
+	// The transaction sees its own write; other sessions do not until it commits.
+	var inside, outside int64
+	if err := tx.QueryRow(ctx, "SELECT count(*) FROM item").Scan(&inside); err != nil {
+		log.Fatal(err)
+	}
+	if err := db.QueryRow(ctx, "SELECT count(*) FROM item").Scan(&outside); err != nil {
+		log.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(inside, outside)
+	// Output: 1 0
+}
+
+func ExampleEnvironmentBuilder_RegisterFunction() {
+	ctx := context.Background()
+	b := jed.NewEnvironmentBuilder()
+	// discount(cents, pct) is strict: a NULL argument returns NULL without calling the kernel.
+	discount := jed.NewHostFunction("discount", []string{"i64", "i64"}, "i64",
+		func(args []jed.Value) (jed.Value, error) {
+			var cents, pct int64
+			if err := args[0].Scan(&cents); err != nil {
+				return jed.Value{}, err
+			}
+			if err := args[1].Scan(&pct); err != nil {
+				return jed.Value{}, err
+			}
+			return jed.IntValue(cents - cents*pct/100), nil
+		}).WithVolatility(jed.VolatilityImmutable)
+	if err := b.RegisterFunction(discount); err != nil {
+		log.Fatal(err)
+	}
+	db, err := jed.Create(jed.CreateOptions{Environment: b.Build()})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+	var price int64
+	if err := db.QueryRow(ctx, "SELECT discount(1250, 20)").Scan(&price); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(price)
+	// Output: 1000
+}
+
+func ExampleDatabase_Attach() {
+	ctx := context.Background()
+	db, err := jed.Create(jed.CreateOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+	// Attach a second, empty in-memory database as "scratch"; jed.AttachFile attaches a file.
+	if err := db.Attach(ctx, "scratch", jed.AttachMemory(), jed.AttachOptions{}); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, "CREATE TABLE scratch.note (id i64 PRIMARY KEY, body text)"); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, "INSERT INTO scratch.note VALUES (1, 'hello')"); err != nil {
+		log.Fatal(err)
+	}
+	var body string
+	if err := db.QueryRow(ctx, "SELECT body FROM scratch.note WHERE id = 1").Scan(&body); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(body)
+	// Output: hello
+}
+
+func ExampleDatabase_Query_cancellation() {
+	db, err := jed.Create(jed.CreateOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	cancel() // canceled before the query starts, so the example is deterministic
+	_, err = db.Query(ctx, "SELECT count(*) FROM generate_series(1, 100000000)")
+	var ee *jed.EngineError
+	fmt.Println(errors.Is(err, context.Canceled), errors.As(err, &ee) && ee.Code() == "57014")
+	// Output: true true
 }
