@@ -82,6 +82,7 @@ pub struct Program {
     pub ngroups: usize,
     cap_depth: usize,
     cap_leaf_len: usize,
+    prefix: Option<LiteralPrefix>,
     seen_pool: SeenPool,
 }
 
@@ -905,6 +906,39 @@ enum Wrapper {
     GatedRightmost,
 }
 
+/// Bytecode eligible for the two unanchored search shortcuts of regex.md §4.
+#[derive(Clone, Copy, Debug)]
+struct LiteralPrefix {
+    pc: usize,
+    ch: char,
+    overlap: usize,
+}
+
+impl LiteralPrefix {
+    fn from_program(insts: &[Inst], wrapper: Wrapper) -> Option<Self> {
+        if wrapper != Wrapper::Search {
+            return None;
+        }
+        let mut pc = 4;
+        while matches!(insts[pc], Inst::Save(_)) {
+            pc += 1;
+        }
+        let Inst::Char(ch) = insts[pc] else {
+            return None;
+        };
+        let mut end = pc + 1;
+        while insts[end] == Inst::Char(ch) {
+            end += 1;
+        }
+        let overlap = if end - pc >= 2 && matches!(insts[end], Inst::Char(_)) {
+            end - pc
+        } else {
+            0
+        };
+        Some(Self { pc, ch, overlap })
+    }
+}
+
 fn compile_wrapped(pattern: &str, mode: Mode, wrapper: Wrapper) -> Result<Program> {
     let mut parser = Parser {
         chars: pattern.chars().collect(),
@@ -941,6 +975,7 @@ fn compile_wrapped(pattern: &str, mode: Mode, wrapper: Wrapper) -> Result<Progra
     c.push(Inst::Match)?;
     let (cap_depth, cap_leaf_len) = cap_shape(2 * (ngroups + 1));
     Ok(Program {
+        prefix: LiteralPrefix::from_program(&c.insts, wrapper),
         insts: c.insts,
         classes: c.classes,
         ngroups,
@@ -1255,8 +1290,68 @@ impl Program {
         Ok(ends)
     }
 
+    /// Advance the two-thread prefix miss (width zero), or the saturated overlap frontier.
+    fn skip_prefix<R: CapRep>(
+        &self,
+        prefix: LiteralPrefix,
+        list: &mut [Thread<R::Caps>],
+        input: &[char],
+        sp: usize,
+        m: &mut Meter,
+    ) -> Result<usize> {
+        let same = input[sp] == prefix.ch;
+        let width = if same { prefix.overlap } else { 0 };
+        if (same && width == 0)
+            || list.len() != width + 2
+            || list[width + 1].pc != 1
+            || !(0..=width).all(|i| list[i].pc == prefix.pc + width - i)
+        {
+            return Ok(0);
+        }
+
+        let units = (prefix.pc + width + 1) as i64 * COSTS.regex_step;
+        let bulk = !m.has_cancellation();
+        let mut limit = (input.len() - sp).min(4096);
+        if bulk && let Some(room) = m.headroom() {
+            if room <= units {
+                return Ok(0); // let the ordinary VM execute the boundary position
+            }
+            limit = (limit as i64).min((room - 1) / units) as usize;
+        }
+        let mut n = 0;
+        for &ch in &input[sp..sp + limit] {
+            if (ch == prefix.ch) != same {
+                break;
+            }
+            if !bulk {
+                m.charge(units);
+                m.checkpoint()?;
+            }
+            n += 1;
+        }
+        if bulk {
+            m.charge(n as i64 * units);
+        }
+        // Oldest starts come first. Keep each surviving history, then seed the new starts.
+        for i in 0..=width {
+            list[i].caps = if i + n <= width {
+                list[i + n].caps.clone()
+            } else {
+                let start = sp + n - (width - i);
+                let mut caps = None;
+                for inst in &self.insts[3..prefix.pc] {
+                    let Inst::Save(slot) = inst else {
+                        unreachable!()
+                    };
+                    caps = Some(R::with(self, caps.as_ref(), *slot, start as i64));
+                }
+                caps
+            };
+        }
+        Ok(n)
+    }
+
     /// [`Program::search`] over the capture representation `R`, returning the winning thread's slots.
-    #[allow(clippy::needless_range_loop)]
     fn pike_search<R: CapRep>(
         &self,
         seen: &mut Seen,
@@ -1278,7 +1373,17 @@ impl Program {
             &mut stack, &mut clist, seen, generation, 0, None, start, input, gate, m,
         )?;
 
-        for sp in start..=len {
+        let mut sp = start;
+        while sp <= len {
+            if sp < len
+                && let Some(prefix) = self.prefix
+            {
+                let skipped = self.skip_prefix::<R>(prefix, &mut clist, input, sp, m)?;
+                if skipped != 0 {
+                    sp += skipped;
+                    continue;
+                }
+            }
             let generation = seen.next();
             nlist.clear();
             let mut i = 0;
@@ -1323,6 +1428,7 @@ impl Program {
             if clist.is_empty() {
                 break;
             }
+            sp += 1;
         }
         Ok(matched)
     }
@@ -1915,6 +2021,54 @@ mod tests {
 
     fn cost_meter() -> Meter {
         Meter::new()
+    }
+
+    #[test]
+    fn prefix_shortcuts_preserve_meter_boundaries() {
+        use crate::cancel::CancellationToken;
+        use crate::cost::Lifetime;
+        use std::cell::Cell;
+
+        for (pattern, text) in [
+            ("needle", "xxxneedxneedle".to_owned()),
+            ("((猫猫猫犬))", "😀猫猫猫猫猫猫犬".to_owned()),
+            ("(?:aaab)+c", "aaabaaaaabaaabc".to_owned()),
+            ("((((((((aaab))))))))", "a".repeat(8200) + "b"),
+        ] {
+            let fast = compile(pattern).unwrap();
+            let mut slow = fast.clone();
+            slow.prefix = None;
+            let input: Vec<char> = text.chars().collect();
+            let run = |p: &Program, limit, life_limit, token| {
+                let lifetime = Lifetime {
+                    total: Rc::new(Cell::new(12)),
+                    limit: life_limit,
+                };
+                let mut m = Meter::for_session(limit, lifetime.clone(), token);
+                let result = p.run(&input, &mut m).map(|caps| caps.map(|c| p.slots(&c)));
+                (result, m.accrued, lifetime.total.get())
+            };
+            let check = |limit, life_limit, token: Option<CancellationToken>| {
+                assert_eq!(
+                    run(&fast, limit, life_limit, token.clone()),
+                    run(&slow, limit, life_limit, token),
+                    "{pattern}: {limit}/{life_limit}"
+                );
+            };
+            check(0, 0, None);
+            check(0, 0, Some(CancellationToken::new()));
+            let cancelled = CancellationToken::new();
+            cancelled.cancel();
+            check(1, 13, Some(cancelled));
+            if input.len() < 100 {
+                for limit in 1..=run(&slow, 0, 0, None).1 + 1 {
+                    for delta in [11, 12, 13] {
+                        check(limit, limit + delta, None);
+                    }
+                    check(0, limit + 12, None);
+                }
+            }
+        }
     }
 
     #[test]

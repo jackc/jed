@@ -9,6 +9,7 @@
 // (spec/regex/match_vectors.toml). The lowering follows regex.md §3 exactly. Iteration is by Unicode
 // CODE POINT (Array.from / codePointAt — never charCodeAt), a §8 determinism surface.
 
+import { hasCancellation } from "./cancel.ts";
 import { COSTS, MEMORY_ARRAY_DIM, MEMORY_VALUE } from "./costs.ts";
 import type { Meter } from "./cost.ts";
 import { foldLowerSimple, type PropertyTable } from "./collation.ts";
@@ -152,6 +153,8 @@ export type RegexProgram = {
   ngroups: number;
   capDepth: number;
   capLeafLen: number;
+  prefixPC: number;
+  overlapWidth: number;
   seen: RegexSeen | null;
 };
 
@@ -897,6 +900,18 @@ function compileRegexWrapped(
     ys[i] = inst.y;
     chs[i] = inst.ch;
   }
+  let prefixPC = 0;
+  let overlapWidth = 0;
+  if (wrapper === "search") {
+    let pc = 4;
+    while (ops[pc] === OP_SAVE) pc++;
+    if (ops[pc] === OP_CHAR) {
+      prefixPC = pc;
+      let end = pc + 1;
+      while (ops[end] === OP_CHAR && chs[end] === chs[pc]) end++;
+      if (end - pc >= 2 && ops[end] === OP_CHAR) overlapWidth = end - pc;
+    }
+  }
   const ascii = c.classes.map(() => null);
   return {
     insts,
@@ -909,6 +924,8 @@ function compileRegexWrapped(
     ngroups,
     capDepth,
     capLeafLen,
+    prefixPC,
+    overlapWidth,
     seen: null,
   };
 }
@@ -1097,6 +1114,61 @@ export function regexMatchEnds(
   return ends;
 }
 
+// Advance the two-thread prefix miss (width zero), or the saturated overlap frontier (regex.md §4).
+function skipPrefix(
+  p: RegexProgram,
+  seen: RegexSeen,
+  cl: number,
+  caps: (CapNode | null)[],
+  count: number,
+  input: number[],
+  sp: number,
+  m: Meter,
+  initialCaps: CapNode | null,
+  bulk: boolean,
+): number {
+  const pc = p.prefixPC;
+  const literal = p.chs[pc];
+  const same = input[sp] === literal;
+  const width = same ? p.overlapWidth : 0;
+  if ((same && width === 0) || count !== width + 2 || seen.buf[cl + width + 1] !== 1) return 0;
+  for (let i = 0; i <= width; i++) {
+    if (seen.buf[cl + i] !== pc + width - i) return 0;
+  }
+
+  const units = BigInt(pc + width + 1) * COSTS.regexStep;
+  let limit = Math.min(4096, input.length - sp);
+  if (bulk) {
+    const room = m.headroom();
+    if (room !== undefined) {
+      if (room <= units) return 0; // the ordinary VM executes the boundary position
+      limit = Math.min(limit, Number((room - 1n) / units));
+    }
+  }
+  let n = 0;
+  while (n < limit && (input[sp + n] === literal) === same) {
+    if (!bulk) {
+      m.charge(units);
+      m.guard();
+    }
+    n++;
+  }
+  if (bulk) m.charge(BigInt(n) * units);
+  if (initialCaps !== NO_CAPTURES) {
+    // Oldest starts come first. The new starts have consumed width-i code points.
+    for (let i = 0; i <= width; i++) {
+      if (i + n <= width) caps[i] = caps[i + n];
+      else {
+        const start = sp + n - (width - i);
+        let fresh: CapNode | null = null;
+        for (let save = 3; save < pc; save++) fresh = withSlot(p, fresh, p.xs[save], start);
+        caps[i] = fresh;
+      }
+    }
+  }
+  return n;
+}
+
 // regexSearch runs the Pike VM, considering only matches that START at code-point position `start` or
 // later (the unanchored search seeds its lazy `.*?` prefix at `start`); ^/$ still anchor at the true
 // input bounds. Used by regexp_replace's global loop. Charges regex_step per explored state and
@@ -1140,7 +1212,16 @@ function regexSearch(
   let nn = 0;
   let matched: CapNode | null = null;
 
-  for (let sp = start; sp <= len; sp++) {
+  const bulk = !hasCancellation();
+  for (let sp = start; sp <= len; ) {
+    // The first scalar transition charges the still-pending seed closure together with its states.
+    if (p.prefixPC !== 0 && sp < len && seen.steps === 0) {
+      const skipped = skipPrefix(p, seen, cl, ccaps, cn, input, sp, m, initialCaps, bulk);
+      if (skipped !== 0) {
+        sp += skipped;
+        continue;
+      }
+    }
     const generation = nextGeneration(p, seen);
     nn = 0;
     const cp = sp < len ? input[sp] : -1;
@@ -1183,6 +1264,7 @@ function regexSearch(
     }
     m.guard(); // §6 ceiling, once per input position
     if (cn === 0) break;
+    sp++;
   }
   return matched;
 }

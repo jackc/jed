@@ -342,7 +342,10 @@ recreates the same two threads: `Jmp` at 2, `Split` at 0, the saves at 3 through
 position the literal thread carries only the initial saves, all set to that position.
 A core may scan a consecutive run of such misses and charge their combined steps. A batch
 must stop before any due cancellation poll or cost ceiling, leaving the boundary position
-to the ordinary VM.
+to the ordinary VM. A core that polls cancellation at every position can still specialize
+the transition by charging the single position's full cost and running its normal checkpoint
+before examining the next code point. This also preserves the first crossed ceiling and the
+partial cost reported on abort.
 
 A second shortcut applies when `w` consecutive copies of the same literal start at pc `k`,
 followed by a different literal at `k+w`. Suppose the parked pcs are exactly `k+w, …, k, 1`

@@ -576,6 +576,11 @@ impl Meter {
         self.limit <= 0 && self.lifetime.as_ref().is_none_or(|l| l.limit <= 0)
     }
 
+    /// Whether a per-position checkpoint must poll the operation's cancellation token.
+    pub(crate) fn has_cancellation(&self) -> bool {
+        self.cancel.is_some()
+    }
+
     /// Poll immediately at a batch or host-call boundary, then enforce cost.
     #[inline]
     pub fn checkpoint(&self) -> Result<()> {

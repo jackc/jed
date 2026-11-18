@@ -143,6 +143,20 @@ The `regex_dense_starts` SQL lane reads both long subjects from a scratch table 
 id of the one with the trailing `b`. One 100-iteration run per revision measured 6.67 → 0.285 ms
 per query with matching checksums.
 
+**Rust and TypeScript literal-prefix search (2026-11-18).** Both cores use the prefix-miss
+and dense-overlap transitions from regex.md §4. The SQL lanes ran sequentially on the same
+Core Ultra 9 285K with Rust 1.99.0 (release) and Node 26.10.0. Mean milliseconds per query
+from one run per revision appear below.
+
+| Lane | Iterations | Rust before → after | TypeScript before → after |
+|---|---:|---:|---:|
+| `regex_literal_prefix`, 10k rows | 54 | 5.01 → 2.27 | 10.44 → 5.31 |
+| `regex_dense_starts`, two 65,536-character runs, one with a trailing `b` | 100 | 3.64 → 0.106 | 6.54 → 0.662 |
+
+All four before/after answer checksums matched. Each core still polls at every original input
+position when cancellation is active. With a finite statement or lifetime limit, each batch stops
+before the position that can trip the ceiling.
+
 **Variable-width scan result (2026-10-13).** Track A4 ([packed-leaf.md §11](packed-leaf.md)) lets the
 columnar lanes read text, bytea, and array columns in place. The seven `varscan_*` lanes run over a
 100k-row scratch table (nullable text, `text[]`, `bytea`; no secondary index); `gin_stats_common_tag`

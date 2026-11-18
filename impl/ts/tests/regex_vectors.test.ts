@@ -12,7 +12,9 @@ import { foldLowerSimple } from "../src/collation.ts";
 
 // The vectors fold under the ASCII casing baseline: no Unicode property table is loaded.
 const NO_PROPERTY = undefined;
-import { Meter } from "../src/cost.ts";
+import { withCancellationScope } from "../src/cancel.ts";
+import { EngineError } from "../src/errors.ts";
+import { LifetimeBudget, Meter } from "../src/cost.ts";
 import {
   compileRegex,
   compileRegexMode,
@@ -217,5 +219,59 @@ test("regex SIMILAR vectors match spec/regex/similar_vectors.toml", () => {
       BigInt(Number(c.get("substring_steps"))),
       `substring_steps for ${what}`,
     );
+  }
+});
+
+test("literal prefix transitions preserve partial cost, captures and every cancellation poll", () => {
+  for (const [pattern, text] of [
+    ["needle", "xxxneedxneedle"],
+    ["((猫猫猫犬))", "😀猫猫猫猫猫猫犬"],
+    ["(?:aaab)+c", "aaabaaaaabaaabc"],
+    ["((((((((aaab))))))))", "a".repeat(8200) + "b"],
+  ]) {
+    const fast = compileRegex(pattern);
+    const slow = compileRegex(pattern);
+    slow.prefixPC = 0;
+    const input = Array.from(text, (ch) => ch.codePointAt(0) as number);
+    function run(p: typeof fast, limit: bigint, lifeLimit: bigint, cancelAt?: number) {
+      const life = new LifetimeBudget(lifeLimit);
+      life.total = 12n;
+      const m = new Meter(limit, life);
+      const polls: bigint[] = [];
+      const poll =
+        cancelAt === undefined
+          ? undefined
+          : () => {
+              polls.push(m.accrued);
+              return polls.length === cancelAt;
+            };
+      let result: number[] | string | null;
+      try {
+        const caps = withCancellationScope(poll, () => regexRun(p, input, m));
+        result = caps === null ? null : regexSlots(p, caps);
+      } catch (err) {
+        if (!(err instanceof EngineError)) throw err;
+        result = err.state;
+      }
+      return { result, cost: m.accrued, lifetime: life.total, polls };
+    }
+    function check(limit: bigint, lifeLimit: bigint, cancelAt?: number) {
+      assert.deepEqual(
+        run(fast, limit, lifeLimit, cancelAt),
+        run(slow, limit, lifeLimit, cancelAt),
+        pattern,
+      );
+    }
+    check(0n, 0n);
+    check(0n, 0n, -1);
+    check(0n, 0n, 7);
+    if (input.length < 100) {
+      const full = run(slow, 0n, 0n, -1);
+      for (let limit = 1n; limit <= full.cost + 1n; limit++) {
+        for (const delta of [11n, 12n, 13n]) check(limit, limit + delta);
+        check(0n, limit + 12n);
+      }
+      for (const [i, cost] of full.polls.entries()) check(cost, cost + 12n, i + 1);
+    }
   }
 });
