@@ -110,7 +110,7 @@ func TestCatalogOrderIsExactNameBytesAcrossReload(t *testing.T) {
 	} {
 		mustCreate(t, db, sql)
 	}
-	image, err := db.ToImage(8192, 1)
+	image, err := db.toImage(8192, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestCatalogOrderIsExactNameBytesAcrossReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	again, err := fresh.ToImage(8192, 1)
+	again, err := fresh.toImage(8192, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

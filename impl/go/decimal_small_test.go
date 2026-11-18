@@ -56,10 +56,10 @@ func sameDecimal(t *testing.T, what string, got, want Decimal) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("%s: fast path %#v, limb path %#v", what, got, want)
 	}
-	if len(got.Limbs) == 0 && (got.Neg || got.Limbs != nil) {
+	if len(got.limbs) == 0 && (got.neg || got.limbs != nil) {
 		t.Fatalf("%s: zero is not canonical: %#v", what, got)
 	}
-	if n := len(got.Limbs); n > 0 && got.Limbs[n-1] == 0 {
+	if n := len(got.limbs); n > 0 && got.limbs[n-1] == 0 {
 		t.Fatalf("%s: a high zero limb: %#v", what, got)
 	}
 }
@@ -100,28 +100,28 @@ func TestSmallAddAndCompareMatchLimbPaths(t *testing.T) {
 		// Every value against a spread of the others (the full square is ~1.5M pairs).
 		for j := i % 7; j < len(vals); j += 7 {
 			b := vals[j]
-			what := fmt.Sprintf("%s , %s", a.Render(), b.Render())
+			what := fmt.Sprintf("%s , %s", a.String(), b.String())
 			if got, ok := addSmall(a, b); ok {
 				taken++
 				sameDecimal(t, "add "+what, got, a.addLimbs(b))
 			} else {
 				declined++
 			}
-			sameDecimal(t, "AddUncapped "+what, a.AddUncapped(b), a.addLimbs(b))
+			sameDecimal(t, "AddUncapped "+what, a.addUncapped(b), a.addLimbs(b))
 			if got, ok := cmpSmall(a, b); ok && got != a.cmpMagLimbs(b) {
 				t.Fatalf("cmp %s: fast path %d, limb path %d", what, got, a.cmpMagLimbs(b))
 			}
 			// CmpValue by the limb path alone.
 			want := a.cmpMagLimbs(b)
 			switch {
-			case a.Neg != b.Neg && a.Neg:
+			case a.neg != b.neg && a.neg:
 				want = -1
-			case a.Neg != b.Neg:
+			case a.neg != b.neg:
 				want = 1
-			case a.Neg:
+			case a.neg:
 				want = -want
 			}
-			if got := a.CmpValue(b); got != want {
+			if got := a.Cmp(b); got != want {
 				t.Fatalf("CmpValue %s: %d, want %d", what, got, want)
 			}
 		}
@@ -137,25 +137,25 @@ func TestSmallMulMatchesLimbPath(t *testing.T) {
 	for i, a := range vals {
 		for j := i % 11; j < len(vals); j += 11 {
 			b := vals[j]
-			want := magMul(a.Limbs, b.Limbs)
+			want := magMul(a.limbs, b.limbs)
 			if got, ok := mulSmall(a, b); ok {
 				taken++
 				if !reflect.DeepEqual(got, want) {
-					t.Fatalf("mul %s × %s: fast path %v, limb path %v", a.Render(), b.Render(), got, want)
+					t.Fatalf("mul %s × %s: fast path %v, limb path %v", a.String(), b.String(), got, want)
 				}
 			} else {
 				declined++
 			}
 			// Mul end to end against its definition over the limb product (round past the scale cap,
 			// then the format cap).
-			exact := newDecimal(a.Neg != b.Neg, a.Scale+b.Scale, want)
-			if exact.Scale > maxScale {
-				exact = exact.RoundToScale(maxScale)
+			exact := newDecimal(a.neg != b.neg, a.scale+b.scale, want)
+			if exact.scale > maxScale {
+				exact = exact.roundToScale(maxScale)
 			}
-			wantD, wantErr := exact.CheckCap()
-			gotD, gotErr := a.Mul(b)
+			wantD, wantErr := exact.checkCap()
+			gotD, gotErr := a.mul(b)
 			if (gotErr == nil) != (wantErr == nil) {
-				t.Fatalf("Mul %s × %s: err %v, want %v", a.Render(), b.Render(), gotErr, wantErr)
+				t.Fatalf("Mul %s × %s: err %v, want %v", a.String(), b.String(), gotErr, wantErr)
 			}
 			if gotErr == nil {
 				sameDecimal(t, "Mul", gotD, wantD)
@@ -197,11 +197,11 @@ func TestSmallCodecMatchesLimbPath(t *testing.T) {
 				pos := 0
 				v, err := decodeDecimalBody(body, &pos, decodeConstruct)
 				if err != nil || pos != len(body) {
-					t.Fatalf("%s: decode: %v (consumed %d of %d)", d.Render(), err, pos, len(body))
+					t.Fatalf("%s: decode: %v (consumed %d of %d)", d.String(), err, pos, len(body))
 				}
-				cn, cs, cg := d.ToCodec()
-				sameDecimal(t, "decode "+d.Render(), *v.decimal(), newDecimal(cn, cs, magFromNbase4Limbs(orEmptyGroups(cg))))
-				sameDecimal(t, "codec round trip "+d.Render(), *v.decimal(), d)
+				cn, cs, cg := d.toCodec()
+				sameDecimal(t, "decode "+d.String(), *v.decimal(), newDecimal(cn, cs, magFromNbase4Limbs(orEmptyGroups(cg))))
+				sameDecimal(t, "codec round trip "+d.String(), *v.decimal(), d)
 			}
 		}
 	}

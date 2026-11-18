@@ -28,7 +28,7 @@ func TestMultidimAndLowerBoundKeyOrder(t *testing.T) {
 	}
 	got := make([]string, len(out.Rows))
 	for i, r := range out.Rows {
-		got[i] = r[0].Render()
+		got[i] = r[0].String()
 	}
 	want := []string{"{1,2,3}", "[2:4]={1,2,3}", "{1,2,3,4}", "{{1,2},{3,4}}"}
 	for i := range want {
@@ -47,7 +47,7 @@ func firstColRows(t *testing.T, db dbHandle, sql string) []string {
 	}
 	got := make([]string, len(out.Rows))
 	for i, r := range out.Rows {
-		got[i] = r[0].Render()
+		got[i] = r[0].String()
 	}
 	return got
 }

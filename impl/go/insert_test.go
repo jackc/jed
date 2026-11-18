@@ -19,7 +19,7 @@ func dbWith(t *testing.T, stmts ...string) *Session {
 func ids(rows []storedRow) []int64 {
 	out := make([]int64, len(rows))
 	for i, r := range rows {
-		out[i] = r[0].Int
+		out[i] = r[0].num
 	}
 	return out
 }
@@ -54,10 +54,10 @@ func TestBoundaryValuesRoundTrip(t *testing.T) {
 	mustCreate(t, db, "INSERT INTO t VALUES (1, 32767, 9223372036854775807)")
 	mustCreate(t, db, "INSERT INTO t VALUES (2, -32768, -9223372036854775808)")
 	rows := db.rowsInKeyOrder("t")
-	if rows[0][1].Int != 32767 || rows[0][2].Int != 9223372036854775807 {
+	if rows[0][1].num != 32767 || rows[0][2].num != 9223372036854775807 {
 		t.Errorf("row 0 wrong: %+v", rows[0])
 	}
-	if rows[1][1].Int != -32768 || rows[1][2].Int != -9223372036854775808 {
+	if rows[1][1].num != -32768 || rows[1][2].num != -9223372036854775808 {
 		t.Errorf("row 1 wrong: %+v", rows[1])
 	}
 }
@@ -142,7 +142,7 @@ func TestValuesExpressionParamsTypedByContext(t *testing.T) {
 		t.Fatalf("INSERT with expression params: %v", err)
 	}
 	rows := db.rowsInKeyOrder("t")
-	if len(rows) != 1 || rows[0][0].Int != 2 || rows[0][1].Kind != ValText || rows[0][1].str() != "AB" {
+	if len(rows) != 1 || rows[0][0].num != 2 || rows[0][1].kind != ValText || rows[0][1].str() != "AB" {
 		t.Fatalf("got %v, want [[2 AB]]", rows)
 	}
 }

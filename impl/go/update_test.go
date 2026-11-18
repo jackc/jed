@@ -37,7 +37,7 @@ func idsABC(db dbHandle) []string {
 	rows := db.rowsInKeyOrder("t")
 	out := make([]string, len(rows))
 	for i, r := range rows {
-		out[i] = fmt.Sprintf("%d/%d/%d", r[0].Int, r[1].Int, r[2].Int)
+		out[i] = fmt.Sprintf("%d/%d/%d", r[0].num, r[1].num, r[2].num)
 	}
 	return out
 }

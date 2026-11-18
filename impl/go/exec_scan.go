@@ -138,7 +138,7 @@ func (m *planMemo) len() int {
 
 func hasNullValue(values []Value) bool {
 	for _, v := range values {
-		if v.Kind == ValNull {
+		if v.kind == ValNull {
 			return true
 		}
 	}

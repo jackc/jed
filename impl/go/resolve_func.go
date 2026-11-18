@@ -2281,7 +2281,7 @@ func jsonOpSymbol(op binaryOp) string {
 // node; a json value is parsed from its verbatim text on demand, preserving key order + duplicates
 // (json.md §4). The resolver restricts a json/jsonb function argument to json/jsonb.
 func jsonArgNode(v Value) (JSONNode, error) {
-	switch v.Kind {
+	switch v.kind {
 	case ValJSONB:
 		return *v.jsonb(), nil
 	case ValJSON:
@@ -2295,7 +2295,7 @@ func jsonArgNode(v Value) (JSONNode, error) {
 // json_array_length): a json value is only lexed, as PostgreSQL does without need_escapes, so a
 // `\u0000` or an unpaired surrogate inside it does not raise (json.md §4.2).
 func jsonArgShape(v Value) (JSONNode, error) {
-	switch v.Kind {
+	switch v.kind {
 	case ValJSONB:
 		return *v.jsonb(), nil
 	case ValJSON:
@@ -2847,13 +2847,13 @@ func passingBindings(exprs []*rExpr, names []string, row storedRow, env *evalEnv
 			return nil, err
 		}
 		var node JSONNode
-		switch v.Kind {
+		switch v.kind {
 		case ValNull:
 			node = JSONNode{Kind: JNull}
 		case ValBool:
 			node = JSONNode{Kind: JBool, B: v.boolVal()}
 		case ValInt:
-			node = JSONNode{Kind: JNumber, Num: decimalFromInt64(v.Int)}
+			node = JSONNode{Kind: JNumber, Num: decimalFromInt64(v.num)}
 		case ValDecimal:
 			node = JSONNode{Kind: JNumber, Num: *v.decimal()}
 		case ValFloat32, ValFloat64:
@@ -2862,7 +2862,7 @@ func passingBindings(exprs []*rExpr, names []string, row storedRow, env *evalEnv
 				return nil, newError(FeatureNotSupported, "a NaN or infinite float PASSING value is not supported yet")
 			}
 			if bits == 32 {
-				node = JSONNode{Kind: JNumber, Num: decimalFromFloat32FltDig(v.F32())}
+				node = JSONNode{Kind: JNumber, Num: decimalFromFloat32FltDig(v.f32())}
 			} else {
 				node = JSONNode{Kind: JNumber, Num: decimalFromFloat64DblDig(f)}
 			}
@@ -2984,7 +2984,7 @@ func resolveJsonpathArgs(s *scope, name string, args []*exprNode, argNames []*st
 // FORMAT JSON — json-sql-functions.md §5.1) parsed as jsonb: malformed text is 22P02, raised by
 // the context's conversion, outside ON ERROR (json.md §4.2), as in PostgreSQL.
 func jsonpathContextNode(v Value) (JSONNode, error) {
-	if v.Kind == ValJSON || v.Kind == ValText {
+	if v.kind == ValJSON || v.kind == ValText {
 		return jsonbIn(v.str())
 	}
 	return jsonArgNode(v)
@@ -2996,7 +2996,7 @@ func jsonpathContextNode(v Value) (JSONNode, error) {
 // mode a SQL/JSON error ends the evaluation: the items found before it are returned with
 // errored = true.
 func evalJsonpath(ctx, path Value, opts jpEvalOpts, silent bool, m *costMeter) (seq []JSONNode, ok, errored bool, err error) {
-	if ctx.Kind == ValNull || path.Kind == ValNull {
+	if ctx.kind == ValNull || path.kind == ValNull {
 		return nil, false, false, nil
 	}
 	node, err := jsonpathContextNode(ctx)
@@ -3224,12 +3224,12 @@ func resolveJSONImage(s *scope, fn jsonImageFunc, name string, fc *funcCallExpr,
 // pointer) — nil if the value is not an array. Used by json_object (a NULL value → JSON null; a NULL
 // key → 22004).
 func valueToOptTextArray(v Value) []*string {
-	if v.Kind != ValArray || v.arrayVal() == nil {
+	if v.kind != ValArray || v.arrayVal() == nil {
 		return nil
 	}
 	out := make([]*string, len(v.arrayVal().Elements))
 	for i, e := range v.arrayVal().Elements {
-		if e.Kind == ValText {
+		if e.kind == ValText {
 			s := e.str()
 			out[i] = &s
 		}

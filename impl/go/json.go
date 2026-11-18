@@ -78,14 +78,14 @@ func jsonTypeRank(n *JSONNode) int {
 	}
 }
 
-// Cmp is the PG jsonb total btree order (spec/design/json.md §5) of two WHOLE documents. A definite
+// cmp is the PG jsonb total btree order (spec/design/json.md §5) of two WHOLE documents. A definite
 // ordering (no SQL NULLs inside a document), driving both `<` and `ORDER BY` from one comparator so
 // they agree by construction. It is cmpNested plus PostgreSQL's one root-level quirk: a top-level
 // scalar is stored as a one-element "raw scalar" pseudo-array, and compareJsonbContainers checks
 // the element count AFTER the raw-scalar flag, so a scalar sorts after the empty array and before
 // every non-empty array (`[]` < null < "a" < 1 < true < [1] < {}). Inside a container the ordinary
 // type rank applies (`[null]` < `[[]]`).
-func (n *JSONNode) Cmp(other *JSONNode) int {
+func (n *JSONNode) cmp(other *JSONNode) int {
 	ns, os := jsonIsScalar(n), jsonIsScalar(other)
 	if ns && other.Kind == JArray {
 		if len(other.Arr) == 0 {
@@ -122,7 +122,7 @@ func (n *JSONNode) cmpNested(other *JSONNode) int {
 		// false < true.
 		return cmpInt(boolRank(n.B), boolRank(other.B))
 	case JNumber:
-		return n.Num.CmpValue(other.Num)
+		return n.Num.Cmp(other.Num)
 	case JString:
 		return strings.Compare(n.S, other.S)
 	case JArray:
@@ -172,7 +172,7 @@ func writeJsonbDistinctKey(b *strings.Builder, n *JSONNode) {
 		}
 	case JNumber:
 		b.WriteByte('d')
-		b.WriteString(n.Num.CanonicalString())
+		b.WriteString(n.Num.canonicalString())
 		b.WriteByte(';')
 	case JString:
 		b.WriteByte('s')
@@ -219,7 +219,7 @@ func jsonKeyCmp(a, b string) int {
 // jsonbValueEqual reports whether two jsonb nodes are value-equal (Cmp == 0). Because the canonical
 // form makes structural equality the value equality (§5), this drives `=` (always definite — no SQL
 // NULLs inside a document, PG btree not 3VL).
-func jsonbValueEqual(a, b *JSONNode) bool { return a.Cmp(b) == 0 }
+func jsonbValueEqual(a, b *JSONNode) bool { return a.cmp(b) == 0 }
 
 // ---------------------------------------------------------------------------------------------
 // Parsing (RFC 8259). `jsonbIn` canonicalizes; `validateJSON` validates and the caller stores
@@ -823,7 +823,7 @@ func (p *jsonParser) parseNumber() (JSONNode, error) {
 	}
 
 	digits, scale := decimalFromParts(intPart, frac, hasExp, exp)
-	d, err := decimalFromDigitsScale(neg, digits, scale).CheckCap()
+	d, err := decimalFromDigitsScale(neg, digits, scale).checkCap()
 	if err != nil {
 		return JSONNode{}, err
 	}
@@ -954,7 +954,7 @@ func writeJSONNode(node *JSONNode, out *strings.Builder) {
 			out.WriteString("false")
 		}
 	case JNumber:
-		out.WriteString(node.Num.Render())
+		out.WriteString(node.Num.String())
 	case JString:
 		writeJSONString(node.S, out)
 	case JArray:
@@ -1001,7 +1001,7 @@ func writeCompactJSON(node *JSONNode, out *strings.Builder) {
 			out.WriteString("false")
 		}
 	case JNumber:
-		out.WriteString(node.Num.Render())
+		out.WriteString(node.Num.String())
 	case JString:
 		writeJSONString(node.S, out)
 	case JArray:
@@ -1749,7 +1749,7 @@ func jsonTextPathArg(v Value) ([]*string, error) {
 	}
 	path := make([]*string, len(arr.Elements))
 	for i, el := range arr.Elements {
-		if el.Kind == ValText {
+		if el.kind == ValText {
 			s := el.str()
 			path[i] = &s
 		}
@@ -2152,4 +2152,22 @@ func pushJSONIndent(level int, out *strings.Builder) {
 	for i := 0; i < level; i++ {
 		out.WriteString("    ")
 	}
+}
+
+// clone deep-copies the node tree, so a host may modify the copy (Value.Scan).
+func (n *JSONNode) clone() JSONNode {
+	out := *n
+	if n.Arr != nil {
+		out.Arr = make([]JSONNode, len(n.Arr))
+		for i := range n.Arr {
+			out.Arr[i] = n.Arr[i].clone()
+		}
+	}
+	if n.Obj != nil {
+		out.Obj = make([]JSONMember, len(n.Obj))
+		for i, m := range n.Obj {
+			out.Obj[i] = JSONMember{Key: m.Key, Val: m.Val.clone()}
+		}
+	}
+	return out
 }

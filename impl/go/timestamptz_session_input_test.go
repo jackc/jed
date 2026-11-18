@@ -29,7 +29,7 @@ func preparedIDs(t *testing.T, db *Session, stmt *PreparedStatement, params ...V
 	}
 	got := make([]int64, len(out.Rows))
 	for i, r := range out.Rows {
-		got[i] = r[0].Int
+		got[i] = r[0].num
 	}
 	return got
 }

@@ -50,7 +50,7 @@ func ginJsonbScalarTerm(n *JSONNode, asKey bool) []byte {
 		return []byte{ginJsonbFlagBool, 0x00}
 	case JNumber:
 		// The value's decimal-order-preserving key (encoding.md §2.5): 1.5 and 1.50 share a term.
-		return ginJsonbFramed(ginJsonbFlagNum, n.Num.EncodeKey())
+		return ginJsonbFramed(ginJsonbFlagNum, n.Num.encodeKey())
 	case JString:
 		if asKey {
 			return ginJsonbKeyTerm(n.S)

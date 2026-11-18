@@ -80,7 +80,9 @@ func open(dataDir, dataset string) (bench.Engine, error) {
 // benchMix is the bench host functions' arithmetic (benchmarks.md §8.2) — cheap on purpose, so the
 // timings expose per-call overhead.
 func benchMix(v jed.Value) jed.Value {
-	return jed.IntValue(v.Int * 2654435761 % 1000003)
+	var n int64
+	_ = v.Scan(&n) // a strict kernel's argument is never NULL, and the signature makes it an integer
+	return jed.IntValue(n * 2654435761 % 1000003)
 }
 
 // benchEnvironment builds the Environment every handle opens under, carrying the bench host functions:
@@ -152,7 +154,9 @@ func (e *engine) QueryInt(sql string) (int64, error) {
 	if !rows.Next() {
 		return 0, fmt.Errorf("no row from %q", sql)
 	}
-	return rows.Row()[0].Int, nil
+	var n int64
+	err = rows.Row()[0].Scan(&n)
+	return n, err
 }
 
 func (e *engine) StoredFingerprint() (string, error) {
@@ -206,16 +210,17 @@ func (s *jedStmt) Query(args []any, sum *bench.Checksum) (int, error) {
 		if sum == nil {
 			continue
 		}
-		for _, v := range rows.Row() {
-			switch v.Kind {
+		for i, v := range rows.Row() {
+			switch v.Kind() {
 			case jed.ValNull:
 				sum.Null()
 			case jed.ValInt:
-				sum.Int(v.Int)
+				x, _ := rows.Int(i)
+				sum.Int(x)
 			case jed.ValText:
-				sum.Text(v.Render())
+				sum.Text(v.String())
 			default:
-				return n, fmt.Errorf("unexpected result kind %d", v.Kind)
+				return n, fmt.Errorf("unexpected result kind %d", v.Kind())
 			}
 		}
 		sum.EndRow()
@@ -273,16 +278,17 @@ func (r jedReader) Query(sql string, args []any, sum *bench.Checksum) (int, erro
 		if sum == nil {
 			continue
 		}
-		for _, v := range rows.Row() {
-			switch v.Kind {
+		for i, v := range rows.Row() {
+			switch v.Kind() {
 			case jed.ValNull:
 				sum.Null()
 			case jed.ValInt:
-				sum.Int(v.Int)
+				x, _ := rows.Int(i)
+				sum.Int(x)
 			case jed.ValText:
-				sum.Text(v.Render())
+				sum.Text(v.String())
 			default:
-				return n, fmt.Errorf("unexpected result kind %d", v.Kind)
+				return n, fmt.Errorf("unexpected result kind %d", v.Kind())
 			}
 		}
 		sum.EndRow()

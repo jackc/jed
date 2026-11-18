@@ -94,7 +94,7 @@ func TestQueryMemoryBudgetStaysWithCursor(t *testing.T) {
 	}
 	var got []int64
 	for old.Next() {
-		got = append(got, old.Row()[0].Int)
+		got = append(got, old.Row()[0].num)
 	}
 	if err := old.Err(); err != nil {
 		t.Fatalf("old cursor lost its budget: %v", err)

@@ -116,7 +116,7 @@ func TestEnvironmentDerivation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := baseBuilder.RegisterFunction(NewHostFunction("plus_one", []string{"i64"}, "i64", func(a []Value) (Value, error) {
-		return IntValue(a[0].Int + 1), nil
+		return IntValue(a[0].num + 1), nil
 	})); err != nil {
 		t.Fatal(err)
 	}

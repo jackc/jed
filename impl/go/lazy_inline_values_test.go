@@ -50,7 +50,7 @@ func rowsSorted(t *testing.T, db dbHandle, sql string) []string {
 	for i, r := range rows {
 		cells := make([]string, len(r))
 		for j, v := range r {
-			cells[j] = v.Render()
+			cells[j] = v.String()
 		}
 		out[i] = strings.Join(cells, "\x1f")
 	}
@@ -247,10 +247,10 @@ func TestLazyUntouchedCorruptInlineBodyDefersError(t *testing.T) {
 	if rows := queryRows(t, db, "SELECT id FROM t"); len(rows) != 2 {
 		t.Fatalf("untouching SELECT id: got %d rows, want 2", len(rows))
 	}
-	if rows := queryRows(t, db, "SELECT id, n FROM t WHERE n = 42"); len(rows) != 1 || rows[0][0].Render() != "1" {
+	if rows := queryRows(t, db, "SELECT id, n FROM t WHERE n = 42"); len(rows) != 1 || rows[0][0].String() != "1" {
 		t.Fatal("untouching filter on a fixed-width column must succeed")
 	}
-	if rows := queryRows(t, db, "SELECT body FROM t WHERE id = 2"); rows[0][0].Render() != "clean" {
+	if rows := queryRows(t, db, "SELECT body FROM t WHERE id = 2"); rows[0][0].String() != "clean" {
 		t.Fatal("the clean row's body must resolve")
 	}
 	for _, sql := range []string{"SELECT body FROM t WHERE id = 1", "SELECT * FROM t ORDER BY id"} {
@@ -407,7 +407,7 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 			t.Fatalf("rowAt %d: %v", ri, err)
 		}
 		for ci, v := range row {
-			if v.Kind != ValUnfetched || v.unfetched().Form != 0x00 {
+			if v.kind != valUnfetched || v.unfetched().Form != 0x00 {
 				continue
 			}
 			deferred++
@@ -535,7 +535,7 @@ func TestPackedLeafTouchedColumnsAndSelfResolution(t *testing.T) {
 
 	// resolve a (possibly-deferred) value to its comparable eager bytes.
 	resolve := func(v Value, c int) []byte {
-		if v.Kind == ValUnfetched {
+		if v.kind == valUnfetched {
 			got, err := resolveUnfetched(colTypes[c], v.unfetched(), func(pageRef) ([]byte, error) {
 				return nil, fmt.Errorf("inline values read no overflow pages")
 			}, pageCap{})
@@ -565,7 +565,7 @@ func TestPackedLeafTouchedColumnsAndSelfResolution(t *testing.T) {
 		// The B4 demand-fault backstop: a deferred value carries its own resolution handles, so
 		// resolveUnfetchedSelf reconstructs it with NO caller-supplied type or pager.
 		for c := range colTypes {
-			if whole[c].Kind != ValUnfetched {
+			if whole[c].kind != valUnfetched {
 				continue
 			}
 			got, err := resolveUnfetchedSelf(whole[c].unfetched())

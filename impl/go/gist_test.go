@@ -14,7 +14,7 @@ import (
 func gistIDs(rows [][]Value) []int64 {
 	out := make([]int64, len(rows))
 	for i, r := range rows {
-		out[i] = r[0].Int
+		out[i] = r[0].num
 	}
 	return out
 }

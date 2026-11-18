@@ -249,7 +249,7 @@ func (p *spanPred) evalFilter(n *pnode, i int, scratch *scratchRow, env *evalEnv
 			return false, err
 		}
 		v, err := p.atom.expr.eval(scratch.vals, env, m)
-		return v.IsTrue(), err
+		return v.isTrue(), err
 	default:
 		for _, c := range p.cols {
 			if err := scratch.ensure(n, i, c); err != nil {
@@ -257,7 +257,7 @@ func (p *spanPred) evalFilter(n *pnode, i int, scratch *scratchRow, env *evalEnv
 			}
 		}
 		v, err := p.expr.eval(scratch.vals, env, m)
-		return v.IsTrue(), err
+		return v.isTrue(), err
 	}
 }
 
@@ -518,9 +518,9 @@ func compileSpanAtom(e *rExpr, colTypes []colType, mask []bool, env *evalEnv) *s
 		t := colTypes[col]
 		a := &spanAtom{expr: e, col: col, kind: atomBytesEq, negated: e.op == opNe, base: operatorCost(e.op.catalogName()) + charge}
 		switch {
-		case isScalar(t) && t.Scalar.IsText() && k.Kind == ValText:
+		case isScalar(t) && t.Scalar.IsText() && k.kind == ValText:
 			a.text, a.k, a.kWidth = true, []byte(k.str()), utf8.RuneCountInString(k.str())
-		case isScalar(t) && t.Scalar.IsBytea() && k.Kind == ValBytea:
+		case isScalar(t) && t.Scalar.IsBytea() && k.kind == ValBytea:
 			a.k, a.kWidth = []byte(k.str()), len(k.str())
 		default:
 			return nil
@@ -571,7 +571,7 @@ func compileSpanAtom(e *rExpr, colTypes []colType, mask []bool, env *evalEnv) *s
 			return nil
 		}
 		k, charge, ok := constantOperand(other, env)
-		if !ok || k.Kind != ValArray {
+		if !ok || k.kind != ValArray {
 			return nil
 		}
 		a := &spanAtom{expr: e, col: col, kind: atomArrayOp, op: op, elem: elem, base: costs.OperatorEval + charge}
@@ -581,10 +581,10 @@ func compileSpanAtom(e *rExpr, colTypes []colType, mask []bool, env *evalEnv) *s
 			case v.IsNull():
 				a.kHasNull = true
 				continue
-			case es.IsText() && v.Kind == ValText, es.IsBytea() && v.Kind == ValBytea:
+			case es.IsText() && v.kind == ValText, es.IsBytea() && v.kind == ValBytea:
 				fits = len(v.str()) <= 0xFFFF
-			case es.IsInteger() && v.Kind == ValInt:
-				fits = es.InRange(v.Int)
+			case es.IsInteger() && v.kind == ValInt:
+				fits = es.InRange(v.num)
 			}
 			if !fits {
 				return nil

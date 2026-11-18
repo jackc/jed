@@ -242,10 +242,10 @@ func pageCRC(page []byte) uint32 {
 func encodeValue(ty colType, v Value) []byte {
 	if ty.Elem != nil {
 		// An array column (spec/design/array.md §4): the shared presence tag then the array body.
-		if v.Kind == ValNull {
+		if v.kind == ValNull {
 			return []byte{0x01}
 		}
-		if v.Kind != ValArray {
+		if v.kind != ValArray {
 			panic("BUG: a non-array value in an array column")
 		}
 		out := []byte{0x00} // present
@@ -253,10 +253,10 @@ func encodeValue(ty colType, v Value) []byte {
 	}
 	if ty.RangeElem != nil {
 		// A range column (spec/design/ranges.md §4): the shared presence tag then the range body.
-		if v.Kind == ValNull {
+		if v.kind == ValNull {
 			return []byte{0x01}
 		}
-		if v.Kind != ValRange {
+		if v.kind != ValRange {
 			panic("BUG: a non-range value in a range column")
 		}
 		out := []byte{0x00} // present
@@ -268,10 +268,10 @@ func encodeValue(ty colType, v Value) []byte {
 		}
 		return encodeScalar(ty.Scalar, v)
 	}
-	if v.Kind == ValNull {
+	if v.kind == ValNull {
 		return []byte{0x01}
 	}
-	if v.Kind != ValComposite {
+	if v.kind != ValComposite {
 		panic("BUG: a non-composite value in a composite column")
 	}
 	out := []byte{0x00} // present
@@ -298,7 +298,7 @@ func fixedDecimalInt(width uint8) scalarType {
 // writing it would truncate, so it panics instead.
 func encodeFixedDecimal(width uint8, scale uint16, v Value) []byte {
 	it := fixedDecimalInt(width)
-	switch v.Kind {
+	switch v.kind {
 	case ValNull:
 		return []byte{0x01}
 	case ValDecimal:
@@ -323,7 +323,7 @@ func encodeArrayBody(elem colType, a *ArrayVal) []byte {
 	}
 	hasNulls := false
 	for _, e := range a.Elements {
-		if e.Kind == ValNull {
+		if e.kind == ValNull {
 			hasNulls = true
 			break
 		}
@@ -343,14 +343,14 @@ func encodeArrayBody(elem colType, a *ArrayVal) []byte {
 		nbytes := (len(a.Elements) + 7) / 8
 		bitmap := make([]byte, nbytes)
 		for i, e := range a.Elements {
-			if e.Kind == ValNull {
+			if e.kind == ValNull {
 				bitmap[i/8] |= 0x80 >> uint(i%8)
 			}
 		}
 		out = append(out, bitmap...)
 	}
 	for _, e := range a.Elements {
-		if e.Kind != ValNull {
+		if e.kind != ValNull {
 			out = append(out, encodeValue(elem, e)[1:]...) // body only (no presence tag)
 		}
 	}
@@ -401,7 +401,7 @@ func encodeCompositeBody(fields []colField, vals []Value) []byte {
 	bitmap := make([]byte, nbytes)
 	var bodies []byte
 	for i := range fields {
-		if vals[i].Kind == ValNull {
+		if vals[i].kind == ValNull {
 			bitmap[i/8] |= 0x80 >> uint(i%8)
 		} else {
 			bodies = append(bodies, encodeValue(fields[i].Type, vals[i])[1:]...)
@@ -475,7 +475,7 @@ func readUvarint(buf []byte, pos *int) (uint64, error) {
 // u16 ndigits ‖ groups (base-10^4, MS-first) — the ntagNumber payload and the inverse of
 // decodeDecimalBody.
 func encodeDecimalBody(d Decimal, out []byte) []byte {
-	neg, scale, groups := d.ToCodec()
+	neg, scale, groups := d.toCodec()
 	var flags byte
 	if neg {
 		flags = 1 // bit0 = sign
@@ -686,10 +686,10 @@ func decodeJsonbString(buf []byte, pos *int, mode decodeMode) (string, error) {
 }
 
 func encodeScalar(ty scalarType, v Value) []byte {
-	switch v.Kind {
+	switch v.kind {
 	case ValNull:
 		return encodeNullable(ty, nil)
-	case ValUnfetched:
+	case valUnfetched:
 		// An unfetched reference is resolved before any encode/plan (the scan layer for reads,
 		// the commit encoder writes a deferred value from its stored bytes — large-values.md §15).
 		panic("BUG: encoding an unfetched large value")
@@ -737,7 +737,7 @@ func encodeScalar(ty scalarType, v Value) []byte {
 	case ValDecimal:
 		// Decimal value codec (spec/fileformat/format.md): tag, flags (sign), u16 scale, u16
 		// ndigits, then that many big-endian base-10^4 coefficient groups (MS-first).
-		neg, scale, groups := v.decimal().ToCodec()
+		neg, scale, groups := v.decimal().toCodec()
 		out := make([]byte, 0, 6+len(groups)*2)
 		out = append(out, 0x00) // present
 		var flags byte
@@ -769,7 +769,7 @@ func encodeScalar(ty scalarType, v Value) []byte {
 		// core-specific (math.NaN() is …001, hardware Inf-Inf is the negative 0xFFF8…), so the codec
 		// re-canonicalizes it to keep a stored NaN cross-core byte-identical (spec/design/float.md §10,
 		// determinism.md §4). The -0→+0 collapse is a comparison/key concern only, NOT applied here.
-		bits := uint64(v.Int)
+		bits := uint64(v.num)
 		if math.IsNaN(math.Float64frombits(bits)) {
 			bits = 0x7FF8000000000000
 		}
@@ -780,7 +780,7 @@ func encodeScalar(ty scalarType, v Value) []byte {
 	case ValFloat32:
 		// Fixed 4-byte body, NO length prefix: the IEEE bits big-endian (format.md code 13). VERBATIM
 		// except a NaN is canonicalized to the single quiet pattern 0x7FC00000 (see ValFloat64).
-		bits := uint32(v.Int)
+		bits := uint32(v.num)
 		if math.IsNaN(float64(math.Float32frombits(bits))) {
 			bits = 0x7FC00000
 		}
@@ -788,7 +788,7 @@ func encodeScalar(ty scalarType, v Value) []byte {
 		out = append(out, 0x00) // present
 		return appendU32(out, bits)
 	default:
-		n := v.Int
+		n := v.num
 		return encodeNullable(ty, &n)
 	}
 }
@@ -812,11 +812,11 @@ func appendI64(b []byte, v int64) []byte {
 	return append(b, s[:]...)
 }
 
-// ToImage serializes the whole committed state to one on-disk image (format.md). A thin wrapper
-// over Snapshot.ToImage for the committed snapshot — txid is written into both meta slots. (The
-// writer's working snapshot is serialized directly via Snapshot.ToImage at commit; this serves
+// toImage serializes the whole committed state to one on-disk image (format.md). A thin wrapper
+// over Snapshot.toImage for the committed snapshot — txid is written into both meta slots. (The
+// writer's working snapshot is serialized directly via Snapshot.toImage at commit; this serves
 // callers/tests holding a *Engine.)
-func (db *engine) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
+func (db *engine) toImage(pageSize uint32, txid uint64) ([]byte, error) {
 	return db.committed.ToImage(pageSize, txid)
 }
 
@@ -2474,7 +2474,7 @@ func orphanedLeafPages(pageIdx pageRef, shared map[uint32]bool, paging *sharedPa
 			if err != nil {
 				return 0, err
 			}
-			if v.Kind != ValUnfetched {
+			if v.kind != valUnfetched {
 				continue
 			}
 			switch u := v.unfetched(); u.Form {
@@ -3188,7 +3188,7 @@ func valueFacts(ty colType, v Value) (inline, payload int) {
 	if v.IsNull() {
 		return 0, 0
 	}
-	if v.Kind == ValUnfetched {
+	if v.kind == valUnfetched {
 		u := v.unfetched()
 		switch u.Form {
 		case 0x00:
@@ -3231,7 +3231,7 @@ func stringPayload(ty colType) bool {
 // text/bytea/json value's u16 length, every other spillable body whole (format.md "Value codec"). No
 // decode, so a corrupt span cannot fail planning; resolving it later reports it.
 func planningPayload(ty colType, v Value) []byte {
-	if v.Kind == ValUnfetched {
+	if v.kind == valUnfetched {
 		u := v.unfetched()
 		if u.Form != 0x00 {
 			panic("BUG: a stored large form's compression outcome is known")
@@ -3247,7 +3247,7 @@ func planningPayload(ty colType, v Value) []byte {
 // planningCompress is the LZ4 block of planningPayload, written into scratch. A resident string body
 // is compressed in place rather than from a copy of it.
 func planningCompress(scratch *lz4Scratch, ty colType, v Value) []byte {
-	if v.Kind != ValUnfetched && stringPayload(ty) {
+	if v.kind != valUnfetched && stringPayload(ty) {
 		scratch.out = lz4CompressInto(scratch.out, &scratch.table, v.str())
 	} else {
 		scratch.out = lz4CompressInto(scratch.out, &scratch.table, planningPayload(ty, v))
@@ -3329,7 +3329,7 @@ func planDispositionsMemo(colTypes []colType, key []byte, row storedRow, pcap pa
 		plan.compressUnits += (plan.payloadLen[i] + capacity - 1) / capacity
 		var comp []byte
 		compLen := -1 // -1: the attempt is known to be rejected
-		if v := row[i]; v.Kind == ValUnfetched && v.unfetched().Form != 0x00 {
+		if v := row[i]; v.kind == valUnfetched && v.unfetched().Form != 0x00 {
 			u := v.unfetched()
 			switch u.Form {
 			case tagInlineComp:
@@ -3406,7 +3406,7 @@ func deferredInStoredForm(colTypes []colType, key []byte, row storedRow, capacit
 	plan := planDispositions(colTypes, key, row, capacity)
 	out := make([]bool, len(row))
 	for i, v := range row {
-		if v.Kind != ValUnfetched {
+		if v.kind != valUnfetched {
 			continue
 		}
 		switch v.unfetched().Form {
@@ -3517,7 +3517,7 @@ func recordScanUnits(colTypes []colType, key []byte, row storedRow, pcap pageCap
 	// resident variable-width value (an UPDATE's new row) takes the plan.
 	lazy, residentVar := false, false
 	for i, v := range row {
-		if v.Kind == ValUnfetched {
+		if v.kind == valUnfetched {
 			lazy = true
 		} else if _, fixed := fixedValueWidth(colTypes[i]); !fixed && !v.IsNull() {
 			residentVar = true
@@ -3525,7 +3525,7 @@ func recordScanUnits(colTypes []colType, key []byte, row storedRow, pcap pageCap
 	}
 	if lazy && !residentVar {
 		for i, v := range row {
-			if !mask[i] || v.Kind != ValUnfetched {
+			if !mask[i] || v.kind != valUnfetched {
 				continue
 			}
 			switch v.unfetched().Form {
@@ -3590,7 +3590,7 @@ type compressOutcome struct {
 // lookup returns a recorded outcome for v's payload. A nil memo, or a payload that is not a resident
 // string body, never hits.
 func (m *compressMemo) lookup(ty colType, v Value) ([]byte, int, bool) {
-	if m == nil || v.Kind == ValUnfetched || !stringPayload(ty) {
+	if m == nil || v.kind == valUnfetched || !stringPayload(ty) {
 		return nil, 0, false
 	}
 	m.mu.Lock()
@@ -3601,7 +3601,7 @@ func (m *compressMemo) lookup(ty colType, v Value) ([]byte, int, bool) {
 
 // record remembers the outcome of compressing v's payload.
 func (m *compressMemo) record(ty colType, v Value, block []byte, compLen int) {
-	if m == nil || v.Kind == ValUnfetched || !stringPayload(ty) {
+	if m == nil || v.kind == valUnfetched || !stringPayload(ty) {
 		return
 	}
 	m.mu.Lock()
@@ -3656,7 +3656,7 @@ func valueFromStringPayload(ty colType, payload string) (Value, error) {
 		}
 		return TextValue(payload), nil
 	case ty.Scalar.IsBytea():
-		return Value{Kind: ValBytea, ref: payload}, nil
+		return Value{kind: ValBytea, ref: payload}, nil
 	default: // json
 		if !utf8.ValidString(payload) {
 			return Value{}, newError(DataCorrupted, "non-UTF-8 json value")
@@ -3770,7 +3770,7 @@ func (s *chainSource) readChain(first pageRef, length int) ([]byte, error) {
 // resident returns v materialized: a deferred value resolved through the database's pager
 // (unmetered, like all commit work), a resident value as is.
 func (s *chainSource) resident(ty colType, v Value) (Value, error) {
-	if v.Kind != ValUnfetched {
+	if v.kind != valUnfetched {
 		return v, nil
 	}
 	return resolveUnfetched(ty, v.unfetched(), s.fetch, s.cap())
@@ -3799,7 +3799,7 @@ func (s *chainSource) keepChain(first pageRef, stored int, seal sealer, take fun
 // record never re-reads, decompresses, or recompresses an unchanged value.
 func encodeDisposedValue(ty colType, v Value, plan *recordPlan, c int, seal sealer, take func() uint32, ovf *[]dirtyPage, src *chainSource) ([]byte, error) {
 	var u *unfetchedValue
-	if v.Kind == ValUnfetched {
+	if v.kind == valUnfetched {
 		u = v.unfetched()
 	}
 	pcap := seal.cap
@@ -4937,7 +4937,7 @@ func decodeStatisticsValue(buf []byte, pos *int, s *snapshot, tableKey string, c
 	if valuePos != len(encoded) || !bytes.Equal(encodeValue(colType, value), encoded) {
 		return statisticsValue{}, newError(DataCorrupted, "noncanonical statistics value")
 	}
-	if value.Kind == ValNull {
+	if value.kind == ValNull {
 		return statisticsValue{}, newError(DataCorrupted, "statistics values may not be NULL")
 	}
 	_, _, _, _, collationSkewed := s.collationSkew(table.Columns[column].Collation)
@@ -6750,7 +6750,7 @@ func (p *packedLeaf) value(c, i int) (Value, error) {
 			pos := 0
 			return readValueLazy(p.colTypes, c, raw, &pos, p.cap, p.paging)
 		}
-		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: 0x00, lazy: lz, lazyIdx: i, bare: stringPayload(p.colTypes[c]), types: p.colTypes, typeIdx: c}}, nil
+		return Value{kind: valUnfetched, ref: &unfetchedValue{Form: 0x00, lazy: lz, lazyIdx: i, bare: stringPayload(p.colTypes[c]), types: p.colTypes, typeIdx: c}}, nil
 	}
 	vb, err := p.dirs.value(c, i, nil)
 	if err != nil {
@@ -6862,7 +6862,7 @@ func (p *packedLeaf) valueResolved(c, i int) (Value, error) {
 		return valueFromPayload(ty, vb[1:])
 	}
 	v, err := readValueLazy(p.colTypes, c, vb, &pos, p.cap, p.paging)
-	if err != nil || v.Kind != ValUnfetched {
+	if err != nil || v.kind != valUnfetched {
 		return v, err
 	}
 	return resolveUnfetchedSelf(v.unfetched())
@@ -7646,7 +7646,7 @@ func readValueLazy(types []colType, c int, buf []byte, pos *int, pcap pageCap, p
 			if err != nil {
 				return Value{}, err
 			}
-			return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: 0x00, Comp: span, types: types, typeIdx: c}}, nil
+			return Value{kind: valUnfetched, ref: &unfetchedValue{Form: 0x00, Comp: span, types: types, typeIdx: c}}, nil
 		}
 		return readInlineBody(ty, buf, pos, decodeConstruct)
 	case tagInlineBare:
@@ -7657,7 +7657,7 @@ func readValueLazy(types []colType, c int, buf []byte, pos *int, pcap pageCap, p
 		}
 		span := buf[*pos:]
 		*pos = len(buf)
-		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: 0x00, Comp: span, bare: true, types: types, typeIdx: c}}, nil
+		return Value{kind: valUnfetched, ref: &unfetchedValue{Form: 0x00, Comp: span, bare: true, types: types, typeIdx: c}}, nil
 	case 0x01:
 		return NullValue(), nil
 	case tagExternal:
@@ -7673,7 +7673,7 @@ func readValueLazy(types []colType, c int, buf []byte, pos *int, pcap pageCap, p
 		if err != nil {
 			return Value{}, err
 		}
-		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: tagExternal, FirstPage: first, firstTag: ref.tag, StoredLen: length, types: types, typeIdx: c, paging: paging}}, nil
+		return Value{kind: valUnfetched, ref: &unfetchedValue{Form: tagExternal, FirstPage: first, firstTag: ref.tag, StoredLen: length, types: types, typeIdx: c, paging: paging}}, nil
 	case tagInlineComp:
 		rawLen, err := readU32(buf, pos)
 		if err != nil {
@@ -7689,7 +7689,7 @@ func readValueLazy(types []colType, c int, buf []byte, pos *int, pcap pageCap, p
 		}
 		comp := make([]byte, len(compSlice))
 		copy(comp, compSlice)
-		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: tagInlineComp, RawLen: rawLen, Comp: comp, types: types, typeIdx: c}}, nil
+		return Value{kind: valUnfetched, ref: &unfetchedValue{Form: tagInlineComp, RawLen: rawLen, Comp: comp, types: types, typeIdx: c}}, nil
 	case tagExternalComp:
 		first, err := readU32(buf, pos)
 		if err != nil {
@@ -7707,7 +7707,7 @@ func readValueLazy(types []colType, c int, buf []byte, pos *int, pcap pageCap, p
 		if err != nil {
 			return Value{}, err
 		}
-		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: tagExternalComp, FirstPage: first, firstTag: ref.tag, StoredLen: stored, RawLen: rawLen, types: types, typeIdx: c, paging: paging}}, nil
+		return Value{kind: valUnfetched, ref: &unfetchedValue{Form: tagExternalComp, FirstPage: first, firstTag: ref.tag, StoredLen: stored, RawLen: rawLen, types: types, typeIdx: c, paging: paging}}, nil
 	default:
 		return Value{}, newError(DataCorrupted, "invalid value presence tag")
 	}
@@ -7845,7 +7845,7 @@ func chainPages(first pageRef, length int, fetch func(pageRef) ([]byte, error), 
 // free-list reachability walk), via the header-only chainPages hop.
 func markChains(row storedRow, fetch func(pageRef) ([]byte, error), pcap pageCap, reached map[uint32]bool) error {
 	for _, v := range row {
-		if v.Kind != ValUnfetched {
+		if v.kind != valUnfetched {
 			continue
 		}
 		switch v.unfetched().Form {
@@ -8303,14 +8303,14 @@ func readInlineScalar(ty scalarType, buf []byte, pos *int, mode decodeMode) (Val
 		}
 		bits := uint64(vb[0])<<56 | uint64(vb[1])<<48 | uint64(vb[2])<<40 | uint64(vb[3])<<32 |
 			uint64(vb[4])<<24 | uint64(vb[5])<<16 | uint64(vb[6])<<8 | uint64(vb[7])
-		return Value{Kind: ValFloat64, Int: int64(bits)}, nil
+		return Value{kind: ValFloat64, num: int64(bits)}, nil
 	case ty.IsFloat32():
 		vb, err := take(buf, pos, 4)
 		if err != nil {
 			return Value{}, err
 		}
 		bits := uint32(vb[0])<<24 | uint32(vb[1])<<16 | uint32(vb[2])<<8 | uint32(vb[3])
-		return Value{Kind: ValFloat32, Int: int64(bits)}, nil
+		return Value{kind: ValFloat32, num: int64(bits)}, nil
 	case ty.IsDate():
 		// 4-byte i32 day count, same order-preserving codec as i32 (spec/design/date.md).
 		vb, err := take(buf, pos, ty.WidthBytes())

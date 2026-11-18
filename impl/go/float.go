@@ -232,8 +232,8 @@ func floatShortestExact(m uint64, e int, lowerTight bool, minLen int) (string, i
 			lo += strings.Repeat("0", n-len(xd))
 		}
 		hi := incrementDigits(lo)
-		loIn := decimalTimesPow10(lo, q).CmpValue(lower) > 0
-		hiIn := decimalTimesPow10(hi, q).CmpValue(upper) < 0
+		loIn := decimalTimesPow10(lo, q).Cmp(lower) > 0
+		hiIn := decimalTimesPow10(hi, q).Cmp(upper) < 0
 		var pick string
 		switch {
 		case loIn && hiIn:
@@ -374,10 +374,10 @@ func floatJSONNumber(f float64, bitSize int) Decimal {
 
 // floatOf is a float value as a float64 (an f32 widens exactly) and its width in bits.
 func floatOf(v Value) (float64, int) {
-	if v.Kind == ValFloat32 {
-		return float64(v.F32()), 32
+	if v.kind == ValFloat32 {
+		return float64(v.f32()), 32
 	}
-	return v.F64(), 64
+	return v.f64(), 64
 }
 
 // --- the arithmetic kernel (spec/design/float.md §5) --------------------------------------
@@ -394,7 +394,7 @@ func floatOf(v Value) (float64, int) {
 // of the result width, or a trap (22003 finite-overflow, 22012 division by zero).
 func evalFloatArith(op binaryOp, a, b Value, resultIs32 bool) (Value, error) {
 	if resultIs32 {
-		x, y := a.F32(), b.F32()
+		x, y := a.f32(), b.f32()
 		r, err := float32Op(op, x, y)
 		if err != nil {
 			return Value{}, err
@@ -500,10 +500,10 @@ func float32Op(op binaryOp, x, y float32) (float32, error) {
 // evalFloatNeg negates a float value (unary -) — pure IEEE sign flip, never traps (negation
 // cannot overflow; -NaN is NaN, -(-0) = +0). Preserves the operand width.
 func evalFloatNeg(v Value) Value {
-	if v.Kind == ValFloat32 {
-		return Float32Value(-v.F32())
+	if v.kind == ValFloat32 {
+		return Float32Value(-v.f32())
 	}
-	return Float64Value(-v.F64())
+	return Float64Value(-v.f64())
 }
 
 func isFinite(f float64) bool   { return !math.IsInf(f, 0) && !math.IsNaN(f) }
@@ -566,13 +566,13 @@ func floatToDecimal(f float64, typmod *decimalTypmod) (Value, error) {
 	d := exactDecimalFromFloat64(f)
 	if typmod != nil {
 		var err error
-		d, err = d.CoerceToTypmod(uint32(typmod.Precision), uint32(typmod.Scale))
+		d, err = d.coerceToTypmod(uint32(typmod.Precision), uint32(typmod.Scale))
 		if err != nil {
 			return Value{}, err
 		}
 	} else {
 		var err error
-		d, err = d.CheckCap()
+		d, err = d.checkCap()
 		if err != nil {
 			return Value{}, err
 		}
@@ -638,13 +638,13 @@ func decimalFromFloat32FltDig(f float32) Decimal { return decimalFromFloatSigDig
 // bit-for-bit.
 func decimalFromFloatSigDigits(f float64, sig uint32) Decimal {
 	exact := exactDecimalFromFloat64(f)
-	digits := exact.Precision()
+	digits := exact.precision()
 	if digits <= sig {
 		return exact
 	}
 	drop := digits - sig
 	pow := magPow10(drop)
-	q, r := magDivMod(exact.Limbs, pow)
+	q, r := magDivMod(exact.limbs, pow)
 	roundUp := false
 	switch magCmp(magAdd(r, r), pow) {
 	case 1:
@@ -656,10 +656,10 @@ func decimalFromFloatSigDigits(f float64, sig uint32) Decimal {
 		q = magAdd(q, []uint32{1})
 	}
 	var rounded Decimal
-	if exact.Scale >= drop {
-		rounded = newDecimal(exact.Neg, exact.Scale-drop, q)
+	if exact.scale >= drop {
+		rounded = newDecimal(exact.neg, exact.scale-drop, q)
 	} else {
-		rounded = newDecimal(exact.Neg, 0, magMulPow10(q, drop-exact.Scale))
+		rounded = newDecimal(exact.neg, 0, magMulPow10(q, drop-exact.scale))
 	}
 	neg, cdigits, cscale := rounded.canonical()
 	return decimalFromDigitsScale(neg, cdigits, cscale)
@@ -670,7 +670,7 @@ func decimalFromFloatSigDigits(f float64, sig uint32) Decimal {
 // whose magnitude overflows binary64 traps 22003 (the §3 finite-overflow rule — NOT ±Inf); a
 // non-zero decimal that rounds to zero traps 22003 underflow (§6, as PG's numeric → float8).
 func decimalToFloat64(d Decimal) (float64, error) {
-	f, err := strconv.ParseFloat(d.Render(), 64)
+	f, err := strconv.ParseFloat(d.String(), 64)
 	if err != nil || math.IsInf(f, 0) {
 		return 0, overflowFloatErr(scalarFloat64)
 	}
@@ -682,7 +682,7 @@ func decimalToFloat64(d Decimal) (float64, error) {
 
 // decimalToFloat32 is decimalToFloat64 at binary32 width.
 func decimalToFloat32(d Decimal) (float32, error) {
-	f, err := strconv.ParseFloat(d.Render(), 32)
+	f, err := strconv.ParseFloat(d.String(), 32)
 	if err != nil || math.IsInf(f, 0) {
 		return 0, overflowFloatErr(scalarFloat32)
 	}
@@ -857,7 +857,7 @@ func evalFloatFunc(fn scalarFunc, vals []Value, result scalarType) (Value, error
 	case sfFloatRound:
 		places := int64(0)
 		if len(vals) > 1 {
-			places = vals[1].Int
+			places = vals[1].num
 		}
 		return Float64Value(roundFloatPlaces(x, places)), nil
 	case sfSqrt:
@@ -1114,7 +1114,7 @@ func roundFloatPlaces(f float64, n int64) float64 {
 		}
 		// Decimal scales 309..323 still round subnormal operands. Avoid an
 		// overflowing scale factor with the exact, bounded decimal form.
-		rounded := exactDecimalFromFloat64(f).RoundToScale(uint32(n))
+		rounded := exactDecimalFromFloat64(f).roundToScale(uint32(n))
 		// The rounded decimal is either zero or at least 1e-323, and cannot
 		// exceed the finite input's magnitude enough to overflow binary64.
 		out, _ := decimalToFloat64(rounded)

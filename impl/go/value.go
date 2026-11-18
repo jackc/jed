@@ -61,13 +61,13 @@ const (
 	// POINTER so the flat Value struct stays ==-comparable (like Comp). Comparison uses PG btree
 	// semantics (NULLs comparable and mutually equal — NOT the composite 3VL rule, §5).
 	ValArray
-	// ValUnfetched is an unfetched large-value reference (spec/design/large-values.md §14): a
+	// valUnfetched is an unfetched large-value reference (spec/design/large-values.md §14): a
 	// stored external/compressed value loaded as its on-disk pointer instead of being
 	// materialized; Unf holds the pointer fields. Internal to the storage/scan layers — the scan
 	// layer resolves every column a query touches before the evaluator sees the row, so this kind
 	// must never reach a comparison, render, or encode. It is POISONED: those paths panic loudly
 	// (an engine bug), never read it as NULL.
-	ValUnfetched
+	valUnfetched
 	// ValRange is a range value (spec/design/ranges.md §2/§4) — the distinguished empty range or a
 	// non-empty range over a scalar element. Range holds a *RangeVal POINTER so the flat Value
 	// struct stays ==-comparable (like Comp/Array); range equality/hashing/comparison go through
@@ -158,20 +158,18 @@ func (u *unfetchedValue) bufferedPayloadLen() int64 {
 	return int64(u.RawLen)
 }
 
-// Value is a runtime value: SQL NULL, an integer, a boolean, or a text string. Integers
-// fit in i64 regardless of their declared column type (the type governs range checks and
-// key-encoding width, not the representation). A ValBool is produced by comparisons and
-// connectives, can be projected/rendered, and — now that boolean is storable
-// (spec/design/types.md §9) — is stored in a boolean column; a NULL boolean (unknown) is
-// ValNull, so {true, false, NULL} is the three-valued domain, ordered false < true. ValText
-// is a stored non-integer value; it compares by the C collation (UTF-8 byte / code-point
-// order — spec/design/types.md §11).
+// Value is one SQL value of any jed type, including NULL. The zero Value is NULL.
+//
+// Values arrive in Rows.Value, Rows.Row and host function arguments. Read one with Scan, which
+// converts to Go types the way Rows.Scan does, or with String for its canonical text. Build one
+// with the constructors (IntValue, TextValue, …) to return from a host function or to bind as a
+// parameter. Kind reports which type the value has.
 type Value struct {
-	// Int holds every scalar that reduces to an i64, stored INLINE with no allocation — the hot
+	// num holds every scalar that reduces to an i64, stored INLINE with no allocation — the hot
 	// path: integers (any int* width), a boolean (0/1 — the old Bool field folded in), timestamp /
 	// timestamptz / date microsecond/day instants, and the verbatim IEEE bits of a float
 	// (math.Float{32,64}bits, see Float{32,64}Value). Kind disambiguates which.
-	Int int64
+	num int64
 	// ref holds every NON-scalar payload behind a single interface word, so the whole struct is
 	// exactly 32 bytes (Int 8 + ref 16 + Kind 8) — two Values per cache line, no straddling. The
 	// six former pointer fields (Dec/Unf/Comp/Array/Range/Json) collapse here at ZERO added cost
@@ -194,10 +192,10 @@ type Value struct {
 	// ref (that compares pointers/headers). See spec/design/{decimal,interval,composite,array,
 	// ranges,json}.md. (A ValJSON value's verbatim text lives in ref as a string, like text/bytea.)
 	ref any
-	// Kind tags which of the above the value is. A zero Value is ValNull. Kept a full ValueKind
+	// kind tags which of the above the value is. A zero Value is ValNull. Kept a full ValueKind
 	// (its 8 bytes are free padding — narrowing to uint8 would not shrink the 32-byte struct), so no
-	// Kind call site changes.
-	Kind ValueKind
+	// kind call site changes.
+	kind ValueKind
 }
 
 // The typed accessors below are the single home for reading a non-scalar payload out of ref: each
@@ -209,7 +207,7 @@ type Value struct {
 func (v Value) str() string { return v.ref.(string) }
 
 // boolVal returns the boolean of a ValBool value (false/true stored as Int 0/1).
-func (v Value) boolVal() bool { return v.Int != 0 }
+func (v Value) boolVal() bool { return v.num != 0 }
 
 // decimal returns the *Decimal of a ValDecimal value.
 func (v Value) decimal() *Decimal { return v.ref.(*Decimal) }
@@ -250,7 +248,7 @@ type RangeVal struct {
 func emptyRangeVal() *RangeVal { return &RangeVal{Empty: true} }
 
 // RangeValue wraps a *RangeVal as a Value.
-func RangeValue(r *RangeVal) Value { return Value{Kind: ValRange, ref: r} }
+func RangeValue(r *RangeVal) Value { return Value{kind: ValRange, ref: r} }
 
 // ArrayVal is a shaped array value (spec/design/array.md §4). Shape is a value property: Dims holds
 // the per-dimension element counts (row-major), Lbounds the per-dimension lower bounds (default 1,
@@ -305,10 +303,10 @@ func oneDimArray(elems []Value) *ArrayVal {
 }
 
 // IntValue builds a non-null integer value.
-func IntValue(n int64) Value { return Value{Kind: ValInt, Int: n} }
+func IntValue(n int64) Value { return Value{kind: ValInt, num: n} }
 
 // NullValue builds a NULL value.
-func NullValue() Value { return Value{Kind: ValNull} }
+func NullValue() Value { return Value{kind: ValNull} }
 
 // BoolValue builds a boolean value (false/true stored as Int 0/1).
 func BoolValue(b bool) Value {
@@ -316,86 +314,86 @@ func BoolValue(b bool) Value {
 	if b {
 		i = 1
 	}
-	return Value{Kind: ValBool, Int: i}
+	return Value{kind: ValBool, num: i}
 }
 
 // TextValue builds a non-null text value.
-func TextValue(s string) Value { return Value{Kind: ValText, ref: s} }
+func TextValue(s string) Value { return Value{kind: ValText, ref: s} }
 
 // DecimalValue builds a non-null decimal value.
-func DecimalValue(d Decimal) Value { return Value{Kind: ValDecimal, ref: &d} }
+func DecimalValue(d Decimal) Value { return Value{kind: ValDecimal, ref: &d} }
 
 // ByteaValue builds a non-null bytea value from raw bytes (stored as a byte-holding string).
-func ByteaValue(b []byte) Value { return Value{Kind: ValBytea, ref: string(b)} }
+func ByteaValue(b []byte) Value { return Value{kind: ValBytea, ref: string(b)} }
 
 // UUIDValue builds a non-null uuid value from its 16 raw bytes (stored as a byte-holding string,
 // like bytea, but tagged ValUUID). The caller must pass exactly 16 bytes (ParseUUID guarantees).
-func UUIDValue(b []byte) Value { return Value{Kind: ValUUID, ref: string(b)} }
+func UUIDValue(b []byte) Value { return Value{kind: ValUUID, ref: string(b)} }
 
 // TimestampValue builds a non-null timestamp from its i64 microsecond instant.
-func TimestampValue(m int64) Value { return Value{Kind: ValTimestamp, Int: m} }
+func TimestampValue(m int64) Value { return Value{kind: ValTimestamp, num: m} }
 
 // TimestamptzValue builds a non-null timestamptz from its i64 microsecond instant.
-func TimestamptzValue(m int64) Value { return Value{Kind: ValTimestamptz, Int: m} }
+func TimestamptzValue(m int64) Value { return Value{kind: ValTimestamptz, num: m} }
 
 // IntervalValue builds a non-null interval value.
-func IntervalValue(iv Interval) Value { return Value{Kind: ValInterval, ref: iv} }
+func IntervalValue(iv Interval) Value { return Value{kind: ValInterval, ref: iv} }
 
 // DateValue builds a non-null date from its i32 day count since 1970-01-01.
-func DateValue(d int32) Value { return Value{Kind: ValDate, Int: int64(d)} }
+func DateValue(d int32) Value { return Value{kind: ValDate, num: int64(d)} }
 
 // JSONValue builds a non-null json value from its verbatim UTF-8 text (spec/design/json.md §4).
-func JSONValue(s string) Value { return Value{Kind: ValJSON, ref: s} }
+func JSONValue(s string) Value { return Value{kind: ValJSON, ref: s} }
 
 // JSONBValue builds a non-null jsonb value from its canonical node tree (spec/design/json.md §2).
 // The node is held by pointer so Value stays ==-comparable; equality/ordering go through Eq3/Cmp.
-func JSONBValue(n JSONNode) Value { return Value{Kind: ValJSONB, ref: &n} }
+func JSONBValue(n JSONNode) Value { return Value{kind: ValJSONB, ref: &n} }
 
 // JSONPathValue builds a non-null jsonpath value from its canonical normalized text
 // (spec/design/jsonpath.md, P1a). The text lives in Str, like a verbatim json value.
-func JSONPathValue(s string) Value { return Value{Kind: ValJSONPath, ref: s} }
+func JSONPathValue(s string) Value { return Value{kind: ValJSONPath, ref: s} }
 
 // CompositeValue builds a non-null composite (row) value from its field values
 // (spec/design/composite.md §2). The slice is held by pointer so Value stays ==-comparable;
 // structural equality/ordering go through Eq3/Lt3/Gt3, never raw ==.
-func CompositeValue(fields []Value) Value { return Value{Kind: ValComposite, ref: &fields} }
+func CompositeValue(fields []Value) Value { return Value{kind: ValComposite, ref: &fields} }
 
 // ArrayValue builds a 1-D array value from its element list (spec/design/array.md §2).
-func ArrayValue(elems []Value) Value { return Value{Kind: ValArray, ref: oneDimArray(elems)} }
+func ArrayValue(elems []Value) Value { return Value{kind: ValArray, ref: oneDimArray(elems)} }
 
 // ArrayValueOf builds an array value from an already-shaped ArrayVal (spec/design/array.md §4).
-func arrayValueOf(a *ArrayVal) Value { return Value{Kind: ValArray, ref: a} }
+func arrayValueOf(a *ArrayVal) Value { return Value{kind: ValArray, ref: a} }
 
 // Float32Value builds a non-null f32 value from a Go f32 — the bits are stored verbatim
 // in Int (math.Float32bits, zero-extended), so -0.0 / NaN / ±Inf keep their original pattern
 // (spec/design/float.md §3/§10). The total order / keys canonicalize at comparison time, not here.
 func Float32Value(f float32) Value {
-	return Value{Kind: ValFloat32, Int: int64(math.Float32bits(f))}
+	return Value{kind: ValFloat32, num: int64(math.Float32bits(f))}
 }
 
 // Float64Value builds a non-null f64 value from a Go f64 — the bits are stored verbatim
 // in Int (math.Float64bits), preserving -0.0 / NaN / ±Inf bit patterns (spec/design/float.md §3/§10).
 func Float64Value(f float64) Value {
-	return Value{Kind: ValFloat64, Int: int64(math.Float64bits(f))}
+	return Value{kind: ValFloat64, num: int64(math.Float64bits(f))}
 }
 
-// F32 returns the Go f32 of a ValFloat32 value (the inverse of Float32Value).
-func (v Value) F32() float32 { return math.Float32frombits(uint32(v.Int)) }
+// f32 returns the Go f32 of a ValFloat32 value (the inverse of Float32Value).
+func (v Value) f32() float32 { return math.Float32frombits(uint32(v.num)) }
 
-// F64 returns the Go f64 of a ValFloat64 value (the inverse of Float64Value).
-func (v Value) F64() float64 { return math.Float64frombits(uint64(v.Int)) }
+// f64 returns the Go f64 of a ValFloat64 value (the inverse of Float64Value).
+func (v Value) f64() float64 { return math.Float64frombits(uint64(v.num)) }
 
 // asF64 returns a float value (either width) as a f64 — f32 widens losslessly (the
 // implicit-cast / total-order path; spec/design/float.md §2). Caller guarantees a float kind.
 func (v Value) asF64() float64 {
-	if v.Kind == ValFloat32 {
-		return float64(v.F32())
+	if v.kind == ValFloat32 {
+		return float64(v.f32())
 	}
-	return v.F64()
+	return v.f64()
 }
 
-// IsFloat reports whether the value is one of the two float widths.
-func (v Value) IsFloat() bool { return v.Kind == ValFloat32 || v.Kind == ValFloat64 }
+// isFloat reports whether the value is one of the two float widths.
+func (v Value) isFloat() bool { return v.kind == ValFloat32 || v.kind == ValFloat64 }
 
 // parseByteaHex decodes a bytea literal from its hex input form (spec/design/types.md §13):
 // a `\x` prefix followed by hexadecimal digit pairs (case-insensitive), each pair one byte, with
@@ -535,9 +533,12 @@ func renderUUID(b []byte) string {
 }
 
 // IsNull reports whether the value is SQL NULL.
-func (v Value) IsNull() bool { return v.Kind == ValNull }
+func (v Value) IsNull() bool { return v.kind == ValNull }
 
-// IsNullTest evaluates `IS NULL` (negated=false) / `IS NOT NULL` (negated=true) for this value.
+// Kind reports the value's type. A NULL of any type is ValNull.
+func (v Value) Kind() ValueKind { return v.kind }
+
+// isNullTest evaluates `IS NULL` (negated=false) / `IS NOT NULL` (negated=true) for this value.
 // For a composite the rule is PG's all-fields rule and is **NON-recursive** (the empirically-probed
 // PG 18 behavior — the differential oracle): a field counts as "null" only if it is itself SQL-NULL;
 // a *composite-valued* field is a non-null value, so it counts as PRESENT and is not descended into.
@@ -545,14 +546,14 @@ func (v Value) IsNull() bool { return v.Kind == ValNull }
 // is TRUE iff this value is non-NULL and every immediate field is non-SQL-NULL. So `ROW(1, NULL)`
 // is FALSE for both, and `ROW(ROW(NULL,NULL), ROW(NULL,NULL)) IS NULL` is FALSE (the inner rows are
 // non-null values). A scalar follows the ordinary rule. Always definite (never UNKNOWN).
-func (v Value) IsNullTest(negated bool) bool {
-	switch v.Kind {
+func (v Value) isNullTest(negated bool) bool {
+	switch v.kind {
 	case ValComposite:
 		fields := *v.composite()
 		if negated {
 			// IS NOT NULL: every immediate field is a non-(SQL-)NULL value.
 			for _, f := range fields {
-				if f.Kind == ValNull {
+				if f.kind == ValNull {
 					return false
 				}
 			}
@@ -560,7 +561,7 @@ func (v Value) IsNullTest(negated bool) bool {
 		}
 		// IS NULL: every immediate field is SQL-NULL (a composite-valued field is NOT).
 		for _, f := range fields {
-			if f.Kind != ValNull {
+			if f.kind != ValNull {
 				return false
 			}
 		}
@@ -574,46 +575,46 @@ func (v Value) IsNullTest(negated bool) bool {
 	}
 }
 
-// IsTrue reports whether the value is boolean TRUE: a WHERE expression keeps a row
+// isTrue reports whether the value is boolean TRUE: a WHERE expression keeps a row
 // only when it is TRUE; FALSE and NULL/unknown both reject (CLAUDE.md §4, Kleene).
-func (v Value) IsTrue() bool { return v.Kind == ValBool && v.boolVal() }
+func (v Value) isTrue() bool { return v.kind == ValBool && v.boolVal() }
 
-// ThreeValued is the result of a three-valued comparison (CLAUDE.md §4):
+// threeValued is the result of a three-valued comparison (CLAUDE.md §4):
 // TRUE / FALSE / UNKNOWN. UNKNOWN arises whenever a NULL participates.
-type ThreeValued int
+type threeValued int
 
 const (
-	// True comparison result.
-	True ThreeValued = iota
-	// False comparison result.
-	False
-	// Unknown comparison result (a NULL participated).
-	Unknown
+	// tvTrue comparison result.
+	tvTrue threeValued = iota
+	// tvFalse comparison result.
+	tvFalse
+	// tvUnknown comparison result (a NULL participated).
+	tvUnknown
 )
 
-// IsTrue reports whether a WHERE predicate selects a row: only TRUE selects;
+// isTrue reports whether a WHERE predicate selects a row: only TRUE selects;
 // UNKNOWN (NULL) and FALSE both reject (CLAUDE.md §4).
-func (t ThreeValued) IsTrue() bool { return t == True }
+func (t threeValued) isTrue() bool { return t == tvTrue }
 
 // sqlLiteral renders v as a SQL literal that re-parses to v when assigned to a column of its type
 // (introspection.md §5 column_default): an integer, decimal, or boolean renders bare by Render; every
 // other value renders its canonical text quoted, ' doubled. NULL renders NULL.
 func (v Value) sqlLiteral() string {
-	switch v.Kind {
+	switch v.kind {
 	case ValNull, ValInt, ValBool, ValDecimal:
-		return v.Render()
+		return v.String()
 	}
-	return "'" + strings.ReplaceAll(v.Render(), "'", "''") + "'"
+	return "'" + strings.ReplaceAll(v.String(), "'", "''") + "'"
 }
 
-// Render formats for conformance output: integers as shortest decimal, booleans as
+// String formats for conformance output: integers as shortest decimal, booleans as
 // the canonical "true"/"false", NULL (including a NULL/unknown boolean) as the literal
 // "NULL" (spec/design/conformance.md §1; the canonical spelling is a §8 decision). This is the
 // zone-free canonical render: a timestamptz renders in UTC (+00) at any depth, so the text
-// re-parses to the same instant under any session zone. Session.Render renders the way PostgreSQL
+// re-parses to the same instant under any session zone. Session.String renders the way PostgreSQL
 // shows a result column, in the session zone (spec/design/timezones.md §9.5).
-func (v Value) Render() string {
-	switch v.Kind {
+func (v Value) String() string {
+	switch v.kind {
 	case ValNull:
 		return "NULL"
 	case ValBool:
@@ -626,26 +627,26 @@ func (v Value) Render() string {
 	case ValDecimal:
 		// Decimal renders as its canonical base-10 string, preserving display scale
 		// (the D tag — spec/design/decimal.md §6).
-		return v.decimal().Render()
+		return v.decimal().String()
 	case ValBytea:
 		return "\\x" + hex.EncodeToString([]byte(v.str()))
 	case ValUUID:
 		// Canonical 8-4-4-4-12 lowercase-hex form (PG uuid_out).
 		return renderUUID([]byte(v.str()))
 	case ValTimestamp:
-		return renderTimestamp(v.Int)
+		return renderTimestamp(v.num)
 	case ValTimestamptz:
 		// The zone-free canonical render (UTC, +00); renderIn renders in a session zone.
-		return renderTimestamptz(v.Int)
+		return renderTimestamptz(v.num)
 	case ValDate:
-		return renderDate(int32(v.Int))
+		return renderDate(int32(v.num))
 	case ValInterval:
 		return renderInterval(v.interval())
 	case ValFloat32:
 		// PostgreSQL's float4out / float8out text (spec/design/float.md §9).
-		return renderFloatPG(float64(v.F32()), 32)
+		return renderFloatPG(float64(v.f32()), 32)
 	case ValFloat64:
-		return renderFloatPG(v.F64(), 64)
+		return renderFloatPG(v.f64(), 64)
 	case ValComposite:
 		// A composite renders as PG record_out: `(f1,f2,…)` with per-field quoting
 		// (spec/design/composite.md §8). The renderer recurses (a composite field's text is itself
@@ -670,10 +671,10 @@ func (v Value) Render() string {
 	case ValJSONPath:
 		// jsonpath renders its canonical normalized text (the stored Str).
 		return v.str()
-	case ValUnfetched:
+	case valUnfetched:
 		panic("BUG: unfetched large value escaped the storage layer")
 	default:
-		return strconv.FormatInt(v.Int, 10)
+		return strconv.FormatInt(v.num, 10)
 	}
 }
 
@@ -688,10 +689,10 @@ func (v Value) renderIn(zone zoneRef) (string, error) {
 // renderZoned is the shared body of Render (zone == nil, the canonical UTC render, infallible) and
 // renderIn (zone != nil).
 func (v Value) renderZoned(zone *zoneRef) (string, error) {
-	switch v.Kind {
+	switch v.kind {
 	case ValTimestamptz:
 		if zone != nil {
-			return renderTimestamptzIn(v.Int, *zone)
+			return renderTimestamptzIn(v.num, *zone)
 		}
 	case ValComposite:
 		return recordOutZoned(*v.composite(), zone)
@@ -700,16 +701,16 @@ func (v Value) renderZoned(zone *zoneRef) (string, error) {
 	case ValRange:
 		return rangeOutZoned(v.rangeVal(), zone)
 	}
-	return v.Render(), nil
+	return v.String(), nil
 }
 
 // zoneRenderCount reports how many finite timestamptz values a session-zone render of v converts —
 // each one timezone cost unit when the engine renders it (the array → text cast, timezones.md
 // §9.5). NULL and ±infinity count nothing; containers are walked at every depth.
 func (v Value) zoneRenderCount() int64 {
-	switch v.Kind {
+	switch v.kind {
 	case ValTimestamptz:
-		if v.Int != negInfinity && v.Int != posInfinity {
+		if v.num != negInfinity && v.num != posInfinity {
 			return 1
 		}
 	case ValComposite:
@@ -738,11 +739,11 @@ func (v Value) zoneRenderCount() int64 {
 	return 0
 }
 
-func bool3(b bool) ThreeValued {
+func bool3(b bool) threeValued {
 	if b {
-		return True
+		return tvTrue
 	}
-	return False
+	return tvFalse
 }
 
 // numericCmp compares two numeric values by value, promoting an integer operand to decimal
@@ -750,119 +751,119 @@ func bool3(b bool) ThreeValued {
 // ok=false for any non-numeric pair (text, boolean, NULL), which callers treat as UNKNOWN.
 func numericCmp(a, b Value) (int, bool) {
 	switch {
-	case a.Kind == ValInt && b.Kind == ValInt:
+	case a.kind == ValInt && b.kind == ValInt:
 		switch {
-		case a.Int < b.Int:
+		case a.num < b.num:
 			return -1, true
-		case a.Int > b.Int:
+		case a.num > b.num:
 			return 1, true
 		default:
 			return 0, true
 		}
-	case a.Kind == ValDecimal && b.Kind == ValDecimal:
-		return a.decimal().CmpValue(*b.decimal()), true
-	case a.Kind == ValInt && b.Kind == ValDecimal:
+	case a.kind == ValDecimal && b.kind == ValDecimal:
+		return a.decimal().Cmp(*b.decimal()), true
+	case a.kind == ValInt && b.kind == ValDecimal:
 		var buf [3]uint32 // the widened integer is read by the compare and dropped
-		return decimalFromInt64Buf(a.Int, &buf).CmpValue(*b.decimal()), true
-	case a.Kind == ValDecimal && b.Kind == ValInt:
+		return decimalFromInt64Buf(a.num, &buf).Cmp(*b.decimal()), true
+	case a.kind == ValDecimal && b.kind == ValInt:
 		var buf [3]uint32
-		return a.decimal().CmpValue(decimalFromInt64Buf(b.Int, &buf)), true
+		return a.decimal().Cmp(decimalFromInt64Buf(b.num, &buf)), true
 	default:
 		return 0, false
 	}
 }
 
-// Eq3 is three-valued equality. NULL compared with anything (including NULL) is
+// eq3 is three-valued equality. NULL compared with anything (including NULL) is
 // UNKNOWN — equality is not reflexive across NULL (CLAUDE.md §4). Integers compare by
 // value (all integer types promote losslessly into i64); text compares by the C
 // collation — raw UTF-8 bytes, which for UTF-8 equals code-point order
 // (spec/design/types.md §11). Go string == / < / > already compare by byte order;
 // booleans compare by value (false < true). A mixed cross-family pair never reaches here
 // — the resolver rejects it (42804).
-func (v Value) Eq3(o Value) ThreeValued {
+func (v Value) eq3(o Value) threeValued {
 	// Poisoned (large-values.md §14): an unfetched value must never be compared — falling
 	// through to UNKNOWN would silently read it as NULL.
-	if v.Kind == ValUnfetched || o.Kind == ValUnfetched {
+	if v.kind == valUnfetched || o.kind == valUnfetched {
 		panic("BUG: unfetched large value escaped the storage layer")
 	}
-	if v.Kind == ValNull || o.Kind == ValNull {
-		return Unknown
+	if v.kind == ValNull || o.kind == ValNull {
+		return tvUnknown
 	}
 	if c, ok := numericCmp(v, o); ok {
 		return bool3(c == 0)
 	}
-	if v.IsFloat() && o.IsFloat() {
+	if v.isFloat() && o.isFloat() {
 		// The PG float8 TOTAL order (NOT raw IEEE): -0 = +0, NaN = NaN, NaN largest. So
 		// NaN = NaN is TRUE (spec/design/float.md §3). Mixed widths promote to f64.
 		return bool3(floatTotalCmp(v.asF64(), o.asF64()) == 0)
 	}
-	if v.Kind == ValText && o.Kind == ValText {
+	if v.kind == ValText && o.kind == ValText {
 		return bool3(v.str() == o.str())
 	}
-	if v.Kind == ValBool || o.Kind == ValBool {
+	if v.kind == ValBool || o.kind == ValBool {
 		return bool3(v.boolVal() == o.boolVal())
 	}
-	if v.Kind == ValBytea || o.Kind == ValBytea {
+	if v.kind == ValBytea || o.kind == ValBytea {
 		return bool3(v.str() == o.str())
 	}
-	if v.Kind == ValUUID || o.Kind == ValUUID {
+	if v.kind == ValUUID || o.kind == ValUUID {
 		return bool3(v.str() == o.str())
 	}
 	// Timestamps compare by the i64 instant (infinity is just an extreme value).
-	if v.Kind == ValTimestamp && o.Kind == ValTimestamp {
-		return bool3(v.Int == o.Int)
+	if v.kind == ValTimestamp && o.kind == ValTimestamp {
+		return bool3(v.num == o.num)
 	}
-	if v.Kind == ValTimestamptz && o.Kind == ValTimestamptz {
-		return bool3(v.Int == o.Int)
+	if v.kind == ValTimestamptz && o.kind == ValTimestamptz {
+		return bool3(v.num == o.num)
 	}
 	// Dates compare by the i32 day count (infinity is just an extreme value).
-	if v.Kind == ValDate && o.Kind == ValDate {
-		return bool3(v.Int == o.Int)
+	if v.kind == ValDate && o.kind == ValDate {
+		return bool3(v.num == o.num)
 	}
 	// Intervals compare by the canonical 128-bit span (spec/design/interval.md §2).
-	if v.Kind == ValInterval && o.Kind == ValInterval {
-		return bool3(v.interval().SpanCmp(o.interval()) == 0)
+	if v.kind == ValInterval && o.kind == ValInterval {
+		return bool3(v.interval().spanCmp(o.interval()) == 0)
 	}
 	// Composite `=` is element-wise 3VL (PG row comparison, spec/design/composite.md §5): FALSE if
 	// any field is FALSE; else UNKNOWN if any field is UNKNOWN; else TRUE. So a FALSE field
 	// dominates a NULL field. Arity matches (the resolver only compares two composites of the same
 	// type). The recursion bottoms out in the field comparators.
-	if v.Kind == ValComposite && o.Kind == ValComposite {
+	if v.kind == ValComposite && o.kind == ValComposite {
 		a, b := *v.composite(), *o.composite()
 		anyUnknown := false
 		for i := range a {
-			switch a[i].Eq3(b[i]) {
-			case False:
-				return False
-			case Unknown:
+			switch a[i].eq3(b[i]) {
+			case tvFalse:
+				return tvFalse
+			case tvUnknown:
 				anyUnknown = true
 			}
 		}
 		if anyUnknown {
-			return Unknown
+			return tvUnknown
 		}
-		return True
+		return tvTrue
 	}
 	// Array `=` uses PG btree semantics (spec/design/array.md §5), NOT the composite 3VL rule: same
 	// length and every element pair equal-or-both-NULL → TRUE, else FALSE. NULL elements are
 	// comparable and mutually equal, so the result is ALWAYS definite (never UNKNOWN).
-	if v.Kind == ValArray && o.Kind == ValArray {
+	if v.kind == ValArray && o.kind == ValArray {
 		return bool3(arrayEqual(v.arrayVal(), o.arrayVal()))
 	}
 	// Range `=` is structural over the canonical form (PG range btree, NOT 3VL): two ranges are equal
 	// iff their canonical (empty + bounds + inclusivity) forms match — always definite
 	// (spec/design/ranges.md §6). rangeTotalCmp == 0 agrees with this structural equality (the stored
 	// form is canonical).
-	if v.Kind == ValRange && o.Kind == ValRange {
+	if v.kind == ValRange && o.kind == ValRange {
 		return bool3(rangeTotalCmp(v.rangeVal(), o.rangeVal()) == 0)
 	}
 	// jsonb `=` is structural over the canonical tree — always definite (PG btree, not 3VL; no SQL
 	// NULLs inside a document, §5). Consistent with JSONNode.Cmp == 0. (json never reaches here — the
 	// resolver maps any json comparison to 42883; jsonb comparison resolves in J2.)
-	if v.Kind == ValJSONB && o.Kind == ValJSONB {
+	if v.kind == ValJSONB && o.kind == ValJSONB {
 		return bool3(jsonbValueEqual(v.jsonb(), o.jsonb()))
 	}
-	return Unknown
+	return tvUnknown
 }
 
 // arrayEqual is PG array_eq (spec/design/array.md §5): same dimensionality AND lower bounds AND
@@ -908,155 +909,155 @@ func int32SliceEqual(a, b []int32) bool {
 	return true
 }
 
-// Lt3 is the three-valued ordering predicate v < o (numerics by value with int↔decimal
+// lt3 is the three-valued ordering predicate v < o (numerics by value with int↔decimal
 // promotion; text by C collation = byte order; boolean by value, false < true).
-func (v Value) Lt3(o Value) ThreeValued {
+func (v Value) lt3(o Value) threeValued {
 	// Poisoned (large-values.md §14): an unfetched value must never be compared — falling
 	// through to UNKNOWN would silently read it as NULL.
-	if v.Kind == ValUnfetched || o.Kind == ValUnfetched {
+	if v.kind == valUnfetched || o.kind == valUnfetched {
 		panic("BUG: unfetched large value escaped the storage layer")
 	}
-	if v.Kind == ValNull || o.Kind == ValNull {
-		return Unknown
+	if v.kind == ValNull || o.kind == ValNull {
+		return tvUnknown
 	}
 	if c, ok := numericCmp(v, o); ok {
 		return bool3(c < 0)
 	}
-	if v.IsFloat() && o.IsFloat() {
+	if v.isFloat() && o.isFloat() {
 		return bool3(floatTotalCmp(v.asF64(), o.asF64()) < 0)
 	}
-	if v.Kind == ValText && o.Kind == ValText {
+	if v.kind == ValText && o.kind == ValText {
 		return bool3(v.str() < o.str())
 	}
-	if v.Kind == ValBool || o.Kind == ValBool {
+	if v.kind == ValBool || o.kind == ValBool {
 		return bool3(!v.boolVal() && o.boolVal())
 	}
-	if v.Kind == ValBytea || o.Kind == ValBytea {
+	if v.kind == ValBytea || o.kind == ValBytea {
 		return bool3(v.str() < o.str())
 	}
-	if v.Kind == ValUUID || o.Kind == ValUUID {
+	if v.kind == ValUUID || o.kind == ValUUID {
 		return bool3(v.str() < o.str())
 	}
-	if v.Kind == ValTimestamp && o.Kind == ValTimestamp {
-		return bool3(v.Int < o.Int)
+	if v.kind == ValTimestamp && o.kind == ValTimestamp {
+		return bool3(v.num < o.num)
 	}
-	if v.Kind == ValTimestamptz && o.Kind == ValTimestamptz {
-		return bool3(v.Int < o.Int)
+	if v.kind == ValTimestamptz && o.kind == ValTimestamptz {
+		return bool3(v.num < o.num)
 	}
-	if v.Kind == ValDate && o.Kind == ValDate {
-		return bool3(v.Int < o.Int)
+	if v.kind == ValDate && o.kind == ValDate {
+		return bool3(v.num < o.num)
 	}
-	if v.Kind == ValInterval && o.Kind == ValInterval {
-		return bool3(v.interval().SpanCmp(o.interval()) < 0)
+	if v.kind == ValInterval && o.kind == ValInterval {
+		return bool3(v.interval().spanCmp(o.interval()) < 0)
 	}
 	// Composite `<` is lexicographic with PG row-comparison NULL propagation
 	// (spec/design/composite.md §5): the first field that is not equal decides via its own `<`; a
 	// field whose `=` is UNKNOWN (a NULL operand) makes the whole comparison UNKNOWN; all-equal rows
 	// are not `<`.
-	if v.Kind == ValComposite && o.Kind == ValComposite {
+	if v.kind == ValComposite && o.kind == ValComposite {
 		return compositeOrder3(*v.composite(), *o.composite(), false)
 	}
 	// Array `<` uses the PG array_cmp total order (spec/design/array.md §5): element-wise, NULL
 	// sorts after every non-NULL (NULLs mutually equal), shorter prefix first. Always definite.
-	if v.Kind == ValArray && o.Kind == ValArray {
+	if v.kind == ValArray && o.kind == ValArray {
 		return bool3(arrayTotalCmp(v.arrayVal(), o.arrayVal()) < 0)
 	}
 	// Range `<` uses the PG range_cmp total order (spec/design/ranges.md §6): `empty` below every
 	// non-empty, then lower bound, then upper bound — accounting for infinity and inclusivity. Always
 	// definite (the btree total order), never UNKNOWN.
-	if v.Kind == ValRange && o.Kind == ValRange {
+	if v.kind == ValRange && o.kind == ValRange {
 		return bool3(rangeTotalCmp(v.rangeVal(), o.rangeVal()) < 0)
 	}
 	// jsonb `<` uses PG's total btree order (spec/design/json.md §5): type rank, then per-kind
 	// ordering (containers by count first). Always definite, never UNKNOWN.
-	if v.Kind == ValJSONB && o.Kind == ValJSONB {
-		return bool3(v.jsonb().Cmp(o.jsonb()) < 0)
+	if v.kind == ValJSONB && o.kind == ValJSONB {
+		return bool3(v.jsonb().cmp(o.jsonb()) < 0)
 	}
-	return Unknown
+	return tvUnknown
 }
 
-// Gt3 is the three-valued ordering predicate v > o (numerics by value with int↔decimal
+// gt3 is the three-valued ordering predicate v > o (numerics by value with int↔decimal
 // promotion; text by C collation = byte order; boolean by value, false < true).
-func (v Value) Gt3(o Value) ThreeValued {
+func (v Value) gt3(o Value) threeValued {
 	// Poisoned (large-values.md §14): an unfetched value must never be compared — falling
 	// through to UNKNOWN would silently read it as NULL.
-	if v.Kind == ValUnfetched || o.Kind == ValUnfetched {
+	if v.kind == valUnfetched || o.kind == valUnfetched {
 		panic("BUG: unfetched large value escaped the storage layer")
 	}
-	if v.Kind == ValNull || o.Kind == ValNull {
-		return Unknown
+	if v.kind == ValNull || o.kind == ValNull {
+		return tvUnknown
 	}
 	if c, ok := numericCmp(v, o); ok {
 		return bool3(c > 0)
 	}
-	if v.IsFloat() && o.IsFloat() {
+	if v.isFloat() && o.isFloat() {
 		return bool3(floatTotalCmp(v.asF64(), o.asF64()) > 0)
 	}
-	if v.Kind == ValText && o.Kind == ValText {
+	if v.kind == ValText && o.kind == ValText {
 		return bool3(v.str() > o.str())
 	}
-	if v.Kind == ValBool || o.Kind == ValBool {
+	if v.kind == ValBool || o.kind == ValBool {
 		return bool3(v.boolVal() && !o.boolVal())
 	}
-	if v.Kind == ValBytea || o.Kind == ValBytea {
+	if v.kind == ValBytea || o.kind == ValBytea {
 		return bool3(v.str() > o.str())
 	}
-	if v.Kind == ValUUID || o.Kind == ValUUID {
+	if v.kind == ValUUID || o.kind == ValUUID {
 		return bool3(v.str() > o.str())
 	}
-	if v.Kind == ValTimestamp && o.Kind == ValTimestamp {
-		return bool3(v.Int > o.Int)
+	if v.kind == ValTimestamp && o.kind == ValTimestamp {
+		return bool3(v.num > o.num)
 	}
-	if v.Kind == ValTimestamptz && o.Kind == ValTimestamptz {
-		return bool3(v.Int > o.Int)
+	if v.kind == ValTimestamptz && o.kind == ValTimestamptz {
+		return bool3(v.num > o.num)
 	}
-	if v.Kind == ValDate && o.Kind == ValDate {
-		return bool3(v.Int > o.Int)
+	if v.kind == ValDate && o.kind == ValDate {
+		return bool3(v.num > o.num)
 	}
-	if v.Kind == ValInterval && o.Kind == ValInterval {
-		return bool3(v.interval().SpanCmp(o.interval()) > 0)
+	if v.kind == ValInterval && o.kind == ValInterval {
+		return bool3(v.interval().spanCmp(o.interval()) > 0)
 	}
 	// Composite `>` — the lexicographic mirror of `<` (spec/design/composite.md §5).
-	if v.Kind == ValComposite && o.Kind == ValComposite {
+	if v.kind == ValComposite && o.kind == ValComposite {
 		return compositeOrder3(*v.composite(), *o.composite(), true)
 	}
 	// Array `>` — the total-order mirror of `<` (spec/design/array.md §5).
-	if v.Kind == ValArray && o.Kind == ValArray {
+	if v.kind == ValArray && o.kind == ValArray {
 		return bool3(arrayTotalCmp(v.arrayVal(), o.arrayVal()) > 0)
 	}
 	// Range `>` — the total-order mirror of `<` (spec/design/ranges.md §6).
-	if v.Kind == ValRange && o.Kind == ValRange {
+	if v.kind == ValRange && o.kind == ValRange {
 		return bool3(rangeTotalCmp(v.rangeVal(), o.rangeVal()) > 0)
 	}
 	// jsonb `>` — the total-order mirror of `<` (spec/design/json.md §5).
-	if v.Kind == ValJSONB && o.Kind == ValJSONB {
-		return bool3(v.jsonb().Cmp(o.jsonb()) > 0)
+	if v.kind == ValJSONB && o.kind == ValJSONB {
+		return bool3(v.jsonb().cmp(o.jsonb()) > 0)
 	}
-	return Unknown
+	return tvUnknown
 }
 
-// NotDistinctFrom is NULL-safe equality — the `IS NOT DISTINCT FROM` primitive
+// notDistinctFrom is NULL-safe equality — the `IS NOT DISTINCT FROM` primitive
 // (CLAUDE.md §4, spec/design/functions.md §3). NULL is a comparable value, not a poison:
 // two NULLs are "not distinct" (the same), a NULL and a present value are distinct, and
 // two present integers compare by value. The answer is always definite — there is no
 // UNKNOWN here, which is the whole point of the operator. `IS DISTINCT FROM` is the
 // negation of this. (The resolver guarantees integer/NULL operands, so non-null values
 // reduce to Eq3, which is definite when neither side is NULL.)
-func (v Value) NotDistinctFrom(o Value) bool {
-	if v.Kind == ValNull || o.Kind == ValNull {
-		return v.Kind == ValNull && o.Kind == ValNull
+func (v Value) notDistinctFrom(o Value) bool {
+	if v.kind == ValNull || o.kind == ValNull {
+		return v.kind == ValNull && o.kind == ValNull
 	}
 	// Two composites are "not distinct" iff structurally equal — NULL-safe, so a NULL field equals a
 	// NULL field (the value-level structural equality, not the 3VL Eq3).
-	if v.Kind == ValComposite && o.Kind == ValComposite {
+	if v.kind == ValComposite && o.kind == ValComposite {
 		return compositeValueEqual(*v.composite(), *o.composite())
 	}
 	// Two arrays are "not distinct" iff structurally equal (the same btree equality as `=`; NULL
 	// elements are mutually equal — spec/design/array.md §5).
-	if v.Kind == ValArray && o.Kind == ValArray {
+	if v.kind == ValArray && o.kind == ValArray {
 		return arrayEqual(v.arrayVal(), o.arrayVal())
 	}
-	return v.Eq3(o) == True
+	return v.eq3(o) == tvTrue
 }
 
 // compositeValueEqual is structural (value-level) equality over two composite field lists
@@ -1068,7 +1069,7 @@ func compositeValueEqual(a, b []Value) bool {
 		return false
 	}
 	for i := range a {
-		if !a[i].NotDistinctFrom(b[i]) {
+		if !a[i].notDistinctFrom(b[i]) {
 			return false
 		}
 	}
@@ -1080,21 +1081,21 @@ func compositeValueEqual(a, b []Value) bool {
 // whose `=` is FALSE decides via that field's `<`/`>`; the first whose `=` is UNKNOWN (a NULL
 // operand) makes the whole comparison UNKNOWN; all-equal rows are neither `<` nor `>` (FALSE).
 // Arity matches (same composite type — the resolver's gate).
-func compositeOrder3(a, b []Value, gt bool) ThreeValued {
+func compositeOrder3(a, b []Value, gt bool) threeValued {
 	for i := range a {
-		switch a[i].Eq3(b[i]) {
-		case True:
+		switch a[i].eq3(b[i]) {
+		case tvTrue:
 			continue
-		case False:
+		case tvFalse:
 			if gt {
-				return a[i].Gt3(b[i])
+				return a[i].gt3(b[i])
 			}
-			return a[i].Lt3(b[i])
-		case Unknown:
-			return Unknown
+			return a[i].lt3(b[i])
+		case tvUnknown:
+			return tvUnknown
 		}
 	}
-	return False
+	return tvFalse
 }
 
 // recordOut renders a composite's fields as PG record_out (spec/design/composite.md §8):
@@ -1121,7 +1122,7 @@ func recordOutZoned(fields []Value, zone *zoneRef) (string, error) {
 		if i > 0 {
 			b.WriteByte(',')
 		}
-		if f.Kind == ValNull {
+		if f.kind == ValNull {
 			continue // a NULL field is the empty string between delimiters (unquoted)
 		}
 		s, err := f.renderElementZoned(zone)
@@ -1350,7 +1351,7 @@ func cmpInt(a, b int) int {
 // (spec/design/array.md §5 — the array-of-composite subtlety; this must agree with valueCmp, the
 // ORDER BY path). A present scalar element uses its definite Eq3/Lt3.
 func elemTotalCmp(x, y Value) int {
-	xn, yn := x.Kind == ValNull, y.Kind == ValNull
+	xn, yn := x.kind == ValNull, y.kind == ValNull
 	switch {
 	case xn && yn:
 		return 0
@@ -1358,15 +1359,15 @@ func elemTotalCmp(x, y Value) int {
 		return 1
 	case yn:
 		return -1
-	case x.Kind == ValComposite && y.Kind == ValComposite:
+	case x.kind == ValComposite && y.kind == ValComposite:
 		return compositeTotalCmp(*x.composite(), *y.composite())
-	case x.Kind == ValArray && y.Kind == ValArray:
+	case x.kind == ValArray && y.kind == ValArray:
 		return arrayTotalCmp(x.arrayVal(), y.arrayVal())
 	}
-	if x.Eq3(y) == True {
+	if x.eq3(y) == tvTrue {
 		return 0
 	}
-	if x.Lt3(y) == True {
+	if x.lt3(y) == tvTrue {
 		return -1
 	}
 	return 1
@@ -1392,7 +1393,7 @@ func compositeTotalCmp(a, b []Value) int {
 // true/false (conformance.md §1), and a bool -> text cast stays true/false as PostgreSQL's booltext
 // (spec/design/array.md §7).
 func (v Value) renderElementZoned(zone *zoneRef) (string, error) {
-	if v.Kind == ValBool {
+	if v.kind == ValBool {
 		if v.boolVal() {
 			return "t", nil
 		}
@@ -1469,7 +1470,7 @@ func renderArrayDim(a *ArrayVal, d int, cursor *int, b *strings.Builder, zone *z
 
 // renderArrayElem renders one array element (PG array_out quoting; a NULL element is unquoted NULL).
 func renderArrayElem(e Value, b *strings.Builder, zone *zoneRef) error {
-	if e.Kind == ValNull {
+	if e.kind == ValNull {
 		b.WriteString("NULL")
 		return nil
 	}
@@ -1854,11 +1855,11 @@ func flattenNodes(node arrNode, out *[]*string) {
 // Value back so the connectives can reuse or3 (in executor.go).
 
 // from3 lifts a three-valued result into a boolean Value (UNKNOWN → NULL).
-func from3(t ThreeValued) Value {
+func from3(t threeValued) Value {
 	switch t {
-	case True:
+	case tvTrue:
 		return BoolValue(true)
-	case False:
+	case tvFalse:
 		return BoolValue(false)
 	default:
 		return NullValue()
@@ -1866,9 +1867,9 @@ func from3(t ThreeValued) Value {
 }
 
 // to3 projects a Value into the three-valued domain. A non-boolean Value is UNKNOWN.
-func to3(v Value) ThreeValued {
-	if v.Kind != ValBool {
-		return Unknown
+func to3(v Value) threeValued {
+	if v.kind != ValBool {
+		return tvUnknown
 	}
 	return bool3(v.boolVal())
 }
@@ -1878,9 +1879,9 @@ func to3(v Value) ThreeValued {
 func boolAnd(a, b Value) Value {
 	ta, tb := to3(a), to3(b)
 	switch {
-	case ta == False || tb == False:
+	case ta == tvFalse || tb == tvFalse:
 		return BoolValue(false)
-	case ta == True && tb == True:
+	case ta == tvTrue && tb == tvTrue:
 		return BoolValue(true)
 	default:
 		return NullValue()
@@ -1893,9 +1894,9 @@ func boolOr(a, b Value) Value { return from3(or3(to3(a), to3(b))) }
 // boolNot is Kleene NOT: genuine propagation — NOT NULL = NULL.
 func boolNot(a Value) Value {
 	switch to3(a) {
-	case True:
+	case tvTrue:
 		return BoolValue(false)
-	case False:
+	case tvFalse:
 		return BoolValue(true)
 	default:
 		return NullValue()

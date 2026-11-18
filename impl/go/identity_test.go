@@ -31,7 +31,7 @@ func TestIdentityDesugarsToOwnedSequences(t *testing.T) {
 	want := [][2]int64{{1, 1}, {2, 2}}
 	for i, w := range want {
 		r := out.Rows[i]
-		if r[0].Kind != ValInt || r[1].Kind != ValInt || r[0].Int != w[0] || r[1].Int != w[1] {
+		if r[0].kind != ValInt || r[1].kind != ValInt || r[0].num != w[0] || r[1].num != w[1] {
 			t.Fatalf("row %d: got %v, want %v", i, r, w)
 		}
 	}
@@ -130,10 +130,10 @@ func TestIdentityWithSequenceOptions(t *testing.T) {
 	if out.Kind != outcomeQuery {
 		t.Fatalf("expected a query, got kind %v", out.Kind)
 	}
-	if out.Rows[0][0].Kind != ValInt || out.Rows[0][0].Int != 100 {
+	if out.Rows[0][0].kind != ValInt || out.Rows[0][0].num != 100 {
 		t.Fatalf("row 0: got %v, want 100", out.Rows[0][0])
 	}
-	if out.Rows[1][0].Kind != ValInt || out.Rows[1][0].Int != 105 {
+	if out.Rows[1][0].kind != ValInt || out.Rows[1][0].num != 105 {
 		t.Fatalf("row 1: got %v, want 105", out.Rows[1][0])
 	}
 }

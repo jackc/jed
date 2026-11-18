@@ -62,8 +62,8 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 		t.Fatalf("row count %d != %d", len(rows), n)
 	}
 	for i, row := range rows {
-		if row[0].Int != int64(i) || row[1].Int != int64(i)*2 {
-			t.Fatalf("row %d = (%d, %d)", i, row[0].Int, row[1].Int)
+		if row[0].num != int64(i) || row[1].num != int64(i)*2 {
+			t.Fatalf("row %d = (%d, %d)", i, row[0].num, row[1].num)
 		}
 	}
 	assertPoolBounded(t, db, cap*256)
@@ -99,16 +99,16 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 		t.Fatalf("after one delete + one insert, count %d != %d", len(rows), n)
 	}
 	for _, row := range rows {
-		switch row[0].Int {
+		switch row[0].num {
 		case 100:
 			t.Fatal("k=100 should have been deleted")
 		case 200:
-			if row[1].Int != 999 {
-				t.Fatalf("k=200 v = %d, want 999", row[1].Int)
+			if row[1].num != 999 {
+				t.Fatalf("k=200 v = %d, want 999", row[1].num)
 			}
 		case 6000:
-			if row[1].Int != 12000 {
-				t.Fatalf("k=6000 v = %d, want 12000", row[1].Int)
+			if row[1].num != 12000 {
+				t.Fatalf("k=6000 v = %d, want 12000", row[1].num)
 			}
 		}
 	}
@@ -168,7 +168,7 @@ func TestMemoryBudgetBoundsResidencyUnderLookups(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(out.Rows) != 1 || out.Rows[0][0].Int != int64(k+1) {
+		if len(out.Rows) != 1 || out.Rows[0][0].num != int64(k+1) {
 			t.Fatalf("query at k=%d: %v", k, out.Rows)
 		}
 		assertPoolBounded(t, db, cap*256)
@@ -218,8 +218,8 @@ func TestTinyBudgetKeepsOneLeafResident(t *testing.T) {
 		t.Fatalf("row count %d != %d", len(rows), n)
 	}
 	for i, row := range rows {
-		if row[0].Int != int64(i) || row[1].Int != int64(i)+1 {
-			t.Fatalf("row %d = (%d, %d)", i, row[0].Int, row[1].Int)
+		if row[0].num != int64(i) || row[1].num != int64(i)+1 {
+			t.Fatalf("row %d = (%d, %d)", i, row[0].num, row[1].num)
 		}
 	}
 	if got := db.ResidentLeaves(); got != 1 {

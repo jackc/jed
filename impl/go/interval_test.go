@@ -92,7 +92,7 @@ func TestIntervalSpanCanonical(t *testing.T) {
 	oneMonth, _ := parseInterval("1 mon")
 	thirtyDays, _ := parseInterval("30 days")
 	hours, _ := parseInterval("720:00:00")
-	if oneMonth.SpanCmp(thirtyDays) != 0 || oneMonth.SpanCmp(hours) != 0 {
+	if oneMonth.spanCmp(thirtyDays) != 0 || oneMonth.spanCmp(hours) != 0 {
 		t.Errorf("'1 mon', '30 days', '720:00:00' should be span-equal")
 	}
 	if renderInterval(oneMonth) == renderInterval(thirtyDays) {
@@ -101,7 +101,7 @@ func TestIntervalSpanCanonical(t *testing.T) {
 	day, _ := parseInterval("1 day")
 	twoDays, _ := parseInterval("2 days")
 	negDay, _ := parseInterval("-1 day")
-	if day.SpanCmp(twoDays) >= 0 || negDay.SpanCmp(day) >= 0 {
+	if day.spanCmp(twoDays) >= 0 || negDay.spanCmp(day) >= 0 {
 		t.Errorf("span ordering wrong")
 	}
 }
@@ -120,18 +120,18 @@ func TestIntervalEncodeKey(t *testing.T) {
 	}
 	byKey := append([]Interval(nil), ordered...)
 	sort.Slice(byKey, func(i, j int) bool {
-		return bytes.Compare(byKey[i].EncodeKey(), byKey[j].EncodeKey()) < 0
+		return bytes.Compare(byKey[i].encodeKey(), byKey[j].encodeKey()) < 0
 	})
 	for i := range ordered {
-		if byKey[i].SpanCmp(ordered[i]) != 0 {
+		if byKey[i].spanCmp(ordered[i]) != 0 {
 			t.Fatalf("encode_key order must equal span order at %d", i)
 		}
 	}
 	// Span-equal intervals share a key (1 mon == 30 days == 720:00:00) — the UNIQUE wrinkle.
-	if !bytes.Equal(iv(1, 0, 0).EncodeKey(), iv(0, 30, 0).EncodeKey()) {
+	if !bytes.Equal(iv(1, 0, 0).encodeKey(), iv(0, 30, 0).encodeKey()) {
 		t.Errorf("1 mon / 30 days keys must coincide")
 	}
-	if !bytes.Equal(iv(1, 0, 0).EncodeKey(), iv(0, 0, 30*86_400_000_000).EncodeKey()) {
+	if !bytes.Equal(iv(1, 0, 0).encodeKey(), iv(0, 0, 30*86_400_000_000).encodeKey()) {
 		t.Errorf("1 mon / 720:00:00 keys must coincide")
 	}
 	// Byte-exact canonical vectors (the §2.10 worked-bytes table).
@@ -147,7 +147,7 @@ func TestIntervalEncodeKey(t *testing.T) {
 		{iv(0, -1, 0), "7fffffffffffffffffffffebe228a000"},
 	}
 	for _, e := range exact {
-		if got := hex.EncodeToString(e.iv.EncodeKey()); got != e.want {
+		if got := hex.EncodeToString(e.iv.encodeKey()); got != e.want {
 			t.Errorf("EncodeKey(%+v) = %s, want %s", e.iv, got, e.want)
 		}
 	}

@@ -33,7 +33,7 @@ const nearMidnightUTC int64 = 1721086200000000
 func dateAt(t *testing.T, db *Session, expr string) string {
 	t.Helper()
 	v := castOne(t, db, "SELECT ("+expr+") = '2024-07-16'::date")
-	if v.Kind != ValBool {
+	if v.kind != ValBool {
 		t.Fatalf("expected boolean, got %v", v)
 	}
 	if v.boolVal() {
@@ -83,7 +83,7 @@ func TestDateClockDefaultNeverFolds(t *testing.T) {
 		t.Fatal(err)
 	}
 	v := castOne(t, db, "SELECT (SELECT dt FROM d WHERE id = 2) = (SELECT dt FROM d WHERE id = 1) + 1")
-	if v.Kind != ValBool || !v.boolVal() {
+	if v.kind != ValBool || !v.boolVal() {
 		t.Fatalf("DEFAULT 'today' folded: day 2 is not day 1 + 1 (%v)", v)
 	}
 }

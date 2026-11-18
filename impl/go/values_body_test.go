@@ -82,7 +82,7 @@ func TestValuesBodyColumnTypeUnification(t *testing.T) {
 		t.Errorf("int+decimal got %v", got)
 	}
 	rows := query(t, db, "SELECT column1 FROM (VALUES (1), (2.5)) AS v ORDER BY column1")
-	if len(rows) != 2 || rows[0][0].Kind != ValDecimal || rows[1][0].Kind != ValDecimal {
+	if len(rows) != 2 || rows[0][0].kind != ValDecimal || rows[1][0].kind != ValDecimal {
 		t.Errorf("int+decimal coercion got %v", rows)
 	}
 	// anything + NULL keeps the other type.
@@ -99,7 +99,7 @@ func TestValuesBodyParamTypedBySibling(t *testing.T) {
 	t.Parallel()
 	db := dbWith(t)
 	rows := queryRows(t, db, "SELECT column1 FROM (VALUES (1), ($1)) AS v ORDER BY column1", IntValue(7))
-	if len(rows) != 2 || rows[0][0].Int != 1 || rows[1][0].Int != 7 {
+	if len(rows) != 2 || rows[0][0].num != 1 || rows[1][0].num != 7 {
 		t.Errorf("param typed by sibling got %v", rows)
 	}
 }

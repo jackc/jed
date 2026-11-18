@@ -103,8 +103,8 @@ func BenchmarkSpecialization(b *testing.B) {
 						checksum := uint32(2166136261)
 						for rows.Next() {
 							for _, v := range rows.Row() {
-								checksum = (checksum ^ uint32(v.Kind)) * 16777619
-								checksum = (checksum ^ uint32(v.Int)) * 16777619
+								checksum = (checksum ^ uint32(v.kind)) * 16777619
+								checksum = (checksum ^ uint32(v.num)) * 16777619
 							}
 						}
 						if err := rows.Err(); err != nil {

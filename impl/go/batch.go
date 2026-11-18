@@ -93,10 +93,10 @@ func extractIntColumn(rows []storedRow, idx int) colBatch {
 	b := colBatch{n: n, ints: make([]int64, n), nulls: make([]bool, n)}
 	for i := range rows {
 		v := rows[i][idx]
-		if v.Kind == ValNull {
+		if v.kind == ValNull {
 			b.nulls[i] = true
 		} else {
-			b.ints[i] = v.Int
+			b.ints[i] = v.num
 		}
 	}
 	return b
@@ -721,8 +721,8 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 				return spilled.put(kv, state)
 			}
 			gi, found := nullGI, nullGI >= 0
-			if kv.Kind != ValNull {
-				gi, found = groupIdx[kv.Int]
+			if kv.kind != ValNull {
+				gi, found = groupIdx[kv.num]
 			}
 			if !found {
 				if bounded {
@@ -736,10 +736,10 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 					}
 				}
 				gi = len(groups)
-				if kv.Kind == ValNull {
+				if kv.kind == ValNull {
 					nullGI = gi
 				} else {
-					groupIdx[kv.Int] = gi
+					groupIdx[kv.num] = gi
 				}
 				groups = append(groups, laneGroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs, zone)})
 				resident += groupBase
@@ -1138,7 +1138,7 @@ func (db *engine) groupByIntKey(plan *selectPlan, gset *groupSetPlan, survivors 
 			kv = r[keyIdx]
 		}
 		var gi int
-		if kv.Kind == ValNull {
+		if kv.kind == ValNull {
 			if nullGI < 0 {
 				if charge.active() {
 					if err := charge.reserve(meter, memEntryBytes([]Value{NullValue()})); err != nil {
@@ -1151,14 +1151,14 @@ func (db *engine) groupByIntKey(plan *selectPlan, gset *groupSetPlan, survivors 
 			gi = nullGI
 		} else {
 			var ok bool
-			if gi, ok = index[kv.Int]; !ok {
+			if gi, ok = index[kv.num]; !ok {
 				if charge.active() {
 					if err := charge.reserve(meter, memEntryBytes([]Value{kv})); err != nil {
 						return nil, err
 					}
 				}
 				gi = len(groups)
-				index[kv.Int] = gi
+				index[kv.num] = gi
 				groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs, db.session.timeZone)})
 			}
 		}
@@ -1281,7 +1281,7 @@ func foldAggBatch(a *acc, spec *aggSpec, survivors []storedRow, env *evalEnv, me
 				}
 			}
 			v := survivors[i][idx]
-			if v.Kind != ValNull {
+			if v.kind != ValNull {
 				a.floatSum.add(v)
 			}
 		}
@@ -1294,7 +1294,7 @@ func foldAggBatch(a *acc, spec *aggSpec, survivors []storedRow, env *evalEnv, me
 				}
 			}
 			v := survivors[i][idx]
-			if v.Kind == ValNull {
+			if v.kind == ValNull {
 				continue
 			}
 			if !a.hasCur {

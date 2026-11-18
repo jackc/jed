@@ -68,7 +68,7 @@ func TestRowReuseDeferredReads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !rows.Next() || rows.Row()[0].Int != 1 {
+	if !rows.Next() || rows.Row()[0].num != 1 {
 		t.Fatal(rows.Err())
 	}
 	before := device.reads
@@ -224,7 +224,7 @@ func TestRowReusePreparedIsolation(t *testing.T) {
 		_ = b.Close()
 		for i, row := range held {
 			want := int64(start + i/2 + (i%2)*20)
-			if row[0].Int != want || row[2].Render() != fmt.Sprintf("row-%d", want) {
+			if row[0].num != want || row[2].String() != fmt.Sprintf("row-%d", want) {
 				return fmt.Errorf("aliased row %d: %v", i, row)
 			}
 		}

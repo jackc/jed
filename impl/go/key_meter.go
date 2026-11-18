@@ -11,7 +11,7 @@ import "unicode/utf8"
 // a collated text or text[] key, else sort_key per payload byte.
 func chargeSortKey(m *costMeter, v Value, coll *compiledCollation) error {
 	var units int64
-	if coll != nil && (v.Kind == ValText || v.Kind == ValArray) {
+	if coll != nil && (v.kind == ValText || v.kind == ValArray) {
 		units = costs.Collate * collatedCodePoints(v)
 	} else {
 		units = costs.SortKey * memPayloadBytes(v)
@@ -38,13 +38,13 @@ func chargeSortKeys[R ~[]Value](m *costMeter, row R, order []orderSlot) error {
 // collatedCodePoints is the code points a collated key's UCA sort key is built from: a text's, or
 // a text[]'s non-NULL elements'.
 func collatedCodePoints(v Value) int64 {
-	switch v.Kind {
+	switch v.kind {
 	case ValText:
 		return int64(utf8.RuneCountInString(v.str()))
 	case ValArray:
 		var n int64
 		for _, e := range v.arrayVal().Elements {
-			if e.Kind == ValText {
+			if e.kind == ValText {
 				n += int64(utf8.RuneCountInString(e.str()))
 			}
 		}

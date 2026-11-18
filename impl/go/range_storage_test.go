@@ -46,7 +46,7 @@ func TestRangeImageRoundtrip(t *testing.T) {
 	run(t, db, "INSERT INTO t VALUES (4, '(,)', '(5,)')") // canonical [6,)
 	run(t, db, "INSERT INTO t VALUES (5, NULL, '[1,1]')") // canonical [1,2)
 
-	image, err := db.ToImage(4096, 1)
+	image, err := db.toImage(4096, 1)
 	if err != nil {
 		t.Fatalf("serialize image: %v", err)
 	}

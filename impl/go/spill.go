@@ -488,12 +488,12 @@ func spillWriteRow(w *bufio.Writer, row storedRow) {
 }
 
 func spillWriteValue(w *bufio.Writer, v Value) {
-	switch v.Kind {
+	switch v.kind {
 	case ValNull:
 		_ = w.WriteByte(0)
 	case ValInt:
 		_ = w.WriteByte(1)
-		spillWriteU64(w, uint64(v.Int))
+		spillWriteU64(w, uint64(v.num))
 	case ValBool:
 		_ = w.WriteByte(2)
 		if v.boolVal() {
@@ -506,7 +506,7 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 		spillWriteBytes(w, []byte(v.str()))
 	case ValDecimal:
 		_ = w.WriteByte(4)
-		neg, scale, groups := v.decimal().ToCodec()
+		neg, scale, groups := v.decimal().toCodec()
 		if neg {
 			_ = w.WriteByte(1)
 		} else {
@@ -527,19 +527,19 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 		_, _ = w.Write([]byte(v.str())) // exactly 16 bytes
 	case ValFloat32:
 		_ = w.WriteByte(13)
-		spillWriteU64(w, uint64(v.Int))
+		spillWriteU64(w, uint64(v.num))
 	case ValFloat64:
 		_ = w.WriteByte(14)
-		spillWriteU64(w, uint64(v.Int))
+		spillWriteU64(w, uint64(v.num))
 	case ValDate:
 		_ = w.WriteByte(17)
-		spillWriteU64(w, uint64(v.Int))
+		spillWriteU64(w, uint64(v.num))
 	case ValTimestamp:
 		_ = w.WriteByte(7)
-		spillWriteU64(w, uint64(v.Int))
+		spillWriteU64(w, uint64(v.num))
 	case ValTimestamptz:
 		_ = w.WriteByte(8)
-		spillWriteU64(w, uint64(v.Int))
+		spillWriteU64(w, uint64(v.num))
 	case ValInterval:
 		// Interval — tag 12 (tags 9/10/11 are the unfetchedValue forms below); months, days, micros.
 		_ = w.WriteByte(12)
@@ -616,7 +616,7 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 		// Derived/CTE rows may carry a non-storable jsonpath through a blocking operator.
 		_ = w.WriteByte(22)
 		spillWriteBytes(w, []byte(v.str()))
-	case ValUnfetched:
+	case valUnfetched:
 		// An untouched large-value reference rides along to the output unread (spill.md §4); spill
 		// it opaquely so it round-trips, never resolving it. The same pass-through covers an
 		// inline-deferred value (lazy-record.md §5b) — tag 21.
@@ -759,7 +759,7 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 		if tag == 17 {
 			kind = ValDate
 		}
-		return Value{Kind: kind, Int: int64(n)}, err
+		return Value{kind: kind, num: int64(n)}, err
 	case 7:
 		n, err := spillReadU64(r)
 		return TimestampValue(int64(n)), err
@@ -780,14 +780,14 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 			return Value{}, err
 		}
 		length, err := spillReadU32(r)
-		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: tagExternal, FirstPage: first, firstTag: tag, StoredLen: length}}, err
+		return Value{kind: valUnfetched, ref: &unfetchedValue{Form: tagExternal, FirstPage: first, firstTag: tag, StoredLen: length}}, err
 	case 10:
 		raw, err := spillReadU32(r)
 		if err != nil {
 			return Value{}, err
 		}
 		comp, err := spillReadBytes(r)
-		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: tagInlineComp, RawLen: raw, Comp: comp}}, err
+		return Value{kind: valUnfetched, ref: &unfetchedValue{Form: tagInlineComp, RawLen: raw, Comp: comp}}, err
 	case 11:
 		first, err := spillReadU32(r)
 		if err != nil {
@@ -802,13 +802,13 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 			return Value{}, err
 		}
 		raw, err := spillReadU32(r)
-		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: tagExternalComp, FirstPage: first, firstTag: tag, StoredLen: stored, RawLen: raw}}, err
+		return Value{kind: valUnfetched, ref: &unfetchedValue{Form: tagExternalComp, FirstPage: first, firstTag: tag, StoredLen: stored, RawLen: raw}}, err
 	case 22:
 		body, err := spillReadBytes(r)
 		return JSONPathValue(string(body)), err
 	case 21:
 		body, err := spillReadBytes(r)
-		return Value{Kind: ValUnfetched, ref: &unfetchedValue{Form: 0x00, Comp: body}}, err
+		return Value{kind: valUnfetched, ref: &unfetchedValue{Form: 0x00, Comp: body}}, err
 	case 12:
 		months, err := spillReadU32(r)
 		if err != nil {

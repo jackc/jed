@@ -14,7 +14,7 @@ import "testing"
 // castScalar evaluates SELECT <expr> (single row/column) and renders the value.
 func castScalar(t *testing.T, db dbHandle, expr string) string {
 	t.Helper()
-	return castOne(t, db, "SELECT "+expr).Render()
+	return castOne(t, db, "SELECT "+expr).String()
 }
 
 // castErr returns the SQLSTATE of a statement expected to error.
@@ -89,7 +89,7 @@ func TestRuntimeTextToFloatArrays(t *testing.T) {
 	if _, err := queryOutcome(db, "INSERT INTO t VALUES (1, '{0.5,0.25,-1.5}')", nil); err != nil {
 		t.Fatal(err)
 	}
-	got := castOne(t, db, "SELECT (s::float8[])::text FROM t WHERE id = 1").Render()
+	got := castOne(t, db, "SELECT (s::float8[])::text FROM t WHERE id = 1").String()
 	if got != "{0.5,0.25,-1.5}" {
 		t.Fatalf("text → f64[]: want {0.5,0.25,-1.5}, got %s", got)
 	}

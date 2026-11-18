@@ -234,7 +234,7 @@ func resolvedToKeyType(rt resolvedType) (dataType, bool) {
 func indexSlotKey(key resolvedKey, colTypes []colType, colls []*compiledCollation, row storedRow, env *evalEnv) (present bool, b []byte, err error) {
 	if key.Expr == nil {
 		v := row[key.Col]
-		if v.Kind == ValNull {
+		if v.kind == ValNull {
 			return false, nil, nil
 		}
 		b, err = encodeColTypeKey(colTypes[key.Col], v, colls[key.Col])
@@ -247,7 +247,7 @@ func indexSlotKey(key resolvedKey, colTypes []colType, colls []*compiledCollatio
 	if err != nil {
 		return false, nil, err
 	}
-	if v.Kind == ValNull {
+	if v.kind == ValNull {
 		return false, nil, nil
 	}
 	b, err = encodeTypedKey(key.Ty, v, key.Coll)
@@ -361,7 +361,7 @@ func gistEntries(columns []catColumn, cols []int, storageKey []byte, row storedR
 		if err != nil {
 			return nil, err
 		}
-		if v.Kind == ValNull {
+		if v.kind == ValNull {
 			return nil, nil // any NULL excluded column → row not indexed (the §7 NULL rule)
 		}
 		if rt, ok := col.Type.RangeElement(); ok {
@@ -397,7 +397,7 @@ func exclusionProbeQuery(columns []catColumn, exc exclusionConstraint, row store
 		if err != nil {
 			return nil, nil, false, err
 		}
-		if v.Kind == ValNull {
+		if v.kind == ValNull {
 			return nil, nil, false, nil // NULL rule: exempt
 		}
 		switch el.Op {
@@ -435,7 +435,7 @@ func exclusionPairConflicts(columns []catColumn, exc exclusionConstraint, a, b s
 		if err != nil {
 			return false, err
 		}
-		if va.Kind == ValNull || vb.Kind == ValNull {
+		if va.kind == ValNull || vb.kind == ValNull {
 			return false, nil
 		}
 		var ok bool
@@ -581,12 +581,12 @@ func ginOpclassFor(ty dataType) (ginOpclass, bool) {
 // extraction.
 func ginValueTerms(opclass ginOpclass, v Value) [][]byte {
 	if opclass.jsonb {
-		if v.Kind != ValJSONB {
+		if v.kind != ValJSONB {
 			return nil
 		}
 		return ginJsonbIndexTerms(v.jsonb())
 	}
-	if v.Kind != ValArray {
+	if v.kind != ValArray {
 		return nil
 	}
 	// Dedup by the encoded term (the key is canonical under SQL =: a float -0/+0 or two NaNs, or
@@ -595,7 +595,7 @@ func ginValueTerms(opclass ginOpclass, v Value) [][]byte {
 	seen := make(map[string]bool)
 	var terms [][]byte
 	for _, el := range v.arrayVal().Elements {
-		if el.Kind == ValNull {
+		if el.kind == ValNull {
 			continue // a NULL element carries no term; a non-keyable element is impossible under the gate
 		}
 		t := ginElementTerm(opclass.elem, el)
@@ -615,7 +615,7 @@ func ginValueTerms(opclass ginOpclass, v Value) [][]byte {
 // element keys its first ginMaxTermBytes raw bytes the same way, and a decimal element keeps the first
 // ginMaxTermBytes bytes of its value-based key (§4.3).
 func ginElementTerm(elem scalarType, v Value) []byte {
-	switch v.Kind {
+	switch v.kind {
 	case ValText, ValBytea:
 		b := []byte(v.str())
 		if len(b) > ginMaxTermBytes {
@@ -623,7 +623,7 @@ func ginElementTerm(elem scalarType, v Value) []byte {
 		}
 		return encodeTerminated(b)
 	case ValDecimal:
-		key := v.decimal().EncodeKey()
+		key := v.decimal().encodeKey()
 		if len(key) > ginMaxTermBytes {
 			key = key[:ginMaxTermBytes]
 		}
@@ -2583,7 +2583,7 @@ func (db *engine) buildInsertRow(table *catTable, colTypes []colType, provided [
 			}
 			candidate = dv
 		}
-		if col.NotNull && candidate.Kind == ValNull {
+		if col.NotNull && candidate.kind == ValNull {
 			if nullCol < 0 {
 				nullCol = i
 			}
@@ -3151,7 +3151,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 				return 0, nil, err
 			}
 			// NOT NULL over the complete new row (error-fields.md §9.5).
-			if ap.notNull && raw.Kind == ValNull {
+			if ap.notNull && raw.kind == ValNull {
 				if nullCol < 0 {
 					nullCol = ap.idx
 				}
@@ -4769,7 +4769,7 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 				}
 			}
 			// NOT NULL over the complete new row, after every assignment (error-fields.md §9.5).
-			if p.notNull && raw.Kind == ValNull {
+			if p.notNull && raw.kind == ValNull {
 				if nullCol < 0 {
 					nullCol = p.idx
 				}
@@ -4800,9 +4800,9 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 		// RETURNING read a carried value through the evaluator's demand fault, also unmetered.
 		for i := range newRow {
 			carried := !assignedCol[i] && !slices.Contains(pkMembers, i)
-			if sv := e.Row[i]; carried && sv.Kind == ValUnfetched && sv.unfetched().Form != 0x00 {
+			if sv := e.Row[i]; carried && sv.kind == valUnfetched && sv.unfetched().Form != 0x00 {
 				newRow[i] = sv
-			} else if newRow[i].Kind == ValUnfetched {
+			} else if newRow[i].kind == valUnfetched {
 				if newRow[i], err = store.resolveValue(i, newRow[i].unfetched()); err != nil {
 					return outcome{}, err
 				}

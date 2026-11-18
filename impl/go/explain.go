@@ -168,7 +168,7 @@ func (db *engine) executeExplainAnalyze(ex *explain, inner, run *statement, para
 	}
 	r.emit(0, "Analyze", fmt.Sprintf("cost=%d rows=%d", innerOut.Cost, actualRows))
 	for _, row := range body.rows {
-		shifted := append([]Value{IntValue(row[0].Int + 1)}, row[1:]...)
+		shifted := append([]Value{IntValue(row[0].num + 1)}, row[1:]...)
 		r.rows = append(r.rows, shifted)
 	}
 	return db.explainOutcome(r.rows, ex)
@@ -273,10 +273,10 @@ func (p *actualCostProfile) apply(rows [][]Value, frameDepths []int, actual []in
 	cteUsed := make(map[actualCostKey]int)
 	suppressedDepth := -1
 	for i, row := range rows {
-		if len(row) < 2 || row[1].Kind != ValText {
+		if len(row) < 2 || row[1].kind != ValText {
 			continue
 		}
-		depth := int(row[0].Int)
+		depth := int(row[0].num)
 		if suppressedDepth >= 0 {
 			if depth > suppressedDepth {
 				continue
@@ -1338,7 +1338,7 @@ func renderBoundLit(e *rExpr) string {
 		}
 		return "false"
 	case reConstDecimal:
-		return e.cDec.Render()
+		return e.cDec.String()
 	case reConstText:
 		return quoteExplainText(e.cText)
 	case reConstFloat32:
@@ -1423,40 +1423,40 @@ func renderRExpr(e *rExpr) string {
 	case reConstText:
 		return quoteExplainText(e.cText)
 	case reConstDecimal:
-		return e.cDec.Render()
+		return e.cDec.String()
 	case reConstBytea:
-		return quoteExplainText(ByteaValue(e.cBytea).Render())
+		return quoteExplainText(ByteaValue(e.cBytea).String())
 	case reConstUuid:
-		return quoteExplainText(UUIDValue(e.cBytea).Render())
+		return quoteExplainText(UUIDValue(e.cBytea).String())
 	case reConstTimestamp:
-		return quoteExplainText(TimestampValue(e.cInt).Render())
+		return quoteExplainText(TimestampValue(e.cInt).String())
 	case reConstTimestamptz:
-		return quoteExplainText(TimestamptzValue(e.cInt).Render())
+		return quoteExplainText(TimestamptzValue(e.cInt).String())
 	case reConstDate:
-		return quoteExplainText(DateValue(int32(e.cInt)).Render())
+		return quoteExplainText(DateValue(int32(e.cInt)).String())
 	case reConstInterval:
-		return quoteExplainText(IntervalValue(e.cIv).Render())
+		return quoteExplainText(IntervalValue(e.cIv).String())
 	case reConstFloat32:
-		return Float32Value(float32(e.cFloat)).Render()
+		return Float32Value(float32(e.cFloat)).String()
 	case reConstFloat64:
-		return Float64Value(e.cFloat).Render()
+		return Float64Value(e.cFloat).String()
 	case reConstJson, reConstJsonPath:
 		return quoteExplainText(e.cText)
 	case reConstJsonb:
 		if e.cJsonb != nil {
-			return quoteExplainText(JSONBValue(*e.cJsonb).Render())
+			return quoteExplainText(JSONBValue(*e.cJsonb).String())
 		}
 		return "NULL"
 	case reConstNull:
 		return "NULL"
 	case reConstArray:
 		if e.cArray != nil {
-			return quoteExplainText(Value{Kind: ValArray, ref: e.cArray}.Render())
+			return quoteExplainText(Value{kind: ValArray, ref: e.cArray}.String())
 		}
 		return "NULL"
 	case reConstRange:
 		if e.cRange != nil {
-			return quoteExplainText(RangeValue(e.cRange).Render())
+			return quoteExplainText(RangeValue(e.cRange).String())
 		}
 		return "NULL"
 	case reRow:
@@ -2037,13 +2037,13 @@ func explainSubquery(e *rExpr) string {
 }
 
 func renderExplainValue(v Value) string {
-	switch v.Kind {
+	switch v.kind {
 	case ValNull:
 		return "NULL"
 	case ValInt, ValBool, ValDecimal, ValFloat32, ValFloat64:
-		return v.Render()
+		return v.String()
 	default:
-		return quoteExplainText(v.Render())
+		return quoteExplainText(v.String())
 	}
 }
 

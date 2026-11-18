@@ -29,12 +29,12 @@ func TestCreateCommitReopenRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if db.Txid() != 1 { // the initial empty image is committed at create
-		t.Fatalf("txid after create = %d want 1", db.Txid())
+	if db.txid() != 1 { // the initial empty image is committed at create
+		t.Fatalf("txid after create = %d want 1", db.txid())
 	}
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	mustExec(t, db, "INSERT INTO t VALUES (1, 10), (2, 20)") // autocommitted durably
-	afterCommit := db.Txid()
+	afterCommit := db.txid()
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -44,11 +44,11 @@ func TestCreateCommitReopenRoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if db.Txid() != afterCommit {
-		t.Fatalf("reopened txid = %d want %d", db.Txid(), afterCommit)
+	if db.txid() != afterCommit {
+		t.Fatalf("reopened txid = %d want %d", db.txid(), afterCommit)
 	}
 	rows := queryRows(t, db, "SELECT id, v FROM t")
-	if len(rows) != 2 || rows[0][0].Int != 1 || rows[1][1].Int != 20 {
+	if len(rows) != 2 || rows[0][0].num != 1 || rows[1][1].num != 20 {
 		t.Fatalf("got %v", rows)
 	}
 }
@@ -121,7 +121,7 @@ func TestAutocommitPersistsEachWriteAcrossClose(t *testing.T) {
 	}
 	defer db.Close()
 	rows := queryRows(t, db, "SELECT id FROM t")
-	if len(rows) != 1 || rows[0][0].Int != 1 {
+	if len(rows) != 1 || rows[0][0].num != 1 {
 		t.Fatalf("autocommitted insert must persist, got %v", rows)
 	}
 }
@@ -139,7 +139,7 @@ func TestCommitAndRollbackAreNoopsUnderAutocommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := queryRows(t, db, "SELECT id FROM t")
-	if len(rows) != 1 || rows[0][0].Int != 1 {
+	if len(rows) != 1 || rows[0][0].num != 1 {
 		t.Fatalf("autocommitted row must remain, got %v", rows)
 	}
 }
@@ -174,7 +174,7 @@ func TestPrepareExecuteAndQueryWithParams(t *testing.T) {
 	for rows.Next() {
 		collected = append(collected, rows.Row())
 	}
-	if len(collected) != 1 || collected[0][0].Int != 2 || collected[0][1].Int != 200 {
+	if len(collected) != 1 || collected[0][0].num != 2 || collected[0][1].num != 200 {
 		t.Fatalf("got %v", collected)
 	}
 	if rows.Cost() < 0 {
@@ -253,7 +253,7 @@ func TestPreparedHandleMethods(t *testing.T) {
 	var got [][]int64
 	for rows.Next() {
 		r := rows.Row()
-		got = append(got, []int64{r[0].Int, r[1].Int})
+		got = append(got, []int64{r[0].num, r[1].num})
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
@@ -314,7 +314,7 @@ func TestQueryOnNonQueryStatementIsTotal(t *testing.T) {
 		t.Fatalf("SELECT drain error: %v", err)
 	}
 	_ = sel.Close()
-	if len(got) != 2 || got[0][0].Int != 100 || got[1][0].Int != 200 {
+	if len(got) != 2 || got[0][0].num != 100 || got[1][0].num != 200 {
 		t.Fatalf("rows after INSERT via Query = %v", got)
 	}
 }
@@ -333,12 +333,12 @@ func TestCommitOnInMemoryIsNoopSuccess(t *testing.T) {
 	t.Parallel()
 	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
-	before := db.Txid()
+	before := db.txid()
 	if err := db.commitBlock(); err != nil { // no open block -> no-op success, not an error
 		t.Fatal(err)
 	}
-	if db.Txid() != before || db.Path() != "" {
-		t.Fatalf("txid=%d (want %d) path=%q want empty", db.Txid(), before, db.Path())
+	if db.txid() != before || db.Path() != "" {
+		t.Fatalf("txid=%d (want %d) path=%q want empty", db.txid(), before, db.Path())
 	}
 }
 

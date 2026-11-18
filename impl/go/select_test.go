@@ -23,7 +23,7 @@ func queryIDs(t *testing.T, db dbHandle, sql string) []int64 {
 	rows := query(t, db, sql)
 	out := make([]int64, len(rows))
 	for i, r := range rows {
-		out[i] = r[0].Int
+		out[i] = r[0].num
 	}
 	return out
 }

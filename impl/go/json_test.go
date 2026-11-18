@@ -115,7 +115,7 @@ func TestLargeJsonbSpillsAndRoundTrips(t *testing.T) {
 	// A second row with a small value, so the table spans the spilled + inline cases.
 	run(t, db, "INSERT INTO t VALUES (2, '{\"k\": 42}')")
 
-	image, err := db.ToImage(4096, 1)
+	image, err := db.toImage(4096, 1)
 	if err != nil {
 		t.Fatalf("serialize image: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestLargeJsonSpillsVerbatim(t *testing.T) {
 	verbatim := "{ \"a\" :" + pad + "1 }"
 	run(t, db, "INSERT INTO t VALUES (1, '"+strings.ReplaceAll(verbatim, "'", "''")+"')")
 
-	image, err := db.ToImage(4096, 1)
+	image, err := db.toImage(4096, 1)
 	if err != nil {
 		t.Fatalf("serialize image: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestJsonbAllNodeKindsRoundTrip(t *testing.T) {
 	db := mustSession(newInMemoryWithPageSize(4096, NewEnvironment()), SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)")
 	run(t, db, "INSERT INTO t VALUES (1, '{\"a\": 1, \"b\": [true, false, null], \"c\": \"x\"}')")
-	image, err := db.ToImage(4096, 1)
+	image, err := db.toImage(4096, 1)
 	if err != nil {
 		t.Fatalf("serialize image: %v", err)
 	}

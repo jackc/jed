@@ -62,8 +62,8 @@ func TestCompositeKeyOrdersByTuple(t *testing.T) {
 		t.Fatalf("got %d rows, want %d", len(rows), len(want))
 	}
 	for i, r := range rows {
-		if r[0].Int != want[i][0] || r[1].Int != want[i][1] {
-			t.Fatalf("row %d = (%d,%d), want (%d,%d)", i, r[0].Int, r[1].Int, want[i][0], want[i][1])
+		if r[0].num != want[i][0] || r[1].num != want[i][1] {
+			t.Fatalf("row %d = (%d,%d), want (%d,%d)", i, r[0].num, r[1].num, want[i][0], want[i][1])
 		}
 	}
 }
@@ -150,7 +150,7 @@ func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
 	}
 	var bs []int64
 	for _, row := range db.rowsInKeyOrder("rev") {
-		bs = append(bs, row[1].Int)
+		bs = append(bs, row[1].num)
 	}
 	if !slices.Equal(bs, []int64{10, 15, 20}) {
 		t.Fatalf("stored order = %v, want the (b, a) tuple order [10 15 20]", bs)
@@ -189,7 +189,7 @@ func TestCompositeMembersNotNullAndRekey(t *testing.T) {
 		}
 	}
 	rows := db.rowsInKeyOrder("t")
-	if len(rows) != 1 || rows[0][0].Int != 9 || rows[0][1].Int != 9 || rows[0][2].Int != 11 {
+	if len(rows) != 1 || rows[0][0].num != 9 || rows[0][1].num != 9 || rows[0][2].num != 11 {
 		t.Fatalf("after re-key: got %v, want one row (9,9,11)", rows)
 	}
 }
@@ -211,8 +211,8 @@ func TestCompositeMixedUuidIntComponentsOrder(t *testing.T) {
 	rows := db.rowsInKeyOrder("t")
 	want := []int64{-2, 7, -5}
 	for i, r := range rows {
-		if r[1].Int != want[i] {
-			t.Fatalf("row %d second component = %d, want %d", i, r[1].Int, want[i])
+		if r[1].num != want[i] {
+			t.Fatalf("row %d second component = %d, want %d", i, r[1].num, want[i])
 		}
 	}
 }
@@ -228,7 +228,7 @@ func TestCompositeRoundTripsThroughTheOnDiskImage(t *testing.T) {
 		"CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))",
 		"INSERT INTO t VALUES (2, 1, 40), (1, 2, 20), (1, 1, 10)",
 	)
-	image, err := db.ToImage(256, 1)
+	image, err := db.toImage(256, 1)
 	if err != nil {
 		t.Fatalf("ToImage: %v", err)
 	}
@@ -251,8 +251,8 @@ func TestCompositeRoundTripsThroughTheOnDiskImage(t *testing.T) {
 		t.Fatalf("got %d rows, want %d", len(rows), len(want))
 	}
 	for i, r := range rows {
-		if r[0].Int != want[i][0] || r[1].Int != want[i][1] {
-			t.Fatalf("row %d = (%d,%d), want (%d,%d)", i, r[0].Int, r[1].Int, want[i][0], want[i][1])
+		if r[0].num != want[i][0] || r[1].num != want[i][1] {
+			t.Fatalf("row %d = (%d,%d), want (%d,%d)", i, r[0].num, r[1].num, want[i][0], want[i][1])
 		}
 	}
 

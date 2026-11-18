@@ -20,8 +20,8 @@ func TestWherePushdownBoundParameters(t *testing.T) {
 	)
 	const param = "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.v >= $1 AND b.w > $2 ORDER BY a.id, b.id"
 	literal := func(v, w int64) string {
-		return "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.v >= " + IntValue(v).Render() +
-			" AND b.w > " + IntValue(w).Render() + " ORDER BY a.id, b.id"
+		return "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.v >= " + IntValue(v).String() +
+			" AND b.w > " + IntValue(w).String() + " ORDER BY a.id, b.id"
 	}
 
 	stmt, err := db.Prepare(param)
@@ -49,7 +49,7 @@ func TestWherePushdownBoundParameters(t *testing.T) {
 				t.Fatalf("v=%d w=%d: rows = %v, want %v", tc.v, tc.w, out.Rows, tc.want)
 			}
 			for i, row := range out.Rows {
-				if row[0].Int != tc.want[i][0] || row[1].Int != tc.want[i][1] {
+				if row[0].num != tc.want[i][0] || row[1].num != tc.want[i][1] {
 					t.Fatalf("v=%d w=%d: rows = %v, want %v", tc.v, tc.w, out.Rows, tc.want)
 				}
 			}
@@ -129,7 +129,7 @@ func TestDerivedAndOnPushdownBoundParameters(t *testing.T) {
 				t.Fatalf("%s: rows = %v, want %v", tc.param, out.Rows, tc.want)
 			}
 			for i, row := range out.Rows {
-				if row[0].Int != tc.want[i] {
+				if row[0].num != tc.want[i] {
 					t.Fatalf("%s: rows = %v, want %v", tc.param, out.Rows, tc.want)
 				}
 			}

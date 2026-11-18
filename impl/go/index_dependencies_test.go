@@ -56,7 +56,7 @@ func skewZonePin(t *testing.T, original []byte, mode string) []byte {
 }
 
 func TestIndexTimezoneLifetime(t *testing.T) {
-	image, err := buildZoneIndex(t).ToImage(4096, 1)
+	image, err := buildZoneIndex(t).toImage(4096, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestIndexTimezoneLifetime(t *testing.T) {
 			}
 			for _, row := range query(t, db, "EXPLAIN SELECT id FROM t WHERE (ts AT TIME ZONE 'America/New_York')::date >= DATE '2024-01-01' AND account = 7") {
 				for _, v := range row {
-					if v.Kind == ValText && strings.Contains(v.str(), "zone_idx") {
+					if v.kind == ValText && strings.Contains(v.str(), "zone_idx") {
 						t.Fatal("skewed index used")
 					}
 				}
@@ -119,7 +119,7 @@ func TestIndexTimezoneLifetime(t *testing.T) {
 // rebuild: it re-pins the named zone to the loaded data, a rolled-back REINDEX leaves the stale pin, and
 // the rebuilt UNIQUE partial index enforces again.
 func TestIndexTimezoneReindexRepins(t *testing.T) {
-	image, err := buildZoneIndex(t).ToImage(4096, 1)
+	image, err := buildZoneIndex(t).toImage(4096, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestIndexTimezoneReindexRepins(t *testing.T) {
 				t.Fatal(c)
 			}
 			// The re-pinned index survives a round trip in the same environment.
-			again, err := db.ToImage(4096, 1)
+			again, err := db.toImage(4096, 1)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -219,7 +219,7 @@ func TestIndexDynamicZoneCache(t *testing.T) {
 	if err := grown.LoadTimeZoneData(saveTzBundle(b)); err != nil {
 		t.Fatal(err)
 	}
-	image, err := db.ToImage(4096, 1)
+	image, err := db.toImage(4096, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

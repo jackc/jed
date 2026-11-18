@@ -34,10 +34,10 @@ func siIds(t *testing.T, db dbHandle, sql string) []int64 {
 	o := siRun(t, db, sql)
 	out := make([]int64, 0, len(o.Rows))
 	for _, r := range o.Rows {
-		if r[0].Kind != ValInt {
+		if r[0].kind != ValInt {
 			t.Fatalf("expected an int id, got %v", r[0])
 		}
-		out = append(out, r[0].Int)
+		out = append(out, r[0].num)
 	}
 	return out
 }
@@ -213,7 +213,7 @@ func TestIndexRoundTripsThroughTheImage(t *testing.T) {
 	db := siDB20(t)
 	siRun(t, db, "CREATE INDEX t_v_idx ON t (v)")
 	siRun(t, db, "INSERT INTO t VALUES (100, NULL, 0)")
-	img, err := db.ToImage(8192, 1)
+	img, err := db.toImage(8192, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +221,7 @@ func TestIndexRoundTripsThroughTheImage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	img2, err := loaded.ToImage(8192, 1)
+	img2, err := loaded.toImage(8192, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

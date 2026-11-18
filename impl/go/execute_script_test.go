@@ -17,7 +17,7 @@ func scriptCount(t *testing.T, db dbHandle) int64 {
 	if err != nil {
 		t.Fatalf("count: %v", err)
 	}
-	return out.Rows[0][0].Int
+	return out.Rows[0][0].num
 }
 
 func TestScriptSummaryCountsAndCommitsAtomicallyWhenIdle(t *testing.T) {
@@ -191,7 +191,7 @@ func TestAdditionalSessionRunsAScriptOverTheSharedCore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Rows[0][0].Int != 2 {
+	if out.Rows[0][0].num != 2 {
 		t.Fatalf("count: want 2, got %v", out.Rows[0][0])
 	}
 	if a.Status() != TxIdle {

@@ -105,7 +105,7 @@ func varwidthRun(t *testing.T, s *Session, sql string, params []Value) (string, 
 	for i, r := range out.Rows {
 		cells := make([]string, len(r))
 		for j, v := range r {
-			cells[j] = v.Render()
+			cells[j] = v.String()
 		}
 		rows[i] = strings.Join(cells, "\x1f")
 	}
@@ -319,7 +319,7 @@ func laneRows(out outcome, sql string) string {
 	for i, r := range out.Rows {
 		cells := make([]string, len(r))
 		for j, v := range r {
-			cells[j] = v.Render()
+			cells[j] = v.String()
 		}
 		rows[i] = strings.Join(cells, "\x1f")
 	}

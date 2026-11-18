@@ -33,8 +33,8 @@ func TestEncodingVectors(t *testing.T) {
 			switch c.kind {
 			case "bare":
 				got, _ = parseUUID(c.strValue)
-				if UUIDValue(got).Render() != c.strValue {
-					t.Errorf("bare uuid %s: round-trip got %s", c.strValue, UUIDValue(got).Render())
+				if UUIDValue(got).String() != c.strValue {
+					t.Errorf("bare uuid %s: round-trip got %s", c.strValue, UUIDValue(got).String())
 				}
 			case "nullable":
 				got = nullableUUIDBytes(c)

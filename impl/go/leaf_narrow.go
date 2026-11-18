@@ -228,7 +228,7 @@ func forEligible(ty colType) bool {
 // forSlot is the unsigned image of an eligible column's present value: its value body read as a
 // big-endian integer (format.md "Value codec": the sign bit flipped at the column's width).
 func forSlot(fc forCol, v Value) uint64 {
-	x := v.Int
+	x := v.num
 	if fc.dec {
 		u, ok := v.decimal().unscaledInt64(uint32(fc.scale))
 		if !ok {
@@ -629,7 +629,7 @@ func rowItems(shape leafShape, pcap pageCap, key []byte, row storedRow, out []di
 			out[j] = dictItem{kind: dictNull}
 		case plan != nil && plan.disp[c] != dispInline:
 			out[j] = dictItem{kind: dictOwn}
-		case v.Kind == ValUnfetched && v.unfetched().Form != 0x00:
+		case v.kind == valUnfetched && v.unfetched().Form != 0x00:
 			// A stored row's deferred values equal its own plan's output (large-values.md §15.2), so a
 			// record that fits all-inline holds no large form.
 			panic("BUG: a stored large form in a record whose plan is all-inline")

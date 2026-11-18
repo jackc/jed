@@ -65,7 +65,7 @@ func TestRuntimeTextToTimestamptzZoneShiftOverflowTraps(t *testing.T) {
 	if err := db.SetTimeZone("UTC"); err != nil {
 		t.Fatal(err)
 	}
-	if v := castAt(t, db, "s :: timestamptz", 1); v.Kind != ValTimestamptz {
+	if v := castAt(t, db, "s :: timestamptz", 1); v.kind != ValTimestamptz {
 		t.Fatalf("UTC: got %v", v)
 	}
 }
@@ -77,10 +77,10 @@ func TestRuntimeTextToTimestamptzReadsFixedOffsetSessionZone(t *testing.T) {
 	if err := db.SetTimeZone("-02:00"); err != nil {
 		t.Fatal(err)
 	}
-	if got := castAt(t, db, "(s :: timestamptz) AT TIME ZONE 'UTC'", 1).Render(); got != "2024-07-15 10:00:00" {
+	if got := castAt(t, db, "(s :: timestamptz) AT TIME ZONE 'UTC'", 1).String(); got != "2024-07-15 10:00:00" {
 		t.Fatalf("offset-less: got %s", got)
 	}
-	if got := castAt(t, db, "(s :: timestamptz) AT TIME ZONE 'UTC'", 2).Render(); got != "2024-07-15 12:00:00" {
+	if got := castAt(t, db, "(s :: timestamptz) AT TIME ZONE 'UTC'", 2).String(); got != "2024-07-15 12:00:00" {
 		t.Fatalf("explicit offset: got %s", got)
 	}
 }
@@ -89,7 +89,7 @@ func TestParamCastToIntervalTypesTheParameter(t *testing.T) {
 	t.Parallel()
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	rows := queryRows(t, db, "SELECT $1::interval", IntervalValue(Interval{Days: 3}))
-	if got := rows[0][0].Render(); got != "3 days" {
+	if got := rows[0][0].String(); got != "3 days" {
 		t.Fatalf("$1::interval = %s, want 3 days", got)
 	}
 }

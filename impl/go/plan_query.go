@@ -2434,10 +2434,10 @@ func requireSetopEquality(t resolvedType) error {
 // value no-op (integer-width promotion is free — all integers are i64).
 func widenToUnified(v Value, to resolvedType) Value {
 	switch {
-	case to.kind == rtDecimal && v.Kind == ValInt:
-		return DecimalValue(decimalFromInt64(v.Int))
-	case to.kind == rtFloat64 && v.Kind == ValFloat32:
-		return Float64Value(float64(v.F32()))
+	case to.kind == rtDecimal && v.kind == ValInt:
+		return DecimalValue(decimalFromInt64(v.num))
+	case to.kind == rtFloat64 && v.kind == ValFloat32:
+		return Float64Value(float64(v.f32()))
 	}
 	return v
 }

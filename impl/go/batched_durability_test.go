@@ -62,8 +62,8 @@ func TestRelaxedCommitsDeferTheBarrier(t *testing.T) {
 		t.Fatalf("relaxed commits issued %d barriers below the batch cap, want 0", count.syncs)
 	}
 	// Every pending commit writes the slot that does not hold the floor (create's txid 1 in slot 1).
-	if got := metaTxidAt(t, path, 0); got != db.Txid() {
-		t.Fatalf("slot 0 holds txid %d, want the newest pending commit %d", got, db.Txid())
+	if got := metaTxidAt(t, path, 0); got != db.txid() {
+		t.Fatalf("slot 0 holds txid %d, want the newest pending commit %d", got, db.txid())
 	}
 	if got := metaTxidAt(t, path, 1); got != 1 {
 		t.Fatalf("slot 1 holds txid %d, want the floor (txid 1)", got)
@@ -238,7 +238,7 @@ func TestRelaxedNewestMetaVouchesForTheWholeBatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recovery over a half-landed batch failed: %v", err)
 	}
-	if len(rows) != 2 || rows[0][0].Render() != "aaaaaaaaaaaaaaaaaaaa" || rows[1][0].Render() != "aaaaaaaaaaaaaaaaaaaa" {
+	if len(rows) != 2 || rows[0][0].String() != "aaaaaaaaaaaaaaaaaaaa" || rows[1][0].String() != "aaaaaaaaaaaaaaaaaaaa" {
 		t.Fatalf("recovery over a half-landed batch returned %v, want the floor's rows", rows)
 	}
 	_ = reopened.Close()
@@ -335,7 +335,7 @@ func TestSynchronousOnKeepsTxidParitySlots(t *testing.T) {
 	mustExecDB(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	for i := 1; i <= 5; i++ {
 		mustExecDB(t, db, "INSERT INTO t VALUES ("+strconv.Itoa(i)+")")
-		v := db.Txid()
+		v := db.txid()
 		if got := metaTxidAt(t, path, int(v&1)); got != v {
 			t.Fatalf("txid %d not in slot %d (holds %d)", v, v&1, got)
 		}
@@ -421,7 +421,7 @@ func TestRelaxedDeadlineFlushesBeforeTheNextCommit(t *testing.T) {
 		t.Fatal("a commit before the deadline flushed")
 	}
 	clock.Advance(1)
-	before := db.Txid()
+	before := db.txid()
 	mustExecDB(t, db, "INSERT INTO t VALUES (3)")
 	if count.syncs != 1 {
 		t.Fatalf("the commit at the deadline issued %d barriers, want the one flush first", count.syncs)
@@ -430,8 +430,8 @@ func TestRelaxedDeadlineFlushesBeforeTheNextCommit(t *testing.T) {
 	if got := metaTxidAt(t, path, int(before&1)); got != before {
 		t.Fatalf("slot %d holds txid %d, want the flushed floor %d", before&1, got, before)
 	}
-	if got := metaTxidAt(t, path, int(before&1^1)); got != db.Txid() {
-		t.Fatalf("slot %d holds txid %d, want the new pending commit %d", before&1^1, got, db.Txid())
+	if got := metaTxidAt(t, path, int(before&1^1)); got != db.txid() {
+		t.Fatalf("slot %d holds txid %d, want the new pending commit %d", before&1^1, got, db.txid())
 	}
 	if !storagePending(st) {
 		t.Fatal("the commit after the flush is not pending")

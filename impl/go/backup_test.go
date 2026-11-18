@@ -155,8 +155,8 @@ func TestPageIdenticalBackupCopiesReachablePagesAtTheirIndices(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer copyDB.Close()
-	if copyDB.Txid() != mt.txid {
-		t.Fatalf("the copy is at txid %d, the snapshot at %d", copyDB.Txid(), mt.txid)
+	if copyDB.txid() != mt.txid {
+		t.Fatalf("the copy is at txid %d, the snapshot at %d", copyDB.txid(), mt.txid)
 	}
 	for _, sql := range []string{compactProbe, "SELECT count(*), sum(length(body)) FROM big", "SELECT count(*) FROM spans WHERE r && i64range(100, 105)"} {
 		wantRows, wantCost := rowsAndCost(t, db, sql)

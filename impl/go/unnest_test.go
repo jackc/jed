@@ -21,7 +21,7 @@ func unnestInts(t *testing.T, db dbHandle, sql string) []int64 {
 		if len(r) != 1 {
 			t.Fatalf("%q: expected one column, got %d", sql, len(r))
 		}
-		out[i] = r[0].Int
+		out[i] = r[0].num
 	}
 	return out
 }
@@ -95,8 +95,8 @@ func TestUnnestCorrelatedOuterArg(t *testing.T) {
 		t.Fatalf("correlated unnest: got %v", rows)
 	}
 	for i, w := range want {
-		if rows[i][0].Int != w[0] || rows[i][1].Int != w[1] {
-			t.Errorf("row %d: got (%d,%d), want %v", i, rows[i][0].Int, rows[i][1].Int, w)
+		if rows[i][0].num != w[0] || rows[i][1].num != w[1] {
+			t.Errorf("row %d: got (%d,%d), want %v", i, rows[i][0].num, rows[i][1].num, w)
 		}
 	}
 	// A SIBLING FROM table's column IS now in scope for the SRF arg — an SRF is implicitly lateral

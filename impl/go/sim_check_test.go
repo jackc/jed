@@ -147,7 +147,7 @@ func simCheckLive(db *Database) error {
 // simExternalRef returns the overflow chain a stored value names — its first page and the bytes the
 // chain carries — or ok false for an inline or resident value.
 func simExternalRef(v Value) (first pageRef, length int, ok bool) {
-	if v.Kind != ValUnfetched {
+	if v.kind != valUnfetched {
 		return pageRef{}, 0, false
 	}
 	u := v.unfetched()

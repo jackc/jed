@@ -36,7 +36,7 @@ func TestArrayImageRoundtrip(t *testing.T) {
 	runArray(t, db, "INSERT INTO t VALUES (1, ARRAY[10, 20, 30], ARRAY['a', 'b'])")
 	runArray(t, db, "INSERT INTO t VALUES (2, ARRAY[1, NULL, 3], '{}')")
 	runArray(t, db, "INSERT INTO t VALUES (3, NULL, NULL)")
-	image, err := db.ToImage(4096, 1)
+	image, err := db.toImage(4096, 1)
 	if err != nil {
 		t.Fatalf("serialize: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestArrayOfCompositeImageRoundtrip(t *testing.T) {
 	runArray(t, db, `INSERT INTO t VALUES (1, '{"(Main,90210)","(Side,5)"}')`)
 	runArray(t, db, `INSERT INTO t VALUES (2, '{"(Main,)",NULL}')`)
 	runArray(t, db, "INSERT INTO t VALUES (3, NULL)")
-	image, err := db.ToImage(4096, 1)
+	image, err := db.toImage(4096, 1)
 	if err != nil {
 		t.Fatalf("serialize: %v", err)
 	}

@@ -35,7 +35,7 @@ func TestRuntimeTextToDateNullPropagates(t *testing.T) {
 	db := dbWith(t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, s text)",
 		"INSERT INTO t VALUES (1, NULL)")
-	if v := castAt(t, db, "s :: date", 1); v.Kind != ValNull {
+	if v := castAt(t, db, "s :: date", 1); v.kind != ValNull {
 		t.Fatalf("NULL::date = %v, want NULL", v)
 	}
 }

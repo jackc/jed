@@ -27,7 +27,7 @@ func TestTextCastIsExplicitOnly(t *testing.T) {
 	if _, err := queryOutcome(db, "INSERT INTO t SELECT 1, 42::text", nil); err != nil {
 		t.Fatal(err)
 	}
-	if v := castOne(t, db, "SELECT s FROM t WHERE s = 42::text"); v.Kind != ValText || v.str() != "42" {
+	if v := castOne(t, db, "SELECT s FROM t WHERE s = 42::text"); v.kind != ValText || v.str() != "42" {
 		t.Fatalf("s = %v, want text 42", v)
 	}
 }
@@ -60,7 +60,7 @@ func TestParamCastToTextDeclaresText(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%q: %v", c.sql, err)
 		}
-		if got := out.Rows[0][0]; got.Kind != c.want.Kind || got.Render() != c.want.Render() {
+		if got := out.Rows[0][0]; got.kind != c.want.kind || got.String() != c.want.String() {
 			t.Fatalf("%q: got %v, want %v", c.sql, got, c.want)
 		}
 	}

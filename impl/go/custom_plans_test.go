@@ -67,7 +67,7 @@ func TestCustomPlanKeyLookupPlannedOnce(t *testing.T) {
 		t.Fatal("a full-key equality is value-blind and cached")
 	}
 	r2, c2 := drainValues(t, s, stmt, &stmt.sc, IntValue(900))
-	if len(r2) != 1 || r2[0][0].Int != 900 || c2 != c1 {
+	if len(r2) != 1 || r2[0][0].num != 900 || c2 != c1 {
 		t.Fatalf("second lookup: %v cost %d (first %d)", r2, c2, c1)
 	}
 	if stmt.sc.p.Load() != entry {
@@ -231,7 +231,7 @@ func TestCustomPlanLimitOffsetParameterIsSensitive(t *testing.T) {
 	ids := func(rows [][]Value) []int64 {
 		out := []int64{}
 		for _, r := range rows {
-			out = append(out, r[0].Int)
+			out = append(out, r[0].num)
 		}
 		return out
 	}

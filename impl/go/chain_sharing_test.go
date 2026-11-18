@@ -58,7 +58,7 @@ func renderedRows(t *testing.T, db dbHandle, sql string) [][]string {
 	for _, r := range queryRows(t, db, sql) {
 		row := make([]string, len(r))
 		for i, v := range r {
-			row[i] = v.Render()
+			row[i] = v.String()
 		}
 		out = append(out, row)
 	}
@@ -265,7 +265,7 @@ func TestChainSharingKeptChainsStayExclusive(t *testing.T) {
 		if err := simCheckLive(host); err != nil {
 			t.Fatalf("phase %d: live check: %v", i, err)
 		}
-		txid := host.Txid()
+		txid := host.txid()
 		s.Close()
 		if err := host.Close(); err != nil {
 			t.Fatal(err)

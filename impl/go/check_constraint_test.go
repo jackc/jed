@@ -227,7 +227,7 @@ func TestCheckTwoPhaseAndDefaults(t *testing.T) {
 		t.Fatalf("update = %s, want 23514", code)
 	}
 	rows := db.rowsInKeyOrder("t")
-	if len(rows) != 2 || rows[0][0].Int != 1 || rows[1][0].Int != 2 {
+	if len(rows) != 2 || rows[0][0].num != 1 || rows[1][0].num != 2 {
 		t.Fatalf("two-phase UPDATE changed rows: %v", rows)
 	}
 	// An UPDATE that passes every check applies.
@@ -316,7 +316,7 @@ func TestCheckRoundTripsThroughOnDiskImage(t *testing.T) {
 			"CHECK (note = 'ok' OR note = 'a''b'))",
 		"INSERT INTO t VALUES (1, 5, 1.00, 'ok'), (2, NULL, 9999.99, 'a''b'), (3, 100, 0.50, 'ok')",
 	)
-	image, err := db.ToImage(256, 1)
+	image, err := db.toImage(256, 1)
 	if err != nil {
 		t.Fatalf("ToImage: %v", err)
 	}
@@ -349,7 +349,7 @@ func TestCheckRoundTripsThroughOnDiskImage(t *testing.T) {
 	mustExecCheck(t, loaded, "INSERT INTO t VALUES (4, 1, 1.00, 'a''b')")
 	// A second generation (load → image → load) is byte-stable: the text is written back
 	// verbatim.
-	image2, err := loaded.ToImage(256, 1)
+	image2, err := loaded.toImage(256, 1)
 	if err != nil {
 		t.Fatalf("ToImage 2: %v", err)
 	}

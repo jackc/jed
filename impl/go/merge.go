@@ -790,7 +790,7 @@ func (db *engine) executeMergeTarget(written *mergeStmt, params []Value, ctx cte
 				if err != nil {
 					return err
 				}
-				if a.notNull && raw.Kind == ValNull {
+				if a.notNull && raw.kind == ValNull {
 					if nullCol < 0 {
 						nullCol = a.idx
 					}
@@ -823,9 +823,9 @@ func (db *engine) executeMergeTarget(written *mergeStmt, params []Value, ctx cte
 			// every other deferred value is resolved, unmetered.
 			for i := range newRow {
 				carried := !assigned[i] && !slices.Contains(pkMembers, i)
-				if sv := stored[i]; carried && sv.Kind == ValUnfetched && sv.unfetched().Form != 0x00 {
+				if sv := stored[i]; carried && sv.kind == valUnfetched && sv.unfetched().Form != 0x00 {
 					newRow[i] = sv
-				} else if newRow[i].Kind == ValUnfetched {
+				} else if newRow[i].kind == valUnfetched {
 					v, err := store.resolveValue(i, newRow[i].unfetched())
 					if err != nil {
 						return err

@@ -149,7 +149,7 @@ func TestSavepointsWorkInsideUpdateClosure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Rows) != 2 || out.Rows[0][0].Int != 1 || out.Rows[1][0].Int != 3 {
+	if len(out.Rows) != 2 || out.Rows[0][0].num != 1 || out.Rows[1][0].num != 3 {
 		t.Fatalf("rows = %v want [1 3]", out.Rows)
 	}
 }

@@ -28,7 +28,7 @@ func selectIDs(t *testing.T, db *engine) []int64 {
 	rows := queryRows(t, db, "SELECT id FROM t")
 	out := make([]int64, len(rows))
 	for i, r := range rows {
-		out[i] = r[0].Int
+		out[i] = r[0].num
 	}
 	return out
 }
@@ -53,7 +53,7 @@ func TestSingleRowCommitAppendsOnlyTheDirtyPath(t *testing.T) {
 	}
 
 	// The whole tree spans many pages; a from-scratch image (no leaks) measures it.
-	whole, err := db.ToImage(db.PageSize(), db.Txid())
+	whole, err := db.toImage(db.PageSize(), db.txid())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func TestSingleRowCommitAppendsOnlyTheDirtyPath(t *testing.T) {
 	// inserts (each insert copies its root→leaf path + catalog and reclaims the pages the prior root
 	// abandoned), NOT 30× the dirty-path size — so the committed pageCount is a small multiple of the
 	// whole (garbage-free) tree, proving the commit is incremental, not a whole-tree rewrite.
-	before := int64(db.PageCount())
+	before := int64(db.pageHighWater())
 	if before > 3*wholePages {
 		t.Fatalf("within-session reclamation bounds the high-water at ~2× the %d-page tree, not monotonic churn growth (got %d)", wholePages, before)
 	}
@@ -75,7 +75,7 @@ func TestSingleRowCommitAppendsOnlyTheDirtyPath(t *testing.T) {
 	// handful of pages, and often not at all. We track the committed pageCount delta, not the file
 	// length — the file is preallocated in chunks ahead of the high-water (spec/design/pager.md §7).
 	mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (31, 'row-31-%s')", pad))
-	appended := int64(db.PageCount()) - before
+	appended := int64(db.pageHighWater()) - before
 	if appended > 8 {
 		t.Fatalf("the dirty path is bounded by tree height, not table size, and reuses free pages, got %d", appended)
 	}
@@ -174,8 +174,8 @@ func TestMetaSlotsAlternateAcrossCommits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if db.Txid() != 3 {
-		t.Fatalf("open adopts the highest valid txid, got %d", db.Txid())
+	if db.txid() != 3 {
+		t.Fatalf("open adopts the highest valid txid, got %d", db.txid())
 	}
 }
 
@@ -211,8 +211,8 @@ func TestTornLatestCommitFallsBackToPriorSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if db.Txid() != 3 {
-		t.Fatalf("should fall back to the prior committed snapshot, got txid %d", db.Txid())
+	if db.txid() != 3 {
+		t.Fatalf("should fall back to the prior committed snapshot, got txid %d", db.txid())
 	}
 	got := selectIDs(t, db)
 	if len(got) != 1 || got[0] != 1 {
@@ -250,10 +250,10 @@ func TestCommitPreallocatesFileGrowthGeometrically(t *testing.T) {
 	}
 	mustExec(t, db, "COMMIT")
 
-	logical := int64(db.PageCount()) * int64(db.PageSize())
+	logical := int64(db.pageHighWater()) * int64(db.PageSize())
 	physical := fileSize(t, path)
-	if db.PageCount() <= 128 {
-		t.Fatalf("the batch should span more than one chunk's worth of pages, got %d", db.PageCount())
+	if db.pageHighWater() <= 128 {
+		t.Fatalf("the batch should span more than one chunk's worth of pages, got %d", db.pageHighWater())
 	}
 	// Preallocation runs ahead of the committed image (so steady-state commits are metadata-free) but
 	// is bounded by ≈2× it — the geometric policy, not a fixed 1 MiB multiple.
@@ -314,7 +314,7 @@ func TestSmallDatabaseFileStaysProportional(t *testing.T) {
 	for i := 0; i < 30; i++ {
 		mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", i, i))
 	}
-	logical := int64(db.PageCount()) * int64(db.PageSize())
+	logical := int64(db.pageHighWater()) * int64(db.PageSize())
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}

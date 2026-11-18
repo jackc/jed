@@ -143,7 +143,7 @@ func hashJoinRowKey(row storedRow, indices []int, types []dataType, unit int64, 
 		if err := meter.Step(); err != nil {
 			return nil, false, err
 		}
-		if row[index].Kind == ValNull {
+		if row[index].kind == ValNull {
 			meter.Charge(unit)
 			present = false
 			continue

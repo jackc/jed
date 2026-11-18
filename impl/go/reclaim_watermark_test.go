@@ -24,7 +24,7 @@ func countOf(db *Database, rd *Session) (int64, error) {
 	if !rows.Next() {
 		return 0, fmt.Errorf("no row (rows.Err=%v)", rows.Err())
 	}
-	return rows.Row()[0].Int, nil
+	return rows.Row()[0].num, nil
 }
 
 func TestFallbackReaderSnapshotIsolationUnderReclamation(t *testing.T) {

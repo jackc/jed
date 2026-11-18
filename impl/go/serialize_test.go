@@ -57,7 +57,7 @@ func TestSerializeRoundTripKeepsRowsCostsAndVersion(t *testing.T) {
 	if len(data)%compactPage != 0 || uint64(len(data)) >= uint64(db.core.storage.pageCount)*compactPage {
 		t.Fatalf("export of %d bytes is not a clean image (page count %d)", len(data), db.core.storage.pageCount)
 	}
-	image, err := db.ToImage(compactPage, db.Version())
+	image, err := db.toImage(compactPage, db.Version())
 	if err != nil || !bytes.Equal(data, image) {
 		t.Fatalf("export differs from the from-scratch image (%v)", err)
 	}
@@ -120,7 +120,7 @@ func TestSerializeEmptyDatabase(t *testing.T) {
 		t.Fatalf("empty export is %d bytes, want two meta slots and the catalog", len(data))
 	}
 	cp := mustDeserialize(t, data, DeserializeOptions{})
-	if rows, _ := rowsAndCost(t, cp, "SELECT count(*) FROM jed_tables"); cp.Version() != 0 || rows[0][0].Int != 0 {
+	if rows, _ := rowsAndCost(t, cp, "SELECT count(*) FROM jed_tables"); cp.Version() != 0 || rows[0][0].num != 0 {
 		t.Fatalf("empty copy: version %d", cp.Version())
 	}
 }
@@ -162,7 +162,7 @@ func TestSerializeAttachmentsByName(t *testing.T) {
 	serializeExec(t, db, "CREATE TABLE scratch.u (id i32 PRIMARY KEY)")
 	serializeExec(t, db, "INSERT INTO scratch.u VALUES (7)")
 	cp := mustDeserialize(t, mustSerialize(t, db, "scratch"), DeserializeOptions{})
-	if rows, _ := rowsAndCost(t, cp, "SELECT id FROM u"); len(rows) != 1 || rows[0][0].Int != 7 {
+	if rows, _ := rowsAndCost(t, cp, "SELECT id FROM u"); len(rows) != 1 || rows[0][0].num != 7 {
 		t.Fatalf("attachment copy rows %v", rows)
 	}
 	for _, name := range []string{"nope", "temp"} {

@@ -70,7 +70,7 @@ func TestTempOnCommitZeroFileWrites(t *testing.T) {
 	}
 	defer db.Close()
 	mustExec(t, db, "CREATE TABLE p (id i32 PRIMARY KEY)")
-	baseTxid, basePages := db.Txid(), db.PageCount()
+	baseTxid, basePages := db.txid(), db.pageHighWater()
 
 	mustExec(t, db, "CREATE TEMP TABLE d (id i32 PRIMARY KEY, pad text) ON COMMIT DELETE ROWS")
 	for i := 1; i <= 20; i++ {
@@ -82,9 +82,9 @@ func TestTempOnCommitZeroFileWrites(t *testing.T) {
 	mustExec(t, db, "INSERT INTO y VALUES (1)")
 	mustExec(t, db, "INSERT INTO d VALUES (1, 'x')")
 	mustExec(t, db, "COMMIT")
-	if db.Txid() != baseTxid || db.PageCount() != basePages {
+	if db.txid() != baseTxid || db.pageHighWater() != basePages {
 		t.Fatalf("ON COMMIT actions touched the file: txid %d->%d, pageCount %d->%d",
-			baseTxid, db.Txid(), basePages, db.PageCount())
+			baseTxid, db.txid(), basePages, db.pageHighWater())
 	}
 	if n := len(queryRows(t, db, "SELECT id FROM d")); n != 0 {
 		t.Fatalf("want an empty d, got %d rows", n)

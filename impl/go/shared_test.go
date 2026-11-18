@@ -24,10 +24,10 @@ func readCount(t *testing.T, r *Session) int64 {
 		t.Fatalf("count query returned no row")
 	}
 	v := rows.Row()[0]
-	if v.Kind != ValInt {
-		t.Fatalf("expected an int count, got kind %v", v.Kind)
+	if v.kind != ValInt {
+		t.Fatalf("expected an int count, got kind %v", v.kind)
 	}
-	return v.Int
+	return v.num
 }
 
 // seeded builds a shared db with table t holding the given ids, committed via a write handle.
@@ -200,13 +200,13 @@ func TestSharedOldestLiveTxidTracksPinnedReaders(t *testing.T) {
 	if db.Version() != 1 {
 		t.Fatalf("version = %d, want 1", db.Version())
 	}
-	if db.OldestLiveTxid() != 1 { // no readers ⇒ the committed version
-		t.Fatalf("oldest (no readers) = %d, want 1", db.OldestLiveTxid())
+	if db.oldestLiveTxid() != 1 { // no readers ⇒ the committed version
+		t.Fatalf("oldest (no readers) = %d, want 1", db.oldestLiveTxid())
 	}
 
 	r1 := db.readSession() // pins version 1
-	if db.OldestLiveTxid() != 1 {
-		t.Fatalf("oldest (r1 pinned v1) = %d, want 1", db.OldestLiveTxid())
+	if db.oldestLiveTxid() != 1 {
+		t.Fatalf("oldest (r1 pinned v1) = %d, want 1", db.oldestLiveTxid())
 	}
 
 	w := db.writeSession()
@@ -219,23 +219,23 @@ func TestSharedOldestLiveTxidTracksPinnedReaders(t *testing.T) {
 	if db.Version() != 2 {
 		t.Fatalf("version = %d, want 2", db.Version())
 	}
-	if db.OldestLiveTxid() != 1 { // r1 still pins v1 ⇒ watermark held at 1
-		t.Fatalf("oldest (r1 still pinned) = %d, want 1", db.OldestLiveTxid())
+	if db.oldestLiveTxid() != 1 { // r1 still pins v1 ⇒ watermark held at 1
+		t.Fatalf("oldest (r1 still pinned) = %d, want 1", db.oldestLiveTxid())
 	}
 
 	r2 := db.readSession() // pins version 2
-	if db.OldestLiveTxid() != 1 {
-		t.Fatalf("oldest (r1+r2) = %d, want 1", db.OldestLiveTxid())
+	if db.oldestLiveTxid() != 1 {
+		t.Fatalf("oldest (r1+r2) = %d, want 1", db.oldestLiveTxid())
 	}
 
 	r1.Close()
-	if db.OldestLiveTxid() != 2 { // r1 gone ⇒ watermark advances to r2's version
-		t.Fatalf("oldest (r1 closed) = %d, want 2", db.OldestLiveTxid())
+	if db.oldestLiveTxid() != 2 { // r1 gone ⇒ watermark advances to r2's version
+		t.Fatalf("oldest (r1 closed) = %d, want 2", db.oldestLiveTxid())
 	}
 
 	r2.Close()
-	if db.OldestLiveTxid() != 2 { // no readers ⇒ the committed version
-		t.Fatalf("oldest (none) = %d, want 2", db.OldestLiveTxid())
+	if db.oldestLiveTxid() != 2 { // no readers ⇒ the committed version
+		t.Fatalf("oldest (none) = %d, want 2", db.oldestLiveTxid())
 	}
 }
 

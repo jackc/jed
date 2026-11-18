@@ -75,7 +75,7 @@ func TestExplainOwnsRenderCost(t *testing.T) {
 		t.Fatalf("EXPLAIN render cost %d != plan-row count %d", out.Cost, len(out.Rows))
 	}
 	// The Analyze root (row 0) reports the inner cost, which exceeds the render cost here.
-	if got := out.Rows[0][1].Render(); got != "Analyze" {
+	if got := out.Rows[0][1].String(); got != "Analyze" {
 		t.Fatalf("root node = %q, want Analyze", got)
 	}
 }
@@ -86,5 +86,5 @@ func scalarInt(t *testing.T, db dbHandle, sql string) int64 {
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
-	return out.Rows[0][0].Int
+	return out.Rows[0][0].num
 }

@@ -80,7 +80,7 @@ func (c *catColumn) defaultText() (text string, ok bool) {
 	if c.DefaultExpr != nil {
 		return c.DefaultExpr.ExprText, true
 	}
-	if c.Default == nil || c.Default.Kind == ValNull {
+	if c.Default == nil || c.Default.kind == ValNull {
 		return "", false
 	}
 	return c.Default.sqlLiteral(), true

@@ -183,7 +183,7 @@ func repeatText(s string, n int64, m *costMeter) (string, error) {
 // chargeOutput charges a growth kernel's constructed result (spec/design/cost.md §8.1):
 // scalar_byte × payload(result), guarded before the value is returned. A NULL result charges nothing.
 func chargeOutput(m *costMeter, out Value) error {
-	if out.Kind == ValNull {
+	if out.kind == ValNull {
 		return nil
 	}
 	m.Charge(costs.ScalarByte * memPayloadBytes(out))
@@ -276,7 +276,7 @@ func replaceText(s, from, to string, m *costMeter) (string, error) {
 // cost.md §8.1) and the compile. A NULL pattern or escape is NULL before any translation; a NULL
 // subject is NULL after it, so it does not hide a bad escape. The result is a slice of the subject.
 func similarSubstring(e *rExpr, vals []Value, m *costMeter) (Value, error) {
-	if vals[1].Kind == ValNull || vals[2].Kind == ValNull {
+	if vals[1].kind == ValNull || vals[2].kind == ValNull {
 		return NullValue(), nil
 	}
 	sm := e.rxSimilarMatcher
@@ -305,7 +305,7 @@ func similarSubstring(e *rExpr, vals []Value, m *costMeter) (Value, error) {
 			return Value{}, err
 		}
 	}
-	if vals[0].Kind == ValNull {
+	if vals[0].kind == ValNull {
 		return NullValue(), nil
 	}
 	chars := []rune(vals[0].str())
@@ -1057,8 +1057,8 @@ func minScaleOf(d Decimal) uint32 {
 	if d.IsZero() {
 		return 0
 	}
-	t := d.Scale
-	for t > 0 && d.RoundToScale(t-1).CmpValue(d) == 0 {
+	t := d.scale
+	for t > 0 && d.roundToScale(t-1).Cmp(d) == 0 {
 		t--
 	}
 	return t
@@ -1069,21 +1069,21 @@ func minScaleOf(d Decimal) uint32 {
 // truncated decimal quotient (all-positive in range, so trunc == floor). Returns the raw index (the
 // caller range-checks it to int4). count > 0 is checked by the caller.
 func widthBucketNumeric(op, low, high Decimal, count int64) (int64, error) {
-	cmpBounds := low.CmpValue(high)
+	cmpBounds := low.Cmp(high)
 	if cmpBounds == 0 {
 		return 0, widthBucketErr("lower bound cannot equal upper bound")
 	}
 	countDec := decimalFromInt64(count)
 	bucket := func(hiNum, loNum, hiDen, loDen Decimal) (int64, error) {
 		// Only the bucket index is a result value; intermediate values may exceed numeric's cap.
-		num := hiNum.AddUncapped(loNum.Negate()).mulExact(countDec)
-		den := hiDen.AddUncapped(loDen.Negate())
+		num := hiNum.addUncapped(loNum.negate()).mulExact(countDec)
+		den := hiDen.addUncapped(loDen.negate())
 		// The quotient lies in [0, count). Exact-product bisection avoids long division
 		// over a near-limit decimal denominator.
 		left, right := int64(0), count
 		for right-left > 1 {
 			mid := left + (right-left)/2
-			if den.mulExact(decimalFromInt64(mid)).CmpValue(num) <= 0 {
+			if den.mulExact(decimalFromInt64(mid)).Cmp(num) <= 0 {
 				left = mid
 			} else {
 				right = mid
@@ -1092,19 +1092,19 @@ func widthBucketNumeric(op, low, high Decimal, count int64) (int64, error) {
 		return left + 1, nil
 	}
 	if cmpBounds < 0 { // ascending low < high
-		if op.CmpValue(low) < 0 {
+		if op.Cmp(low) < 0 {
 			return 0, nil
 		}
-		if op.CmpValue(high) >= 0 {
+		if op.Cmp(high) >= 0 {
 			return satAdd1(count), nil
 		}
 		return bucket(op, low, high, low)
 	}
 	// descending low > high
-	if op.CmpValue(low) > 0 {
+	if op.Cmp(low) > 0 {
 		return 0, nil
 	}
-	if op.CmpValue(high) <= 0 {
+	if op.Cmp(high) <= 0 {
 		return satAdd1(count), nil
 	}
 	return bucket(low, op, low, high)
@@ -1201,10 +1201,10 @@ func intervalScaleResult(op binaryOp, lt, rt rtKind) (st scalarType, isScale boo
 
 // factorToFraction returns a numeric factor value as an exact fraction (num, den) with den > 0.
 func factorToFraction(v Value) (*big.Int, *big.Int, error) {
-	if v.Kind == ValInt {
-		return big.NewInt(v.Int), big.NewInt(1), nil
+	if v.kind == ValInt {
+		return big.NewInt(v.num), big.NewInt(1), nil
 	}
-	return parseFactorDecimal(v.decimal().Render())
+	return parseFactorDecimal(v.decimal().String())
 }
 
 // zonelessIntervalShift reports whether a timestamptz ± interval pair (either order) never consults
@@ -1936,9 +1936,9 @@ func coerceStringLiteral(s string, target scalarType, tm typmod, iz *inputZone) 
 			return nil, resolvedType{}, err
 		}
 		if decTypmod != nil {
-			d, err = d.CoerceToTypmod(uint32(decTypmod.Precision), uint32(decTypmod.Scale))
+			d, err = d.coerceToTypmod(uint32(decTypmod.Precision), uint32(decTypmod.Scale))
 		} else {
-			d, err = d.CheckCap()
+			d, err = d.checkCap()
 		}
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -2390,12 +2390,12 @@ func requireTextOrNull(t resolvedType) error {
 // timezone unit each), the exact UTF-8 size computed and capped at maxResultChars (54000), then
 // charged and reserved before the result is joined.
 func arrayToStringValue(vals []Value, zone zoneRef, m *costMeter) (Value, error) {
-	if vals[0].Kind == ValNull || vals[1].Kind == ValNull {
+	if vals[0].kind == ValNull || vals[1].kind == ValNull {
 		return NullValue(), nil
 	}
 	a := vals[0].arrayVal()
 	sep := vals[1].str()
-	hasNull := len(vals) > 2 && vals[2].Kind != ValNull
+	hasNull := len(vals) > 2 && vals[2].kind != ValNull
 	nullString := ""
 	if hasNull {
 		nullString = vals[2].str()
@@ -2421,11 +2421,11 @@ func arrayToStringValue(vals []Value, zone zoneRef, m *costMeter) (Value, error)
 	for _, e := range a.Elements {
 		var item string
 		switch {
-		case e.Kind == ValNull && !hasNull:
+		case e.kind == ValNull && !hasNull:
 			continue
-		case e.Kind == ValNull:
+		case e.kind == ValNull:
 			item = nullString
-		case e.Kind == ValBool:
+		case e.kind == ValBool:
 			// PostgreSQL's boolout spelling, not the bool → text cast's true/false.
 			item = "f"
 			if e.boolVal() {
@@ -2463,17 +2463,17 @@ func arrayToStringValue(vals []Value, zone zoneRef, m *costMeter) (Value, error)
 // equal to a non-NULL null_string becomes a NULL element. A NULL s is NULL. Not charged beyond the
 // call's operator_eval: the pieces partition s (cost.md §8.1).
 func stringToArrayValue(vals []Value) Value {
-	if vals[0].Kind == ValNull {
+	if vals[0].kind == ValNull {
 		return NullValue()
 	}
 	s := vals[0].str()
-	hasNull := len(vals) > 2 && vals[2].Kind != ValNull
+	hasNull := len(vals) > 2 && vals[2].kind != ValNull
 	if s == "" {
 		return arrayValueOf(emptyArray())
 	}
 	var pieces []string
 	switch {
-	case vals[1].Kind == ValNull:
+	case vals[1].kind == ValNull:
 		for _, r := range s {
 			pieces = append(pieces, string(r))
 		}

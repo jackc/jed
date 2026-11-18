@@ -51,8 +51,8 @@ func TestWindowRunningAggregateOverPersistedColumn(t *testing.T) {
 	var want int64
 	for i, r := range rows {
 		want += int64((i + 1) * 10)
-		if r[1].Kind != ValInt || r[1].Int != want {
-			t.Fatalf("row %d running sum = %s (kind %d), want %d — operand column read as NULL?", i+1, r[1].Render(), r[1].Kind, want)
+		if r[1].kind != ValInt || r[1].num != want {
+			t.Fatalf("row %d running sum = %s (kind %d), want %d — operand column read as NULL?", i+1, r[1].String(), r[1].kind, want)
 		}
 	}
 }
@@ -74,8 +74,8 @@ func TestWindowTopNOverPersistedColumn(t *testing.T) {
 	var want int64
 	for i, r := range rows {
 		want += int64((i + 1) * 10)
-		if r[1].Kind != ValInt || r[1].Int != want {
-			t.Fatalf("row %d running sum = %s (kind %d), want %d — operand column read as NULL from disk?", i+1, r[1].Render(), r[1].Kind, want)
+		if r[1].kind != ValInt || r[1].num != want {
+			t.Fatalf("row %d running sum = %s (kind %d), want %d — operand column read as NULL from disk?", i+1, r[1].String(), r[1].kind, want)
 		}
 	}
 }
@@ -95,15 +95,15 @@ func TestWindowAggregateFilterAndOffsetOverPersistedColumn(t *testing.T) {
 		v    int64
 	}{{true, 0}, {false, 10}, {false, 20}}
 	for i, r := range rows {
-		if r[1].Kind != ValInt || r[1].Int != wantMax[i] {
-			t.Fatalf("row %d moving max = %s, want %d", i+1, r[1].Render(), wantMax[i])
+		if r[1].kind != ValInt || r[1].num != wantMax[i] {
+			t.Fatalf("row %d moving max = %s, want %d", i+1, r[1].String(), wantMax[i])
 		}
 		if wantLag[i].null {
-			if r[2].Kind != ValNull {
-				t.Fatalf("row %d lag = %s, want NULL", i+1, r[2].Render())
+			if r[2].kind != ValNull {
+				t.Fatalf("row %d lag = %s, want NULL", i+1, r[2].String())
 			}
-		} else if r[2].Kind != ValInt || r[2].Int != wantLag[i].v {
-			t.Fatalf("row %d lag = %s, want %d", i+1, r[2].Render(), wantLag[i].v)
+		} else if r[2].kind != ValInt || r[2].num != wantLag[i].v {
+			t.Fatalf("row %d lag = %s, want %d", i+1, r[2].String(), wantLag[i].v)
 		}
 	}
 
@@ -116,11 +116,11 @@ func TestWindowAggregateFilterAndOffsetOverPersistedColumn(t *testing.T) {
 	}{{true, 0}, {false, 20}, {false, 20}, {false, 60}}
 	for i, r := range f {
 		if wantF[i].null {
-			if r[1].Kind != ValNull {
-				t.Fatalf("filter row %d = %s, want NULL", i+1, r[1].Render())
+			if r[1].kind != ValNull {
+				t.Fatalf("filter row %d = %s, want NULL", i+1, r[1].String())
 			}
-		} else if r[1].Kind != ValInt || r[1].Int != wantF[i].v {
-			t.Fatalf("filter row %d = %s, want %d", i+1, r[1].Render(), wantF[i].v)
+		} else if r[1].kind != ValInt || r[1].num != wantF[i].v {
+			t.Fatalf("filter row %d = %s, want %d", i+1, r[1].String(), wantF[i].v)
 		}
 	}
 }

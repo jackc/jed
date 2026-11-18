@@ -421,7 +421,7 @@ func orphanedLeafIDs(pageIdx pageRef, shared map[uint32]bool, paging *sharedPagi
 			if err != nil {
 				return nil, err
 			}
-			if v.Kind != ValUnfetched {
+			if v.kind != valUnfetched {
 				continue
 			}
 			switch u := v.unfetched(); u.Form {

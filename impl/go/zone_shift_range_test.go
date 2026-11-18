@@ -115,7 +115,7 @@ func TestZoneShiftOntoInfinitySentinelTraps(t *testing.T) {
 		t.Fatal(err)
 	}
 	v := castAt(t, db, "(tz - INTERVAL '1 microsecond') :: timestamp", 3)
-	if v.Kind != ValTimestamp || v.Int != math.MaxInt64-1 {
+	if v.kind != ValTimestamp || v.num != math.MaxInt64-1 {
 		t.Fatalf("got %v, want timestamp MaxInt64-1", v)
 	}
 }
@@ -139,7 +139,7 @@ func TestZoneShiftInwardSucceeds(t *testing.T) {
 		if err := db.SetTimeZone(zone); err != nil {
 			t.Fatal(err)
 		}
-		if v := castAt(t, db, expr, id); v.Kind != want {
+		if v := castAt(t, db, expr, id); v.kind != want {
 			t.Fatalf("%s %s (row %d): got %v", zone, expr, id, v)
 		}
 	}

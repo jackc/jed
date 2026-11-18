@@ -23,9 +23,9 @@ func seqOneInt(t *testing.T, db dbHandle, sql string) *int64 {
 		t.Fatalf("%q: expected a query, got kind %v", sql, out.Kind)
 	}
 	v := out.Rows[0][0]
-	switch v.Kind {
+	switch v.kind {
 	case ValInt:
-		n := v.Int
+		n := v.num
 		return &n
 	case ValNull:
 		return nil
@@ -294,10 +294,10 @@ func seqQueryRows(t *testing.T, db dbHandle, sql string) [][]int64 {
 	for i, r := range out.Rows {
 		row := make([]int64, len(r))
 		for j, v := range r {
-			if v.Kind != ValInt {
+			if v.kind != ValInt {
 				t.Fatalf("%q: row %d col %d expected int, got %v", sql, i, j, v)
 			}
-			row[j] = v.Int
+			row[j] = v.num
 		}
 		rows[i] = row
 	}

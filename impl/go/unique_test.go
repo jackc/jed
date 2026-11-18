@@ -34,10 +34,10 @@ func uqIds(t *testing.T, db dbHandle, sql string) []int64 {
 	o := uqRun(t, db, sql)
 	out := make([]int64, 0, len(o.Rows))
 	for _, r := range o.Rows {
-		if r[0].Kind != ValInt {
+		if r[0].kind != ValInt {
 			t.Fatalf("expected an int id, got %v", r[0])
 		}
-		out = append(out, r[0].Int)
+		out = append(out, r[0].num)
 	}
 	return out
 }
@@ -345,7 +345,7 @@ func TestUniqueRoundTrip(t *testing.T) {
 	uqRun(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE, w i32)")
 	uqRun(t, db, "CREATE INDEX plain ON t (w)")
 	uqRun(t, db, "INSERT INTO t VALUES (1, 10, 100), (2, NULL, 100)")
-	image, err := db.ToImage(8192, 1)
+	image, err := db.toImage(8192, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,7 +360,7 @@ func TestUniqueRoundTrip(t *testing.T) {
 		t.Fatalf("loaded enforcement = %s", code)
 	}
 	uqRun(t, loaded, "INSERT INTO t VALUES (3, NULL, 1)")
-	again, err := db.ToImage(8192, 1)
+	again, err := db.toImage(8192, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

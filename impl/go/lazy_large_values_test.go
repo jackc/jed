@@ -124,8 +124,8 @@ func TestLazyChainsAreReadOnlyWhenTouched(t *testing.T) {
 	if rows := queryRows(t, db, "SELECT id FROM t"); len(rows) != 4 {
 		t.Fatalf("SELECT id: got %d rows, want 4", len(rows))
 	}
-	if rows := queryRows(t, db, "SELECT count(*) FROM t"); rows[0][0].Render() != "4" {
-		t.Fatalf("count(*): got %s", rows[0][0].Render())
+	if rows := queryRows(t, db, "SELECT count(*) FROM t"); rows[0][0].String() != "4" {
+		t.Fatalf("count(*): got %s", rows[0][0].String())
 	}
 
 	// Touching the spilled column reads the chain: the corruption surfaces as XX001 —
@@ -141,10 +141,10 @@ func TestLazyChainsAreReadOnlyWhenTouched(t *testing.T) {
 	}
 
 	// The inline-compressed and plain rows live in the (uncorrupted) leaf: still exact.
-	if rows := queryRows(t, db, "SELECT body FROM t WHERE id = 3"); rows[0][0].Render() != strings.Repeat("x", 600) {
+	if rows := queryRows(t, db, "SELECT body FROM t WHERE id = 3"); rows[0][0].String() != strings.Repeat("x", 600) {
 		t.Fatal("inline-compressed value should decode from the leaf")
 	}
-	if rows := queryRows(t, db, "SELECT body FROM t WHERE id = 4"); rows[0][0].Render() != "tiny" {
+	if rows := queryRows(t, db, "SELECT body FROM t WHERE id = 4"); rows[0][0].String() != "tiny" {
 		t.Fatal("plain inline value should decode from the leaf")
 	}
 }
@@ -174,7 +174,7 @@ func TestLazyValuesRoundTripExactly(t *testing.T) {
 		"tiny",
 	}
 	for i, w := range want {
-		if rows[i][0].Render() != w {
+		if rows[i][0].String() != w {
 			t.Fatalf("row %d: lazy value did not round-trip", i+1)
 		}
 	}
@@ -214,10 +214,10 @@ func TestLazyUpdateOfOtherColumnsPreservesSpilledValues(t *testing.T) {
 	}
 	defer db.Close()
 	rows := queryRows(t, db, "SELECT body, n FROM t")
-	if rows[0][0].Render() != big || rows[0][1].Render() != "11" {
+	if rows[0][0].String() != big || rows[0][1].String() != "11" {
 		t.Fatal("row 1's spilled body or updated n did not survive the rewrite")
 	}
-	if rows[1][0].Render() != "small" || rows[1][1].Render() != "99" {
+	if rows[1][0].String() != "small" || rows[1][1].String() != "99" {
 		t.Fatal("row 2 did not survive the rewrite")
 	}
 }

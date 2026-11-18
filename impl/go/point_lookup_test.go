@@ -48,7 +48,7 @@ func TestPointLookupMultiLeaf(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0][0].Int != 500 {
+	if len(rows) != 1 || rows[0][0].num != 500 {
 		t.Errorf("RangeRows point bound got %v, want one row id=500", rows)
 	}
 
@@ -57,7 +57,7 @@ func TestPointLookupMultiLeaf(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Rows) != 1 || out.Rows[0][0].Int != 500 {
+	if len(out.Rows) != 1 || out.Rows[0][0].num != 500 {
 		t.Errorf("point lookup got %v, want [500]", out.Rows)
 	}
 	full, err := queryOutcome(db, "SELECT v FROM t", nil)
@@ -156,7 +156,7 @@ func TestLimitShortCircuitMultiLeaf(t *testing.T) {
 	dz := dbWith(t,
 		"CREATE TABLE z (id i32 PRIMARY KEY, c i32)",
 		"INSERT INTO z VALUES (1, 5), (2, 0), (3, 5)")
-	if rows := query(t, dz, "SELECT 100 / c FROM z LIMIT 1"); len(rows) != 1 || rows[0][0].Int != 20 {
+	if rows := query(t, dz, "SELECT 100 / c FROM z LIMIT 1"); len(rows) != 1 || rows[0][0].num != 20 {
 		t.Errorf("LIMIT 1 should produce only the safe first row (100/5=20), got %v", rows)
 	}
 	if _, err := queryOutcome(dz, "SELECT 100 / c FROM z LIMIT 2", nil); err == nil {
@@ -192,7 +192,7 @@ func TestMutationPushdownMultiLeaf(t *testing.T) {
 	if u.Cost > 50 {
 		t.Errorf("UPDATE point-lookup cost %d should be small", u.Cost)
 	}
-	if got := query(t, db, "SELECT v FROM t WHERE id = 700"); got[0][0].Int != -1 {
-		t.Errorf("row 700 should be updated to -1, got %v", got[0][0].Int)
+	if got := query(t, db, "SELECT v FROM t WHERE id = 700"); got[0][0].num != -1 {
+		t.Errorf("row 700 should be updated to -1, got %v", got[0][0].num)
 	}
 }

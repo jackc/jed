@@ -183,13 +183,13 @@ func scanRangeBound(s string, start int) (*string, int, bool) {
 // rangeElemCmp compares two element bound values of the same range element type (-1/0/1). The six
 // element types all store their orderable value in Int (integers/date/timestamps) or Dec (decimal).
 func rangeElemCmp(a, b Value) int {
-	if a.Kind == ValDecimal {
-		return a.decimal().CmpValue(*b.decimal())
+	if a.kind == ValDecimal {
+		return a.decimal().Cmp(*b.decimal())
 	}
 	switch {
-	case a.Int < b.Int:
+	case a.num < b.num:
 		return -1
-	case a.Int > b.Int:
+	case a.num > b.num:
 		return 1
 	default:
 		return 0
@@ -218,19 +218,19 @@ func elemMaxFinite(elem scalarType) int64 {
 // (dateNegInfinity / datePosInfinity). PG's daterange_canonical skips such a bound: it keeps the
 // inclusivity it was given rather than stepping the sentinel (ranges.md §4).
 func isInfiniteDateBound(v Value, elem scalarType) bool {
-	return elem == scalarDate && (v.Int == int64(dateNegInfinity) || v.Int == int64(datePosInfinity))
+	return elem == scalarDate && (v.num == int64(dateNegInfinity) || v.num == int64(datePosInfinity))
 }
 
 // incrementDiscrete steps a discrete bound value up by one unit (the canonicalization +1): an
 // integer +1 or a date +1 day. A step past the element domain traps 22003.
 func incrementDiscrete(v Value, elem scalarType) (Value, error) {
 	max := elemMaxFinite(elem)
-	if v.Int >= max {
+	if v.num >= max {
 		return Value{}, newError(NumericValueOutOfRange,
 			"value out of range for type "+elem.CanonicalName()).withDataType(elem.CanonicalName())
 	}
 	out := v
-	out.Int = v.Int + 1
+	out.num = v.num + 1
 	return out, nil
 }
 
@@ -447,10 +447,10 @@ func pushRangeBound(out []byte, elem scalarType, v *Value, inc bool, isLower boo
 // scalar subtypes (i32/i64/decimal/date/timestamp/timestamptz); the decimal stores its value in Dec
 // (decimal-order-preserving, §2.5), the rest in Int via the int-be-signflip / day / instant codec.
 func encodeRangeElem(elem scalarType, v Value) []byte {
-	if v.Kind == ValDecimal {
-		return v.decimal().EncodeKey()
+	if v.kind == ValDecimal {
+		return v.decimal().encodeKey()
 	}
-	return encodeInt(elem, v.Int)
+	return encodeInt(elem, v.num)
 }
 
 // --- boolean operators (RF3, spec/design/range-functions.md §3) -------------

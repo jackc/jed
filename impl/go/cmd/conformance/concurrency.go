@@ -487,7 +487,7 @@ func runScheduleSequential(steps []cStep, header []string) error {
 // expectValue reads the Database state a `expect <kind>` directive asserts.
 func expectValue(db *jed.Database, kind string) uint64 {
 	if kind == "oldest_live" {
-		return db.OldestLiveTxid()
+		return jed.OldestLiveTxidForTesting(db)
 	}
 	return db.Version() // "version"
 }

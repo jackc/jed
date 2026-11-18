@@ -119,22 +119,22 @@ func proverConstFromRExpr(e *rExpr) (proverConst, bool) {
 }
 
 func proverConstFromValue(v Value) (proverConst, bool) {
-	switch v.Kind {
+	switch v.kind {
 	case ValInt:
-		return proverConst{kind: pcInt, i: v.Int}, true
+		return proverConst{kind: pcInt, i: v.num}, true
 	case ValText:
 		return proverConst{kind: pcText, s: v.str()}, true
 	case ValDecimal:
 		return proverConst{kind: pcDecimal, dec: *v.decimal()}, true
 	case ValDate:
-		return proverConst{kind: pcDate, i: v.Int}, true
+		return proverConst{kind: pcDate, i: v.num}, true
 	case ValTimestamp:
-		return proverConst{kind: pcTimestamp, i: v.Int}, true
+		return proverConst{kind: pcTimestamp, i: v.num}, true
 	case ValTimestamptz:
-		return proverConst{kind: pcTimestamptz, i: v.Int}, true
+		return proverConst{kind: pcTimestamptz, i: v.num}, true
 	case ValBool:
 		b := int64(0)
-		if v.Int != 0 {
+		if v.num != 0 {
 			b = 1
 		}
 		return proverConst{kind: pcBool, i: b}, true
@@ -153,7 +153,7 @@ func (a proverConst) cmp(b proverConst) (int, bool) {
 	case pcText, pcUuid:
 		return strings.Compare(a.s, b.s), true
 	case pcDecimal:
-		return a.dec.CmpValue(b.dec), true
+		return a.dec.Cmp(b.dec), true
 	default:
 		switch {
 		case a.i < b.i:
@@ -363,7 +363,7 @@ func anyArrayPremise(w *rExpr) (operand *rExpr, elems []*proverConst, cOrder boo
 			return nil, nil, false, false
 		}
 		for _, v := range a.Elements {
-			if v.Kind == ValNull {
+			if v.kind == ValNull {
 				elems = append(elems, nil)
 				continue
 			}

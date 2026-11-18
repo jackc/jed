@@ -82,7 +82,7 @@ func run() error {
 		for rows.Next() {
 			count++
 			for _, value := range rows.Row() {
-				s := value.Render()
+				s := value.String()
 				add(strconv.Itoa(len(s)) + ":")
 				add(s)
 			}

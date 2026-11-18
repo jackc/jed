@@ -549,8 +549,8 @@ func (a *acc) fold(v Value, m *costMeter) error {
 		}
 	case planSumInt:
 		if !v.IsNull() {
-			s := a.sumInt + v.Int
-			if (v.Int > 0 && s < a.sumInt) || (v.Int < 0 && s > a.sumInt) {
+			s := a.sumInt + v.num
+			if (v.num > 0 && s < a.sumInt) || (v.num < 0 && s > a.sumInt) {
 				return overflowErr(scalarInt64)
 			}
 			a.sumInt = s
@@ -603,7 +603,7 @@ func (a *acc) fold(v Value, m *costMeter) error {
 			if !a.hasCur {
 				a.cur, a.hasCur = v, true
 			} else {
-				a.cur = IntValue(bitFold(a.plan, a.cur.Int, v.Int))
+				a.cur = IntValue(bitFold(a.plan, a.cur.num, v.num))
 			}
 		}
 	case planVarPop, planVarSamp, planStddevSamp, planStddevPop:
@@ -655,7 +655,7 @@ func (a *acc) fold(v Value, m *costMeter) error {
 		// not `{}`) and split the two fields back out.
 		a.seen = true
 		m.Charge(costs.GeneratedRow)
-		if v.Kind != ValComposite || v.composite() == nil || len(*v.composite()) != 2 {
+		if v.kind != ValComposite || v.composite() == nil || len(*v.composite()) != 2 {
 			panic("BUG: object_agg operand is a 2-field Row")
 		}
 		fields := *v.composite()
@@ -665,7 +665,7 @@ func (a *acc) fold(v Value, m *costMeter) error {
 			return err
 		}
 		// A NULL key: json_object_agg 22004, jsonb_object_agg 22023 (PG's two messages).
-		if kv.Kind == ValNull {
+		if kv.kind == ValNull {
 			if a.jsonAsJSON {
 				return objectKeyNull()
 			}
@@ -765,7 +765,7 @@ func (a *acc) retainedBytes(v Value) int64 {
 		}
 		return memValueBytes(v)
 	case planJsonbObjectAgg, planJsonObjectAgg, planJsonbObjectAggUnique, planJsonObjectAggUnique:
-		if v.Kind == ValComposite && v.composite() != nil {
+		if v.kind == ValComposite && v.composite() != nil {
 			return memKeyBytes(*v.composite())
 		}
 		return 0
@@ -836,7 +836,7 @@ func (a *acc) finalize() (Value, error) {
 		if a.seen {
 			// The only cap check for the fold: the FINAL sum traps 22003 if over the §2 cap
 			// (PG's make_result), but no intermediate does (decimal.md §2).
-			d, err := a.sumDec.CheckCap()
+			d, err := a.sumDec.checkCap()
 			if err != nil {
 				return NullValue(), err
 			}
@@ -849,7 +849,7 @@ func (a *acc) finalize() (Value, error) {
 		}
 		// Div cap-checks its (in-range) result; the over-cap-capable running sum is never
 		// surfaced directly, so AVG matches PG even when SUM would overflow.
-		d, err := a.sumDec.Div(decimalFromInt64(a.count))
+		d, err := a.sumDec.div(decimalFromInt64(a.count))
 		if err != nil {
 			return NullValue(), err
 		}
@@ -994,7 +994,7 @@ func finalizeStringAgg(rows []Value) Value {
 		}
 		b.WriteString(f[0].str())
 	}
-	if (*rows[0].composite())[0].Kind == ValBytea {
+	if (*rows[0].composite())[0].kind == ValBytea {
 		return ByteaValue([]byte(b.String()))
 	}
 	return TextValue(b.String())
@@ -1092,7 +1092,7 @@ func finalizePercentile(frac *Value, empty bool, compute func(p float64) (Value,
 	if frac == nil || frac.IsNull() {
 		return NullValue(), nil
 	}
-	if frac.Kind == ValArray {
+	if frac.kind == ValArray {
 		// Range-check every non-NULL element FIRST (before the empty-group check, PG).
 		fracs := make([]*float64, 0, len(frac.arrayVal().Elements))
 		for i := range frac.arrayVal().Elements {
@@ -1148,7 +1148,7 @@ func finalizePercentile(frac *Value, empty bool, compute func(p float64) (Value,
 // expectInterval returns the Interval of a buffered ValInterval (a planPercentileContInterval group
 // only ever buffers intervals — the resolver gates the operand to interval).
 func expectInterval(v Value) Interval {
-	if v.Kind != ValInterval {
+	if v.kind != ValInterval {
 		panic("percentile_cont(interval) buffered a non-interval")
 	}
 	return v.interval()
@@ -1158,7 +1158,7 @@ func expectInterval(v Value) Interval {
 // (spec/design/aggregates.md §13). intervalMul below replicates PG's exact field-cascade + rounding
 // so the result is byte-identical to PostgreSQL.
 func intervalLerp(lo, hi Interval, pct float64) (Interval, error) {
-	diff, err := hi.Sub(lo)
+	diff, err := hi.sub(lo)
 	if err != nil {
 		return Interval{}, err
 	}
@@ -1166,7 +1166,7 @@ func intervalLerp(lo, hi Interval, pct float64) (Interval, error) {
 	if err != nil {
 		return Interval{}, err
 	}
-	return scaled.Add(lo)
+	return scaled.add(lo)
 }
 
 // intervalMul is interval * f64, byte-identical to PostgreSQL's interval_mul (timestamp.c): multiply
@@ -1237,15 +1237,15 @@ func fractionToF64(frac *Value) (*float64, error) {
 	if frac == nil || frac.IsNull() {
 		return nil, nil
 	}
-	switch frac.Kind {
+	switch frac.kind {
 	case ValFloat64:
-		f := frac.F64()
+		f := frac.f64()
 		return &f, nil
 	case ValFloat32:
-		f := float64(frac.F32())
+		f := float64(frac.f32())
 		return &f, nil
 	case ValInt:
-		f := float64(frac.Int)
+		f := float64(frac.num)
 		return &f, nil
 	case ValDecimal:
 		f, err := decimalToFloat64(*frac.decimal())
@@ -1329,7 +1329,7 @@ func sortOsaVals(vals []Value, collation *compiledCollation, desc bool, meter *c
 	}
 	d := make([]deco, len(vals))
 	for i, v := range vals {
-		if v.Kind != ValText && v.Kind != ValArray {
+		if v.kind != ValText && v.kind != ValArray {
 			panic("a collated WITHIN GROUP key buffers only text or text[]")
 		}
 		sk, err := collationSortKey(collation, v)
@@ -1436,7 +1436,7 @@ func aggOrderTuple(order *aggOrder, v Value, row storedRow, env *evalEnv, m *cos
 		if err := chargeSortKey(m, kv, order.sorts[i].collation); err != nil {
 			return nil, err
 		}
-		if c := order.sorts[i].collation; c != nil && (kv.Kind == ValText || kv.Kind == ValArray) {
+		if c := order.sorts[i].collation; c != nil && (kv.kind == ValText || kv.kind == ValArray) {
 			b, err := collationSortKey(c, kv)
 			if err != nil {
 				return nil, err
@@ -1520,9 +1520,9 @@ func checkPercentileFraction(p float64) error {
 // integers via the IEEE cast, decimals via the correctly-rounded decimal→f64 cast (matching PG's
 // numeric→float8), floats unchanged. The resolver restricts the operand to a numeric family.
 func percentileInputF64(v Value) (float64, error) {
-	switch v.Kind {
+	switch v.kind {
 	case ValInt:
-		return float64(v.Int), nil
+		return float64(v.num), nil
 	case ValFloat32, ValFloat64:
 		return v.asF64(), nil
 	case ValDecimal:
@@ -2506,10 +2506,10 @@ func isJSONAggPlan(plan aggPlan) bool {
 // foldDecimal is toDecimal for a fold's operand: an integer widens into buf rather than a fresh
 // allocation, since the accumulator reads the operand and keeps only its own new sum.
 func foldDecimal(v Value, buf *[3]uint32) Decimal {
-	if v.Kind == ValDecimal {
+	if v.kind == ValDecimal {
 		return *v.decimal()
 	}
-	return decimalFromInt64Buf(v.Int, buf)
+	return decimalFromInt64Buf(v.num, buf)
 }
 
 // addDecimal folds one non-NULL input into a decimal SUM or AVG accumulator. The sum is uncapped:
@@ -2521,7 +2521,7 @@ func (a *acc) addDecimal(in Decimal, m *costMeter) error {
 	if err := m.Step(); err != nil {
 		return err
 	}
-	a.sumDec = a.sumDec.AddUncapped(in)
+	a.sumDec = a.sumDec.addUncapped(in)
 	if a.plan == planAvg {
 		a.count++
 	} else {

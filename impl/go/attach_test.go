@@ -54,7 +54,7 @@ func TestAttachLifecycle(t *testing.T) {
 	}
 	var got []int64
 	for rows.Next() {
-		got = append(got, rows.Row()[0].Int)
+		got = append(got, rows.Row()[0].num)
 	}
 	rows.Close() // release the streaming cursor's reader pin (a live cursor would block the detach below)
 	if len(got) != 2 || got[0] != 10 || got[1] != 20 {
@@ -114,10 +114,10 @@ func TestAttachmentWorkingRootsAndCursorsDoNotAlias(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !mainPin.Next() || mainPin.Row()[0].Int != 1 || mainPin.Row()[1].Int != 10 {
+	if !mainPin.Next() || mainPin.Row()[0].num != 1 || mainPin.Row()[1].num != 10 {
 		t.Fatalf("main first row = %v", mainPin.Row())
 	}
-	if !workPin.Next() || workPin.Row()[0].Int != 1 || workPin.Row()[1].Int != 100 {
+	if !workPin.Next() || workPin.Row()[0].num != 1 || workPin.Row()[1].num != 100 {
 		t.Fatalf("work first row = %v", workPin.Row())
 	}
 	for id := int64(4); id <= 40; id++ {
@@ -126,16 +126,16 @@ func TestAttachmentWorkingRootsAndCursorsDoNotAlias(t *testing.T) {
 	}
 	for _, sql := range []string{"SELECT count(*) FROM t", "SELECT count(*) FROM work.t"} {
 		out, err := queryOutcome(s, sql, nil)
-		if err != nil || len(out.Rows) != 1 || out.Rows[0][0].Int != 40 {
+		if err != nil || len(out.Rows) != 1 || out.Rows[0][0].num != 40 {
 			t.Fatalf("%s = %v, err=%v", sql, out.Rows, err)
 		}
 	}
 	var mainRest, workRest []int64
 	for mainPin.Next() {
-		mainRest = append(mainRest, mainPin.Row()[1].Int)
+		mainRest = append(mainRest, mainPin.Row()[1].num)
 	}
 	for workPin.Next() {
-		workRest = append(workRest, workPin.Row()[1].Int)
+		workRest = append(workRest, workPin.Row()[1].num)
 	}
 	if len(mainRest) != 2 || mainRest[0] != 20 || mainRest[1] != 30 {
 		t.Fatalf("main pinned rest = %v", mainRest)
@@ -152,7 +152,7 @@ func TestAttachmentWorkingRootsAndCursorsDoNotAlias(t *testing.T) {
 	defer fresh.Close()
 	for _, sql := range []string{"SELECT count(*) FROM t", "SELECT count(*) FROM work.t"} {
 		out, err := queryOutcome(fresh, sql, nil)
-		if err != nil || len(out.Rows) != 1 || out.Rows[0][0].Int != 3 {
+		if err != nil || len(out.Rows) != 1 || out.Rows[0][0].num != 3 {
 			t.Fatalf("after rollback %s = %v, err=%v", sql, out.Rows, err)
 		}
 	}
@@ -333,7 +333,7 @@ func TestAttachFileReadWritePersistsAcrossReopen(t *testing.T) {
 	}
 	defer reopened.Close()
 	rows := queryRows(t, reopened, "SELECT id, bal FROM acct ORDER BY id")
-	if len(rows) != 2 || rows[0][0].Int != 1 || rows[0][1].Int != 100 || rows[1][1].Int != 200 {
+	if len(rows) != 2 || rows[0][0].num != 1 || rows[0][1].num != 100 || rows[1][1].num != 200 {
 		t.Fatalf("reopened rows = %v, want [[1 100] [2 200]]", rows)
 	}
 	// The index persisted too (introspection — the catalog carries it).
@@ -380,7 +380,7 @@ func TestAttachFileCompositeColumnDML(t *testing.T) {
 	}
 	var got []int64
 	for rows.Next() {
-		got = append(got, rows.Row()[0].Int)
+		got = append(got, rows.Row()[0].num)
 	}
 	rows.Close()
 	if len(got) != 3 || got[0] != 1 || got[1] != 3 || got[2] != 4 {
@@ -420,20 +420,20 @@ func TestAttachFileOneDurableWriter(t *testing.T) {
 		t.Fatalf("two durable writers: want 0A000, got %s", code)
 	}
 	// Nothing was committed — both files are still empty of the attempted rows.
-	if rows := queryRows(t, s, "SELECT count(*) FROM m"); rows[0][0].Int != 0 {
+	if rows := queryRows(t, s, "SELECT count(*) FROM m"); rows[0][0].num != 0 {
 		t.Fatalf("main m should be empty after the rejected commit, got %v", rows)
 	}
-	if rows := queryRows(t, s, "SELECT count(*) FROM extra.e"); rows[0][0].Int != 0 {
+	if rows := queryRows(t, s, "SELECT count(*) FROM extra.e"); rows[0][0].num != 0 {
 		t.Fatalf("extra e should be empty after the rejected commit, got %v", rows)
 	}
 
 	// Writing each durable database ALONE (its own autocommit statement) is fine.
 	attachExec(t, s, "INSERT INTO m VALUES (2)")
 	attachExec(t, s, "INSERT INTO extra.e VALUES (2)")
-	if rows := queryRows(t, s, "SELECT id FROM m"); len(rows) != 1 || rows[0][0].Int != 2 {
+	if rows := queryRows(t, s, "SELECT id FROM m"); len(rows) != 1 || rows[0][0].num != 2 {
 		t.Fatalf("main m = %v, want [[2]]", rows)
 	}
-	if rows := queryRows(t, s, "SELECT id FROM extra.e"); len(rows) != 1 || rows[0][0].Int != 2 {
+	if rows := queryRows(t, s, "SELECT id FROM extra.e"); len(rows) != 1 || rows[0][0].num != 2 {
 		t.Fatalf("extra e = %v, want [[2]]", rows)
 	}
 }
@@ -459,7 +459,7 @@ func TestAttachFileWithMemoryMainMultiWrite(t *testing.T) {
 	if err := s.commitBlock(); err != nil {
 		t.Fatalf("memory-main + one file attachment should commit: %v", err)
 	}
-	if rows := queryRows(t, s, "SELECT id FROM work.w"); len(rows) != 1 || rows[0][0].Int != 1 {
+	if rows := queryRows(t, s, "SELECT id FROM work.w"); len(rows) != 1 || rows[0][0].num != 1 {
 		t.Fatalf("work.w = %v, want [[1]]", rows)
 	}
 }
@@ -496,7 +496,7 @@ func TestAttachFilePageSizeIndependent(t *testing.T) {
 		t.Fatalf("reopened page size = %d, want 256", reopened.PageSize())
 	}
 	rows := queryRows(t, reopened, "SELECT count(*), sum(v) FROM grid")
-	if rows[0][0].Int != 40 || rows[0][1].Int != 22140 { // sum of i*i for i in 1..40
+	if rows[0][0].num != 40 || rows[0][1].num != 22140 { // sum of i*i for i in 1..40
 		t.Fatalf("reopened grid aggregate = %v, want [[40 22140]]", rows)
 	}
 }
@@ -516,7 +516,7 @@ func TestAttachFileReattach(t *testing.T) {
 		s := mustSession(db, SessionOptions{})
 		rows := queryRows(t, s, "SELECT id FROM ref.t")
 		s.Close()
-		if len(rows) != 1 || rows[0][0].Int != 1 {
+		if len(rows) != 1 || rows[0][0].num != 1 {
 			t.Fatalf("attach #%d rows = %v, want [[1]]", i, rows)
 		}
 		if err := db.Detach("ref"); err != nil {

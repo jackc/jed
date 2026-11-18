@@ -277,8 +277,8 @@ func (s *tableStore) unstage(key []byte) error {
 
 // stagedOf is the stored bytes a staged-key entry records (zero for none).
 func stagedOf(entry storedRow) int64 {
-	if len(entry) == 1 && entry[0].Kind == ValInt {
-		return entry[0].Int
+	if len(entry) == 1 && entry[0].kind == ValInt {
+		return entry[0].num
 	}
 	return 0
 }
@@ -572,7 +572,7 @@ func (s *tableStore) WriteCompressUnits(key []byte, row storedRow) int {
 func (s *tableStore) resolveColumns(row storedRow, mask []bool) (storedRow, error) {
 	needs := false
 	for i, v := range row {
-		if mask[i] && v.Kind == ValUnfetched {
+		if mask[i] && v.kind == valUnfetched {
 			needs = true
 			break
 		}
@@ -598,7 +598,7 @@ func (s *tableStore) resolveColumnsBuffering(row storedRow, mask, buffer []bool)
 	var kept []int
 	resolve := mask
 	for i, v := range row {
-		if buffer[i] && v.Kind == ValUnfetched && v.unfetched().Form != 0x00 && stringPayload(s.colTypes[i]) {
+		if buffer[i] && v.kind == valUnfetched && v.unfetched().Form != 0x00 && stringPayload(s.colTypes[i]) {
 			if kept == nil {
 				resolve = slices.Clone(mask)
 			}
@@ -616,7 +616,7 @@ func (s *tableStore) resolveColumnsBuffering(row storedRow, mask, buffer []bool)
 	for _, i := range kept {
 		u := *out[i].unfetched()
 		u.buffered = true
-		out[i] = Value{Kind: ValUnfetched, ref: &u}
+		out[i] = Value{kind: valUnfetched, ref: &u}
 	}
 	return out, nil
 }
@@ -626,7 +626,7 @@ func (s *tableStore) resolveColumnsBuffering(row storedRow, mask, buffer []bool)
 // resolveColumns. Streaming scan scratch is private; tree and read-ahead rows are not.
 func (s *tableStore) resolveColumnsInPlace(out storedRow, mask []bool) (storedRow, error) {
 	for i := range out {
-		if mask[i] && out[i].Kind == ValUnfetched {
+		if mask[i] && out[i].kind == valUnfetched {
 			v, err := resolveUnfetched(s.colTypes[i], out[i].unfetched(), s.paging.readBody, s.cap)
 			if err != nil {
 				return nil, err
@@ -654,7 +654,7 @@ func (s *tableStore) resolveValue(col int, u *unfetchedValue) (Value, error) {
 func (s *tableStore) settleCarried(key []byte, row storedRow) (storedRow, error) {
 	deferred := false
 	for _, v := range row {
-		if v.Kind == ValUnfetched {
+		if v.kind == valUnfetched {
 			deferred = true
 			break
 		}
@@ -664,7 +664,7 @@ func (s *tableStore) settleCarried(key []byte, row storedRow) (storedRow, error)
 	}
 	kept := deferredInStoredForm(s.colTypes, key, row, s.cap)
 	for i, v := range row {
-		if v.Kind == ValUnfetched && !kept[i] {
+		if v.kind == valUnfetched && !kept[i] {
 			r, err := s.resolveValue(i, v.unfetched())
 			if err != nil {
 				return nil, err
@@ -698,7 +698,7 @@ func retainedOldRow(resolved, stored storedRow, keep []bool) storedRow {
 	out := resolved
 	copied := false
 	for i, sv := range stored {
-		if sv.Kind != ValUnfetched || sv.unfetched().Form == 0x00 || resolved[i].Kind == ValUnfetched ||
+		if sv.kind != valUnfetched || sv.unfetched().Form == 0x00 || resolved[i].kind == valUnfetched ||
 			(keep != nil && keep[i]) {
 			continue
 		}
@@ -715,7 +715,7 @@ func retainedOldRow(resolved, stored storedRow, keep []bool) storedRow {
 func resolveInlineColumnsOf(colTypes []colType, row storedRow) (storedRow, error) {
 	needs := false
 	for _, v := range row {
-		if v.Kind == ValUnfetched && v.unfetched().Form == 0x00 {
+		if v.kind == valUnfetched && v.unfetched().Form == 0x00 {
 			needs = true
 			break
 		}
@@ -726,7 +726,7 @@ func resolveInlineColumnsOf(colTypes []colType, row storedRow) (storedRow, error
 	out := make(storedRow, len(row))
 	copy(out, row)
 	for i := range out {
-		if out[i].Kind == ValUnfetched && out[i].unfetched().Form == 0x00 {
+		if out[i].kind == valUnfetched && out[i].unfetched().Form == 0x00 {
 			// An inline form reads no overflow pages — fetch is never invoked.
 			v, err := resolveUnfetched(colTypes[i], out[i].unfetched(), nil, pageCap{})
 			if err != nil {
@@ -864,7 +864,7 @@ func rootReferencesChains(root *pnode) bool {
 func rowsReferenceChains(rows []storedRow) bool {
 	for _, row := range rows {
 		for _, v := range row {
-			if v.Kind == ValUnfetched {
+			if v.kind == valUnfetched {
 				if f := v.unfetched().Form; f == tagExternal || f == tagExternalComp {
 					return true
 				}

@@ -609,10 +609,10 @@ func TestPMapRangeCursorMatchesScanRange(t *testing.T) {
 	}
 	decode := func(k []byte) uint64 { return binary.BigEndian.Uint64(k) }
 	val := func(r storedRow) int64 {
-		if r[0].Kind != ValInt {
+		if r[0].kind != ValInt {
 			t.Fatalf("unexpected row value %#v", r[0])
 		}
-		return r[0].Int
+		return r[0].num
 	}
 	type pair struct {
 		k uint64

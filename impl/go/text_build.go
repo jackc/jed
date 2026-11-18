@@ -81,7 +81,7 @@ func evalTextVariadic(e *rExpr, row storedRow, env *evalEnv, m *costMeter) (Valu
 // session zone and charges one timezone unit, charged and guarded before rendering. The caller
 // handles NULL.
 func outputText(v Value, zone zoneRef, m *costMeter) (string, error) {
-	switch v.Kind {
+	switch v.kind {
 	case ValText:
 		return v.str(), nil
 	case ValBool:
@@ -267,14 +267,14 @@ func formatParseSpec(b string, start int) (formatSpec, error) {
 // 22003; any other value goes through the text → i32 cast, so a non-integer is that cast's 22P02 /
 // 22003.
 func formatWidthValue(v Value, zone zoneRef, m *costMeter) (int32, error) {
-	switch v.Kind {
+	switch v.kind {
 	case ValNull:
 		return 0, nil
 	case ValInt:
-		if v.Int < math.MinInt32 || v.Int > math.MaxInt32 {
+		if v.num < math.MinInt32 || v.num > math.MaxInt32 {
 			return 0, overflowErr(scalarInt32)
 		}
-		return int32(v.Int), nil
+		return int32(v.num), nil
 	}
 	text, err := outputText(v, zone, m)
 	if err != nil {

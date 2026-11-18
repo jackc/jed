@@ -52,7 +52,7 @@ func wcAffected(t *testing.T, db dbHandle, sql string) int64 {
 func wcInts(rows []storedRow) []int64 {
 	v := make([]int64, len(rows))
 	for i, r := range rows {
-		v[i] = r[0].Int
+		v[i] = r[0].num
 	}
 	sort.Slice(v, func(a, b int) bool { return v[a] < v[b] })
 	return v
@@ -112,12 +112,12 @@ func TestDataModifyingCteCountNotSurfacedUnderSelectPrimary(t *testing.T) {
 	// it reads the PRE-statement table (the pin, §2), so count is 3, not 4.
 	rows := wcRows(t, db,
 		"WITH ins AS (INSERT INTO t VALUES (4, 40) RETURNING *) SELECT count(*) FROM t")
-	if len(rows) != 1 || rows[0][0].Int != 3 {
+	if len(rows) != 1 || rows[0][0].num != 3 {
 		t.Fatalf("count under pin got %v want [[3]]", rows)
 	}
 	// ...and the insert still landed (always to completion, §3).
 	rows = wcRows(t, db, "SELECT count(*) FROM t")
-	if len(rows) != 1 || rows[0][0].Int != 4 {
+	if len(rows) != 1 || rows[0][0].num != 4 {
 		t.Fatalf("post-statement count got %v want [[4]]", rows)
 	}
 }
@@ -140,7 +140,7 @@ func TestSameRowTwoUpdatesLastWriteWins(t *testing.T) {
 	}
 	// The committed value is the second (lexically later) write.
 	rows := wcRows(t, db, "SELECT v FROM t WHERE id = 1")
-	if len(rows) != 1 || rows[0][0].Int != 200 {
+	if len(rows) != 1 || rows[0][0].num != 200 {
 		t.Fatalf("committed v got %v want [[200]]", rows)
 	}
 }

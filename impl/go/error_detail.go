@@ -58,14 +58,14 @@ func (db *engine) detailVisible(relation string) bool {
 // resolved or the value cannot render (an out-of-range zoned instant) — the detail is then omitted,
 // never wrong.
 func (db *engine) detailValue(v Value) (string, bool) {
-	if v.Kind == ValUnfetched {
+	if v.kind == valUnfetched {
 		r, err := resolveUnfetchedSelf(v.unfetched())
 		if err != nil {
 			return "", false
 		}
 		v = r
 	}
-	switch v.Kind {
+	switch v.kind {
 	case ValNull:
 		return "null", true
 	case ValText:

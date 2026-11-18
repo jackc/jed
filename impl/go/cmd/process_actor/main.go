@@ -224,9 +224,9 @@ func run() error {
 				value = jed.PageServiceAttachmentRoleForTesting(db, argument)
 			}
 		case "TXID":
-			value = strconv.FormatUint(db.Txid(), 10)
+			value = strconv.FormatUint(db.Version(), 10)
 		case "PAGE_COUNT":
-			value = strconv.FormatUint(uint64(db.PageCount()), 10)
+			value = strconv.FormatUint(uint64(jed.PageCountForTesting(db)), 10)
 		case "CLOSE":
 			if reader != nil {
 				reader.Close()

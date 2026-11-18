@@ -35,7 +35,7 @@ func varErrCode(t *testing.T, db dbHandle, sql string) string {
 
 func mustText(t *testing.T, v Value, want string) {
 	t.Helper()
-	if v.Kind != ValText || v.str() != want {
+	if v.kind != ValText || v.str() != want {
 		t.Fatalf("want text %q, got %v", want, v)
 	}
 }
@@ -115,7 +115,7 @@ func TestVarMissingOkTurnsTheUnsetErrorIntoNull(t *testing.T) {
 	if got := varErrCode(t, db, "SELECT current_setting('myapp.unset')"); got != "42704" {
 		t.Fatalf("one-arg unset: want 42704, got %s", got)
 	}
-	if v := varScalar(t, db, "SELECT current_setting('myapp.unset', true)"); v.Kind != ValNull {
+	if v := varScalar(t, db, "SELECT current_setting('myapp.unset', true)"); v.kind != ValNull {
 		t.Fatalf("missing_ok=true: want NULL, got %v", v)
 	}
 	// false behaves like the one-arg form.
@@ -134,7 +134,7 @@ func TestVarNullNamePropagatesToNull(t *testing.T) {
 	if err := db.SetVar("myapp.x", "set"); err != nil {
 		t.Fatal(err)
 	}
-	if v := varScalar(t, db, "SELECT current_setting(n) FROM t WHERE id = 1"); v.Kind != ValNull {
+	if v := varScalar(t, db, "SELECT current_setting(n) FROM t WHERE id = 1"); v.kind != ValNull {
 		t.Fatalf("NULL name: want NULL, got %v", v)
 	}
 }

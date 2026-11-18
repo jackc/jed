@@ -100,7 +100,7 @@ func TestAdditionalSessionSharesStorageWithIndependentSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Rows) != 1 || out.Rows[0][0].Int != 1 || out.Rows[0][1].Int != 10 {
+	if len(out.Rows) != 1 || out.Rows[0][0].num != 1 || out.Rows[0][1].num != 10 {
 		t.Fatalf("unexpected rows from second session: %v", out.Rows)
 	}
 
@@ -112,7 +112,7 @@ func TestAdditionalSessionSharesStorageWithIndependentSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Rows) != 2 || out.Rows[0][0].Int != 1 || out.Rows[1][0].Int != 2 {
+	if len(out.Rows) != 2 || out.Rows[0][0].num != 1 || out.Rows[1][0].num != 2 {
 		t.Fatalf("unexpected rows after second-session write: %v", out.Rows)
 	}
 
@@ -177,7 +177,7 @@ func TestAdditionalSessionUpdateClosureCommitsToSharedStorage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Rows[0][0].Int != 2 {
+	if out.Rows[0][0].num != 2 {
 		t.Fatalf("want count 2, got %v", out.Rows[0][0])
 	}
 	if a.Status() != TxIdle {

@@ -658,11 +658,11 @@ func recordFieldFits(field, decl dataType) bool {
 // (composite.md §13).
 func checkRecordFieldValue(v Value, decl dataType) error {
 	switch {
-	case v.Kind == ValInt && decl.IsInteger():
-		if !decl.Scalar.InRange(v.Int) {
+	case v.kind == ValInt && decl.IsInteger():
+		if !decl.Scalar.InRange(v.num) {
 			return overflowErr(decl.Scalar)
 		}
-	case v.Kind == ValArray && decl.Array != nil:
+	case v.kind == ValArray && decl.Array != nil:
 		for _, e := range v.arrayVal().Elements {
 			if err := checkRecordFieldValue(e, *decl.Array); err != nil {
 				return err
@@ -1516,7 +1516,7 @@ func (db *engine) generateSeriesRows(sp *srfPlan, env *evalEnv, m *costMeter, ma
 	// Any NULL argument yields zero rows (PG).
 	numeric := false
 	for _, v := range vals {
-		switch v.Kind {
+		switch v.kind {
 		case ValNull:
 			return nil, nil
 		case ValDecimal:
@@ -1530,9 +1530,9 @@ func (db *engine) generateSeriesRows(sp *srfPlan, env *evalEnv, m *costMeter, ma
 	if numeric {
 		return generateNumericSeriesRows(vals, m, mask)
 	}
-	start, stop, step := vals[0].Int, vals[1].Int, int64(1)
+	start, stop, step := vals[0].num, vals[1].num, int64(1)
 	if len(vals) == 3 {
-		step = vals[2].Int
+		step = vals[2].num
 	}
 	if step == 0 {
 		return nil, newError(InvalidParameterValue, "step size cannot be equal to zero")
@@ -1577,10 +1577,10 @@ func (db *engine) generateSeriesRows(sp *srfPlan, env *evalEnv, m *costMeter, ma
 // value would already lie past stop.
 func generateNumericSeriesRows(vals []Value, m *costMeter, mask []bool) ([]storedRow, error) {
 	dec := func(v Value) Decimal {
-		if v.Kind == ValDecimal {
+		if v.kind == ValDecimal {
 			return *v.decimal()
 		}
-		return decimalFromInt64(v.Int)
+		return decimalFromInt64(v.num)
 	}
 	start, stop, step := dec(vals[0]), dec(vals[1]), decimalFromInt64(1)
 	if len(vals) == 3 {
@@ -1589,7 +1589,7 @@ func generateNumericSeriesRows(vals []Value, m *costMeter, mask []bool) ([]store
 	if step.IsZero() {
 		return nil, newError(InvalidParameterValue, "step size cannot equal zero")
 	}
-	up := !step.Neg
+	up := !step.neg
 	var out []storedRow
 	cur := start
 	for {
@@ -1597,7 +1597,7 @@ func generateNumericSeriesRows(vals []Value, m *costMeter, mask []bool) ([]store
 		if err := m.Step(); err != nil {
 			return nil, err
 		}
-		ord := cur.CmpValue(stop)
+		ord := cur.Cmp(stop)
 		if (up && ord > 0) || (!up && ord < 0) {
 			break
 		}
@@ -1608,7 +1608,7 @@ func generateNumericSeriesRows(vals []Value, m *costMeter, mask []bool) ([]store
 		}
 		out = append(out, row)
 		m.Charge(costs.DecimalWork * (workLinear(cur, step) - 1))
-		next, err := cur.Add(step)
+		next, err := cur.add(step)
 		if err != nil {
 			break
 		}
@@ -1637,11 +1637,11 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 		for i := range base {
 			base[i] = NullValue()
 		}
-		if bv.Kind != ValNull {
+		if bv.kind != ValNull {
 			copy(base, *bv.composite())
 		}
 	}
-	if arg.Kind == ValNull {
+	if arg.kind == ValNull {
 		// A NULL document: populate_record returns the base row unchanged (PostgreSQL returns the
 		// record argument as is — one row, all NULL for a NULL base); every other form yields no rows.
 		if sp.kind == srfJSONRecord && base != nil {
@@ -1663,9 +1663,9 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 	// container's kind error at its opening bracket, before lexing inside it (json.md §4.2).
 	var node JSONNode
 	switch {
-	case arg.Kind == ValJSON && (sp.kind == srfJsonObjectKeys || sp.kind == srfJSONRecord):
+	case arg.kind == ValJSON && (sp.kind == srfJsonObjectKeys || sp.kind == srfJSONRecord):
 		node, err = parsePreservingJSONUnlessRoot(arg.str(), '[')
-	case arg.Kind == ValJSON && sp.kind == srfJSONRecordset:
+	case arg.kind == ValJSON && sp.kind == srfJSONRecordset:
 		text := arg.str()
 		if start := skipJSONWS(text, 0); start < len(text) && text[start] == '[' {
 			return jsonRecordsetRowsVerbatim(sp, text, base, env, m)
@@ -1793,7 +1793,7 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 		if err != nil {
 			return nil, err
 		}
-		if path.Kind == ValNull || varsV.Kind == ValNull || silentV.Kind == ValNull {
+		if path.kind == ValNull || varsV.kind == ValNull || silentV.kind == ValNull {
 			return nil, nil
 		}
 		varsNode := varsV.jsonb()
@@ -1940,7 +1940,7 @@ func applyJSONBehavior(behavior jsonOnBehavior, clause jsonClause, defaults json
 		if err != nil {
 			return Value{}, err
 		}
-		if v.Kind != ValJSONB || returning == scalarJsonb {
+		if v.kind != ValJSONB || returning == scalarJsonb {
 			return v, nil
 		}
 		out, err := coerceJSONMember(v.jsonb(), scalarT(returning), typmod{}, env, m)
@@ -2078,7 +2078,7 @@ func (db *engine) jsonTableRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stor
 	if err != nil {
 		return nil, err
 	}
-	if ctx.Kind == ValNull {
+	if ctx.kind == ValNull {
 		return nil, nil
 	}
 	// A json context is converted to jsonb, as PostgreSQL casts it (jsonpath.md §5).
@@ -2365,7 +2365,7 @@ func (db *engine) regexSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]store
 	if err != nil {
 		return nil, err
 	}
-	if v.Kind == ValNull {
+	if v.kind == ValNull {
 		return nil, nil
 	}
 	items := v.arrayVal().Elements
@@ -2385,7 +2385,7 @@ func (db *engine) unnestRows(sp *srfPlan, env *evalEnv, m *costMeter, mask []boo
 	if err != nil {
 		return nil, err
 	}
-	switch v.Kind {
+	switch v.kind {
 	case ValNull:
 		// A NULL array → zero rows (PG; the empty_on_null discipline).
 		return nil, nil
@@ -2417,10 +2417,10 @@ func (db *engine) unnestRecordRows(sp *srfPlan, env *evalEnv, m *costMeter, mask
 	if err != nil {
 		return nil, err
 	}
-	if v.Kind == ValNull {
+	if v.kind == ValNull {
 		return nil, nil
 	}
-	if v.Kind != ValArray {
+	if v.kind != ValArray {
 		panic("the resolver restricts unnest's argument to an array")
 	}
 	width := len(sp.recordCols)
@@ -2431,7 +2431,7 @@ func (db *engine) unnestRecordRows(sp *srfPlan, env *evalEnv, m *costMeter, mask
 		}
 		m.Charge(costs.GeneratedRow)
 		var row storedRow
-		if e.Kind == ValComposite {
+		if e.kind == ValComposite {
 			fields := *e.composite()
 			for i, f := range fields {
 				if err := checkRecordFieldValue(f, sp.recordCols[i].Type); err != nil {

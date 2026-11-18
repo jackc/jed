@@ -15,10 +15,10 @@ type dbHandle interface {
 	table(name string) (*catTable, bool)
 	compositeType(name string) *compositeType
 	rowsInKeyOrder(name string) []storedRow
-	ToImage(pageSize uint32, txid uint64) ([]byte, error)
-	Txid() uint64
+	toImage(pageSize uint32, txid uint64) ([]byte, error)
+	txid() uint64
 	PageSize() uint32
-	PageCount() uint32
+	pageHighWater() uint32
 }
 
 var (

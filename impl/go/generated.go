@@ -296,7 +296,7 @@ func (db *engine) computeGenerated(columns []catColumn, colTypes []colType, gene
 		if err != nil {
 			return err
 		}
-		if v.Kind == ValNull {
+		if v.kind == ValNull {
 			row[i] = NullValue()
 			continue
 		}
@@ -314,7 +314,7 @@ func (db *engine) computeGenerated(columns []catColumn, colTypes []colType, gene
 // generated marks are considered. Returns the updated index (-1 for none).
 func generatedNotNull(columns []catColumn, generated []*rExpr, row storedRow, nullCol int) int {
 	for i, g := range generated {
-		if g != nil && columns[i].Generated != nil && columns[i].NotNull && row[i].Kind == ValNull && (nullCol < 0 || i < nullCol) {
+		if g != nil && columns[i].Generated != nil && columns[i].NotNull && row[i].kind == ValNull && (nullCol < 0 || i < nullCol) {
 			nullCol = i
 		}
 	}

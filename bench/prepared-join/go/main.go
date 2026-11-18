@@ -84,7 +84,7 @@ func main() {
 						for rows.Next() {
 							row := []string{}
 							for _, v := range rows.Row() {
-								row = append(row, v.Render())
+								row = append(row, v.String())
 							}
 							values = append(values, row)
 						}
@@ -107,13 +107,15 @@ func main() {
 					if checksum {
 						for _, value := range rows.Row() {
 							var text string
-							switch value.Kind {
+							switch value.Kind() {
 							case jed.ValNull:
 								text = "NULL"
 							case jed.ValInt:
-								text = strconv.FormatInt(value.Int, 10)
+								var n int64
+								_ = value.Scan(&n)
+								text = strconv.FormatInt(n, 10)
 							case jed.ValText:
-								text = value.Render()
+								text = value.String()
 							default:
 								panic("unexpected value kind")
 							}

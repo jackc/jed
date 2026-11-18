@@ -32,7 +32,7 @@ func churnInMemory(t *testing.T, reclaim bool, rounds int) (uint32, *Database) {
 	for k := 0; k < rounds; k++ {
 		sessExec(t, sess, fmt.Sprintf("UPDATE t SET pad = 'a%d-%s' WHERE id = 15", k, pad))
 	}
-	return db.PageCount(), db
+	return db.pageHighWater(), db
 }
 
 func TestWithinSessionCompactionBoundsInMemoryChurn(t *testing.T) {
@@ -88,7 +88,7 @@ func TestCompactionDefersWhileOlderReaderPinned(t *testing.T) {
 	for k := 0; k < 200; k++ {
 		sessExec(t, sess, fmt.Sprintf("UPDATE t SET pad = 'p%d-%s' WHERE id = 15", k, pad))
 	}
-	withReaderOpen := db.PageCount()
+	withReaderOpen := db.pageHighWater()
 	if withReaderOpen <= 200 {
 		t.Fatalf("with an older reader pinned, compaction should defer and leak; high-water only %d", withReaderOpen)
 	}
@@ -100,7 +100,7 @@ func TestCompactionDefersWhileOlderReaderPinned(t *testing.T) {
 	for k := 200; k < 400; k++ {
 		sessExec(t, sess, fmt.Sprintf("UPDATE t SET pad = 'q%d-%s' WHERE id = 15", k, pad))
 	}
-	afterReaderClosed := db.PageCount()
+	afterReaderClosed := db.pageHighWater()
 	if afterReaderClosed-withReaderOpen > 64 {
 		t.Fatalf("after the reader closed, compaction should reuse pages, not keep growing: %d then %d (+%d)", withReaderOpen, afterReaderClosed, afterReaderClosed-withReaderOpen)
 	}

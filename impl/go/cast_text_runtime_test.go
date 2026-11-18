@@ -73,7 +73,7 @@ func TestRuntimeTextToF64Finite(t *testing.T) {
 	db := seededText(t, "1.5", "-0.25", "100", "1e3")
 	for id, want := range map[int]float64{1: 1.5, 2: -0.25, 3: 100, 4: 1000} {
 		v := castAt(t, db, "s :: float8", id)
-		if v.Kind != ValFloat64 || v.F64() != want {
+		if v.kind != ValFloat64 || v.f64() != want {
 			t.Fatalf("id %d: got %v, want float64 %v", id, v, want)
 		}
 	}
@@ -82,10 +82,10 @@ func TestRuntimeTextToF64Finite(t *testing.T) {
 func TestRuntimeTextToF32Frounds(t *testing.T) {
 	t.Parallel()
 	db := seededText(t, "0.5", "3.14")
-	if v := castAt(t, db, "s :: float4", 1); v.Kind != ValFloat32 || v.F32() != 0.5 {
+	if v := castAt(t, db, "s :: float4", 1); v.kind != ValFloat32 || v.f32() != 0.5 {
 		t.Fatalf("0.5::float4 = %v", v)
 	}
-	if v := castAt(t, db, "s :: float4", 2); v.Kind != ValFloat32 || v.F32() != float32(3.14) {
+	if v := castAt(t, db, "s :: float4", 2); v.kind != ValFloat32 || v.f32() != float32(3.14) {
 		t.Fatalf("3.14::float4 = %v", v)
 	}
 }
@@ -93,13 +93,13 @@ func TestRuntimeTextToF32Frounds(t *testing.T) {
 func TestRuntimeTextToFloatSpecialWords(t *testing.T) {
 	t.Parallel()
 	db := seededText(t, "NaN", "Infinity", "-inf")
-	if v := castAt(t, db, "s :: float8", 1); v.Kind != ValFloat64 || !math.IsNaN(v.F64()) {
+	if v := castAt(t, db, "s :: float8", 1); v.kind != ValFloat64 || !math.IsNaN(v.f64()) {
 		t.Fatalf("NaN::float8 = %v", v)
 	}
-	if v := castAt(t, db, "s :: float8", 2); v.Kind != ValFloat64 || v.F64() != math.Inf(1) {
+	if v := castAt(t, db, "s :: float8", 2); v.kind != ValFloat64 || v.f64() != math.Inf(1) {
 		t.Fatalf("Infinity::float8 = %v", v)
 	}
-	if v := castAt(t, db, "s :: float8", 3); v.Kind != ValFloat64 || v.F64() != math.Inf(-1) {
+	if v := castAt(t, db, "s :: float8", 3); v.kind != ValFloat64 || v.f64() != math.Inf(-1) {
 		t.Fatalf("-inf::float8 = %v", v)
 	}
 }
@@ -121,7 +121,7 @@ func TestRuntimeTextToFloatNullPropagates(t *testing.T) {
 	db := dbWith(t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, s text)",
 		"INSERT INTO t VALUES (1, NULL)")
-	if v := castAt(t, db, "s :: float8", 1); v.Kind != ValNull {
+	if v := castAt(t, db, "s :: float8", 1); v.kind != ValNull {
 		t.Fatalf("NULL::float8 = %v, want NULL", v)
 	}
 }

@@ -32,7 +32,7 @@ func drainQ(t *testing.T, s *Session, stmt *PreparedStatement, params ...Value) 
 		src := rows.Row()
 		row := make([]int64, len(src))
 		for i, v := range src {
-			row[i] = v.Int
+			row[i] = v.num
 		}
 		out = append(out, row)
 	}
@@ -162,7 +162,7 @@ func TestInsertCacheEstimatorRevisionDoesNotInvalidate(t *testing.T) {
 	if first.Cost != second.Cost {
 		t.Fatalf("cache-hit cost = %d, want %d", second.Cost, first.Cost)
 	}
-	if len(second.Rows) != 1 || second.Rows[0][0].Int != 2 || second.Rows[0][1].Int != 20 {
+	if len(second.Rows) != 1 || second.Rows[0][0].num != 2 || second.Rows[0][1].num != 20 {
 		t.Fatalf("second rows = %v", second.Rows)
 	}
 }
@@ -259,7 +259,7 @@ func TestInsertCacheReusesValuesExpressions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(first.Rows) != 1 || first.Rows[0][0].Int != 21 {
+	if len(first.Rows) != 1 || first.Rows[0][0].num != 21 {
 		t.Fatalf("first rows = %v", first.Rows)
 	}
 	entry := stmt.ic.p.Load()
@@ -270,7 +270,7 @@ func TestInsertCacheReusesValuesExpressions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(second.Rows) != 1 || second.Rows[0][0].Int != 31 {
+	if len(second.Rows) != 1 || second.Rows[0][0].num != 31 {
 		t.Fatalf("second rows = %v", second.Rows)
 	}
 	if got := stmt.ic.p.Load(); got == nil || got.plan != entry.plan {
@@ -296,7 +296,7 @@ func TestInsertValuesSubqueryIsNotCached(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(first.Rows) != 1 || first.Rows[0][0].Int != 2 {
+	if len(first.Rows) != 1 || first.Rows[0][0].num != 2 {
 		t.Fatalf("first rows = %v", first.Rows)
 	}
 	if stmt.ic.p.Load() != nil {
@@ -306,7 +306,7 @@ func TestInsertValuesSubqueryIsNotCached(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(second.Rows) != 1 || second.Rows[0][0].Int != 3 {
+	if len(second.Rows) != 1 || second.Rows[0][0].num != 3 {
 		t.Fatalf("second rows = %v", second.Rows)
 	}
 }
@@ -526,11 +526,11 @@ func TestInsertCacheHitMatchesFreshResolution(t *testing.T) {
 	if stmt.ic.p.Load().plan != plan || !reflect.DeepEqual(hit.Rows, fresh.Rows) || hit.Cost != fresh.Cost {
 		t.Fatalf("hit/fresh differ: rows=%v/%v cost=%d/%d", hit.Rows, fresh.Rows, hit.Cost, fresh.Cost)
 	}
-	cachedImage, err := cachedDB.ToImage(8192, 1)
+	cachedImage, err := cachedDB.toImage(8192, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	freshImage, err := freshDB.ToImage(8192, 1)
+	freshImage, err := freshDB.toImage(8192, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

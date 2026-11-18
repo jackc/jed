@@ -53,7 +53,7 @@ func TestOrInPointSetMultiLeaf(t *testing.T) {
 	}
 	got := map[int64]bool{}
 	for _, r := range out.Rows {
-		got[r[0].Int] = true
+		got[r[0].num] = true
 	}
 	if !got[100] || !got[5000] || !got[9900] {
 		t.Errorf("IN(10,500,990) rows = %v, want {100,5000,9900}", out.Rows)
@@ -99,7 +99,7 @@ func TestOrInPointSetParamsAndCorrelated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Rows) != 2 || out.Rows[0][0].Int != 10 || out.Rows[1][0].Int != 30 {
+	if len(out.Rows) != 2 || out.Rows[0][0].num != 10 || out.Rows[1][0].num != 30 {
 		t.Fatalf("IN($1,$2,$3) got %v, want [10, 30]", out.Rows)
 	}
 
@@ -108,7 +108,7 @@ func TestOrInPointSetParamsAndCorrelated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(dup.Rows) != 1 || dup.Rows[0][0].Int != 20 {
+	if len(dup.Rows) != 1 || dup.Rows[0][0].num != 20 {
 		t.Fatalf("IN($1,$2) with equal params got %v, want [20]", dup.Rows)
 	}
 
@@ -120,7 +120,7 @@ func TestOrInPointSetParamsAndCorrelated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ranges.Rows) != 3 || ranges.Rows[0][0].Int != 1 || ranges.Rows[1][0].Int != 2 || ranges.Rows[2][0].Int != 4 {
+	if len(ranges.Rows) != 3 || ranges.Rows[0][0].num != 1 || ranges.Rows[1][0].num != 2 || ranges.Rows[2][0].num != 4 {
 		t.Fatalf("parameter interval union got %v, want [1, 2, 4]", ranges.Rows)
 	}
 	clipped, err := queryOutcome(db, "SELECT id FROM t WHERE id IN ($1, $2, $3) AND id > $4 ORDER BY id", []Value{
@@ -129,7 +129,7 @@ func TestOrInPointSetParamsAndCorrelated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(clipped.Rows) != 2 || clipped.Rows[0][0].Int != 3 || clipped.Rows[1][0].Int != 4 {
+	if len(clipped.Rows) != 2 || clipped.Rows[0][0].num != 3 || clipped.Rows[1][0].num != 4 {
 		t.Fatalf("parameter interval clip got %v, want [3, 4]", clipped.Rows)
 	}
 
@@ -156,7 +156,7 @@ func TestOrInPointSetAggregate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Rows) != 1 || out.Rows[0][0].Int != 5 {
+	if len(out.Rows) != 1 || out.Rows[0][0].num != 5 {
 		t.Fatalf("count(*) over IN(1..5) = %v, want 5", out.Rows)
 	}
 	if out.Cost >= full.Cost {
@@ -193,7 +193,7 @@ func TestOrInPointSetMutation(t *testing.T) {
 		t.Errorf("UPDATE point-set cost %d should be small", u.Cost)
 	}
 	if rows := query(t, db, "SELECT a FROM t WHERE id IN (200, 400)"); len(rows) != 2 ||
-		rows[0][0].Int != -1 || rows[1][0].Int != -1 {
+		rows[0][0].num != -1 || rows[1][0].num != -1 {
 		t.Errorf("rows 200,400 should be updated to -1, got %v", rows)
 	}
 }
@@ -226,7 +226,7 @@ func TestOrInPointSetExplain(t *testing.T) {
 		found := false
 		for _, r := range out.Rows {
 			for _, v := range r {
-				if v.Kind == ValText && strings.Contains(v.str(), c.want) {
+				if v.kind == ValText && strings.Contains(v.str(), c.want) {
 					found = true
 				}
 			}

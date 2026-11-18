@@ -445,7 +445,7 @@ func newSessionWithOptions(opts SessionOptions, env *Environment) (sessionState,
 		env:                 env,
 	}
 	if opts.DefaultPrivileges != nil {
-		s.privileges.SetDefaultTable(*opts.DefaultPrivileges)
+		s.privileges.setDefaultTable(*opts.DefaultPrivileges)
 	}
 	if opts.AllowDDL != nil {
 		s.allowDDL = *opts.AllowDDL
@@ -1253,8 +1253,8 @@ func (db *engine) writeIndexStore(nameKey string) *tableStore {
 // (spec/design/transactions.md §4.2). False under autocommit. Used by the host Transaction surface.
 func (db *engine) InTransaction() bool { return db.session.tx != nil }
 
-// Txid is the monotonic commit counter (spec/design/api.md §2): the committed snapshot's version.
-func (db *engine) Txid() uint64 { return db.committed.txid }
+// txid is the monotonic commit counter (spec/design/api.md §2): the committed snapshot's version.
+func (db *engine) txid() uint64 { return db.committed.txid }
 
 // OldestLiveTxid is the oldest still-live snapshot's txid (spec/design/transactions.md §8) — the
 // Phase-6 free-list reclamation gate. Single-handle (P5.3a) it is trivially the committed txid; the
@@ -1264,12 +1264,12 @@ func (db *engine) OldestLiveTxid() uint64 { return db.committed.txid }
 // PageSize is the page size this database serializes with (spec/design/api.md §2).
 func (db *engine) PageSize() uint32 { return db.pageSize }
 
-// PageCount is the committed logical page high-water — the number of pages the on-disk image
+// pageHighWater is the committed logical page high-water — the number of pages the on-disk image
 // references (the count the meta records, format.md), the size an incremental commit extends at
 // (spec/fileformat/format.md *Reclamation*). It is not the physical file length, which the chunked
 // preallocation (pager.go, spec/design/pager.md §7) runs ahead of with trailing zero slack. 0 for a
 // fresh in-memory database.
-func (db *engine) PageCount() uint32 { return db.pageCount }
+func (db *engine) pageHighWater() uint32 { return db.pageCount }
 
 // Path is the backing file path, or "" for an in-memory database.
 func (db *engine) Path() string { return db.path }
@@ -1301,19 +1301,19 @@ func (db *engine) LifetimeCost() int64 { return *db.session.lifetimeTotal }
 // GRANT … ON ALL TABLES default (spec/design/session.md §5.3). PrivSetEmpty.With(PrivSelect) makes
 // the session read-only (a write resolves to 42501). A handle setting, not stored in the file.
 func (db *engine) SetDefaultPrivileges(privs PrivilegeSet) {
-	db.session.privileges.SetDefaultTable(privs)
+	db.session.privileges.setDefaultTable(privs)
 }
 
 // Grant grants privs on a specific object (table or function) on the default session, beyond the
 // default (§5.3).
 func (db *engine) Grant(privs PrivilegeSet, object string) {
-	db.session.privileges.Grant(privs, object)
+	db.session.privileges.grantObject(privs, object)
 }
 
 // Revoke revokes privs from a specific object on the default session (revoke wins over grant and the
 // default, §5.3).
 func (db *engine) Revoke(privs PrivilegeSet, object string) {
-	db.session.privileges.Revoke(privs, object)
+	db.session.privileges.revokeObject(privs, object)
 }
 
 // ResetPrivileges resets the default session's authorization envelope to fully permissive — every
@@ -1466,13 +1466,13 @@ func (s *sessionState) SetWorkMem(b int) { s.workMem = b }
 
 // SetDefaultPrivileges replaces the default table-privilege set — the GRANT … ON ALL TABLES default
 // (§5.3). A read-only session is PrivSetEmpty.With(PrivSelect).
-func (s *sessionState) SetDefaultPrivileges(privs PrivilegeSet) { s.privileges.SetDefaultTable(privs) }
+func (s *sessionState) SetDefaultPrivileges(privs PrivilegeSet) { s.privileges.setDefaultTable(privs) }
 
 // Grant grants privs on a specific object (table or function), beyond the default (§5.3).
-func (s *sessionState) Grant(privs PrivilegeSet, object string) { s.privileges.Grant(privs, object) }
+func (s *sessionState) Grant(privs PrivilegeSet, object string) { s.privileges.grantObject(privs, object) }
 
 // Revoke revokes privs from a specific object (revoke wins over grant and the default, §5.3).
-func (s *sessionState) Revoke(privs PrivilegeSet, object string) { s.privileges.Revoke(privs, object) }
+func (s *sessionState) Revoke(privs PrivilegeSet, object string) { s.privileges.revokeObject(privs, object) }
 
 // Privileges is read-only access to this session's authorization envelope (§5.3).
 func (s *sessionState) Privileges() *Privileges { return &s.privileges }

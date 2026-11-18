@@ -224,7 +224,7 @@ func TestRemapEndToEnd(t *testing.T) {
 		count++
 		sum += int64(id + 1000*hits[id])
 	}
-	if len(got) != 1 || got[0][0].Int != count || got[0][1].Int != sum || got[0][2].Int != int64(len(ys)) {
+	if len(got) != 1 || got[0][0].num != count || got[0][1].num != sum || got[0][2].num != int64(len(ys)) {
 		t.Fatalf("rows after reopen: %v, want count %d sum %d y %d", got, count, sum, len(ys))
 	}
 }
@@ -257,7 +257,7 @@ func TestRemapRubyHistories(t *testing.T) {
 				t.Fatalf("recovered version %d, want %d", v, c.version)
 			}
 			got := query(t, db, "SELECT count(*), sum(id) FROM t")
-			if got[0][0].Int != 90 || got[0][1].Int != 4095 {
+			if got[0][0].num != 90 || got[0][1].num != 4095 {
 				t.Fatalf("count/sum %v", got)
 			}
 			for id, want := range c.rows {
@@ -288,7 +288,7 @@ func TestRemapRubyEncryptedHistory(t *testing.T) {
 		t.Fatalf("recovered version %d, want 2", db.Version())
 	}
 	got := query(t, db, "SELECT count(*), sum(id), (SELECT v FROM t WHERE id = 100) FROM t")
-	if got[0][0].Int != 300 || got[0][1].Int != 45150 || got[0][2].Int != 1001 {
+	if got[0][0].num != 300 || got[0][1].num != 45150 || got[0][2].num != 1001 {
 		t.Fatalf("got %v, want 300 rows, sum 45150, v 1001", got)
 	}
 	report, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{Level: IntegrityFull, MaxFindings: Unlimited, Constraints: true})

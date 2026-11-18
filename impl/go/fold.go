@@ -141,7 +141,7 @@ func foldConstant(e *rExpr) bool {
 // foldValueInDomain is the fold value domain (planner.md §3.7): NULL, the integers, decimal,
 // f32/f64, boolean, text, bytea, uuid, and arrays of those.
 func foldValueInDomain(v Value) bool {
-	switch v.Kind {
+	switch v.kind {
 	case ValNull, ValInt, ValBool, ValText, ValDecimal, ValBytea, ValUUID, ValFloat32, ValFloat64:
 		return true
 	case ValArray:
@@ -152,7 +152,7 @@ func foldValueInDomain(v Value) bool {
 
 func foldArrayInDomain(a *ArrayVal) bool {
 	for _, el := range a.Elements {
-		if el.Kind == ValArray || !foldValueInDomain(el) {
+		if el.kind == ValArray || !foldValueInDomain(el) {
 			return false
 		}
 	}

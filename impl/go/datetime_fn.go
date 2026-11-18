@@ -348,11 +348,11 @@ func julianParts(micros int64) (jd, todUs int64) {
 // (time-of-day micros / 86400000000), the division at numeric's select_div_scale.
 func extractJulian(micros int64) (Decimal, error) {
 	jd, todUs := julianParts(micros)
-	frac, err := decimalFromInt64(todUs).Div(decimalFromInt64(microsPerDayDT))
+	frac, err := decimalFromInt64(todUs).div(decimalFromInt64(microsPerDayDT))
 	if err != nil {
 		return Decimal{}, err
 	}
-	return decimalFromInt64(jd).Add(frac)
+	return decimalFromInt64(jd).add(frac)
 }
 
 // datePartJulian is date_part('julian', timestamp) over finite wall-clock micros — PG's float8
@@ -651,7 +651,7 @@ func extractInterval(unit, name string, iv Interval) (Decimal, error) {
 		return decimalFromInt64(years / 1000), nil
 	case "epoch":
 		intSecs := years*secsPerIntervalYear + mo*secsPerIntervalMonth + days*secsPerDayDT
-		return decimalFromInt64(intSecs).Add(decimalScaled(micros, 6))
+		return decimalFromInt64(intSecs).add(decimalScaled(micros, 6))
 	default:
 		return Decimal{}, unitNotSupported(name, "interval")
 	}

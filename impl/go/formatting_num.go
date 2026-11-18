@@ -1130,7 +1130,7 @@ func toCharDecimal(d Decimal, tmpl string) (Value, error) {
 	}
 	switch {
 	case num.has(numFRoman):
-		iv, fits := d.ToInt64Round()
+		iv, fits := d.toInt64Round()
 		if !fits || iv > math.MaxInt32 || iv < math.MinInt32 {
 			iv = math.MaxInt32
 		}
@@ -1145,16 +1145,16 @@ func toCharDecimal(d Decimal, tmpl string) (Value, error) {
 	val := d
 	if num.has(numFMulti) {
 		p := decimalFromDigitsScale(false, "1"+strings.Repeat("0", num.multi), 0)
-		if val, err = d.Mul(p); err != nil {
+		if val, err = d.mul(p); err != nil {
 			return Value{}, err
 		}
 		num.pre += num.multi
 	}
-	x, err := val.RoundPlaces(int64(num.post))
+	x, err := val.roundPlaces(int64(num.post))
 	if err != nil {
 		return Value{}, err
 	}
-	numstr, sign, outPreSpaces := numLayout(x.Render(), num)
+	numstr, sign, outPreSpaces := numLayout(x.String(), num)
 	return numToCharFinish(nodes, num, numstr, outPreSpaces, sign)
 }
 
@@ -1243,7 +1243,7 @@ func toNumberText(input, tmpl string, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		if d, err = d.Mul(p); err != nil {
+		if d, err = d.mul(p); err != nil {
 			return Value{}, err
 		}
 	}
@@ -1281,13 +1281,13 @@ func parseNumericIn(s string) (Decimal, error) {
 	if i != len(s) || len(intPart)+len(frac) == 0 {
 		return Decimal{}, bad
 	}
-	return decimalFromDigitsScale(neg, string(intPart)+string(frac), uint32(len(frac))).CheckCap()
+	return decimalFromDigitsScale(neg, string(intPart)+string(frac), uint32(len(frac))).checkCap()
 }
 
 // applyNumericTypmod is numeric.c's apply_typmod: round to scale, then 22003 when the integer
 // digits exceed precision − scale.
 func applyNumericTypmod(d Decimal, precision, scale int) (Decimal, error) {
-	r := d.RoundToScale(uint32(scale))
+	r := d.roundToScale(uint32(scale))
 	if r.IsZero() {
 		return r, nil
 	}

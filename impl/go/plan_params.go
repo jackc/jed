@@ -69,7 +69,7 @@ func (f *planFrame) isNull(i int) bool {
 		f.nullRead = true
 		return false
 	}
-	return i < len(f.values) && f.values[i].Kind == ValNull
+	return i < len(f.values) && f.values[i].kind == ValNull
 }
 
 // noteType records the type a probe frame's resolution gave $(idx0+1) (nil = no context here,
@@ -158,7 +158,7 @@ func (p *planning) needsCustom(bound []Value) bool {
 	}
 	if p.frame.nullRead {
 		for _, v := range bound {
-			if v.Kind == ValNull {
+			if v.kind == ValNull {
 				return true
 			}
 		}
@@ -210,7 +210,7 @@ const planMemoCapacity = 8
 func planMemoKey(bound []Value) string {
 	var b []byte
 	for _, v := range bound {
-		b = append(b, byte(v.Kind))
+		b = append(b, byte(v.kind))
 		b = appendMemoValue(b, v)
 		b = append(b, 0xff)
 	}
@@ -218,11 +218,11 @@ func planMemoKey(bound []Value) string {
 }
 
 func appendMemoValue(b []byte, v Value) []byte {
-	switch v.Kind {
+	switch v.kind {
 	case ValNull:
 		return b
 	case ValInt, ValBool, ValTimestamp, ValTimestamptz, ValDate, ValFloat32, ValFloat64:
-		u := uint64(v.Int)
+		u := uint64(v.num)
 		for i := 0; i < 8; i++ {
 			b = append(b, byte(u>>(8*i)))
 		}
@@ -230,9 +230,9 @@ func appendMemoValue(b []byte, v Value) []byte {
 	case ValText, ValBytea, ValUUID, ValJSON, ValJSONPath:
 		return appendMemoString(b, v.str())
 	case ValDecimal:
-		return appendMemoString(b, v.decimal().Render())
+		return appendMemoString(b, v.decimal().String())
 	default:
-		return appendMemoString(b, v.Render())
+		return appendMemoString(b, v.String())
 	}
 }
 
@@ -294,11 +294,11 @@ func (db *engine) resolveRowCount(c *rowCount, isLimit bool, ptypes *paramTypes)
 		return nil, nil
 	}
 	v := f.values[idx0]
-	switch v.Kind {
+	switch v.kind {
 	case ValNull:
 		return nil, nil
 	case ValInt:
-		n := v.Int
+		n := v.num
 		if n < 0 {
 			if isLimit {
 				return nil, newError(InvalidRowCountInLimitClause, "LIMIT must not be negative")

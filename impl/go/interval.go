@@ -33,10 +33,10 @@ type Interval struct {
 	Micros int64
 }
 
-// Span is the canonical comparison key: a signed 128-bit microsecond span combining the three
+// span is the canonical comparison key: a signed 128-bit microsecond span combining the three
 // fields via 1 month = 30 days and 1 day = 24 h (PG interval_cmp_value). Returned as a *big.Int
 // (Go has no int128); the value is exact.
-func (iv Interval) Span() *big.Int {
+func (iv Interval) span() *big.Int {
 	days := int64(iv.Months)*daysPerMonth + int64(iv.Days) // fits i64 (i32*30 + i32)
 	b := big.NewInt(days)
 	b.Mul(b, big.NewInt(microsPerDay))
@@ -44,10 +44,10 @@ func (iv Interval) Span() *big.Int {
 	return b
 }
 
-// SpanCmp compares two intervals by their canonical span: -1, 0, or 1.
-func (iv Interval) SpanCmp(o Interval) int { return iv.Span().Cmp(o.Span()) }
+// spanCmp compares two intervals by their canonical span: -1, 0, or 1.
+func (iv Interval) spanCmp(o Interval) int { return iv.span().Cmp(o.span()) }
 
-// EncodeKey is the order-preserving KEY body for an interval (method interval-span-i128,
+// encodeKey is the order-preserving KEY body for an interval (method interval-span-i128,
 // spec/design/encoding.md §2.10): the 16-byte order-preserving encoding of the canonical 128-bit
 // Span — int-be-signflip at i128 width (add the bias 2^127, emit a 16-byte big-endian unsigned
 // integer), mapping the signed span range monotonically onto [0, 2^128) so negatives sort below
@@ -57,8 +57,8 @@ func (iv Interval) SpanCmp(o Interval) int { return iv.Span().Cmp(o.Span()) }
 // wrinkle, the decimal 1.5/1.50 precedent). A PK is NOT NULL, so the stored key is this bare
 // 16-byte body. (math/big since Go has no int128; the bias keeps the value non-negative so
 // FillBytes never panics.)
-func (iv Interval) EncodeKey() []byte {
-	biased := iv.Span()
+func (iv Interval) encodeKey() []byte {
+	biased := iv.span()
 	biased.Add(biased, new(big.Int).Lsh(big.NewInt(1), 127)) // + 2^127
 	out := make([]byte, 16)
 	return biased.FillBytes(out) // big-endian, left-zero-padded into the 16-byte buffer
@@ -73,9 +73,9 @@ func addI32(a, b int32) (int32, bool) {
 	return int32(s), true
 }
 
-// Add is field-wise interval addition (PG keeps the fields independent, no justification). An
+// add is field-wise interval addition (PG keeps the fields independent, no justification). An
 // i32 month/day or i64 micros overflow traps 22008.
-func (iv Interval) Add(o Interval) (Interval, error) {
+func (iv Interval) add(o Interval) (Interval, error) {
 	months, ok1 := addI32(iv.Months, o.Months)
 	days, ok2 := addI32(iv.Days, o.Days)
 	micros, ok3 := add64(iv.Micros, o.Micros)
@@ -85,8 +85,8 @@ func (iv Interval) Add(o Interval) (Interval, error) {
 	return Interval{Months: months, Days: days, Micros: micros}, nil
 }
 
-// Sub is field-wise interval subtraction. Overflow traps 22008.
-func (iv Interval) Sub(o Interval) (Interval, error) {
+// sub is field-wise interval subtraction. Overflow traps 22008.
+func (iv Interval) sub(o Interval) (Interval, error) {
 	// Widen before subtracting: an i32 minimum on the right can produce an in-range result,
 	// even though negating that field in isolation would overflow.
 	months := int64(iv.Months) - int64(o.Months)
@@ -119,8 +119,8 @@ func makeInterval(years, months, weeks, days, hours, mins, secMicros int64) (Int
 	return Interval{Months: int32(monthsTotal), Days: int32(daysTotal), Micros: micros}, nil
 }
 
-// Neg negates all three fields. i32::MIN / i64::MIN would overflow → 22008.
-func (iv Interval) Neg() (Interval, error) {
+// neg negates all three fields. i32::MIN / i64::MIN would overflow → 22008.
+func (iv Interval) neg() (Interval, error) {
 	if iv.Months == -2147483648 || iv.Days == -2147483648 || iv.Micros == -9223372036854775808 {
 		return Interval{}, intervalFieldOverflow("interval out of range")
 	}

@@ -57,7 +57,7 @@ func (p assignPlan) check(v Value, iz *inputZone) (Value, error) {
 func storeValue(v Value, colTy scalarType, tm typmod, notNull bool, colName string, iz *inputZone) (Value, error) {
 	decTypmod := tm.Decimal
 	varcharLen := tm.VarcharLen
-	switch v.Kind {
+	switch v.kind {
 	case ValNull:
 		if notNull {
 			return Value{}, newNotNullViolation(colName)
@@ -65,13 +65,13 @@ func storeValue(v Value, colTy scalarType, tm typmod, notNull bool, colName stri
 		return NullValue(), nil
 	case ValInt:
 		if colTy.IsInteger() {
-			if !colTy.InRange(v.Int) {
+			if !colTy.InRange(v.num) {
 				return Value{}, overflowErr(colTy)
 			}
-			return IntValue(v.Int), nil
+			return IntValue(v.num), nil
 		}
 		if colTy.IsDecimal() {
-			d, err := coerceDecimal(decimalFromInt64(v.Int), decTypmod)
+			d, err := coerceDecimal(decimalFromInt64(v.num), decTypmod)
 			if err != nil {
 				return Value{}, err
 			}
@@ -82,9 +82,9 @@ func storeValue(v Value, colTy scalarType, tm typmod, notNull bool, colName stri
 			// / DEFAULT reach here with a literal int; an INSERT...SELECT integer VALUE is gated out
 			// upstream by assignableTo (42804), so this only ever adapts a literal.
 			if colTy.IsFloat32() {
-				return Float32Value(intToFloat32(v.Int)), nil
+				return Float32Value(intToFloat32(v.num)), nil
 			}
-			return Float64Value(intToFloat64(v.Int)), nil
+			return Float64Value(intToFloat64(v.num)), nil
 		}
 		return Value{}, typeError("cannot store an integer value in " + colTy.CanonicalName() + " column " + colName)
 	case ValDecimal:
@@ -230,7 +230,7 @@ func storeValue(v Value, colTy scalarType, tm typmod, notNull bool, colName stri
 			if tm.Temporal == nil {
 				return v, nil
 			}
-			m, err := adjustTimestampTypmod(v.Int, tm.Temporal)
+			m, err := adjustTimestampTypmod(v.num, tm.Temporal)
 			if err != nil {
 				return Value{}, err
 			}
@@ -242,7 +242,7 @@ func storeValue(v Value, colTy scalarType, tm typmod, notNull bool, colName stri
 			if tm.Temporal == nil {
 				return v, nil
 			}
-			m, err := adjustTimestampTypmod(v.Int, tm.Temporal)
+			m, err := adjustTimestampTypmod(v.num, tm.Temporal)
 			if err != nil {
 				return Value{}, err
 			}
@@ -272,7 +272,7 @@ func storeValue(v Value, colTy scalarType, tm typmod, notNull bool, colName stri
 		}
 		if colTy.IsFloat64() {
 			// f32 → f64 column is the implicit, lossless widen (§2).
-			return Float64Value(float64(v.F32())), nil
+			return Float64Value(float64(v.f32())), nil
 		}
 		return Value{}, typeError("cannot store a f32 value in " + colTy.CanonicalName() + " column " + colName)
 	case ValFloat64:
@@ -324,7 +324,7 @@ func coerceForStore(v Value, ty colType, tm typmod, notNull bool, colName string
 // identity (an unconstrained scalar coercion — no typmod, NULL-tolerant) and the value passes through;
 // any other value is a 42804.
 func storeRange(v Value, elem colType, notNull bool, colName string, iz *inputZone) (Value, error) {
-	switch v.Kind {
+	switch v.kind {
 	case ValNull:
 		if notNull {
 			return Value{}, newNotNullViolation(colName)
@@ -372,7 +372,7 @@ func storeRange(v Value, elem colType, notNull bool, colName string, iz *inputZo
 // (23502); a ValArray coerces each element to the declared element type via coerceForStore (a NULL
 // element is allowed — array elements are nullable). Any other value is a 42804.
 func storeArray(v Value, elem colType, notNull bool, colName string, iz *inputZone) (Value, error) {
-	switch v.Kind {
+	switch v.kind {
 	case ValNull:
 		if notNull {
 			return Value{}, newNotNullViolation(colName)
@@ -401,7 +401,7 @@ func storeArray(v Value, elem colType, notNull bool, colName string, iz *inputZo
 // coerced to its declared field type via coerceForStore (recursing); any other value is a 42804. A
 // NULL field of a NOT NULL composite field traps 23502.
 func storeComposite(v Value, typeName string, fields []colField, notNull bool, colName string, iz *inputZone) (Value, error) {
-	switch v.Kind {
+	switch v.kind {
 	case ValNull:
 		if notNull {
 			return Value{}, newNotNullViolation(colName)
@@ -434,9 +434,9 @@ func storeComposite(v Value, typeName string, fields []colField, notNull bool, c
 // precision-check (22003) for numeric(p,s); for an unconstrained numeric column just cap-check.
 func coerceDecimal(d Decimal, typmod *decimalTypmod) (Decimal, error) {
 	if typmod != nil {
-		return d.CoerceToTypmod(uint32(typmod.Precision), uint32(typmod.Scale))
+		return d.coerceToTypmod(uint32(typmod.Precision), uint32(typmod.Scale))
 	}
-	return d.CheckCap()
+	return d.checkCap()
 }
 
 // truncateToChars truncates a text value to at most n code points (the explicit varchar(n) cast
@@ -875,14 +875,14 @@ func fkTypesComparable(local, referenced dataType) bool {
 // which range-checks or widens them. A same-type value passes unchanged.
 func fkCascadeValue(v Value, target scalarType) (Value, error) {
 	switch {
-	case v.Kind == ValDecimal && target.IsInteger():
-		n, ok := v.decimal().ToInt64Round()
+	case v.kind == ValDecimal && target.IsInteger():
+		n, ok := v.decimal().toInt64Round()
 		if !ok || !target.InRange(n) {
 			return Value{}, overflowErr(target)
 		}
 		return IntValue(n), nil
-	case v.Kind == ValFloat64 && target.IsFloat32():
-		r, err := float64ToFloat32(v.F64())
+	case v.kind == ValFloat64 && target.IsFloat32():
+		r, err := float64ToFloat32(v.f64())
 		if err != nil {
 			return Value{}, err
 		}
@@ -902,7 +902,7 @@ func fkValueAs(target dataType, v Value) (Value, bool, error) {
 	if !ok {
 		return v, true, nil
 	}
-	if v.Kind == ValUnfetched {
+	if v.kind == valUnfetched {
 		resolved, err := resolveUnfetchedSelf(v.unfetched())
 		if err != nil {
 			return Value{}, false, err
@@ -910,21 +910,21 @@ func fkValueAs(target dataType, v Value) (Value, bool, error) {
 		v = resolved
 	}
 	switch {
-	case v.Kind == ValInt && t.IsInteger():
-		return v, t.InRange(v.Int), nil
-	case v.Kind == ValInt && t.IsDecimal():
-		return DecimalValue(decimalFromInt64(v.Int)), true, nil
-	case v.Kind == ValDecimal && t.IsInteger():
+	case v.kind == ValInt && t.IsInteger():
+		return v, t.InRange(v.num), nil
+	case v.kind == ValInt && t.IsDecimal():
+		return DecimalValue(decimalFromInt64(v.num)), true, nil
+	case v.kind == ValDecimal && t.IsInteger():
 		d := *v.decimal()
-		n, fits := d.ToInt64Round()
-		if !fits || !t.InRange(n) || decimalFromInt64(n).CmpValue(d) != 0 {
+		n, fits := d.toInt64Round()
+		if !fits || !t.InRange(n) || decimalFromInt64(n).Cmp(d) != 0 {
 			return Value{}, false, nil
 		}
 		return IntValue(n), true, nil
-	case v.Kind == ValFloat32 && t.IsFloat64():
-		return Float64Value(float64(v.F32())), true, nil
-	case v.Kind == ValFloat64 && t.IsFloat32():
-		f := v.F64()
+	case v.kind == ValFloat32 && t.IsFloat64():
+		return Float64Value(float64(v.f32())), true, nil
+	case v.kind == ValFloat64 && t.IsFloat32():
+		f := v.f64()
 		n := float32(f)
 		if !math.IsNaN(f) && float64(n) != f {
 			return Value{}, false, nil
@@ -940,33 +940,33 @@ func fkValueAs(target dataType, v Value) (Value, bool, error) {
 // foreign-key column's type equals its PK/UNIQUE parent column's, CREATE TABLE §6.2). A DEFERRED
 // value (a spilled large value of a lazily-decoded row) is resolved first (residentValue).
 func encodeKeyValue(ty scalarType, value Value, coll *compiledCollation) ([]byte, error) {
-	switch value.Kind {
-	case ValUnfetched:
+	switch value.kind {
+	case valUnfetched:
 		v, err := resolveUnfetchedSelf(value.unfetched())
 		if err != nil {
 			return nil, err
 		}
 		return encodeKeyValue(ty, v, coll)
 	case ValInt:
-		return encodeInt(ty, value.Int), nil
+		return encodeInt(ty, value.num), nil
 	case ValBool:
 		return encodeBool(value.boolVal()), nil
 	case ValUUID:
 		return []byte(value.str()), nil
 	case ValTimestamp, ValTimestamptz, ValDate:
-		return encodeInt(ty, value.Int), nil
+		return encodeInt(ty, value.num), nil
 	case ValText:
 		return collatedTextKey(coll, value.str())
 	case ValBytea:
 		return encodeTerminated([]byte(value.str())), nil
 	case ValDecimal:
-		return value.decimal().EncodeKey(), nil
+		return value.decimal().encodeKey(), nil
 	case ValInterval:
-		return value.interval().EncodeKey(), nil
+		return value.interval().encodeKey(), nil
 	case ValFloat64:
-		return encodeFloat64Key(uint64(value.Int)), nil
+		return encodeFloat64Key(uint64(value.num)), nil
 	case ValFloat32:
-		return encodeFloat32Key(uint32(value.Int)), nil
+		return encodeFloat32Key(uint32(value.num)), nil
 	default:
 		// Every key site's type passes a keyability gate, so a value of another kind came from a page
 		// that disagrees with its column type.
@@ -983,7 +983,7 @@ func encodeKeyValue(ty scalarType, value Value, coll *compiledCollation) ([]byte
 // to compute the same key bytes the INSERT wrote (never a panic, never a skipped entry). The fetch is
 // unmetered, like the evaluator's backstop it shares.
 func residentValue(value Value) (Value, error) {
-	if value.Kind == ValUnfetched {
+	if value.kind == valUnfetched {
 		return resolveUnfetchedSelf(value.unfetched())
 	}
 	return value, nil
@@ -1000,14 +1000,14 @@ func encodeTypedKey(ty dataType, value Value, coll *compiledCollation) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	if value.Kind == ValRange {
+	if value.kind == ValRange {
 		elem, ok := ty.RangeElement()
 		if !ok {
 			return nil, newError(DataCorrupted, "a key value does not match its column type")
 		}
 		return encodeRangeKey(elem.ScalarTy(), value.rangeVal()), nil
 	}
-	if value.Kind == ValArray {
+	if value.kind == ValArray {
 		if ty.Array == nil {
 			return nil, newError(DataCorrupted, "a key value does not match its column type")
 		}
@@ -1028,7 +1028,7 @@ func encodeTypedKey(ty dataType, value Value, coll *compiledCollation) ([]byte, 
 func encodeArrayKey(elem scalarType, a *ArrayVal, coll *compiledCollation) ([]byte, error) {
 	var out []byte
 	for _, e := range a.Elements {
-		if e.Kind == ValNull {
+		if e.kind == ValNull {
 			out = append(out, 0x02) // NULL element — sorts after every present element
 			continue
 		}
@@ -1089,7 +1089,7 @@ func encodeColTypeKey(ct colType, value Value, coll *compiledCollation) ([]byte,
 func encodeCompositeKey(fields []colField, vals []Value) ([]byte, error) {
 	var out []byte
 	for i, f := range fields {
-		if vals[i].Kind == ValNull {
+		if vals[i].kind == ValNull {
 			out = append(out, 0x01) // NULL slot — sorts after every present field
 			continue
 		}
@@ -1154,7 +1154,7 @@ func fkMatchFullViolated(fk *foreignKey, row storedRow) bool {
 	}
 	nulls := 0
 	for _, c := range fk.Columns {
-		if row[c].Kind == ValNull {
+		if row[c].kind == ValNull {
 			nulls++
 		}
 	}
@@ -1170,7 +1170,7 @@ func fkMatchFullViolated(fk *foreignKey, row storedRow) bool {
 func buildFkProbe(fk *foreignKey, parent *catTable, parentColls []*compiledCollation, row storedRow, ordinals []int) (fkProbe, bool, error) {
 	// MATCH SIMPLE: a NULL in any supplied (local/parent) column exempts the whole tuple.
 	for _, o := range ordinals {
-		if row[o].Kind == ValNull {
+		if row[o].kind == ValNull {
 			return fkProbe{}, false, nil
 		}
 	}

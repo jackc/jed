@@ -40,7 +40,7 @@ func compositeToJSON(fields []Value, ty *compositeRType, pretty bool, zone zoneR
 // is the value's static type, read only for the field names of a composite (directly or as an array
 // element).
 func datumToJSON(v Value, ty resolvedType, zone zoneRef, out *strings.Builder) error {
-	switch v.Kind {
+	switch v.kind {
 	case ValNull:
 		out.WriteString("null")
 	case ValBool:
@@ -51,9 +51,9 @@ func datumToJSON(v Value, ty resolvedType, zone zoneRef, out *strings.Builder) e
 		}
 	case ValInt:
 		// A number is its exact text (jed's decimal is always finite, so never a quoted NaN).
-		out.WriteString(strconv.FormatInt(v.Int, 10))
+		out.WriteString(strconv.FormatInt(v.num, 10))
 	case ValDecimal:
-		out.WriteString(v.decimal().Render())
+		out.WriteString(v.decimal().String())
 	case ValText:
 		writeJSONString(v.str(), out)
 	case ValJSON:
@@ -67,11 +67,11 @@ func datumToJSON(v Value, ty resolvedType, zone zoneRef, out *strings.Builder) e
 		return arrayToJSON(v.arrayVal(), *ty.elem, false, zone, out)
 	// The datetimes take PostgreSQL's JsonEncodeDateTime (XSD) form.
 	case ValDate:
-		writeJSONString(renderDate(int32(v.Int)), out)
+		writeJSONString(renderDate(int32(v.num)), out)
 	case ValTimestamp:
-		writeJSONString(renderTimestampXSD(v.Int), out)
+		writeJSONString(renderTimestampXSD(v.num), out)
 	case ValTimestamptz:
-		text, err := renderTimestamptzXSDIn(v.Int, zone)
+		text, err := renderTimestamptzXSDIn(v.num, zone)
 		if err != nil {
 			return err
 		}
@@ -139,13 +139,13 @@ func arrayDimToJSON(a *ArrayVal, dim int, elem resolvedType, pretty bool, zone z
 // datumToJSON, except that a json value is parsed (duplicate keys collapse, last wins), a composite
 // is an object in canonical key order, and the result is a node, not text.
 func datumToJSONB(v Value, ty resolvedType, zone zoneRef) (JSONNode, error) {
-	switch v.Kind {
+	switch v.kind {
 	case ValNull:
 		return JSONNode{Kind: JNull}, nil
 	case ValBool:
 		return JSONNode{Kind: JBool, B: v.boolVal()}, nil
 	case ValInt:
-		return JSONNode{Kind: JNumber, Num: decimalFromInt64(v.Int)}, nil
+		return JSONNode{Kind: JNumber, Num: decimalFromInt64(v.num)}, nil
 	case ValDecimal:
 		return JSONNode{Kind: JNumber, Num: *v.decimal()}, nil
 	case ValText:
@@ -173,11 +173,11 @@ func datumToJSONB(v Value, ty resolvedType, zone zoneRef) (JSONNode, error) {
 		next := 0
 		return arrayDimToJSONB(a, 0, *ty.elem, zone, &next)
 	case ValDate:
-		return JSONNode{Kind: JString, S: renderDate(int32(v.Int))}, nil
+		return JSONNode{Kind: JString, S: renderDate(int32(v.num))}, nil
 	case ValTimestamp:
-		return JSONNode{Kind: JString, S: renderTimestampXSD(v.Int)}, nil
+		return JSONNode{Kind: JString, S: renderTimestampXSD(v.num)}, nil
 	case ValTimestamptz:
-		text, err := renderTimestamptzXSDIn(v.Int, zone)
+		text, err := renderTimestamptzXSDIn(v.num, zone)
 		if err != nil {
 			return JSONNode{}, err
 		}
@@ -225,7 +225,7 @@ func arrayDimToJSONB(a *ArrayVal, dim int, elem resolvedType, zone zoneRef, next
 // other scalar its text output. An array, composite, json, or jsonb key is 22023. The caller rejects
 // a NULL key first.
 func jsonKeyText(v Value, zone zoneRef) (string, error) {
-	switch v.Kind {
+	switch v.kind {
 	case ValArray, ValComposite, ValJSON, ValJSONB:
 		return "", newError(InvalidParameterValue, "key value must be scalar, not array, composite, or json")
 	case ValBool:
@@ -234,17 +234,17 @@ func jsonKeyText(v Value, zone zoneRef) (string, error) {
 		}
 		return "false", nil
 	case ValInt:
-		return strconv.FormatInt(v.Int, 10), nil
+		return strconv.FormatInt(v.num, 10), nil
 	case ValDecimal:
-		return v.decimal().Render(), nil
+		return v.decimal().String(), nil
 	case ValText:
 		return v.str(), nil
 	case ValDate:
-		return renderDate(int32(v.Int)), nil
+		return renderDate(int32(v.num)), nil
 	case ValTimestamp:
-		return renderTimestampXSD(v.Int), nil
+		return renderTimestampXSD(v.num), nil
 	case ValTimestamptz:
-		return renderTimestamptzXSDIn(v.Int, zone)
+		return renderTimestamptzXSDIn(v.num, zone)
 	case ValFloat32, ValFloat64:
 		f, bits := floatOf(v)
 		return renderFloatPG(f, bits), nil

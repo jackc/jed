@@ -24,7 +24,7 @@ func oneValue(t *testing.T, db dbHandle, sql string) string {
 	if out.Kind != outcomeQuery || len(out.Rows) != 1 || len(out.Rows[0]) != 1 {
 		t.Fatalf("Execute(%q): expected a 1x1 query result, got %+v", sql, out)
 	}
-	return out.Rows[0][0].Render()
+	return out.Rows[0][0].String()
 }
 
 func TestLineCommentsRunToEndOfLine(t *testing.T) {

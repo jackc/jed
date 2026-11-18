@@ -2,6 +2,8 @@
 
 package jed
 
+import "slices"
+
 // These entry points exist only for repository tooling built with -tags jedtooling.
 // They are excluded from ordinary library builds and are not an embedding API.
 
@@ -62,3 +64,14 @@ func CommitSessionForTesting(s *Session) error { return s.commitBlock() }
 
 // RollbackSessionForTesting rolls back the session's open block; no open block is a no-op.
 func RollbackSessionForTesting(s *Session) error { return s.rollbackBlock() }
+
+// OldestLiveTxidForTesting is the reader-liveness watermark (transactions.md §8): the oldest snapshot
+// version a live reader pins, or the committed version with none.
+func OldestLiveTxidForTesting(db *Database) uint64 { return db.oldestLiveTxid() }
+
+// SupportedCapabilitiesForTesting lists the corpus capabilities this core implements (the
+// conformance harness's gate).
+func SupportedCapabilitiesForTesting() []string { return slices.Clone(supportedCapabilities) }
+
+// PageCountForTesting is the file's page high-water (0 in memory).
+func PageCountForTesting(db *Database) uint32 { return db.pageHighWater() }

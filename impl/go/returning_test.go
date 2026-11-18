@@ -52,10 +52,10 @@ func retGrid(rows [][]Value) string {
 	for _, r := range rows {
 		cells := make([]string, 0, len(r))
 		for _, v := range r {
-			if v.Kind == ValNull {
+			if v.kind == ValNull {
 				cells = append(cells, "NULL")
 			} else {
-				cells = append(cells, fmt.Sprintf("%d", v.Int))
+				cells = append(cells, fmt.Sprintf("%d", v.num))
 			}
 		}
 		parts = append(parts, strings.Join(cells, ","))

@@ -1399,7 +1399,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"max_sep_table.jed", maxSepTableDB},
 	}
 	for _, c := range cases {
-		image, err := c.build(t).ToImage(goldenPageSizeOf(c.name), 1)
+		image, err := c.build(t).toImage(goldenPageSizeOf(c.name), 1)
 		if err != nil {
 			t.Fatalf("%s: serialize: %v", c.name, err)
 		}
@@ -1567,7 +1567,7 @@ func TestReadGoldenReconstructsCatalog(t *testing.T) {
 	}
 	// A NULL value round-trips (id 3's v).
 	rows := loaded.rowsInKeyOrder("t")
-	if rows[2][0].IsNull() || rows[2][0].Int != 3 || !rows[2][1].IsNull() {
+	if rows[2][0].IsNull() || rows[2][0].num != 3 || !rows[2][1].IsNull() {
 		t.Errorf("row 3 should be (3, NULL), got %v", rows[2])
 	}
 }
@@ -1576,7 +1576,7 @@ func TestReadGoldenReconstructsCatalog(t *testing.T) {
 // after a load don't collide with persisted rowids (the step-6 mutation fix).
 func TestRowidCounterSurvivesLoad(t *testing.T) {
 	db := nopkTableDB(t) // existing rows take rowids 0, 1, 2 (built at goldenPageSize)
-	image, err := db.ToImage(goldenPageSize, 1)
+	image, err := db.toImage(goldenPageSize, 1)
 	if err != nil {
 		t.Fatalf("serialize: %v", err)
 	}
@@ -1605,8 +1605,8 @@ func TestDefaultSurvivesLoad(t *testing.T) {
 	rows := loaded.rowsInKeyOrder("t")
 	last := rows[len(rows)-1]
 	// id=3 takes every persisted default: n=0, note='none', maybe=NULL, req=7, plain=NULL.
-	if last[0].Int != 3 || last[1].Int != 0 || last[2].str() != "none" ||
-		last[3].Kind != ValNull || last[4].Int != 7 || last[6].Kind != ValNull {
+	if last[0].num != 3 || last[1].num != 0 || last[2].str() != "none" ||
+		last[3].kind != ValNull || last[4].num != 7 || last[6].kind != ValNull {
 		t.Errorf("persisted defaults not applied: %v", last)
 	}
 }
@@ -1624,7 +1624,7 @@ func TestRoundTripAtDefaultPageSize(t *testing.T) {
 		}
 		run(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %s)", i, v))
 	}
-	image, err := db.ToImage(8192, 1)
+	image, err := db.toImage(8192, 1)
 	if err != nil {
 		t.Fatalf("serialize: %v", err)
 	}
@@ -1636,7 +1636,7 @@ func TestRoundTripAtDefaultPageSize(t *testing.T) {
 		t.Errorf("8 KiB round trip changed rows")
 	}
 	// Re-serializing the loaded database yields identical bytes (determinism).
-	again, err := loaded.ToImage(8192, 1)
+	again, err := loaded.toImage(8192, 1)
 	if err != nil {
 		t.Fatalf("re-serialize: %v", err)
 	}
@@ -1708,8 +1708,8 @@ func TestTypeCodesRoundTrip(t *testing.T) {
 
 func TestSerializeIsDeterministic(t *testing.T) {
 	db := pkTableDB(t)
-	a, _ := db.ToImage(goldenPageSize, 1)
-	b, _ := db.ToImage(goldenPageSize, 1)
+	a, _ := db.toImage(goldenPageSize, 1)
+	b, _ := db.toImage(goldenPageSize, 1)
 	if !bytes.Equal(a, b) {
 		t.Errorf("serializing the same database twice produced different bytes")
 	}
@@ -1860,7 +1860,7 @@ func TestUnparsableDefinitionsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load unparsable_definitions.jed: %v", err)
 	}
-	again, err := loaded.ToImage(goldenPageSize, 1)
+	again, err := loaded.toImage(goldenPageSize, 1)
 	if err != nil {
 		t.Fatalf("ToImage: %v", err)
 	}
@@ -1959,7 +1959,7 @@ func TestPersistedRowCountTracksDMLAndRollback(t *testing.T) {
 		t.Fatalf("temp count after rollback = %d, want 2", got)
 	}
 
-	image, err := loaded.ToImage(goldenPageSize, 2)
+	image, err := loaded.toImage(goldenPageSize, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1974,7 +1974,7 @@ func TestPersistedRowCountTracksDMLAndRollback(t *testing.T) {
 	if got := exactStoreCount(t, reopened.lkpStore("t")); got != 0 {
 		t.Fatalf("count after delete-to-zero = %d, want 0", got)
 	}
-	zeroImage, err := reopened.ToImage(goldenPageSize, 3)
+	zeroImage, err := reopened.toImage(goldenPageSize, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2010,7 +2010,7 @@ func TestTableRowCountInvariantsAreRejected(t *testing.T) {
 
 func TestCorruptImageIsRejected(t *testing.T) {
 	db := pkTableDB(t)
-	image, _ := db.ToImage(goldenPageSize, 1)
+	image, _ := db.toImage(goldenPageSize, 1)
 	image[0] ^= 0xFF              // smash slot 0 magic
 	image[goldenPageSize] ^= 0xFF // smash slot 1 magic
 	if _, err := loadEngine(image, NewEnvironment()); err == nil {
@@ -2028,7 +2028,7 @@ func goldenComparableRows(rows []storedRow) [][]any {
 	for i, row := range rows {
 		out[i] = make([]any, len(row))
 		for j, v := range row {
-			if v.Kind == ValJSONB {
+			if v.kind == ValJSONB {
 				out[i][j] = "jsonb:" + jsonbOut(v.jsonb())
 			} else {
 				out[i][j] = v

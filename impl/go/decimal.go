@@ -42,9 +42,9 @@ const (
 // zero); Scale is the display scale; Limbs is the coefficient magnitude (base 10^9, LSB-first,
 // no high zero limbs; nil/empty == zero).
 type Decimal struct {
-	Neg   bool
-	Scale uint32
-	Limbs []uint32
+	neg   bool
+	scale uint32
+	limbs []uint32
 }
 
 func decimalOverflow() error {
@@ -62,11 +62,11 @@ func newDecimal(neg bool, scale uint32, limbs []uint32) Decimal {
 	if len(limbs) == 0 {
 		neg = false
 	}
-	return Decimal{Neg: neg, Scale: scale, Limbs: limbs}
+	return Decimal{neg: neg, scale: scale, limbs: limbs}
 }
 
 // DecimalZero is zero at the given display scale.
-func decimalZero(scale uint32) Decimal { return Decimal{Neg: false, Scale: scale, Limbs: nil} }
+func decimalZero(scale uint32) Decimal { return Decimal{neg: false, scale: scale, limbs: nil} }
 
 // DecimalFromInt64 is the exact decimal of an integer (the lossless int→decimal cast, scale 0).
 func decimalFromInt64(v int64) Decimal {
@@ -153,20 +153,20 @@ func decimalFromRadixDigits(neg bool, digits string, base int) (Decimal, error) 
 }
 
 // IsZero reports whether the value is zero.
-func (d Decimal) IsZero() bool { return len(d.Limbs) == 0 }
+func (d Decimal) IsZero() bool { return len(d.limbs) == 0 }
 
-// Precision is the number of significant digits in the coefficient (0 for zero).
-func (d Decimal) Precision() uint32 { return magDigitCount(d.Limbs) }
+// precision is the number of significant digits in the coefficient (0 for zero).
+func (d Decimal) precision() uint32 { return magDigitCount(d.limbs) }
 
-// CheckCap traps 22003 if this (unconstrained) value exceeds the numeric-format caps
+// checkCap traps 22003 if this (unconstrained) value exceeds the numeric-format caps
 // (spec/design/decimal.md §2): more than MaxIntDigits integer-part digits or a scale over
 // MaxScale — PG's make_result / numeric_in checks.
-func (d Decimal) CheckCap() (Decimal, error) {
+func (d Decimal) checkCap() (Decimal, error) {
 	intDigits := uint32(0)
-	if p := d.Precision(); p > d.Scale {
-		intDigits = p - d.Scale
+	if p := d.precision(); p > d.scale {
+		intDigits = p - d.scale
 	}
-	if intDigits > decimalMaxIntDigits || d.Scale > maxScale {
+	if intDigits > decimalMaxIntDigits || d.scale > maxScale {
 		return Decimal{}, decimalOverflow()
 	}
 	return d, nil
@@ -176,20 +176,20 @@ func (d Decimal) CheckCap() (Decimal, error) {
 // zeros stripped: 1.50 → ("15",1), 10.0 → ("10",0), 100 → ("100",0). Two values equal in value
 // share this form — the key for equality and DISTINCT/GROUP BY (spec/design/decimal.md §5).
 func (d Decimal) canonical() (bool, string, uint32) {
-	if len(d.Limbs) == 0 {
+	if len(d.limbs) == 0 {
 		return false, "0", 0
 	}
-	digits := magToDecimalStr(d.Limbs)
-	scale := d.Scale
+	digits := magToDecimalStr(d.limbs)
+	scale := d.scale
 	for scale > 0 && strings.HasSuffix(digits, "0") {
 		digits = digits[:len(digits)-1]
 		scale--
 	}
-	return d.Neg, digits, scale
+	return d.neg, digits, scale
 }
 
-// CanonicalString is a collision-free string of the value-canonical form, for DISTINCT dedup.
-func (d Decimal) CanonicalString() string {
+// canonicalString is a collision-free string of the value-canonical form, for DISTINCT dedup.
+func (d Decimal) canonicalString() string {
 	neg, digits, scale := d.canonical()
 	sign := "+"
 	if neg {
@@ -198,10 +198,10 @@ func (d Decimal) CanonicalString() string {
 	return sign + digits + "e" + strconv.FormatUint(uint64(scale), 10)
 }
 
-// CmpValue is the total order over finite decimals by value: <0, 0, >0.
-func (d Decimal) CmpValue(o Decimal) int {
-	if d.Neg != o.Neg {
-		if d.Neg { // neg sorts below non-neg; zero is non-neg
+// Cmp is the total order over finite decimals by value: <0, 0, >0.
+func (d Decimal) Cmp(o Decimal) int {
+	if d.neg != o.neg {
+		if d.neg { // neg sorts below non-neg; zero is non-neg
 			return -1
 		}
 		return 1
@@ -210,7 +210,7 @@ func (d Decimal) CmpValue(o Decimal) int {
 	if !ok {
 		m = d.cmpMagLimbs(o)
 	}
-	if d.Neg {
+	if d.neg {
 		return -m
 	}
 	return m
@@ -218,28 +218,28 @@ func (d Decimal) CmpValue(o Decimal) int {
 
 // cmpMagLimbs compares the two magnitudes at their common scale — the limb path of CmpValue.
 func (d Decimal) cmpMagLimbs(o Decimal) int {
-	s := d.Scale
-	if o.Scale > s {
-		s = o.Scale
+	s := d.scale
+	if o.scale > s {
+		s = o.scale
 	}
-	a := magMulPow10(d.Limbs, s-d.Scale)
-	b := magMulPow10(o.Limbs, s-o.Scale)
+	a := magMulPow10(d.limbs, s-d.scale)
+	b := magMulPow10(o.limbs, s-o.scale)
 	return magCmp(a, b)
 }
 
-// Render is the canonical decimal string (spec/design/decimal.md §6): optional '-', the integer
+// String is the canonical decimal string (spec/design/decimal.md §6): optional '-', the integer
 // digits, and — iff Scale > 0 — '.' and exactly Scale fractional digits.
-func (d Decimal) Render() string {
-	digits := magToDecimalStr(d.Limbs) // "0" for zero
+func (d Decimal) String() string {
+	digits := magToDecimalStr(d.limbs) // "0" for zero
 	var b strings.Builder
-	if d.Neg {
+	if d.neg {
 		b.WriteByte('-')
 	}
-	if d.Scale == 0 {
+	if d.scale == 0 {
 		b.WriteString(digits)
 		return b.String()
 	}
-	scale := int(d.Scale)
+	scale := int(d.scale)
 	want := scale + 1
 	if len(digits) < want {
 		digits = strings.Repeat("0", want-len(digits)) + digits
@@ -251,17 +251,17 @@ func (d Decimal) Render() string {
 	return b.String()
 }
 
-// Negate flips the sign (zero stays +0).
-func (d Decimal) Negate() Decimal {
-	return newDecimal(!d.Neg, d.Scale, d.Limbs)
+// negate flips the sign (zero stays +0).
+func (d Decimal) negate() Decimal {
+	return newDecimal(!d.neg, d.scale, d.limbs)
 }
 
-// AddUncapped is exact addition, result scale max(s1,s2), WITHOUT the §2 format-cap check —
+// addUncapped is exact addition, result scale max(s1,s2), WITHOUT the §2 format-cap check —
 // the running form for the SUM/AVG accumulator, which (like PG) checks the cap only on the
 // FINAL result, not each intermediate (spec/design/decimal.md §2, determinism.md §7). That
 // makes the trap order-independent: whether a fold overflows no longer depends on the order
 // rows are summed. Standalone arithmetic uses Add (capped).
-func (d Decimal) AddUncapped(o Decimal) Decimal {
+func (d Decimal) addUncapped(o Decimal) Decimal {
 	if r, ok := addSmall(d, o); ok {
 		return r
 	}
@@ -270,52 +270,52 @@ func (d Decimal) AddUncapped(o Decimal) Decimal {
 
 // addLimbs is the limb path of AddUncapped.
 func (d Decimal) addLimbs(o Decimal) Decimal {
-	s := d.Scale
-	if o.Scale > s {
-		s = o.Scale
+	s := d.scale
+	if o.scale > s {
+		s = o.scale
 	}
-	a := magMulPow10(d.Limbs, s-d.Scale)
-	b := magMulPow10(o.Limbs, s-o.Scale)
-	if d.Neg == o.Neg {
-		return newDecimal(d.Neg, s, magAdd(a, b))
+	a := magMulPow10(d.limbs, s-d.scale)
+	b := magMulPow10(o.limbs, s-o.scale)
+	if d.neg == o.neg {
+		return newDecimal(d.neg, s, magAdd(a, b))
 	}
 	switch magCmp(a, b) {
 	case 0:
 		return decimalZero(s)
 	case 1:
-		return newDecimal(d.Neg, s, magSub(a, b))
+		return newDecimal(d.neg, s, magSub(a, b))
 	default:
-		return newDecimal(o.Neg, s, magSub(b, a))
+		return newDecimal(o.neg, s, magSub(b, a))
 	}
 }
 
-// Add is exact addition, result scale max(s1,s2); traps 22003 at the cap.
-func (d Decimal) Add(o Decimal) (Decimal, error) {
-	return d.AddUncapped(o).CheckCap()
+// add is exact addition, result scale max(s1,s2); traps 22003 at the cap.
+func (d Decimal) add(o Decimal) (Decimal, error) {
+	return d.addUncapped(o).checkCap()
 }
 
-// Sub is d - o (= d + (-o)).
-func (d Decimal) Sub(o Decimal) (Decimal, error) { return d.Add(o.Negate()) }
+// subtract is d - o (= d + (-o)).
+func (d Decimal) subtract(o Decimal) (Decimal, error) { return d.add(o.negate()) }
 
-// Mul is exact multiplication, result scale s1+s2; traps 22003 at the integer-digit cap.
+// mul is exact multiplication, result scale s1+s2; traps 22003 at the integer-digit cap.
 // A product scale over MaxScale ROUNDS to it instead of trapping (PG numeric_mul rounds the
 // exact product — spec/design/decimal.md §2).
-func (d Decimal) Mul(o Decimal) (Decimal, error) {
-	scale := d.Scale + o.Scale
+func (d Decimal) mul(o Decimal) (Decimal, error) {
+	scale := d.scale + o.scale
 	product, ok := mulSmall(d, o)
 	if !ok {
-		product = magMul(d.Limbs, o.Limbs)
+		product = magMul(d.limbs, o.limbs)
 	}
-	exact := newDecimal(d.Neg != o.Neg, scale, product)
+	exact := newDecimal(d.neg != o.neg, scale, product)
 	if scale > maxScale {
-		exact = exact.RoundToScale(maxScale)
+		exact = exact.roundToScale(maxScale)
 	}
-	return exact.CheckCap()
+	return exact.checkCap()
 }
 
-// Div is d / o with PG's select_div_scale result scale, rounded half away from zero
+// div is d / o with PG's select_div_scale result scale, rounded half away from zero
 // (spec/design/decimal.md §4). Traps 22012 on a zero divisor, 22003 at the cap.
-func (d Decimal) Div(o Decimal) (Decimal, error) {
+func (d Decimal) div(o Decimal) (Decimal, error) {
 	if o.IsZero() {
 		return Decimal{}, decimalDivByZero()
 	}
@@ -327,126 +327,126 @@ func (d Decimal) Div(o Decimal) (Decimal, error) {
 	// 1000-digit display clamp (s1 > 1000): the quotient then has FEWER fractional digits than
 	// the dividend, so the shift moves to the divisor instead (N = |C1|, D = |C2|·10^−E) — never
 	// a wrapped uint32 shift (decimal.md §4).
-	e := int64(rscale) + int64(o.Scale) - int64(d.Scale)
-	numer, denom := d.Limbs, o.Limbs
+	e := int64(rscale) + int64(o.scale) - int64(d.scale)
+	numer, denom := d.limbs, o.limbs
 	if e >= 0 {
-		numer = magMulPow10(d.Limbs, uint32(e))
+		numer = magMulPow10(d.limbs, uint32(e))
 	} else {
-		denom = magMulPow10(o.Limbs, uint32(-e))
+		denom = magMulPow10(o.limbs, uint32(-e))
 	}
 	q, r := magDivMod(numer, denom)
 	// Round half away from zero: if 2*r >= |divisor|, round the magnitude up.
 	if magCmp(magAdd(r, r), denom) >= 0 {
 		q = magAdd(q, []uint32{1})
 	}
-	return newDecimal(d.Neg != o.Neg, rscale, q).CheckCap()
+	return newDecimal(d.neg != o.neg, rscale, q).checkCap()
 }
 
-// Rem is d % o — remainder of truncated division; result scale max(s1,s2), sign of the
+// rem is d % o — remainder of truncated division; result scale max(s1,s2), sign of the
 // dividend (matches the integer %). Traps 22012 on a zero divisor.
-func (d Decimal) Rem(o Decimal) (Decimal, error) {
+func (d Decimal) rem(o Decimal) (Decimal, error) {
 	if o.IsZero() {
 		return Decimal{}, decimalDivByZero()
 	}
-	s := d.Scale
-	if o.Scale > s {
-		s = o.Scale
+	s := d.scale
+	if o.scale > s {
+		s = o.scale
 	}
-	a := magMulPow10(d.Limbs, s-d.Scale)
-	b := magMulPow10(o.Limbs, s-o.Scale)
+	a := magMulPow10(d.limbs, s-d.scale)
+	b := magMulPow10(o.limbs, s-o.scale)
 	_, r := magDivMod(a, b)
-	return newDecimal(d.Neg, s, r), nil
+	return newDecimal(d.neg, s, r), nil
 }
 
-// RoundToScale rounds to target scale, half away from zero (spec/design/decimal.md §3).
+// roundToScale rounds to target scale, half away from zero (spec/design/decimal.md §3).
 // Increasing the scale only appends zeros (exact).
-func (d Decimal) RoundToScale(target uint32) Decimal {
-	if target >= d.Scale {
-		return newDecimal(d.Neg, target, magMulPow10(d.Limbs, target-d.Scale))
+func (d Decimal) roundToScale(target uint32) Decimal {
+	if target >= d.scale {
+		return newDecimal(d.neg, target, magMulPow10(d.limbs, target-d.scale))
 	}
-	pow := magPow10(d.Scale - target)
-	q, r := magDivMod(d.Limbs, pow)
+	pow := magPow10(d.scale - target)
+	q, r := magDivMod(d.limbs, pow)
 	if magCmp(magAdd(r, r), pow) >= 0 {
 		q = magAdd(q, []uint32{1})
 	}
-	return newDecimal(d.Neg, target, q)
+	return newDecimal(d.neg, target, q)
 }
 
-// Abs is the magnitude, preserving scale — the abs(numeric) scalar function
+// abs is the magnitude, preserving scale — the abs(numeric) scalar function
 // (spec/design/functions.md §9). Cannot overflow.
-func (d Decimal) Abs() Decimal {
-	return newDecimal(false, d.Scale, append([]uint32(nil), d.Limbs...))
+func (d Decimal) abs() Decimal {
+	return newDecimal(false, d.scale, append([]uint32(nil), d.limbs...))
 }
 
-// RoundPlaces is PG round(numeric, n) (spec/design/functions.md §9): round half away from zero
+// roundPlaces is PG round(numeric, n) (spec/design/functions.md §9): round half away from zero
 // to n fractional places. n >= 0 rounds to scale n (delegating to RoundToScale, with n clamped
 // at MaxScale like PG numeric_round); n < 0 rounds to the LEFT of the point — result scale 0,
-// value a multiple of 10^-n (round(150, -2) = 200). RoundPlaces(0) is round(x). Traps 22003
+// value a multiple of 10^-n (round(150, -2) = 200). roundPlaces(0) is round(x). Traps 22003
 // when the round-up carry pushes a value at the integer-digit cap over it (decimal.md §4).
-func (d Decimal) RoundPlaces(n int64) (Decimal, error) {
+func (d Decimal) roundPlaces(n int64) (Decimal, error) {
 	if n >= 0 {
 		target := uint32(maxScale)
 		if n < int64(maxScale) {
 			target = uint32(n)
 		}
-		return d.RoundToScale(target).CheckCap()
+		return d.roundToScale(target).checkCap()
 	}
 	// Drop d.Scale + k digits of the magnitude (rounding half away), then re-append the k
 	// integer zeros. k is capped at the digit count + 1: beyond that every value rounds to 0
 	// (or a single carried 1), so the clamp changes no result but bounds the work.
 	mag := uint64(-n) // two's-complement: the correct magnitude even for MinInt64
-	k := d.Precision() + 1
+	k := d.precision() + 1
 	if mag < uint64(k) {
 		k = uint32(mag)
 	}
-	pow := magPow10(d.Scale + k)
-	q, r := magDivMod(d.Limbs, pow)
+	pow := magPow10(d.scale + k)
+	q, r := magDivMod(d.limbs, pow)
 	if magCmp(magAdd(r, r), pow) >= 0 {
 		q = magAdd(q, []uint32{1})
 	}
-	return newDecimal(d.Neg, 0, magMulPow10(q, k)).CheckCap()
+	return newDecimal(d.neg, 0, magMulPow10(q, k)).checkCap()
 }
 
-// TruncToScale truncates toward zero to target scale — drop the dropped fractional digits, no
+// truncToScale truncates toward zero to target scale — drop the dropped fractional digits, no
 // rounding. Increasing the scale only appends zeros (exact). Truncation never grows the
 // magnitude, so it cannot overflow. The toward-zero core of trunc (spec/design/functions.md §9).
-func (d Decimal) TruncToScale(target uint32) Decimal {
-	if target >= d.Scale {
-		return newDecimal(d.Neg, target, magMulPow10(d.Limbs, target-d.Scale))
+func (d Decimal) truncToScale(target uint32) Decimal {
+	if target >= d.scale {
+		return newDecimal(d.neg, target, magMulPow10(d.limbs, target-d.scale))
 	}
-	pow := magPow10(d.Scale - target)
-	q, _ := magDivMod(d.Limbs, pow)
-	return newDecimal(d.Neg, target, q)
+	pow := magPow10(d.scale - target)
+	q, _ := magDivMod(d.limbs, pow)
+	return newDecimal(d.neg, target, q)
 }
 
-// TruncPlaces is PG trunc(numeric, n) (spec/design/functions.md §9): truncate toward zero to n
+// truncPlaces is PG trunc(numeric, n) (spec/design/functions.md §9): truncate toward zero to n
 // fractional places. n >= 0 truncates to scale n (trunc(1.567, 2) = 1.56, clamped at MaxScale);
 // n < 0 truncates to the LEFT of the point — result scale 0, a multiple of 10^-n
-// (trunc(1234.5, -2) = 1200). TruncPlaces(0) is trunc(x). Cannot overflow (truncation never grows
+// (trunc(1234.5, -2) = 1200). truncPlaces(0) is trunc(x). Cannot overflow (truncation never grows
 // the magnitude — mirrors RoundPlaces minus the round-up carry).
-func (d Decimal) TruncPlaces(n int64) Decimal {
+func (d Decimal) truncPlaces(n int64) Decimal {
 	if n >= 0 {
 		target := uint32(maxScale)
 		if n < int64(maxScale) {
 			target = uint32(n)
 		}
-		return d.TruncToScale(target)
+		return d.truncToScale(target)
 	}
 	mag := uint64(-n) // two's-complement: the correct magnitude even for MinInt64
-	k := d.Precision() + 1
+	k := d.precision() + 1
 	if mag < uint64(k) {
 		k = uint32(mag)
 	}
-	pow := magPow10(d.Scale + k)
-	q, _ := magDivMod(d.Limbs, pow)
-	return newDecimal(d.Neg, 0, magMulPow10(q, k))
+	pow := magPow10(d.scale + k)
+	q, _ := magDivMod(d.limbs, pow)
+	return newDecimal(d.neg, 0, magMulPow10(q, k))
 }
 
-// Ceil is ceil(numeric) — round toward +∞ to scale 0 (spec/design/functions.md §9).
-func (d Decimal) Ceil() (Decimal, error) { return d.roundToBound(false) }
+// ceil is ceil(numeric) — round toward +∞ to scale 0 (spec/design/functions.md §9).
+func (d Decimal) ceil() (Decimal, error) { return d.roundToBound(false) }
 
-// Floor is floor(numeric) — round toward −∞ to scale 0.
-func (d Decimal) Floor() (Decimal, error) { return d.roundToBound(true) }
+// floor is floor(numeric) — round toward −∞ to scale 0.
+func (d Decimal) floor() (Decimal, error) { return d.roundToBound(true) }
 
 // roundToBound is the shared kernel for Ceil/Floor to scale 0: drop the fraction toward zero, then
 // grow the magnitude by one iff a fraction was dropped AND the requested direction points away
@@ -454,11 +454,11 @@ func (d Decimal) Floor() (Decimal, error) { return d.roundToBound(true) }
 // true) grows a negative one. A carry can push a value at the integer-digit cap over it → 22003
 // (like round).
 func (d Decimal) roundToBound(towardNeg bool) (Decimal, error) {
-	if d.Scale == 0 {
+	if d.scale == 0 {
 		return d, nil
 	}
-	pow := magPow10(d.Scale)
-	q, r := magDivMod(d.Limbs, pow)
+	pow := magPow10(d.scale)
+	q, r := magDivMod(d.limbs, pow)
 	hasFrac := false
 	for _, x := range r {
 		if x != 0 {
@@ -466,17 +466,17 @@ func (d Decimal) roundToBound(towardNeg bool) (Decimal, error) {
 			break
 		}
 	}
-	if hasFrac && d.Neg == towardNeg {
+	if hasFrac && d.neg == towardNeg {
 		q = magAdd(q, []uint32{1})
 	}
-	return newDecimal(d.Neg, 0, q).CheckCap()
+	return newDecimal(d.neg, 0, q).checkCap()
 }
 
-// CoerceToTypmod coerces into numeric(precision, scale): round to scale (half away), then trap
+// coerceToTypmod coerces into numeric(precision, scale): round to scale (half away), then trap
 // 22003 if the integer-part digits exceed precision-scale (spec/design/decimal.md §2).
-func (d Decimal) CoerceToTypmod(precision, scale uint32) (Decimal, error) {
-	rounded := d.RoundToScale(scale)
-	sig := rounded.Precision()
+func (d Decimal) coerceToTypmod(precision, scale uint32) (Decimal, error) {
+	rounded := d.roundToScale(scale)
+	sig := rounded.precision()
 	intDigits := uint32(0)
 	if sig > scale {
 		intDigits = sig - scale
@@ -487,26 +487,26 @@ func (d Decimal) CoerceToTypmod(precision, scale uint32) (Decimal, error) {
 	return rounded, nil
 }
 
-// ToInt64Round rounds to an integer (scale 0, half away) and returns it as i64 if it fits,
+// toInt64Round rounds to an integer (scale 0, half away) and returns it as i64 if it fits,
 // else ok=false (the decimal→int cast; the caller range-checks the target int type).
-func (d Decimal) ToInt64Round() (int64, bool) {
-	r := d.RoundToScale(0)
-	if len(r.Limbs) > 3 { // > 27 digits, far beyond i64
+func (d Decimal) toInt64Round() (int64, bool) {
+	r := d.roundToScale(0)
+	if len(r.limbs) > 3 { // > 27 digits, far beyond i64
 		return 0, false
 	}
 	var u uint64
-	for i := len(r.Limbs) - 1; i >= 0; i-- {
+	for i := len(r.limbs) - 1; i >= 0; i-- {
 		hi := u * decBase
 		if u != 0 && hi/decBase != u { // multiply overflow
 			return 0, false
 		}
-		next := hi + uint64(r.Limbs[i])
+		next := hi + uint64(r.limbs[i])
 		if next < hi { // add overflow
 			return 0, false
 		}
 		u = next
 	}
-	if r.Neg {
+	if r.neg {
 		const minMag = uint64(1) << 63 // |math.MinInt64|
 		if u > minMag {
 			return 0, false
@@ -522,10 +522,10 @@ func (d Decimal) ToInt64Round() (int64, bool) {
 	return int64(u), true
 }
 
-// ToCodec returns (neg, scale, base-10^4 coefficient groups MS-first) for the value codec.
+// toCodec returns (neg, scale, base-10^4 coefficient groups MS-first) for the value codec.
 // Zero → no groups (spec/fileformat/format.md).
-func (d Decimal) ToCodec() (bool, uint32, []uint16) {
-	return d.Neg, d.Scale, magToNbase4(d.Limbs)
+func (d Decimal) toCodec() (bool, uint32, []uint16) {
+	return d.neg, d.scale, magToNbase4(d.limbs)
 }
 
 // DecimalFromCodec is the inverse of ToCodec (used on load).
@@ -533,7 +533,7 @@ func decimalFromCodec(neg bool, scale uint32, groups []uint16) Decimal {
 	return newDecimal(neg, scale, magFromNbase4(groups))
 }
 
-// EncodeKey returns the order-preserving KEY body for a decimal (method
+// encodeKey returns the order-preserving KEY body for a decimal (method
 // decimal-order-preserving, spec/design/encoding.md §2.5). Self-delimiting; sorts byte-for-byte
 // under bytes.Compare identically to numeric value, INDEPENDENT of display scale — 1.5 and 1.50
 // produce identical bytes (they are equal, so a UNIQUE decimal index treats them as one). A PK is
@@ -546,15 +546,15 @@ func decimalFromCodec(neg bool, scale uint32, groups []uint16) Decimal {
 // pairs most-significant first, each as pair+1 ∈ [0x01, 0x64] (0x00 reserved for the terminator);
 // and a 0x00 terminator (a shorter mantissa sorts before one that extends it). For NEGATIVE values
 // the exponent, mantissa, and terminator are bitwise-complemented so "more negative" sorts first.
-func (d Decimal) EncodeKey() []byte {
+func (d Decimal) encodeKey() []byte {
 	// Zero is the single class byte 0x04 (neg 0x03 < zero 0x04 < pos 0x05).
 	if d.IsZero() {
 		return []byte{0x04}
 	}
 	// Significant digits (no leading zeros) and the base-10 decimal-point exponent:
 	// value = 0.<digits> × 10^decpt, with decpt = precision − scale.
-	digits := []byte(magToDecimalStr(d.Limbs))
-	decpt := int32(d.Precision()) - int32(d.Scale)
+	digits := []byte(magToDecimalStr(d.limbs))
+	decpt := int32(d.precision()) - int32(d.scale)
 	// Drop trailing zero digits (the least-significant ones): the mantissa keeps only its
 	// significant part and decpt is unchanged, so 1.50 ("150") collapses onto 1.5 ("15").
 	for len(digits) > 0 && digits[len(digits)-1] == '0' {
@@ -581,7 +581,7 @@ func (d Decimal) EncodeKey() []byte {
 	body = append(body, 0x00)
 	// Assemble with the sign/class byte; negatives complement the body (E+mantissa+terminator).
 	out := make([]byte, 0, 1+len(body))
-	if d.Neg {
+	if d.neg {
 		out = append(out, 0x03)
 		for _, b := range body {
 			out = append(out, ^b)
@@ -617,11 +617,11 @@ func selectDivScale(a, b Decimal) uint32 {
 		qweight--
 	}
 	rscale := 16 - 4*qweight
-	if int64(a.Scale) > rscale {
-		rscale = int64(a.Scale)
+	if int64(a.scale) > rscale {
+		rscale = int64(a.scale)
 	}
-	if int64(b.Scale) > rscale {
-		rscale = int64(b.Scale)
+	if int64(b.scale) > rscale {
+		rscale = int64(b.scale)
 	}
 	if rscale < 0 {
 		rscale = 0
@@ -640,11 +640,11 @@ func nbase4WeightLead(d Decimal) (int64, int64) {
 	if d.IsZero() {
 		return 0, 0
 	}
-	digits := int64(d.Precision())
-	e := digits - 1 - int64(d.Scale) // exponent of the leading significant digit
+	digits := int64(d.precision())
+	e := digits - 1 - int64(d.scale) // exponent of the leading significant digit
 	w := floorDiv4(e)                // floor(e / 4)
 	g := int(e - 4*w + 1)            // 1..4 leading-group decimal digits
-	s := magToDecimalStr(d.Limbs)
+	s := magToDecimalStr(d.limbs)
 	var f int64
 	for i := 0; i < g; i++ {
 		digit := int64(0)
@@ -684,11 +684,11 @@ func decGroups(n uint32) int64 {
 // max(s1, s2) (the digit count once the lower-scale coefficient is multiplied up — exactly
 // the add/sub/cmp work).
 func alignedDigits(a, b Decimal) (uint32, uint32) {
-	s := a.Scale
-	if b.Scale > s {
-		s = b.Scale
+	s := a.scale
+	if b.scale > s {
+		s = b.scale
 	}
-	return a.Precision() + (s - a.Scale), b.Precision() + (s - b.Scale)
+	return a.precision() + (s - a.scale), b.precision() + (s - b.scale)
 }
 
 // WorkLinear is W for add/sub/compare: the larger aligned operand.
@@ -704,7 +704,7 @@ func workLinear(a, b Decimal) int64 {
 // WorkMul is W for mul: the product of the (unaligned) operand group counts —
 // schoolbook-quadratic.
 func workMul(a, b Decimal) int64 {
-	return decGroups(a.Precision()) * decGroups(b.Precision())
+	return decGroups(a.precision()) * decGroups(b.precision())
 }
 
 // WorkDiv is W for div: numerator groups × divisor groups, where the rescale shift
@@ -716,11 +716,11 @@ func workDiv(a, b Decimal) int64 {
 		return 1
 	}
 	rscale := selectDivScale(a, b)
-	e := int64(rscale) + int64(b.Scale) - int64(a.Scale)
+	e := int64(rscale) + int64(b.scale) - int64(a.scale)
 	if e >= 0 {
-		return decGroups(a.Precision()+uint32(e)) * decGroups(b.Precision())
+		return decGroups(a.precision()+uint32(e)) * decGroups(b.precision())
 	}
-	return decGroups(a.Precision()) * decGroups(b.Precision()+uint32(-e))
+	return decGroups(a.precision()) * decGroups(b.precision()+uint32(-e))
 }
 
 // WorkMod is W for mod: the aligned divmod — the product of the aligned group counts. A zero
@@ -765,19 +765,19 @@ func (d Decimal) nbaseWeight() int64 {
 	if d.IsZero() {
 		return 0
 	}
-	return floorDiv4(int64(d.Precision()) - 1 - int64(d.Scale))
+	return floorDiv4(int64(d.precision()) - 1 - int64(d.scale))
 }
 
 // toF64Estimate is PG `numericvar_to_double_no_overflow` = strtod(get_str_from_var()): the
 // correctly-rounded nearest f64, deterministic across cores. Used ONLY by the scale estimates.
 func (d Decimal) toF64Estimate() float64 {
-	f, _ := strconv.ParseFloat(d.Render(), 64) // ±Inf on range error, as PG ignores ERANGE
+	f, _ := strconv.ParseFloat(d.String(), 64) // ±Inf on range error, as PG ignores ERANGE
 	return f
 }
 
 // mulExact is the exact product (scale s1+s2), NO cap check (PG mul_var; make_result caps later).
 func (d Decimal) mulExact(o Decimal) Decimal {
-	return newDecimal(d.Neg != o.Neg, d.Scale+o.Scale, magMul(d.Limbs, o.Limbs))
+	return newDecimal(d.neg != o.neg, d.scale+o.scale, magMul(d.limbs, o.limbs))
 }
 
 // mulVar is PG `mul_var(a, b, result, rscale)`: exact product rounded half-away to `rscale`
@@ -791,15 +791,15 @@ func (d Decimal) mulVar(o Decimal, rscale int64) Decimal {
 // result scale 0 (jed represents PG's transient negative dscale as the equal value at scale 0).
 func (d Decimal) roundVar(rscale int64) Decimal {
 	if rscale >= 0 {
-		return d.RoundToScale(uint32(rscale))
+		return d.roundToScale(uint32(rscale))
 	}
 	k := uint32(-rscale)
-	pow := magPow10(d.Scale + k)
-	q, r := magDivMod(d.Limbs, pow)
+	pow := magPow10(d.scale + k)
+	q, r := magDivMod(d.limbs, pow)
 	if magCmp(magAdd(r, r), pow) >= 0 {
 		q = magAdd(q, []uint32{1})
 	}
-	return newDecimal(d.Neg, 0, magMulPow10(q, k))
+	return newDecimal(d.neg, 0, magMulPow10(q, k))
 }
 
 // divVar is PG `div_var(a, b, result, rscale, round=true)`: a/b to exactly `rscale` fractional
@@ -811,18 +811,18 @@ func (d Decimal) divVar(o Decimal, rscale int64) (Decimal, error) {
 	if d.IsZero() {
 		return decimalZero(uint32(maxI64(rscale, 0))), nil
 	}
-	e := rscale + int64(o.Scale) - int64(d.Scale)
+	e := rscale + int64(o.scale) - int64(d.scale)
 	var numer, denom []uint32
 	if e >= 0 {
-		numer, denom = magMulPow10(d.Limbs, uint32(e)), o.Limbs
+		numer, denom = magMulPow10(d.limbs, uint32(e)), o.limbs
 	} else {
-		numer, denom = d.Limbs, magMulPow10(o.Limbs, uint32(-e))
+		numer, denom = d.limbs, magMulPow10(o.limbs, uint32(-e))
 	}
 	q, r := magDivMod(numer, denom)
 	if magCmp(magAdd(r, r), denom) >= 0 {
 		q = magAdd(q, []uint32{1})
 	}
-	return newDecimal(d.Neg != o.Neg, uint32(maxI64(rscale, 0)), q), nil
+	return newDecimal(d.neg != o.neg, uint32(maxI64(rscale, 0)), q), nil
 }
 
 // divVarInt is PG `div_var_int(a, ival, 0, result, rscale, round=true)`.
@@ -833,10 +833,10 @@ func (d Decimal) divVarInt(ival int64, rscale int64) (Decimal, error) {
 // toI32IfInteger reports whether the value is an exact integer fitting int32 (PG's power_var_int
 // gate). ok=false otherwise.
 func (d Decimal) toI32IfInteger() (int32, bool) {
-	if d.TruncToScale(0).CmpValue(d) != 0 {
+	if d.truncToScale(0).Cmp(d) != 0 {
 		return 0, false
 	}
-	v, ok := d.ToInt64Round()
+	v, ok := d.toInt64Round()
 	if !ok || v < math.MinInt32 || v > math.MaxInt32 {
 		return 0, false
 	}
@@ -856,20 +856,20 @@ func (d Decimal) sqrtVar(rscale int64, m *costMeter) (Decimal, error) {
 	if d.IsZero() {
 		return decimalZero(uint32(maxI64(rscale, 0))), nil
 	}
-	if d.Neg {
+	if d.neg {
 		return Decimal{}, newError(InvalidArgumentForPowerFunction,
 			"cannot take square root of a negative number")
 	}
 	if err := decimalMathStep(m, rscale, true, d); err != nil {
 		return Decimal{}, err
 	}
-	s := int64(d.Scale)
+	s := int64(d.scale)
 	kc := maxI64(rscale, 0) + 1
 	if 2*kc < s {
 		kc = (s+1)/2 + 1 // ensure E = 2·kc − scale ≥ 0; extra guard never changes the rounded result
 	}
 	e := 2*kc - s
-	n := magMulPow10(d.Limbs, uint32(e))
+	n := magMulPow10(d.limbs, uint32(e))
 	g := magIsqrt(n)
 	atGuard := newDecimal(false, uint32(kc), g)
 	return atGuard.roundVar(rscale), nil
@@ -882,12 +882,12 @@ func (d Decimal) decSqrtMetered(m *costMeter) (Decimal, error) {
 	}
 	sweight := d.nbaseWeight()*decDigits/2 + 1
 	rscale := minSigDigits - sweight
-	rscale = minI64(maxI64(maxI64(rscale, int64(d.Scale)), 0), maxDisplayScale)
+	rscale = minI64(maxI64(maxI64(rscale, int64(d.scale)), 0), maxDisplayScale)
 	r, err := d.sqrtVar(rscale, m)
 	if err != nil {
 		return Decimal{}, err
 	}
-	return r.CheckCap()
+	return r.checkCap()
 }
 
 func minI64(a, b int64) int64 {
@@ -921,7 +921,7 @@ func (d Decimal) expVar(rscale int64, m *costMeter) (Decimal, error) {
 			val /= 2
 		}
 		ndiv2 = n
-		localRscale := int64(x.Scale) + ndiv2
+		localRscale := int64(x.scale) + ndiv2
 		var err error
 		x, err = x.divVarInt(int64(1)<<uint(ndiv2), localRscale)
 		if err != nil {
@@ -931,7 +931,7 @@ func (d Decimal) expVar(rscale int64, m *costMeter) (Decimal, error) {
 	sigDigits := 1 + dweight + rscale + int64(float64(ndiv2)*0.301029995663981)
 	sigDigits = maxI64(sigDigits, 0) + 8
 	localRscale := sigDigits - 1
-	result := decimalFromInt64(1).AddUncapped(x)
+	result := decimalFromInt64(1).addUncapped(x)
 	elem := x.mulVar(x, localRscale)
 	ni := int64(2)
 	var err error
@@ -943,7 +943,7 @@ func (d Decimal) expVar(rscale int64, m *costMeter) (Decimal, error) {
 		if err := decimalMathStep(m, localRscale, false, result, elem, x); err != nil {
 			return Decimal{}, err
 		}
-		result = result.AddUncapped(elem)
+		result = result.addUncapped(elem)
 		elem = elem.mulVar(x, localRscale)
 		ni++
 		elem, err = elem.divVarInt(ni, localRscale)
@@ -974,12 +974,12 @@ func (d Decimal) decExpMetered(m *costMeter) (Decimal, error) {
 		val = float64(maxResultScale)
 	}
 	rscale := minSigDigits - int64(val)
-	rscale = minI64(maxI64(maxI64(rscale, int64(d.Scale)), 0), maxDisplayScale)
+	rscale = minI64(maxI64(maxI64(rscale, int64(d.scale)), 0), maxDisplayScale)
 	r, err := d.expVar(rscale, m)
 	if err != nil {
 		return Decimal{}, err
 	}
-	return r.CheckCap()
+	return r.checkCap()
 }
 
 // lnVar is PG `ln_var(arg, result, rscale)`: the natural log of self (> 0) to `rscale` digits via
@@ -995,7 +995,7 @@ func (d Decimal) lnVar(rscale int64, m *costMeter) (Decimal, error) {
 	x := d
 	fact := two
 	nsqrt := int64(0)
-	for x.CmpValue(nineTenths) <= 0 {
+	for x.Cmp(nineTenths) <= 0 {
 		localRscale := rscale - x.nbaseWeight()*decDigits/2 + 8
 		var err error
 		x, err = x.sqrtVar(localRscale, m)
@@ -1005,7 +1005,7 @@ func (d Decimal) lnVar(rscale int64, m *costMeter) (Decimal, error) {
 		fact = fact.mulVar(two, 0)
 		nsqrt++
 	}
-	for x.CmpValue(elevenTenths) >= 0 {
+	for x.Cmp(elevenTenths) >= 0 {
 		localRscale := rscale - x.nbaseWeight()*decDigits/2 + 8
 		var err error
 		x, err = x.sqrtVar(localRscale, m)
@@ -1016,7 +1016,7 @@ func (d Decimal) lnVar(rscale int64, m *costMeter) (Decimal, error) {
 		nsqrt++
 	}
 	localRscale := rscale + int64(float64(nsqrt+1)*0.301029995663981) + 8
-	result, _ := x.sub(one).divVar(x.AddUncapped(one), localRscale)
+	result, _ := x.sub(one).divVar(x.addUncapped(one), localRscale)
 	xx := result
 	zsq := result.mulVar(result, localRscale)
 	ni := int64(1)
@@ -1030,7 +1030,7 @@ func (d Decimal) lnVar(rscale int64, m *costMeter) (Decimal, error) {
 		if elem.IsZero() {
 			break
 		}
-		result = result.AddUncapped(elem)
+		result = result.addUncapped(elem)
 		if elem.nbaseWeight() < result.nbaseWeight()-localRscale*2/decDigits {
 			break
 		}
@@ -1039,22 +1039,22 @@ func (d Decimal) lnVar(rscale int64, m *costMeter) (Decimal, error) {
 }
 
 // sub is the uncapped subtraction (x − o), the kernels' running form.
-func (d Decimal) sub(o Decimal) Decimal { return d.AddUncapped(o.Negate()) }
+func (d Decimal) sub(o Decimal) Decimal { return d.addUncapped(o.negate()) }
 
 // estimateLnDweight is the deterministic PG `estimate_ln_dweight(var)` — an estimate of
 // trunc(log10(|ln(var)|)) (PG truncates toward zero via (int)), computed WITHOUT libm. var > 0.
 func (d Decimal) estimateLnDweight(m *costMeter) (int64, error) {
-	if d.IsZero() || d.Neg {
+	if d.IsZero() || d.neg {
 		return 0, nil
 	}
 	nineTenths := decimalFromDigitsScale(false, "9", 1)
 	elevenTenths := decimalFromDigitsScale(false, "11", 1)
-	if d.CmpValue(nineTenths) >= 0 && d.CmpValue(elevenTenths) <= 0 {
+	if d.Cmp(nineTenths) >= 0 && d.Cmp(elevenTenths) <= 0 {
 		x := d.sub(decimalFromInt64(1))
 		if x.IsZero() {
 			return 0, nil
 		}
-		return int64(x.Precision()) - 1 - int64(x.Scale), nil // floor(log10(|var−1|))
+		return int64(x.precision()) - 1 - int64(x.scale), nil // floor(log10(|var−1|))
 	}
 	t, err := d.lnVar(20, m)
 	if err != nil {
@@ -1063,7 +1063,7 @@ func (d Decimal) estimateLnDweight(m *costMeter) (int64, error) {
 	if t.IsZero() {
 		return 0, nil
 	}
-	dw := int64(t.Precision()) - 1 - int64(t.Scale) // floor(log10(|ln(var)|))
+	dw := int64(t.precision()) - 1 - int64(t.scale) // floor(log10(|ln(var)|))
 	if dw < 0 {
 		return dw + 1, nil
 	}
@@ -1078,7 +1078,7 @@ func (d Decimal) decLnMetered(m *costMeter) (Decimal, error) {
 	if d.IsZero() {
 		return Decimal{}, logZero()
 	}
-	if d.Neg {
+	if d.neg {
 		return Decimal{}, logNegative()
 	}
 	lnDweight, err := d.estimateLnDweight(m)
@@ -1086,12 +1086,12 @@ func (d Decimal) decLnMetered(m *costMeter) (Decimal, error) {
 		return Decimal{}, err
 	}
 	rscale := minSigDigits - lnDweight
-	rscale = minI64(maxI64(maxI64(rscale, int64(d.Scale)), 0), maxDisplayScale)
+	rscale = minI64(maxI64(maxI64(rscale, int64(d.scale)), 0), maxDisplayScale)
 	r, err := d.lnVar(rscale, m)
 	if err != nil {
 		return Decimal{}, err
 	}
-	return r.CheckCap()
+	return r.checkCap()
 }
 
 // DecLog is log(base, num) (PG numeric_log / log_var): ln(num)/ln(base). Both > 0 (else 2201E).
@@ -1103,7 +1103,7 @@ func decLogMetered(base, num Decimal, m *costMeter) (Decimal, error) {
 		if v.IsZero() {
 			return Decimal{}, logZero()
 		}
-		if v.Neg {
+		if v.neg {
 			return Decimal{}, logNegative()
 		}
 	}
@@ -1117,7 +1117,7 @@ func decLogMetered(base, num Decimal, m *costMeter) (Decimal, error) {
 	}
 	resultDweight := lnNumDweight - lnBaseDweight
 	rscale := minSigDigits - resultDweight
-	rscale = minI64(maxI64(maxI64(maxI64(rscale, int64(base.Scale)), int64(num.Scale)), 0), maxDisplayScale)
+	rscale = minI64(maxI64(maxI64(maxI64(rscale, int64(base.scale)), int64(num.scale)), 0), maxDisplayScale)
 	lnBaseRscale := maxI64(rscale+resultDweight-lnBaseDweight+8, 0)
 	lnNumRscale := maxI64(rscale+resultDweight-lnNumDweight+8, 0)
 	lnBase, err := base.lnVar(lnBaseRscale, m)
@@ -1132,7 +1132,7 @@ func decLogMetered(base, num Decimal, m *costMeter) (Decimal, error) {
 	if err != nil {
 		return Decimal{}, err
 	}
-	return r.CheckCap()
+	return r.checkCap()
 }
 
 // decLog10Metered is log(numeric)/log10(numeric) — base-10 logarithm (PG one-arg log = log(10, x)).
@@ -1163,7 +1163,7 @@ func (d Decimal) log10Estimate(m *costMeter) (Decimal, error) {
 func powerVarInt(base Decimal, exp int32, expDscale uint32, m *costMeter) (Decimal, error) {
 	var f float64
 	if !base.IsZero() {
-		estimate, err := base.Abs().log10Estimate(m)
+		estimate, err := base.abs().log10Estimate(m)
 		if err != nil {
 			return Decimal{}, err
 		}
@@ -1177,7 +1177,7 @@ func powerVarInt(base Decimal, exp int32, expDscale uint32, m *costMeter) (Decim
 	}
 	fi := int64(f)
 	rscale := minSigDigits - fi
-	rscale = minI64(maxI64(maxI64(maxI64(rscale, int64(base.Scale)), int64(expDscale)), 0), maxDisplayScale)
+	rscale = minI64(maxI64(maxI64(maxI64(rscale, int64(base.scale)), int64(expDscale)), 0), maxDisplayScale)
 	switch exp {
 	case 0:
 		return decimalFromInt64(1).roundVar(rscale), nil
@@ -1188,9 +1188,9 @@ func powerVarInt(base Decimal, exp int32, expDscale uint32, m *costMeter) (Decim
 		if err != nil {
 			return Decimal{}, err
 		}
-		return r.CheckCap()
+		return r.checkCap()
 	case 2:
-		return base.mulVar(base, rscale).CheckCap()
+		return base.mulVar(base, rscale).checkCap()
 	}
 	if base.IsZero() {
 		if exp < 0 {
@@ -1225,11 +1225,11 @@ func powerVarInt(base Decimal, exp int32, expDscale uint32, m *costMeter) (Decim
 		if err := decimalMathStep(m, rscale, false, baseProd, result); err != nil {
 			return Decimal{}, err
 		}
-		lr := maxI64(minI64(sigDigits-2*baseProd.nbaseWeight()*decDigits, 2*int64(baseProd.Scale)), 0)
+		lr := maxI64(minI64(sigDigits-2*baseProd.nbaseWeight()*decDigits, 2*int64(baseProd.scale)), 0)
 		baseProd = baseProd.mulVar(baseProd, lr)
 		if mask&1 == 1 {
 			lr2 := maxI64(minI64(sigDigits-(baseProd.nbaseWeight()+result.nbaseWeight())*decDigits,
-				int64(baseProd.Scale)+int64(result.Scale)), 0)
+				int64(baseProd.scale)+int64(result.scale)), 0)
 			result = baseProd.mulVar(result, lr2)
 		}
 		if baseProd.nbaseWeight() > numericWeightMx || result.nbaseWeight() > numericWeightMx {
@@ -1246,15 +1246,15 @@ func powerVarInt(base Decimal, exp int32, expDscale uint32, m *costMeter) (Decim
 		if err != nil {
 			return Decimal{}, err
 		}
-		return r.CheckCap()
+		return r.checkCap()
 	}
-	return result.roundVar(rscale).CheckCap()
+	return result.roundVar(rscale).checkCap()
 }
 
 // powerVar is PG `power_var(base, exp, result)`: base^exp for a general exponent.
 func powerVar(base, exp Decimal, m *costMeter) (Decimal, error) {
 	if iexp, ok := exp.toI32IfInteger(); ok {
-		return powerVarInt(base, iexp, exp.Scale, m)
+		return powerVarInt(base, iexp, exp.scale, m)
 	}
 	if base.IsZero() {
 		return decimalZero(uint32(minSigDigits)), nil
@@ -1264,15 +1264,15 @@ func powerVar(base, exp Decimal, m *costMeter) (Decimal, error) {
 	// the gate. The result's sign is the exponent's parity (odd → negative) and its magnitude is
 	// computed over |base| (decimal.md §8).
 	resNeg := false
-	if base.Neg {
-		intExp := exp.TruncToScale(0)
-		if intExp.CmpValue(exp) != 0 {
+	if base.neg {
+		intExp := exp.truncToScale(0)
+		if intExp.Cmp(exp) != 0 {
 			return Decimal{}, newError(InvalidArgumentForPowerFunction,
 				"a negative number raised to a non-integer power yields a complex result")
 		}
 		// Limbs are little-endian base 10^9 (even), so the units digit's parity is limb 0's.
-		resNeg = len(intExp.Limbs) > 0 && intExp.Limbs[0]%2 == 1
-		base = base.Abs()
+		resNeg = len(intExp.limbs) > 0 && intExp.limbs[0]%2 == 1
+		base = base.abs()
 	}
 	lnDweight, err := base.estimateLnDweight(m)
 	if err != nil {
@@ -1294,7 +1294,7 @@ func powerVar(base, exp Decimal, m *costMeter) (Decimal, error) {
 	val *= 0.434294481903252
 	vi := int64(val)
 	rscale := minSigDigits - vi
-	rscale = minI64(maxI64(maxI64(maxI64(rscale, int64(base.Scale)), int64(exp.Scale)), 0), maxDisplayScale)
+	rscale = minI64(maxI64(maxI64(maxI64(rscale, int64(base.scale)), int64(exp.scale)), 0), maxDisplayScale)
 	sigDigits := maxI64(rscale+vi, 0)
 	localRscale = maxI64(sigDigits-lnDweight+8, 0)
 	lnBase, err = base.lnVar(localRscale, m)
@@ -1307,9 +1307,9 @@ func powerVar(base, exp Decimal, m *costMeter) (Decimal, error) {
 		return Decimal{}, err
 	}
 	if resNeg && !r.IsZero() {
-		r = r.Negate() // a zero result stays positive (no negative zero)
+		r = r.negate() // a zero result stays positive (no negative zero)
 	}
-	return r.CheckCap()
+	return r.checkCap()
 }
 
 // DecPower is power(base, exp) over numeric (PG numeric_power, finite path). 0 ^ negative → 2201F.
@@ -1320,13 +1320,13 @@ func decPowerMetered(base, exp Decimal, m *costMeter) (Decimal, error) {
 	sign1 := 1
 	if base.IsZero() {
 		sign1 = 0
-	} else if base.Neg {
+	} else if base.neg {
 		sign1 = -1
 	}
 	sign2 := 1
 	if exp.IsZero() {
 		sign2 = 0
-	} else if exp.Neg {
+	} else if exp.neg {
 		sign2 = -1
 	}
 	if sign1 == 0 && sign2 < 0 {
@@ -1346,7 +1346,7 @@ func intLnFloor(n uint64, m *costMeter) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	v, _ := r.TruncToScale(0).ToInt64Round()
+	v, _ := r.truncToScale(0).toInt64Round()
 	return v, nil
 }
 
@@ -1599,10 +1599,10 @@ func magDivMod(num, den []uint32) ([]uint32, []uint32) {
 // ceil(digits / 4) of the unscaled magnitude, 0 for zero — without allocating them (the
 // query-memory size schedule, spec/design/memory.md §3).
 func (d *Decimal) codecGroupCount() int {
-	if len(d.Limbs) == 0 {
+	if len(d.limbs) == 0 {
 		return 0
 	}
-	return (9*(len(d.Limbs)-1) + int(limbDigits(d.Limbs[len(d.Limbs)-1])) + 3) / 4
+	return (9*(len(d.limbs)-1) + int(limbDigits(d.limbs[len(d.limbs)-1])) + 3) / 4
 }
 
 // magToNbase4 converts LSB-first base-10^9 limbs to MS-first base-10^4 groups. Zero → empty.
@@ -1665,7 +1665,7 @@ func decimalMathStep(m *costMeter, scale int64, sqrt bool, args ...Decimal) erro
 	}
 	digits := int64(32) + scale
 	for _, a := range args {
-		digits += int64(a.Precision()) + int64(a.Scale)
+		digits += int64(a.precision()) + int64(a.scale)
 	}
 	groups := (digits + 3) / 4
 	work := groups * groups
@@ -1683,10 +1683,10 @@ func decimalMathStep(m *costMeter, scale int64, sqrt bool, args ...Decimal) erro
 	return m.ReserveScalar(8 * digits)
 }
 
-func (d Decimal) DecSqrt() (Decimal, error)       { return d.decSqrtMetered(nil) }
-func (d Decimal) DecExp() (Decimal, error)        { return d.decExpMetered(nil) }
-func (d Decimal) DecLn() (Decimal, error)         { return d.decLnMetered(nil) }
-func (d Decimal) DecLog10() (Decimal, error)      { return d.decLog10Metered(nil) }
+func (d Decimal) decSqrt() (Decimal, error)       { return d.decSqrtMetered(nil) }
+func (d Decimal) decExp() (Decimal, error)        { return d.decExpMetered(nil) }
+func (d Decimal) decLn() (Decimal, error)         { return d.decLnMetered(nil) }
+func (d Decimal) decLog10() (Decimal, error)      { return d.decLog10Metered(nil) }
 func decLog(base, num Decimal) (Decimal, error)   { return decLogMetered(base, num, nil) }
 func decPower(base, exp Decimal) (Decimal, error) { return decPowerMetered(base, exp, nil) }
 
@@ -1825,27 +1825,27 @@ func smallDecimal(neg bool, scale uint32, v u128) Decimal {
 	if limbs == nil {
 		neg = false
 	}
-	return Decimal{Neg: neg, Scale: scale, Limbs: limbs}
+	return Decimal{neg: neg, scale: scale, limbs: limbs}
 }
 
 // smallAligned lifts d's and o's coefficients to their common scale max(d.Scale, o.Scale).
 func smallAligned(d, o Decimal) (a, b u128, s uint32, ok bool) {
-	if len(d.Limbs) > smallMaxLimbs || len(o.Limbs) > smallMaxLimbs {
+	if len(d.limbs) > smallMaxLimbs || len(o.limbs) > smallMaxLimbs {
 		return a, b, 0, false
 	}
-	s = d.Scale
-	if o.Scale > s {
-		s = o.Scale
+	s = d.scale
+	if o.scale > s {
+		s = o.scale
 	}
-	if s-d.Scale >= uint32(len(pow10U128)) || s-o.Scale >= uint32(len(pow10U128)) {
+	if s-d.scale >= uint32(len(pow10U128)) || s-o.scale >= uint32(len(pow10U128)) {
 		return a, b, 0, false
 	}
-	a, _ = magToU128(d.Limbs)
-	b, _ = magToU128(o.Limbs)
-	if a, ok = mulU128(a, pow10U128[s-d.Scale]); !ok {
+	a, _ = magToU128(d.limbs)
+	b, _ = magToU128(o.limbs)
+	if a, ok = mulU128(a, pow10U128[s-d.scale]); !ok {
 		return a, b, 0, false
 	}
-	b, ok = mulU128(b, pow10U128[s-o.Scale])
+	b, ok = mulU128(b, pow10U128[s-o.scale])
 	return a, b, s, ok
 }
 
@@ -1855,20 +1855,20 @@ func addSmall(d, o Decimal) (Decimal, bool) {
 	if !ok {
 		return Decimal{}, false
 	}
-	if d.Neg == o.Neg {
+	if d.neg == o.neg {
 		sum, ok := addU128(a, b)
 		if !ok {
 			return Decimal{}, false
 		}
-		return smallDecimal(d.Neg, s, sum), true
+		return smallDecimal(d.neg, s, sum), true
 	}
 	switch cmpU128(a, b) {
 	case 0:
 		return decimalZero(s), true
 	case 1:
-		return smallDecimal(d.Neg, s, subU128(a, b)), true
+		return smallDecimal(d.neg, s, subU128(a, b)), true
 	}
-	return smallDecimal(o.Neg, s, subU128(b, a)), true
+	return smallDecimal(o.neg, s, subU128(b, a)), true
 }
 
 // cmpSmall is the magnitude comparison of d and o at their common scale, when both fit a u128.
@@ -1882,11 +1882,11 @@ func cmpSmall(d, o Decimal) (int, bool) {
 
 // mulSmall is the exact coefficient product when it fits a u128.
 func mulSmall(d, o Decimal) ([]uint32, bool) {
-	if len(d.Limbs) > smallMaxLimbs || len(o.Limbs) > smallMaxLimbs {
+	if len(d.limbs) > smallMaxLimbs || len(o.limbs) > smallMaxLimbs {
 		return nil, false
 	}
-	a, _ := magToU128(d.Limbs)
-	b, _ := magToU128(o.Limbs)
+	a, _ := magToU128(d.limbs)
+	b, _ := magToU128(o.limbs)
 	p, ok := mulU128(a, b)
 	if !ok {
 		return nil, false
@@ -1985,13 +1985,13 @@ func decimalValueU64(neg bool, scale uint32, v uint64) Value {
 		neg = false
 	case v < decBase:
 		b.limbs[0] = uint32(v)
-		b.d.Limbs = b.limbs[:1:1]
+		b.d.limbs = b.limbs[:1:1]
 	default:
 		b.limbs[0], b.limbs[1] = uint32(v%decBase), uint32(v/decBase)
-		b.d.Limbs = b.limbs[:2:2]
+		b.d.limbs = b.limbs[:2:2]
 	}
-	b.d.Neg, b.d.Scale = neg, scale
-	return Value{Kind: ValDecimal, ref: &b.d}
+	b.d.neg, b.d.scale = neg, scale
+	return Value{kind: ValDecimal, ref: &b.d}
 }
 
 // decimalValueInt64 is DecimalValue of the decimal whose unscaled integer at display scale `scale`
@@ -2009,7 +2009,7 @@ func decimalValueInt64(u int64, scale uint32) Value {
 	// A magnitude of 10^18 or more is outside every fixed-width column's typmod; any bit pattern is
 	// still a value.
 	d := decimalFromInt64(u)
-	d.Scale = scale
+	d.scale = scale
 	return DecimalValue(d)
 }
 
@@ -2018,29 +2018,29 @@ func decimalValueInt64(u int64, scale uint32) Value {
 // digits or the integer is outside int64: a value store-coercion has not brought to the column's
 // typmod.
 func (d Decimal) unscaledInt64(scale uint32) (int64, bool) {
-	if d.Scale > scale || len(d.Limbs) > 3 {
+	if d.scale > scale || len(d.limbs) > 3 {
 		return 0, false
 	}
 	var m uint64
-	for i := len(d.Limbs) - 1; i >= 0; i-- {
+	for i := len(d.limbs) - 1; i >= 0; i-- {
 		hi, lo := bits.Mul64(m, decBase)
 		if hi != 0 {
 			return 0, false
 		}
 		var carry uint64
-		m, carry = bits.Add64(lo, uint64(d.Limbs[i]), 0)
+		m, carry = bits.Add64(lo, uint64(d.limbs[i]), 0)
 		if carry != 0 {
 			return 0, false
 		}
 	}
-	for up := scale - d.Scale; up > 0 && m != 0; up-- {
+	for up := scale - d.scale; up > 0 && m != 0; up-- {
 		hi, lo := bits.Mul64(m, 10)
 		if hi != 0 {
 			return 0, false
 		}
 		m = lo
 	}
-	if d.Neg {
+	if d.neg {
 		if m > 1<<63 {
 			return 0, false
 		}
@@ -2069,5 +2069,5 @@ func decimalFromInt64Buf(v int64, buf *[3]uint32) Decimal {
 	if n == 0 {
 		return Decimal{}
 	}
-	return Decimal{Neg: neg, Limbs: buf[:n:n]}
+	return Decimal{neg: neg, limbs: buf[:n:n]}
 }

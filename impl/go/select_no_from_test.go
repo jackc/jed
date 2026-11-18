@@ -33,7 +33,7 @@ func TestNoFromLiteralSelect(t *testing.T) {
 	if len(out.ColumnNames) != 1 || out.ColumnNames[0] != "?column?" {
 		t.Errorf("column names: %v", out.ColumnNames)
 	}
-	if len(out.Rows) != 1 || len(out.Rows[0]) != 1 || out.Rows[0][0].Int != 1 {
+	if len(out.Rows) != 1 || len(out.Rows[0]) != 1 || out.Rows[0][0].num != 1 {
 		t.Errorf("rows: %v", out.Rows)
 	}
 	// No relation, no scan: zero page_read/storage_row_read — just the one row_produced.
@@ -46,7 +46,7 @@ func TestNoFromExpressionCost(t *testing.T) {
 	t.Parallel()
 	db := mustSession(memDB(), SessionOptions{})
 	rows := query(t, db, "SELECT 1 + 2")
-	if len(rows) != 1 || rows[0][0].Int != 3 {
+	if len(rows) != 1 || rows[0][0].num != 3 {
 		t.Errorf("rows: %v", rows)
 	}
 	// Only the 1 row_produced: the `+` of two constants folds at plan time.
@@ -65,7 +65,7 @@ func TestNoFromWhereFiltersTheVirtualRow(t *testing.T) {
 	if c := costOf(t, db, "SELECT 1 WHERE false"); c != 0 {
 		t.Errorf("SELECT 1 WHERE false cost = %d, want 0", c)
 	}
-	if rows := query(t, db, "SELECT 1 WHERE 1 = 1"); len(rows) != 1 || rows[0][0].Int != 1 {
+	if rows := query(t, db, "SELECT 1 WHERE 1 = 1"); len(rows) != 1 || rows[0][0].num != 1 {
 		t.Errorf("WHERE 1 = 1 rows: %v", rows)
 	}
 	if c := costOf(t, db, "SELECT 1 WHERE 1 = 1"); c != 1 { // the `=` folds; the produced row
@@ -77,20 +77,20 @@ func TestNoFromAggregatesFoldTheSingleGroup(t *testing.T) {
 	t.Parallel()
 	db := mustSession(memDB(), SessionOptions{})
 	// The virtual row is the one input row of the whole-table group (aggregates.md §4).
-	if rows := query(t, db, "SELECT count(*)"); len(rows) != 1 || rows[0][0].Int != 1 {
+	if rows := query(t, db, "SELECT count(*)"); len(rows) != 1 || rows[0][0].num != 1 {
 		t.Errorf("count(*) rows: %v", rows)
 	}
 	if c := costOf(t, db, "SELECT count(*)"); c != 2 { // 1 aggregate_accumulate + 1 row_produced
 		t.Errorf("SELECT count(*) cost = %d, want 2", c)
 	}
 	// A false WHERE empties the input but the single group still emits.
-	if rows := query(t, db, "SELECT count(*) WHERE false"); len(rows) != 1 || rows[0][0].Int != 0 {
+	if rows := query(t, db, "SELECT count(*) WHERE false"); len(rows) != 1 || rows[0][0].num != 0 {
 		t.Errorf("count(*) WHERE false rows: %v", rows)
 	}
 	if c := costOf(t, db, "SELECT count(*) WHERE false"); c != 1 {
 		t.Errorf("SELECT count(*) WHERE false cost = %d, want 1", c)
 	}
-	if rows := query(t, db, "SELECT max(5)"); len(rows) != 1 || rows[0][0].Int != 5 {
+	if rows := query(t, db, "SELECT max(5)"); len(rows) != 1 || rows[0][0].num != 5 {
 		t.Errorf("max(5) rows: %v", rows)
 	}
 	// HAVING filters the single group away.
@@ -102,7 +102,7 @@ func TestNoFromAggregatesFoldTheSingleGroup(t *testing.T) {
 func TestNoFromDistinctAndWindow(t *testing.T) {
 	t.Parallel()
 	db := mustSession(memDB(), SessionOptions{})
-	if rows := query(t, db, "SELECT DISTINCT 1"); len(rows) != 1 || rows[0][0].Int != 1 {
+	if rows := query(t, db, "SELECT DISTINCT 1"); len(rows) != 1 || rows[0][0].num != 1 {
 		t.Errorf("DISTINCT rows: %v", rows)
 	}
 	if rows := query(t, db, "SELECT 1 LIMIT 0"); len(rows) != 0 {
@@ -119,7 +119,7 @@ func TestNoFromSetOperationOperands(t *testing.T) {
 	rows := query(t, db, "SELECT 1 UNION SELECT 2")
 	got := make([]int64, len(rows))
 	for i, r := range rows {
-		got[i] = r[0].Int
+		got[i] = r[0].num
 	}
 	sort.Slice(got, func(i, j int) bool { return got[i] < got[j] })
 	if !eqInts(got, 1, 2) {
@@ -139,7 +139,7 @@ func TestNoFromSubqueries(t *testing.T) {
 		"INSERT INTO t VALUES (1), (2)",
 	)
 	// Uncorrelated FROM-less inner: folded once.
-	if rows := query(t, db, "SELECT (SELECT 1)"); len(rows) != 1 || rows[0][0].Int != 1 {
+	if rows := query(t, db, "SELECT (SELECT 1)"); len(rows) != 1 || rows[0][0].num != 1 {
 		t.Errorf("uncorrelated rows: %v", rows)
 	}
 	// Correlated FROM-less inner: the zero-relation scope resolves o.id purely outward,
@@ -219,7 +219,7 @@ func TestNoFromParams(t *testing.T) {
 	}
 	// The sibling-operand rule (grammar.md §5) works without a FROM.
 	rows := queryRows(t, db, "SELECT $1 + 1", IntValue(7))
-	if len(rows) != 1 || rows[0][0].Int != 8 {
+	if len(rows) != 1 || rows[0][0].num != 8 {
 		t.Errorf("SELECT $1 + 1 rows: %v", rows)
 	}
 }

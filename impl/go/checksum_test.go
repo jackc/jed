@@ -35,7 +35,7 @@ func scanChecksum(path string) ([][]string, error) {
 	for i, r := range out.Rows {
 		cells := make([]string, len(r))
 		for j, v := range r {
-			cells[j] = v.Render()
+			cells[j] = v.String()
 		}
 		rows[i] = cells
 	}
@@ -145,7 +145,7 @@ func checkpointTestFile(t *testing.T, path string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	image, err := db.ToImage(db.pageSize, db.Txid())
+	image, err := db.toImage(db.pageSize, db.txid())
 	if err != nil {
 		t.Fatal(err)
 	}

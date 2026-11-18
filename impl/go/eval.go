@@ -65,13 +65,13 @@ func buildNestedArray(subs []Value) (Value, error) {
 	const mismatch = "multidimensional arrays must have array expressions with matching dimensions"
 	arrs := make([]*ArrayVal, len(subs))
 	for i, sv := range subs {
-		switch sv.Kind {
+		switch sv.kind {
 		case ValArray:
 			arrs[i] = sv.arrayVal()
 		case ValNull:
 			return Value{}, arraySubscriptErr(mismatch)
 		default:
-			panic(fmt.Sprintf("nested array constructor over a non-array: %v", sv.Kind))
+			panic(fmt.Sprintf("nested array constructor over a non-array: %v", sv.kind))
 		}
 	}
 	dims0, lbounds0 := arrs[0].Dims, arrs[0].Lbounds
@@ -112,7 +112,7 @@ func countNulls(vals []Value, wantNulls bool) int {
 func evalArrayFunc(fn arrayFunc, vals []Value, m *costMeter) (Value, error) {
 	switch fn {
 	case afNdims:
-		if vals[0].Kind == ValNull {
+		if vals[0].kind == ValNull {
 			return NullValue(), nil
 		}
 		if vals[0].arrayVal().Ndim() == 0 {
@@ -120,22 +120,22 @@ func evalArrayFunc(fn arrayFunc, vals []Value, m *costMeter) (Value, error) {
 		}
 		return IntValue(int64(vals[0].arrayVal().Ndim())), nil
 	case afCardinality:
-		if vals[0].Kind == ValNull {
+		if vals[0].kind == ValNull {
 			return NullValue(), nil
 		}
 		return IntValue(int64(len(vals[0].arrayVal().Elements))), nil // 0 for empty (NOT NULL)
 	case afDims:
-		if vals[0].Kind == ValNull || vals[0].arrayVal().Ndim() == 0 {
+		if vals[0].kind == ValNull || vals[0].arrayVal().Ndim() == 0 {
 			return NullValue(), nil
 		}
 		return TextValue(arrayDimsText(vals[0].arrayVal())), nil
 	case afLength, afLower, afUpper:
 		// (anyarray, dim): propagate either NULL arg; NULL for an empty array or an out-of-range dim.
-		if vals[0].Kind == ValNull || vals[1].Kind == ValNull {
+		if vals[0].kind == ValNull || vals[1].kind == ValNull {
 			return NullValue(), nil
 		}
 		a := vals[0].arrayVal()
-		dim := vals[1].Int
+		dim := vals[1].num
 		if a.Ndim() == 0 || dim < 1 || dim > int64(a.Ndim()) {
 			return NullValue(), nil
 		}
@@ -185,7 +185,7 @@ func evalArrayFunc(fn arrayFunc, vals []Value, m *costMeter) (Value, error) {
 // infinite bound the _inf reader is true and the _inc reader false. The resolver guarantees the
 // operand is a range or NULL.
 func evalRangeFunc(fn rangeFunc, vals []Value) (Value, error) {
-	if vals[0].Kind == ValNull {
+	if vals[0].kind == ValNull {
 		return NullValue(), nil
 	}
 	rv := vals[0].rangeVal()
@@ -237,7 +237,7 @@ func evalRangeCtor(elem scalarType, vals []Value, iz *inputZone) (Value, error) 
 	}
 	lowerInc, upperInc := true, false // the 2-arg form defaults to `[)`
 	if len(vals) > 2 {
-		switch vals[2].Kind {
+		switch vals[2].kind {
 		case ValNull:
 			return Value{}, newError(DataException, "range constructor flags argument must not be null")
 		case ValText:
@@ -265,7 +265,7 @@ func coerceRangeBound(v Value, elem scalarType, iz *inputZone) (*Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	if out.Kind == ValNull {
+	if out.kind == ValNull {
 		return nil, nil
 	}
 	return &out, nil
@@ -277,7 +277,7 @@ func coerceRangeBound(v Value, elem scalarType, iz *inputZone) (*Value, error) {
 // operand is coerced to the range's element type elem (assignment-style, matching the resolver's hint).
 // The boolean kernels live in range.go.
 func evalRangeOp(op rangeOp, l, r Value, elem scalarType, iz *inputZone) (Value, error) {
-	if l.Kind == ValNull || r.Kind == ValNull {
+	if l.kind == ValNull || r.kind == ValNull {
 		return NullValue(), nil
 	}
 	var result bool
@@ -325,7 +325,7 @@ func evalRangeOp(op rangeOp, l, r Value, elem scalarType, iz *inputZone) (Value,
 // (rsoDifference) raise 22000 on a non-contiguous result, `*` (rsoIntersect) and range_merge (rsoMerge)
 // never error.
 func evalRangeSetOp(op rangeSetOp, l, r Value) (Value, error) {
-	if l.Kind == ValNull || r.Kind == ValNull {
+	if l.kind == ValNull || r.kind == ValNull {
 		return NullValue(), nil
 	}
 	a, b := expectRange(l), expectRange(r)
@@ -358,14 +358,14 @@ func notDistinct(a, b Value) bool { return valueCmp(a, b) == 0 }
 // §10): a NULL element equals NOTHING — including another NULL — the deliberate inverse of
 // notDistinct (§5 #10). For two non-NULL values it is jed's total element comparator (valueCmp == 0).
 func strictElemEq(a, b Value) bool {
-	return a.Kind != ValNull && b.Kind != ValNull && valueCmp(a, b) == 0
+	return a.kind != ValNull && b.kind != ValNull && valueCmp(a, b) == 0
 }
 
 // arrayContainsValue is a @> b (array-functions.md §10): does a CONTAIN b — is every element of b
 // present in a under STRICT equality, over the flattened element multiset (any dimensionality)? A
 // NULL whole-array operand → NULL. The empty array is contained by anything (a @> {} is true).
 func arrayContainsValue(a, b Value) (Value, error) {
-	if a.Kind == ValNull || b.Kind == ValNull {
+	if a.kind == ValNull || b.kind == ValNull {
 		return NullValue(), nil
 	}
 	for _, eb := range b.arrayVal().Elements {
@@ -387,7 +387,7 @@ func arrayContainsValue(a, b Value) (Value, error) {
 // element under STRICT equality, over the flattened element multiset (any dimensionality)? A NULL
 // whole-array operand → NULL. The empty array overlaps nothing.
 func arrayOverlapsValue(a, b Value) (Value, error) {
-	if a.Kind == ValNull || b.Kind == ValNull {
+	if a.kind == ValNull || b.kind == ValNull {
 		return NullValue(), nil
 	}
 	for _, ea := range a.arrayVal().Elements {
@@ -404,7 +404,7 @@ func arrayOverlapsValue(a, b Value) (Value, error) {
 // FROM e. NULL array → NULL; 1-D/empty only (a multidimensional array is 0A000); the lower bound is
 // preserved and an all-removed result is the empty array {}.
 func arrayRemoveValue(arr, elem Value) (Value, error) {
-	if arr.Kind == ValNull {
+	if arr.kind == ValNull {
 		return NullValue(), nil
 	}
 	a := arr.arrayVal()
@@ -431,7 +431,7 @@ func arrayRemoveValue(arr, elem Value) (Value, error) {
 // NOT DISTINCT FROM `from` with `to`. Works on any dimensionality (the shape is preserved). NULL
 // array → NULL.
 func arrayReplaceValue(arr, from, to Value, m *costMeter) (Value, error) {
-	if arr.Kind == ValNull {
+	if arr.kind == ValNull {
 		return NullValue(), nil
 	}
 	a := arr.arrayVal()
@@ -472,7 +472,7 @@ func arrayReplaceValue(arr, from, to Value, m *costMeter) (Value, error) {
 // only (a multidimensional array is 0A000); the optional start is a subscript to begin at, and a
 // NULL start is 22004.
 func arrayPositionValue(arr, elem Value, start *Value) (Value, error) {
-	if arr.Kind == ValNull {
+	if arr.kind == ValNull {
 		return NullValue(), nil
 	}
 	a := arr.arrayVal()
@@ -485,10 +485,10 @@ func arrayPositionValue(arr, elem Value, start *Value) (Value, error) {
 	}
 	begin := 0
 	if start != nil {
-		if start.Kind == ValNull {
+		if start.kind == ValNull {
 			return Value{}, newError(NullValueNotAllowed, "initial position must not be null")
 		}
-		if off := start.Int - int64(lb); off > 0 {
+		if off := start.num - int64(lb); off > 0 {
 			begin = int(off)
 		}
 	}
@@ -504,7 +504,7 @@ func arrayPositionValue(arr, elem Value, start *Value) (Value, error) {
 // subscript (in the array's lower-bound space), the empty array {} if none. NULL array → NULL;
 // 1-D/empty only (a multidimensional array is 0A000).
 func arrayPositionsValue(arr, elem Value) (Value, error) {
-	if arr.Kind == ValNull {
+	if arr.kind == ValNull {
 		return NullValue(), nil
 	}
 	a := arr.arrayVal()
@@ -538,7 +538,7 @@ func arrayDimsText(a *ArrayVal) string {
 // side is non-strict: a NULL or empty array yields the 1-D singleton {elem} (lower bound 1). A 1-D
 // array grows by one element, preserving its lower bound; a multidimensional array is 22000.
 func arrayExtend(arr, elem Value, atEnd bool) (Value, error) {
-	if arr.Kind == ValNull || arr.arrayVal().Ndim() == 0 {
+	if arr.kind == ValNull || arr.arrayVal().Ndim() == 0 {
 		return arrayValueOf(oneDimArray([]Value{elem})), nil
 	}
 	a := arr.arrayVal()
@@ -582,13 +582,13 @@ func arrayExtend(arr, elem Value, atEnd bool) (Value, error) {
 // higher-dim operand (the outer lower bound of the lower-dim operand is irrelevant). The grown
 // outer dimension must keep `lb + len` within an i32 (checkArrayBounds: 54000).
 func arrayCatValues(a, b Value) (Value, error) {
-	if a.Kind == ValNull && b.Kind == ValNull {
+	if a.kind == ValNull && b.kind == ValNull {
 		return NullValue(), nil
 	}
-	if a.Kind == ValNull {
+	if a.kind == ValNull {
 		return b, nil
 	}
-	if b.Kind == ValNull {
+	if b.kind == ValNull {
 		return a, nil
 	}
 	av, bv := a.arrayVal(), b.arrayVal()
@@ -666,11 +666,11 @@ func evalSubscript(e *rExpr, row storedRow, env *evalEnv, m *costMeter) (Value, 
 	if err != nil {
 		return Value{}, err
 	}
-	if base.Kind == ValNull {
+	if base.kind == ValNull {
 		return NullValue(), nil
 	}
-	if base.Kind != ValArray {
-		panic(fmt.Sprintf("subscript on a non-array value: %v", base.Kind))
+	if base.kind != ValArray {
+		panic(fmt.Sprintf("subscript on a non-array value: %v", base.kind))
 	}
 	a := base.arrayVal()
 	if e.isSlice {
@@ -684,11 +684,11 @@ func evalSubscript(e *rExpr, row storedRow, env *evalEnv, m *costMeter) (Value, 
 				if err != nil {
 					return Value{}, err
 				}
-				if v.Kind == ValNull {
+				if v.kind == ValNull {
 					return NullValue(), nil
 				}
 				one := int64(1)
-				iv := v.Int
+				iv := v.num
 				los[i] = &one // scalar i → 1:i
 				his[i] = &iv
 			} else {
@@ -719,10 +719,10 @@ func evalSubscript(e *rExpr, row storedRow, env *evalEnv, m *costMeter) (Value, 
 		if err != nil {
 			return Value{}, err
 		}
-		if v.Kind == ValNull {
+		if v.kind == ValNull {
 			return NullValue(), nil
 		}
-		idxs[i] = v.Int
+		idxs[i] = v.num
 	}
 	return arrayGetElement(a, idxs), nil
 }
@@ -737,10 +737,10 @@ func evalOptBound(e *rExpr, row storedRow, env *evalEnv, m *costMeter) (*int64, 
 	if err != nil {
 		return nil, false, err
 	}
-	if v.Kind == ValNull {
+	if v.kind == ValNull {
 		return nil, true, nil
 	}
-	iv := v.Int
+	iv := v.num
 	return &iv, false, nil
 }
 
@@ -991,8 +991,8 @@ func unifyCaseTypes(arms []resolvedType, mismatch string) (resolvedType, error) 
 // unification needs none (all integers are i64), and an all-NULL CASE is text but every arm
 // evaluates to NULL anyway.
 func coerceCase(v Value, toDecimal bool) Value {
-	if toDecimal && v.Kind == ValInt {
-		return DecimalValue(decimalFromInt64(v.Int))
+	if toDecimal && v.kind == ValInt {
+		return DecimalValue(decimalFromInt64(v.num))
 	}
 	return v
 }
@@ -1192,7 +1192,7 @@ func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value,
 		return zr, nil
 	}
 	switch {
-	case v.Kind == ValText && to == scalarDate:
+	case v.kind == ValText && to == scalarDate:
 		// The runtime text → date cast (date.md §6): the per-row string runs the SAME parseDate
 		// the literal form folds at resolve — 22007 malformed / 22008 out of range, per row.
 		// Zone-free (no timezone charge; the node's operator_eval meters it) — EXCEPT a
@@ -1209,7 +1209,7 @@ func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value,
 			return Value{}, err
 		}
 		return DateValue(d), nil
-	case v.Kind == ValText && to == scalarTimestamp:
+	case v.kind == ValText && to == scalarTimestamp:
 		// text → timestamp (types.md §5): the literal's parseTimestamp per row — an offset is
 		// validated and ignored; 22007 malformed / 22008 out of range. Zone-free.
 		mc, err := parseTimestamp(v.str())
@@ -1217,7 +1217,7 @@ func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value,
 			return Value{}, err
 		}
 		return TimestampValue(mc), nil
-	case v.Kind == ValText && to == scalarTimestamptz:
+	case v.kind == ValText && to == scalarTimestamptz:
 		// text → timestamptz (types.md §5): an explicit offset (or ±infinity) fixes the instant;
 		// an offset-less wall clock is read in the SESSION zone, as PostgreSQL's timestamptz_in
 		// does (charging timezone; DST gap/overlap as the timestamp → timestamptz cast).
@@ -1237,56 +1237,56 @@ func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value,
 			return Value{}, errZoneShiftOutOfRange()
 		}
 		return TimestamptzValue(inst), nil
-	case v.Kind == ValTimestamp && to == scalarDate:
-		return microsToDate(v.Int), nil
-	case v.Kind == ValDate && to == scalarTimestamp:
+	case v.kind == ValTimestamp && to == scalarDate:
+		return microsToDate(v.num), nil
+	case v.kind == ValDate && to == scalarTimestamp:
 		// Midnight; a date past the timestamp range traps 22008.
-		mid, err := dateMidnightMicros(int32(v.Int))
+		mid, err := dateMidnightMicros(int32(v.num))
 		if err != nil {
 			return Value{}, err
 		}
 		return TimestampValue(mid), nil
-	case v.Kind == ValTimestamptz && to == scalarTimestamp:
-		if isInf(v.Int) {
-			return TimestampValue(v.Int), nil
+	case v.kind == ValTimestamptz && to == scalarTimestamp:
+		if isInf(v.num) {
+			return TimestampValue(v.num), nil
 		}
 		zr, err := zoneCharge()
 		if err != nil {
 			return Value{}, err
 		}
-		local, ok := instantToLocalMicros(zr, v.Int)
+		local, ok := instantToLocalMicros(zr, v.num)
 		if !ok {
 			return Value{}, errZoneShiftOutOfRange()
 		}
 		return TimestampValue(local), nil
-	case v.Kind == ValTimestamp && to == scalarTimestamptz:
-		if isInf(v.Int) {
-			return TimestamptzValue(v.Int), nil
+	case v.kind == ValTimestamp && to == scalarTimestamptz:
+		if isInf(v.num) {
+			return TimestamptzValue(v.num), nil
 		}
 		zr, err := zoneCharge()
 		if err != nil {
 			return Value{}, err
 		}
-		inst, ok := localToInstantMicros(zr, v.Int)
+		inst, ok := localToInstantMicros(zr, v.num)
 		if !ok {
 			return Value{}, errZoneShiftOutOfRange()
 		}
 		return TimestamptzValue(inst), nil
-	case v.Kind == ValTimestamptz && to == scalarDate:
-		if isInf(v.Int) {
-			return microsToDate(v.Int), nil
+	case v.kind == ValTimestamptz && to == scalarDate:
+		if isInf(v.num) {
+			return microsToDate(v.num), nil
 		}
 		zr, err := zoneCharge()
 		if err != nil {
 			return Value{}, err
 		}
-		local, ok := instantToLocalMicros(zr, v.Int)
+		local, ok := instantToLocalMicros(zr, v.num)
 		if !ok {
 			return Value{}, errZoneShiftOutOfRange()
 		}
 		return microsToDate(local), nil
-	case v.Kind == ValDate && to == scalarTimestamptz:
-		mid, err := dateMidnightMicros(int32(v.Int))
+	case v.kind == ValDate && to == scalarTimestamptz:
+		mid, err := dateMidnightMicros(int32(v.num))
 		if err != nil {
 			return Value{}, err
 		}
@@ -1343,7 +1343,7 @@ func dateClockValue(exec *engine, rng *stmtRng, m *costMeter, offsetDays int64) 
 func (e *rExpr) evalFilter(row storedRow, env *evalEnv, m *costMeter) (bool, error) {
 	if e.kind != reAnd {
 		v, err := e.eval(row, env, m)
-		return v.IsTrue(), err
+		return v.isTrue(), err
 	}
 	if err := m.Guard(); err != nil {
 		return false, err
@@ -1368,14 +1368,14 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		// A deferred large value the static touched set missed resolves ON TOUCH — the B4
 		// demand-fault backstop (bplus-reshape.md §5): deterministic rows, never a NULL-fold;
 		// deliberately unmetered (§6).
-		if v := row[e.index]; v.Kind == ValUnfetched {
+		if v := row[e.index]; v.kind == valUnfetched {
 			return resolveUnfetchedSelf(v.unfetched())
 		}
 		return row[e.index], nil
 	case reOuterColumn:
 		// A correlated reference: column `index` of the enclosing row `level` hops out (§26),
 		// with the same demand-fault backstop as reColumn.
-		if v := env.outer[len(env.outer)-e.level][e.index]; v.Kind == ValUnfetched {
+		if v := env.outer[len(env.outer)-e.level][e.index]; v.kind == valUnfetched {
 			return resolveUnfetchedSelf(v.unfetched())
 		}
 		return env.outer[len(env.outer)-e.level][e.index], nil
@@ -1439,13 +1439,13 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		switch base.Kind {
+		switch base.kind {
 		case ValComposite:
 			return (*base.composite())[e.index], nil
 		case ValNull:
 			return NullValue(), nil
 		default:
-			panic(fmt.Sprintf("field access on a non-composite value: %v", base.Kind))
+			panic(fmt.Sprintf("field access on a non-composite value: %v", base.kind))
 		}
 	case reSubscript:
 		// Array subscript `base[..][..]` — one operator_eval (spec/design/array.md §6). A NULL array
@@ -1494,7 +1494,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		if v.Kind == ValNull {
+		if v.kind == ValNull {
 			return NullValue(), nil
 		}
 		if e.result.IsJsonPath() {
@@ -1524,14 +1524,14 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		}
 		// Rendering bytea (hex) or jsonb (escapes) to text, and jsonb to json, is a growth kernel
 		// (cost.md §8.1). The full render is charged, before any varchar(n) truncation below.
-		if (v.Kind == ValJSONB || v.Kind == ValBytea) && (out.Kind == ValText || out.Kind == ValJSON) && !rexprIsConstant(e.operand) {
+		if (v.kind == ValJSONB || v.kind == ValBytea) && (out.kind == ValText || out.kind == ValJSON) && !rexprIsConstant(e.operand) {
 			if err := chargeOutput(m, out); err != nil {
 				return Value{}, err
 			}
 		}
 		// A varchar(n) cast target silently truncates the resulting text to n code points (the
 		// explicit-cast rule, spec/design/types.md §15) — applied after any *→text conversion.
-		if e.varchar != nil && out.Kind == ValText {
+		if e.varchar != nil && out.kind == ValText {
 			return TextValue(truncateToChars(out.str(), int(*e.varchar))), nil
 		}
 		return out, nil
@@ -1545,7 +1545,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		if v.Kind == ValNull {
+		if v.kind == ValNull {
 			return NullValue(), nil
 		}
 		if e.castElem == nil {
@@ -1580,7 +1580,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		if v.Kind == ValNull {
+		if v.kind == ValNull {
 			return NullValue(), nil
 		}
 		if e.castElem == nil {
@@ -1606,7 +1606,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			return growthResult(m, []*rExpr{e.operand}, TextValue(text))
 		}
-		if v.Kind == ValText {
+		if v.kind == ValText {
 			// runtime text → T[]: coerce the per-row string via array_in against the target element
 			// ColType (22P02 malformed / 2202E inverted bound — the same as the '{…}'::T[] literal).
 			return coerceStringToArray(v.str(), *e.castElem, env.exec.inputZone())
@@ -1622,7 +1622,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		// charged for the whole result array.
 		grows := false
 		for i, el := range src.Elements {
-			if el.Kind == ValNull {
+			if el.kind == ValNull {
 				newElems[i] = NullValue()
 				continue
 			}
@@ -1630,7 +1630,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// takes no typmod, so a decimal target is the unconstrained form — typmod nil). The
 			// resolver gate (scalarPairCastable) guarantees the (element, target) pair is admitted.
 			if scalar.IsText() {
-				grows = grows || el.Kind == ValBytea
+				grows = grows || el.kind == ValBytea
 				s, err := scalarToText(el, env, m)
 				if err != nil {
 					return Value{}, err
@@ -1655,11 +1655,11 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		if v.Kind == ValNull {
+		if v.kind == ValNull {
 			return NullValue(), nil
 		}
 		if e.result.IsInterval() {
-			r, err := v.interval().Neg()
+			r, err := v.interval().neg()
 			if err != nil {
 				return Value{}, err
 			}
@@ -1670,15 +1670,15 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return evalFloatNeg(v), nil
 		}
 		if e.result.IsDecimal() {
-			if v.Kind == ValInt {
-				return DecimalValue(decimalFromInt64(v.Int).Negate()), nil
+			if v.kind == ValInt {
+				return DecimalValue(decimalFromInt64(v.num).negate()), nil
 			}
-			return DecimalValue(v.decimal().Negate()), nil
+			return DecimalValue(v.decimal().negate()), nil
 		}
-		if v.Int == math.MinInt64 { // negating i64's minimum overflows i64
+		if v.num == math.MinInt64 { // negating i64's minimum overflows i64
 			return Value{}, overflowErr(e.result)
 		}
-		n := -v.Int
+		n := -v.num
 		if !e.result.InRange(n) {
 			return Value{}, overflowErr(e.result)
 		}
@@ -1700,21 +1700,21 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		if a.Kind == ValNull || b.Kind == ValNull {
+		if a.kind == ValNull || b.kind == ValNull {
 			return NullValue(), nil
 		}
 		// Date arithmetic (spec/design/date.md §6): date ± int → date, date − date → i32, date ±
 		// interval → timestamp. A Date operand is present iff this is date arithmetic (the resolver
 		// settled e.result accordingly), so intercept it before the interval/timestamp/integer
 		// dispatch below (which assume non-date operands).
-		if a.Kind == ValDate || b.Kind == ValDate {
+		if a.kind == ValDate || b.kind == ValDate {
 			return evalDateArith(e.op, a, b, e.result)
 		}
 		if e.result.IsInterval() && (e.op == opMul || e.op == opDiv) {
 			// interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5).
 			// Mul commutes; Div is interval / number. A zero divisor traps 22012.
 			iv, num := a, b
-			if a.Kind != ValInterval {
+			if a.kind != ValInterval {
 				iv, num = b, a
 			}
 			fnum, fden, ferr := factorToFraction(num)
@@ -1741,12 +1741,12 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if e.result.IsInterval() {
 			// interval ± interval → interval; timestamp[tz] − timestamp[tz] → interval
 			// (spec/design/interval.md §5). Dispatch on the operand kinds.
-			if a.Kind == ValInterval && b.Kind == ValInterval {
+			if a.kind == ValInterval && b.kind == ValInterval {
 				var r Interval
 				if e.op == opAdd {
-					r, err = a.interval().Add(b.interval())
+					r, err = a.interval().add(b.interval())
 				} else {
-					r, err = a.interval().Sub(b.interval())
+					r, err = a.interval().sub(b.interval())
 				}
 				if err != nil {
 					return Value{}, err
@@ -1754,7 +1754,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return IntervalValue(r), nil
 			}
 			// timestamp[tz] − timestamp[tz] (both Int-carried instants).
-			r, err := tsDiff(a.Int, b.Int)
+			r, err := tsDiff(a.num, b.num)
 			if err != nil {
 				return Value{}, err
 			}
@@ -1765,10 +1765,10 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// interval + timestamp commutes). Find the timestamp instant and the interval.
 			var instant int64
 			var iv Interval
-			if a.Kind == ValInterval {
-				instant, iv = b.Int, a.interval()
+			if a.kind == ValInterval {
+				instant, iv = b.num, a.interval()
 			} else {
-				instant, iv = a.Int, b.interval()
+				instant, iv = a.num, b.interval()
 			}
 			if e.result.IsTimestamptz() {
 				// A timestamptz shifts in the SESSION zone (PG timestamptz_pl_interval; interval.md
@@ -1810,7 +1810,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			return evalDecimalArith(e.op, da, db)
 		}
-		return evalArith(e.op, a.Int, b.Int, e.result)
+		return evalArith(e.op, a.num, b.num, e.result)
 	case reCompare:
 		m.Charge(operatorCost(e.op.catalogName()))
 		a, err := e.lhs.eval(row, env, m)
@@ -1833,7 +1833,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		// collation (§7), so they take the plain path and charge no collate. A NULL operand makes the
 		// result Unknown (no sort key).
 		if e.collation != nil && (e.op == opLt || e.op == opGt || e.op == opLe || e.op == opGe) {
-			if a.Kind == ValText && b.Kind == ValText {
+			if a.kind == ValText && b.kind == ValText {
 				m.Charge(costs.Collate * int64(utf8.RuneCountInString(a.str())+utf8.RuneCountInString(b.str())))
 				if err := m.Guard(); err != nil {
 					return Value{}, err
@@ -1855,7 +1855,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			// Two text[] values walk their element pairs under the collation, charging collate per
 			// compared pair (collation.md §11).
-			if a.Kind == ValArray && b.Kind == ValArray {
+			if a.kind == ValArray && b.kind == ValArray {
 				c, err := collatedArrayCmp(e.collation, a.arrayVal(), b.arrayVal(), m)
 				if err != nil {
 					return Value{}, err
@@ -1872,7 +1872,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				}
 			}
 			// Either operand NULL ⇒ Unknown (text comparison is three-valued).
-			return Value{Kind: ValNull}, nil
+			return Value{kind: ValNull}, nil
 		}
 		// Variable-length text/bytea comparison scans up to the shorter operand's length (code
 		// points / bytes); charge varlen_compare × (W − 1) so the per-comparison length work an
@@ -1885,17 +1885,17 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		}
 		switch e.op {
 		case opEq:
-			return from3(a.Eq3(b)), nil
+			return from3(a.eq3(b)), nil
 		case opNe:
-			return from3(not3(a.Eq3(b))), nil
+			return from3(not3(a.eq3(b))), nil
 		case opLt:
-			return from3(a.Lt3(b)), nil
+			return from3(a.lt3(b)), nil
 		case opGt:
-			return from3(a.Gt3(b)), nil
+			return from3(a.gt3(b)), nil
 		case opLe:
-			return from3(or3(a.Lt3(b), a.Eq3(b))), nil
+			return from3(or3(a.lt3(b), a.eq3(b))), nil
 		default: // OpGe
-			return from3(or3(a.Gt3(b), a.Eq3(b))), nil
+			return from3(or3(a.gt3(b), a.eq3(b))), nil
 		}
 	case reJsonGet:
 		// A jsonb accessor operator (`-> ->> #> #>>`, spec/design/json-sql-functions.md §1). One
@@ -1913,10 +1913,10 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
-		if bv.Kind == ValNull || av.Kind == ValNull {
+		if bv.kind == ValNull || av.kind == ValNull {
 			return NullValue(), nil
 		}
-		if bv.Kind == ValJSON {
+		if bv.kind == ValJSON {
 			return jsonGetVerbatim(e.jgop, bv.str(), av)
 		}
 		node := bv.jsonb() // resolver guarantees a json/jsonb base for an accessor operator
@@ -1925,17 +1925,17 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		var accessed *JSONNode
 		switch e.jgop {
 		case jgArrow, jgArrowText:
-			if av.Kind == ValText {
+			if av.kind == ValText {
 				accessed = jsonGetField(node, av.str())
 			} else { // ValInt — resolver guarantees a text/int arg for -> / ->>
-				accessed = jsonGetRootIndex(node, av.Int) // a top-level scalar is its own element 0 (PG)
+				accessed = jsonGetRootIndex(node, av.num) // a top-level scalar is its own element 0 (PG)
 			}
 		default: // jgHashArrow, jgHashArrowText — a text[] path
 			arr := av.arrayVal()
 			steps := make([]string, 0, len(arr.Elements))
 			nullStep := false
 			for _, el := range arr.Elements {
-				if el.Kind == ValNull {
+				if el.kind == ValNull {
 					nullStep = true
 					break
 				}
@@ -1984,7 +1984,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
-		if av.Kind == ValNull || bv.Kind == ValNull {
+		if av.kind == ValNull || bv.kind == ValNull {
 			return NullValue(), nil
 		}
 		// resolver guarantees jsonb operands for @> / <@.
@@ -2004,7 +2004,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
-		if bv.Kind == ValNull || av.Kind == ValNull {
+		if bv.kind == ValNull || av.kind == ValNull {
 			return NullValue(), nil
 		}
 		node := bv.jsonb() // resolver guarantees a jsonb base for ? / ?| / ?&
@@ -2017,7 +2017,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// requires only every NON-NULL key (an all-NULL / empty list is vacuously true).
 			keys := make([]string, 0, len(av.arrayVal().Elements))
 			for _, el := range av.arrayVal().Elements {
-				if el.Kind == ValNull {
+				if el.kind == ValNull {
 					continue
 				}
 				keys = append(keys, el.str()) // a text[] arg has text/NULL elements
@@ -2055,7 +2055,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
-		if av.Kind == ValNull || bv.Kind == ValNull {
+		if av.kind == ValNull || bv.kind == ValNull {
 			return NullValue(), nil
 		}
 		// resolver guarantees jsonb operands for ||. Wrapping a non-array operand can deepen the
@@ -2080,7 +2080,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
-		if bv.Kind == ValNull || av.Kind == ValNull {
+		if bv.kind == ValNull || av.kind == ValNull {
 			return NullValue(), nil
 		}
 		node := bv.jsonb() // resolver guarantees a jsonb base for - / #-
@@ -2089,7 +2089,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		case dkKey:
 			result, err = jsonDeleteKey(node, av.str()) // resolver guarantees a text arg for - key
 		case dkIndex:
-			result, err = jsonDeleteIndex(node, av.Int) // resolver guarantees an int arg for - index
+			result, err = jsonDeleteIndex(node, av.num) // resolver guarantees an int arg for - index
 		case dkKeys:
 			// A NULL key is skipped (PG).
 			var keys []*string
@@ -2115,7 +2115,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		if to3(a) == False {
+		if to3(a) == tvFalse {
 			return a, nil
 		}
 		b, err := e.rhs.eval(row, env, m)
@@ -2132,7 +2132,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		if to3(a) == True {
+		if to3(a) == tvTrue {
 			return a, nil
 		}
 		b, err := e.rhs.eval(row, env, m)
@@ -2148,7 +2148,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		}
 		// Composite IS NULL / IS NOT NULL is PG's all-fields rule, NON-recursive (composite.md §5);
 		// a scalar follows the ordinary rule. IsNullTest folds both.
-		return BoolValue(v.IsNullTest(e.negated)), nil
+		return BoolValue(v.isNullTest(e.negated)), nil
 	case reIsJson:
 		m.Charge(costs.OperatorEval)
 		v, err := e.operand.eval(row, env, m)
@@ -2156,7 +2156,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return Value{}, err
 		}
 		var ok bool
-		switch v.Kind {
+		switch v.kind {
 		case ValNull:
 			return NullValue(), nil // a NULL operand → NULL (never raises)
 		case ValJSONB:
@@ -2187,7 +2187,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		switch v.Kind {
+		switch v.kind {
 		case ValNull:
 			return NullValue(), nil // a NULL operand → SQL NULL
 		case ValText:
@@ -2224,7 +2224,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		}
 		// NULL propagates BEFORE the matcher runs, so a malformed pattern against a NULL operand
 		// is still NULL, never 22025 (matches PG — grammar.md §22).
-		if subject.Kind == ValNull || pattern.Kind == ValNull {
+		if subject.kind == ValNull || pattern.kind == ValNull {
 			return NullValue(), nil
 		}
 		sub, pat := subject.str(), pattern.str()
@@ -2253,7 +2253,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		}
 		// NULL propagates BEFORE the matcher runs (regex.md §1) — a malformed pattern against a NULL
 		// operand is still NULL, never 2201B.
-		if subject.Kind == ValNull || pattern.Kind == ValNull {
+		if subject.kind == ValNull || pattern.kind == ValNull {
 			return NullValue(), nil
 		}
 		sub := subject.str()
@@ -2319,7 +2319,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
-			if v.Kind == ValNull && (e.rxFunc != rxSimilarSubstring || a.kind == reConstNull) {
+			if v.kind == ValNull && (e.rxFunc != rxSimilarSubstring || a.kind == reConstNull) {
 				return NullValue(), nil
 			}
 			vals[i] = v
@@ -2343,39 +2343,39 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 		case rxCount:
 			if len(vals) > 2 {
-				start = vals[2].Int
+				start = vals[2].num
 			}
 			if len(vals) > 3 {
 				flags = vals[3].str()
 			}
 		case rxSubstr:
 			if len(vals) > 2 {
-				start = vals[2].Int
+				start = vals[2].num
 			}
 			if len(vals) > 3 {
-				nth = vals[3].Int
+				nth = vals[3].num
 			}
 			if len(vals) > 4 {
 				flags = vals[4].str()
 			}
 			if len(vals) > 5 {
-				subexpr = vals[5].Int
+				subexpr = vals[5].num
 			}
 		case rxInstr:
 			if len(vals) > 2 {
-				start = vals[2].Int
+				start = vals[2].num
 			}
 			if len(vals) > 3 {
-				nth = vals[3].Int
+				nth = vals[3].num
 			}
 			if len(vals) > 4 {
-				endoption = vals[4].Int
+				endoption = vals[4].num
 			}
 			if len(vals) > 5 {
 				flags = vals[5].str()
 			}
 			if len(vals) > 6 {
-				subexpr = vals[6].Int
+				subexpr = vals[6].num
 			}
 		}
 		// Numeric argument validation (regex.md §8b), BEFORE the pattern compiles (PG order: a bad
@@ -2563,7 +2563,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		if v.Kind == ValNull {
+		if v.kind == ValNull {
 			return NullValue(), nil
 		}
 		return TextValue(foldCase(v.str(), e.casingUpper, env.exec.session.env.propertyTable())), nil
@@ -2577,14 +2577,14 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		if zv.Kind == ValNull || vv.Kind == ValNull {
+		if zv.kind == ValNull || vv.kind == ValNull {
 			return NullValue(), nil
 		}
 		m.Charge(costs.Timezone)
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
-		micros := vv.Int
+		micros := vv.num
 		// ±infinity passes through unchanged (PG): no zone offset applies, zone not validated.
 		if micros == posInfinity || micros == negInfinity {
 			if e.atTzToTimestamptz {
@@ -2628,13 +2628,13 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			zv = &z
 		}
-		if uv.Kind == ValNull || vv.Kind == ValNull || (zv != nil && zv.Kind == ValNull) {
+		if uv.kind == ValNull || vv.kind == ValNull || (zv != nil && zv.kind == ValNull) {
 			return NullValue(), nil
 		}
 		unitS := uv.str()
-		switch vv.Kind {
+		switch vv.kind {
 		case ValTimestamp:
-			r, err := dateTruncMicros(unitS, vv.Int, false)
+			r, err := dateTruncMicros(unitS, vv.num, false)
 			if err != nil {
 				return Value{}, err
 			}
@@ -2646,7 +2646,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			return IntervalValue(r), nil
 		case ValTimestamptz:
-			mc := vv.Int
+			mc := vv.num
 			if mc == posInfinity || mc == negInfinity {
 				if _, err := dateTruncMicros(unitS, mc, true); err != nil { // still validate the unit
 					return Value{}, err
@@ -2692,17 +2692,17 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		}
 		field := e.cText
 		var src extractSrc
-		switch vv.Kind {
+		switch vv.kind {
 		case ValNull:
 			return NullValue(), nil
 		case ValTimestamp:
-			src = extractSrc{kind: srcTs, local: vv.Int}
+			src = extractSrc{kind: srcTs, local: vv.num}
 		case ValDate:
-			src = extractSrc{kind: srcDate, days: int32(vv.Int)}
+			src = extractSrc{kind: srcDate, days: int32(vv.num)}
 		case ValInterval:
 			src = extractSrc{kind: srcIv, iv: vv.interval()}
 		case ValTimestamptz:
-			mc := vv.Int
+			mc := vv.num
 			// `epoch` is zone-independent (the instant); every other field decomposes in the session
 			// zone — so only the zone-consulting fields charge `timezone`.
 			if field == "epoch" || mc == posInfinity || mc == negInfinity {
@@ -2738,7 +2738,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		if v.Kind == ValNull {
+		if v.kind == ValNull {
 			return NullValue(), nil
 		}
 		return evalDateConvert(v, e.result, env, m)
@@ -2760,7 +2760,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
-			if cv.Kind == ValBool && cv.boolVal() {
+			if cv.kind == ValBool && cv.boolVal() {
 				rv, err := arm.result.eval(row, env, m)
 				if err != nil {
 					return Value{}, err
@@ -2784,7 +2784,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
-			if v.Kind != ValNull {
+			if v.kind != ValNull {
 				return coerceCase(v, e.caseDecimal), nil
 			}
 		}
@@ -2807,7 +2807,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return Value{}, err
 			}
 			v = coerceCase(v, e.caseDecimal)
-			if v.Kind == ValNull {
+			if v.kind == ValNull {
 				continue
 			}
 			if !haveBest {
@@ -2815,7 +2815,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				continue
 			}
 			var c int
-			if e.collation != nil && v.Kind == ValText {
+			if e.collation != nil && v.kind == ValText {
 				m.Charge(costs.Collate * int64(utf8.RuneCountInString(v.str())+utf8.RuneCountInString(best.str())))
 				if err := m.Guard(); err != nil {
 					return Value{}, err
@@ -2823,7 +2823,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				if c, err = collatedCmp(e.collation, v.str(), best.str()); err != nil {
 					return Value{}, err
 				}
-			} else if e.collation != nil && v.Kind == ValArray {
+			} else if e.collation != nil && v.kind == ValArray {
 				if c, err = collatedArrayCmp(e.collation, v.arrayVal(), best.arrayVal(), m); err != nil {
 					return Value{}, err
 				}
@@ -2865,14 +2865,14 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		ca, cb := a, b
 		if e.nullifWidenFloat {
 			// A mixed-width float pair compares at f64 (the implicit f32 → f64 cast).
-			if ca.Kind == ValFloat32 {
+			if ca.kind == ValFloat32 {
 				ca = Float64Value(ca.asF64())
 			}
-			if cb.Kind == ValFloat32 {
+			if cb.kind == ValFloat32 {
 				cb = Float64Value(cb.asF64())
 			}
 		}
-		if ca.Eq3(cb) == True {
+		if ca.eq3(cb) == tvTrue {
 			return NullValue(), nil
 		}
 		return coerceCase(a, e.caseDecimal), nil
@@ -2903,7 +2903,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				if err != nil {
 					return Value{}, err
 				}
-				if v.Kind == ValNull {
+				if v.kind == ValNull {
 					return NullValue(), nil // NULL propagates
 				}
 				hvals = append(hvals, v)
@@ -2926,7 +2926,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		// so a kernel declared `-> i32` returning 2^40 matches the type above yet would leak an
 		// out-of-range i32 into comparisons / casts / key encodings. Trap 22003 here, on this row,
 		// exactly as a built-in's result-boundary check does.
-		if out.Kind == ValInt && !e.result.InRange(out.Int) {
+		if out.kind == ValInt && !e.result.InRange(out.num) {
 			return Value{}, overflowErr(e.result)
 		}
 		return out, nil
@@ -2942,7 +2942,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return Value{}, err
 			}
 			out := TextValue("NULL")
-			if v.Kind != ValNull {
+			if v.kind != ValNull {
 				out = TextValue(quoteLiteralText(v.str()))
 			}
 			// A growth kernel: quoting doubles every quote (cost.md §8.1).
@@ -2954,17 +2954,17 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
-			if v.Kind == ValNull {
+			if v.kind == ValNull {
 				return NullValue(), nil // NULL propagates
 			}
 			vals = append(vals, v)
 		}
 		switch e.sfunc {
 		case sfAbs:
-			if vals[0].Kind == ValInt {
+			if vals[0].kind == ValInt {
 				// abs over an integer: |x| then range-check at the result type's boundary
 				// (abs(i16 -32768) → 22003), exactly like reNeg.
-				n := vals[0].Int
+				n := vals[0].num
 				if n == math.MinInt64 {
 					return Value{}, overflowErr(e.result)
 				}
@@ -2976,19 +2976,19 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				}
 				return IntValue(n), nil
 			}
-			return DecimalValue(vals[0].decimal().Abs()), nil
+			return DecimalValue(vals[0].decimal().abs()), nil
 		case sfRound:
 			var d Decimal
-			if vals[0].Kind == ValInt {
-				d = decimalFromInt64(vals[0].Int)
+			if vals[0].kind == ValInt {
+				d = decimalFromInt64(vals[0].num)
 			} else {
 				d = *vals[0].decimal()
 			}
 			places := int64(0)
 			if len(vals) > 1 {
-				places = vals[1].Int
+				places = vals[1].num
 			}
-			r, err := d.RoundPlaces(places)
+			r, err := d.roundPlaces(places)
 			if err != nil {
 				return Value{}, err
 			}
@@ -3002,7 +3002,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
-			iv, err := makeInterval(vals[0].Int, vals[1].Int, vals[2].Int, vals[3].Int, vals[4].Int, vals[5].Int, secMicros)
+			iv, err := makeInterval(vals[0].num, vals[1].num, vals[2].num, vals[3].num, vals[4].num, vals[5].num, secMicros)
 			if err != nil {
 				return Value{}, err
 			}
@@ -3013,7 +3013,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// field traps 22008). make_timestamptz then interprets that wall clock in a zone (the
 			// session zone for the 6-arg form, the trailing timezone text for the 7-arg form),
 			// charging one timezone unit like AT TIME ZONE; an unrecognized explicit zone is 22023.
-			wall, err := makeTimestamp(vals[0].Int, vals[1].Int, vals[2].Int, vals[3].Int, vals[4].Int, vals[5].asF64())
+			wall, err := makeTimestamp(vals[0].num, vals[1].num, vals[2].num, vals[3].num, vals[4].num, vals[5].asF64())
 			if err != nil {
 				return Value{}, err
 			}
@@ -3043,7 +3043,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		case sfMakeDate:
 			// make_date(year, month, day) — the make_timestamp sibling (functions.md §11): a
 			// negative year is BC; year zero / a bad field / an out-of-range day count traps 22008.
-			d, err := makeDate(vals[0].Int, vals[1].Int, vals[2].Int)
+			d, err := makeDate(vals[0].num, vals[1].num, vals[2].num)
 			if err != nil {
 				return Value{}, err
 			}
@@ -3064,19 +3064,19 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// timezone charge. NULL propagation is the blanket case above.
 			field := toLowerASCII(vals[0].str())
 			var src extractSrc
-			switch vals[1].Kind {
+			switch vals[1].kind {
 			case ValDate:
-				mid, err := dateMidnightMicros(int32(vals[1].Int))
+				mid, err := dateMidnightMicros(int32(vals[1].num))
 				if err != nil {
 					return Value{}, err
 				}
 				src = extractSrc{kind: srcTs, local: mid}
 			case ValTimestamp:
-				src = extractSrc{kind: srcTs, local: vals[1].Int}
+				src = extractSrc{kind: srcTs, local: vals[1].num}
 			case ValInterval:
 				src = extractSrc{kind: srcIv, iv: vals[1].interval()}
 			case ValTimestamptz:
-				mc := vals[1].Int
+				mc := vals[1].num
 				if field == "epoch" || mc == posInfinity || mc == negInfinity {
 					src = extractSrc{kind: srcTstz, instant: mc, local: mc, offsetSecs: 0}
 				} else {
@@ -3151,12 +3151,12 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				if err != nil {
 					return Value{}, err
 				}
-				mid, err := dateMidnightMicros(int32(today.Int))
+				mid, err := dateMidnightMicros(int32(today.num))
 				if err != nil {
 					return Value{}, err
 				}
 				dt1 = mid
-				if x.Kind == ValTimestamptz {
+				if x.kind == ValTimestamptz {
 					m.Charge(costs.Timezone)
 					if err := m.Guard(); err != nil {
 						return Value{}, err
@@ -3168,15 +3168,15 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 					dt1 = instant
 				}
 			} else {
-				dt1 = vals[0].Int
+				dt1 = vals[0].num
 				x = vals[1]
 			}
-			dt2 := x.Int
+			dt2 := x.num
 			if err := ageRejectInfinite(dt1, dt2); err != nil {
 				return Value{}, err
 			}
 			local1, local2 := dt1, dt2
-			if x.Kind == ValTimestamptz {
+			if x.kind == ValTimestamptz {
 				zr := env.exec.session.timeZone
 				for _, p := range []*int64{&local1, &local2} {
 					m.Charge(costs.Timezone)
@@ -3286,7 +3286,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if len(vals) > 2 {
 				isCalled = vals[2].boolVal()
 			}
-			n, err := env.exec.seqSetval(name, vals[1].Int, isCalled)
+			n, err := env.exec.seqSetval(name, vals[1].num, isCalled)
 			if err != nil {
 				return Value{}, err
 			}
@@ -3357,7 +3357,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// JSON_SERIALIZE(v) → the value's text serialization (json-sql-functions.md §5): a json input
 			// is its verbatim text, a jsonb input its canonical render (jsonbOut). STRICT: the NULL-input
 			// case is handled by the blanket propagation above.
-			switch vals[0].Kind {
+			switch vals[0].kind {
 			case ValJSON:
 				return growthResult(m, e.sargs, TextValue(vals[0].str()))
 			case ValJSONB:
@@ -3369,7 +3369,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// length(text) → i32 — the number of characters (Unicode code points). Go strings are
 			// UTF-8, so utf8.RuneCountInString counts code points (string-functions.md §3). Over
 			// bytea, length is the byte count (string-functions.md §4).
-			if vals[0].Kind == ValBytea {
+			if vals[0].kind == ValBytea {
 				return IntValue(int64(len(vals[0].str()))), nil
 			}
 			return IntValue(int64(utf8.RuneCountInString(vals[0].str()))), nil
@@ -3386,34 +3386,34 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// over bytea the same window over bytes (string-functions.md §4).
 			var count *int64
 			if len(vals) > 2 {
-				c := vals[2].Int
+				c := vals[2].num
 				count = &c
 			}
-			if vals[0].Kind == ValBytea {
-				r, err := substrBytes([]byte(vals[0].str()), vals[1].Int, count)
+			if vals[0].kind == ValBytea {
+				r, err := substrBytes([]byte(vals[0].str()), vals[1].num, count)
 				if err != nil {
 					return Value{}, err
 				}
 				return ByteaValue(r), nil
 			}
-			r, err := substrChars(vals[0].str(), vals[1].Int, count)
+			r, err := substrChars(vals[0].str(), vals[1].num, count)
 			if err != nil {
 				return Value{}, err
 			}
 			return TextValue(r), nil
 		case sfLeft:
 			// left(text, n) → text — the first n characters (negative n drops the last |n|).
-			return TextValue(leftChars(vals[0].str(), vals[1].Int)), nil
+			return TextValue(leftChars(vals[0].str(), vals[1].num)), nil
 		case sfRight:
 			// right(text, n) → text — the last n characters (negative n drops the first |n|).
-			return TextValue(rightChars(vals[0].str(), vals[1].Int)), nil
+			return TextValue(rightChars(vals[0].str(), vals[1].num)), nil
 		case sfLpad:
 			// lpad(text, length[, fill]) → text — pad/truncate on the LEFT (default fill a space).
 			fill := " "
 			if len(vals) > 2 {
 				fill = vals[2].str()
 			}
-			r, err := padChars(vals[0].str(), vals[1].Int, fill, true, m)
+			r, err := padChars(vals[0].str(), vals[1].num, fill, true, m)
 			if err != nil {
 				return Value{}, err
 			}
@@ -3424,14 +3424,14 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if len(vals) > 2 {
 				fill = vals[2].str()
 			}
-			r, err := padChars(vals[0].str(), vals[1].Int, fill, false, m)
+			r, err := padChars(vals[0].str(), vals[1].num, fill, false, m)
 			if err != nil {
 				return Value{}, err
 			}
 			return TextValue(r), nil
 		case sfBtrim:
 			// btrim(text[, chars]) → text — trim `chars`-set characters from both ends.
-			if vals[0].Kind == ValBytea {
+			if vals[0].kind == ValBytea {
 				// btrim(bytea, bytes) → bytea — the same trim over a byte set (§4).
 				return ByteaValue(trimBytes([]byte(vals[0].str()), []byte(vals[1].str()), true, true)), nil
 			}
@@ -3442,7 +3442,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return TextValue(trimChars(vals[0].str(), set, true, true)), nil
 		case sfLtrim:
 			// ltrim(text[, chars]) → text — trim `chars`-set characters from the LEFT end.
-			if vals[0].Kind == ValBytea {
+			if vals[0].kind == ValBytea {
 				// ltrim(bytea, bytes) → bytea — the same trim over a byte set (§4).
 				return ByteaValue(trimBytes([]byte(vals[0].str()), []byte(vals[1].str()), true, false)), nil
 			}
@@ -3453,7 +3453,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return TextValue(trimChars(vals[0].str(), set, true, false)), nil
 		case sfRtrim:
 			// rtrim(text[, chars]) → text — trim `chars`-set characters from the RIGHT end.
-			if vals[0].Kind == ValBytea {
+			if vals[0].kind == ValBytea {
 				// rtrim(bytea, bytes) → bytea — the same trim over a byte set (§4).
 				return ByteaValue(trimBytes([]byte(vals[0].str()), []byte(vals[1].str()), false, true)), nil
 			}
@@ -3474,7 +3474,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return TextValue(translateChars(vals[0].str(), vals[1].str(), vals[2].str())), nil
 		case sfRepeat:
 			// repeat(text, n) → text — concatenate the string n times.
-			r, err := repeatText(vals[0].str(), vals[1].Int, m)
+			r, err := repeatText(vals[0].str(), vals[1].num, m)
 			if err != nil {
 				return Value{}, err
 			}
@@ -3489,7 +3489,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		case sfStrpos:
 			// strpos(text, substring) → i32 — 1-based code-point position, else 0. strings.Index
 			// gives a BYTE offset; convert by counting code points in the prefix (empty sub → 1).
-			if vals[0].Kind == ValBytea {
+			if vals[0].kind == ValBytea {
 				// position(bytea, sub) → i32 — the 1-based byte position (§4); empty sub → 1, absent
 				// (Index -1) → 0.
 				return IntValue(int64(strings.Index(vals[0].str(), vals[1].str())) + 1), nil
@@ -3501,7 +3501,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return IntValue(int64(utf8.RuneCountInString(vals[0].str()[:idx])) + 1), nil
 		case sfSplitPart:
 			// split_part(text, delimiter, n) → text — the n-th split field.
-			r, err := splitPart(vals[0].str(), vals[1].str(), vals[2].Int)
+			r, err := splitPart(vals[0].str(), vals[1].str(), vals[2].num)
 			if err != nil {
 				return Value{}, err
 			}
@@ -3517,7 +3517,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return IntValue(0), nil
 		case sfChr:
 			// chr(int) → text — the one-character string for a code point.
-			r, err := chrText(vals[0].Int)
+			r, err := chrText(vals[0].num)
 			if err != nil {
 				return Value{}, err
 			}
@@ -3527,7 +3527,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return TextValue(initcapASCII(vals[0].str())), nil
 		case sfToHex:
 			// to_hex(int) → text — lowercase hex of the 64-bit two's-complement pattern.
-			return TextValue(strconv.FormatUint(uint64(vals[0].Int), 16)), nil
+			return TextValue(strconv.FormatUint(uint64(vals[0].num), 16)), nil
 		case sfEncode:
 			// encode(bytea, format) → text — hex / base64 / escape. bytea is held as raw bytes in Str.
 			r, err := encodeBytea([]byte(vals[0].str()), vals[1].str())
@@ -3545,28 +3545,28 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return ByteaValue(r), nil
 		case sfGetByte:
 			// get_byte(bytea, n) → i32 — the n-th byte (0-based), unsigned.
-			r, err := getByte([]byte(vals[0].str()), vals[1].Int)
+			r, err := getByte([]byte(vals[0].str()), vals[1].num)
 			if err != nil {
 				return Value{}, err
 			}
 			return IntValue(r), nil
 		case sfSetByte:
 			// set_byte(bytea, n, v) → bytea — the n-th byte replaced by v's low 8 bits.
-			r, err := setByte([]byte(vals[0].str()), vals[1].Int, vals[2].Int)
+			r, err := setByte([]byte(vals[0].str()), vals[1].num, vals[2].num)
 			if err != nil {
 				return Value{}, err
 			}
 			return ByteaValue(r), nil
 		case sfGetBit:
 			// get_bit(bytea, n) → i32 — the n-th bit (0-based), 0 or 1.
-			r, err := getBit([]byte(vals[0].str()), vals[1].Int)
+			r, err := getBit([]byte(vals[0].str()), vals[1].num)
 			if err != nil {
 				return Value{}, err
 			}
 			return IntValue(r), nil
 		case sfSetBit:
 			// set_bit(bytea, n, v) → bytea — the n-th bit set to v (0 or 1).
-			r, err := setBit([]byte(vals[0].str()), vals[1].Int, vals[2].Int)
+			r, err := setBit([]byte(vals[0].str()), vals[1].num, vals[2].num)
 			if err != nil {
 				return Value{}, err
 			}
@@ -3581,13 +3581,13 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			tmpl := vals[1].str()
 			switch e.sfunc {
 			case sfToCharTimestamp:
-				out, err = toCharTimestamp(vals[0].Int, tmpl)
+				out, err = toCharTimestamp(vals[0].num, tmpl)
 			case sfToCharTimestamptz:
-				out, err = toCharTimestamptz(vals[0].Int, env.exec.session.timeZone, tmpl, m)
+				out, err = toCharTimestamptz(vals[0].num, env.exec.session.timeZone, tmpl, m)
 			case sfToCharInterval:
 				out, err = toCharInterval(vals[0].interval(), tmpl)
 			case sfToCharInt4, sfToCharInt8:
-				out, err = toCharInt(vals[0].Int, e.sfunc == sfToCharInt8, tmpl)
+				out, err = toCharInt(vals[0].num, e.sfunc == sfToCharInt8, tmpl)
 			case sfToCharDecimal:
 				out, err = toCharDecimal(*vals[0].decimal(), tmpl)
 			default:
@@ -3630,11 +3630,11 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// overlay(string, new, start[, count]) → text / bytea — the SQL OVERLAY splice; count
 			// defaults to length(new) (characters for text, bytes for bytea). A growth kernel
 			// (cost.md §8.1), free over constant operands.
-			start := vals[2].Int
-			if vals[0].Kind == ValBytea {
+			start := vals[2].num
+			if vals[0].kind == ValBytea {
 				count := int64(len(vals[1].str()))
 				if len(vals) > 3 {
-					count = vals[3].Int
+					count = vals[3].num
 				}
 				r, err := overlayBytes([]byte(vals[0].str()), []byte(vals[1].str()), start, count)
 				if err != nil {
@@ -3644,7 +3644,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			count := int64(utf8.RuneCountInString(vals[1].str()))
 			if len(vals) > 3 {
-				count = vals[3].Int
+				count = vals[3].num
 			}
 			r, err := overlayChars(vals[0].str(), vals[1].str(), start, count)
 			if err != nil {
@@ -3696,21 +3696,21 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		case sfSign:
 			// sign: -1 / 0 / +1. Decimal → numeric (scale 0); float → f64 (EXACT, in-contract).
 			// sign(NaN) = sign(±0) = 0, sign(±Inf) = ±1 (PG dsign tests x > 0 / x < 0, so NaN → 0).
-			if vals[0].Kind == ValInt {
+			if vals[0].kind == ValInt {
 				// An integer coerced to the decimal overload (arg-coercion.md §4).
 				s := int64(0)
-				if vals[0].Int > 0 {
+				if vals[0].num > 0 {
 					s = 1
-				} else if vals[0].Int < 0 {
+				} else if vals[0].num < 0 {
 					s = -1
 				}
 				return DecimalValue(decimalFromInt64(s)), nil
 			}
-			if vals[0].Kind == ValDecimal {
+			if vals[0].kind == ValDecimal {
 				s := int64(1)
 				if vals[0].decimal().IsZero() {
 					s = 0
-				} else if vals[0].decimal().Neg {
+				} else if vals[0].decimal().neg {
 					s = -1
 				}
 				return DecimalValue(decimalFromInt64(s)), nil
@@ -3728,31 +3728,31 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// (a − a%b)/b — a − a%b is exactly q·b, so the division is exact and RoundToScale(0)
 			// only drops the (already-zero) fraction. 22012 on a zero divisor (the a%b step traps).
 			toDec := func(v Value) Decimal {
-				if v.Kind == ValInt {
-					return decimalFromInt64(v.Int)
+				if v.kind == ValInt {
+					return decimalFromInt64(v.num)
 				}
 				return *v.decimal()
 			}
 			a, b := toDec(vals[0]), toDec(vals[1])
-			rr, err := a.Rem(b)
+			rr, err := a.rem(b)
 			if err != nil {
 				return Value{}, err
 			}
-			diff, err := a.Sub(rr)
+			diff, err := a.subtract(rr)
 			if err != nil {
 				return Value{}, err
 			}
-			q, err := diff.Div(b)
+			q, err := diff.div(b)
 			if err != nil {
 				return Value{}, err
 			}
-			return DecimalValue(q.RoundToScale(0)), nil
+			return DecimalValue(q.roundToScale(0)), nil
 		case sfGcd:
 			// gcd: integer operands → Euclid (a result whose magnitude overflows the promoted type →
 			// 22003 — gcd(MinInt64, 0) and the rare i16-cap edge); a decimal operand → exact decimal
 			// Euclid at scale max(sₐ, s_b). gcd(0, 0) = 0.
-			if vals[0].Kind == ValInt && vals[1].Kind == ValInt {
-				g, ok := gcdI64(vals[0].Int, vals[1].Int)
+			if vals[0].kind == ValInt && vals[1].kind == ValInt {
+				g, ok := gcdI64(vals[0].num, vals[1].num)
 				if !ok || !e.result.InRange(g) {
 					return Value{}, overflowErr(e.result)
 				}
@@ -3766,8 +3766,8 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		case sfLcm:
 			// lcm: |a/gcd·b|. Integer → the promoted type (an int64-overflow or out-of-result-type
 			// magnitude → 22003); a decimal operand → exact at scale max(sₐ, s_b). lcm(_, 0) = 0.
-			if vals[0].Kind == ValInt && vals[1].Kind == ValInt {
-				l, ok := lcmI64(vals[0].Int, vals[1].Int)
+			if vals[0].kind == ValInt && vals[1].kind == ValInt {
+				l, ok := lcmI64(vals[0].num, vals[1].num)
 				if !ok || !e.result.InRange(l) {
 					return Value{}, overflowErr(e.result)
 				}
@@ -3782,7 +3782,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// factorial(n) = n! at scale 0. A negative operand → 22003. Each multiply is metered
 			// (size-scaled decimal_work, guarded) so the cost ceiling bounds a large factorial
 			// before its limb work runs (cost.md §3, §13); a product over the value cap traps 22003.
-			n := vals[0].Int
+			n := vals[0].num
 			if n < 0 {
 				return Value{}, newError(NumericValueOutOfRange, "factorial of a negative number is undefined")
 			}
@@ -3793,7 +3793,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				if err := m.Guard(); err != nil {
 					return Value{}, err
 				}
-				prod, err := acc.Mul(kd)
+				prod, err := acc.mul(kd)
 				if err != nil {
 					return Value{}, err
 				}
@@ -3804,7 +3804,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// width_bucket(op, low, high, count): the histogram bucket index. count > 0 (else 2201G);
 			// dispatch numeric vs float on the operand; the raw index is range-checked to int4 (a
 			// count+1 past int4 max → 22003).
-			count := vals[3].Int
+			count := vals[3].num
 			if count <= 0 {
 				return Value{}, widthBucketErr("count must be greater than zero")
 			}
@@ -3812,7 +3812,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// otherwise the numeric kernel (integers promote to decimal).
 			var idx int64
 			var err error
-			if vals[0].Kind == ValFloat32 || vals[0].Kind == ValFloat64 {
+			if vals[0].kind == ValFloat32 || vals[0].kind == ValFloat64 {
 				idx, err = widthBucketFloat(vals[0].asF64(), vals[1].asF64(), vals[2].asF64(), count)
 			} else {
 				idx, err = widthBucketNumeric(valueToDecimal(vals[0]), valueToDecimal(vals[1]), valueToDecimal(vals[2]), count)
@@ -3829,24 +3829,24 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// the decimal/integer overloads (decimal.md §6, functions.md §9) compute exactly here.
 			// ceil/floor round to scale 0 toward ±∞ (a round-up carry can trap 22003); trunc
 			// truncates toward zero to scale 0 or its n-place argument (never overflows).
-			if vals[0].Kind == ValFloat32 || vals[0].Kind == ValFloat64 {
+			if vals[0].kind == ValFloat32 || vals[0].kind == ValFloat64 {
 				return evalFloatFunc(e.sfunc, vals, e.result)
 			}
 			var d Decimal
-			if vals[0].Kind == ValInt {
-				d = decimalFromInt64(vals[0].Int)
+			if vals[0].kind == ValInt {
+				d = decimalFromInt64(vals[0].num)
 			} else {
 				d = *vals[0].decimal()
 			}
 			switch e.sfunc {
 			case sfCeil:
-				r, err := d.Ceil()
+				r, err := d.ceil()
 				if err != nil {
 					return Value{}, err
 				}
 				return DecimalValue(r), nil
 			case sfFloor:
-				r, err := d.Floor()
+				r, err := d.floor()
 				if err != nil {
 					return Value{}, err
 				}
@@ -3854,9 +3854,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			default: // sfTrunc
 				places := int64(0)
 				if len(vals) > 1 {
-					places = vals[1].Int
+					places = vals[1].num
 				}
-				return DecimalValue(d.TruncPlaces(places)), nil
+				return DecimalValue(d.truncPlaces(places)), nil
 			}
 		case sfSqrt, sfExp, sfLn, sfLog10, sfPow:
 			// EXACT-numeric transcendentals over decimal (decimal.md §8): a float operand falls to
@@ -3905,24 +3905,24 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		case sfScale:
 			// scale(numeric) → the display (fractional-digit) scale, as i32 (always ≤ 16383). An
 			// integer coerced to the decimal overload has scale 0 (arg-coercion.md §4).
-			if vals[0].Kind == ValInt {
+			if vals[0].kind == ValInt {
 				return IntValue(0), nil
 			}
-			return IntValue(int64(vals[0].decimal().Scale)), nil
+			return IntValue(int64(vals[0].decimal().scale)), nil
 		case sfMinScale:
 			// min_scale(numeric) → the smallest exact scale (trailing fractional zeros dropped).
-			if vals[0].Kind == ValInt {
+			if vals[0].kind == ValInt {
 				return IntValue(0), nil
 			}
 			return IntValue(int64(minScaleOf(*vals[0].decimal()))), nil
 		case sfTrimScale:
 			// trim_scale(numeric) → the value re-scaled down to its min_scale (exact; the dropped
 			// digits are zeros, so RoundToScale does not round).
-			if vals[0].Kind == ValInt {
-				return DecimalValue(decimalFromInt64(vals[0].Int)), nil
+			if vals[0].kind == ValInt {
+				return DecimalValue(decimalFromInt64(vals[0].num)), nil
 			}
 			d := *vals[0].decimal()
-			return DecimalValue(d.RoundToScale(minScaleOf(d))), nil
+			return DecimalValue(d.roundToScale(minScaleOf(d))), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; f64 for the rest, per the catalog).
@@ -4283,7 +4283,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return NullValue(), nil
 			}
 		}
-		pretty := len(vals) == 2 && vals[1].Kind == ValBool && vals[1].boolVal()
+		pretty := len(vals) == 2 && vals[1].kind == ValBool && vals[1].boolVal()
 		if zoned := vals[0].zoneRenderCount(); zoned > 0 {
 			m.Charge(costs.Timezone * zoned)
 			if err := m.Guard(); err != nil {
@@ -4341,14 +4341,14 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		target, pathV, valueV, flagV := args[0], args[1], args[2], args[3]
 		var valueNode JSONNode
 		if e.psLax {
-			if target.Kind == ValNull || pathV.Kind == ValNull || flagV.Kind == ValNull {
+			if target.kind == ValNull || pathV.kind == ValNull || flagV.kind == ValNull {
 				return NullValue(), nil
 			}
 			// An explicit NULL treatment is rejected even for a non-NULL value (PG).
-			if args[4].Kind != ValText {
+			if args[4].kind != ValText {
 				return Value{}, badNullValueTreatment()
 			}
-			if valueV.Kind == ValNull {
+			if valueV.kind == ValNull {
 				switch args[4].str() {
 				case "raise_exception":
 					return Value{}, nullValueRaised()
@@ -4376,7 +4376,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				valueNode = *valueV.jsonb()
 			}
 		} else {
-			if target.Kind == ValNull || pathV.Kind == ValNull || valueV.Kind == ValNull || flagV.Kind == ValNull {
+			if target.kind == ValNull || pathV.kind == ValNull || valueV.kind == ValNull || flagV.kind == ValNull {
 				return NullValue(), nil
 			}
 			valueNode = *valueV.jsonb()
@@ -4386,7 +4386,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return Value{}, err
 		}
 		node := *target.jsonb() // resolver guarantees a jsonb target
-		flag := flagV.Kind == ValBool && flagV.boolVal()
+		flag := flagV.kind == ValBool && flagV.boolVal()
 		var out JSONNode
 		if e.psMode == psSet {
 			out, err = setPath(&node, path, &valueNode, flag)
@@ -4413,7 +4413,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			vals[i] = v
 		}
 		for _, v := range vals {
-			if v.Kind == ValNull {
+			if v.kind == ValNull {
 				return NullValue(), nil
 			}
 		}
@@ -4490,7 +4490,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		if cv.Kind == ValNull || pv.Kind == ValNull {
+		if cv.kind == ValNull || pv.kind == ValNull {
 			return NullValue(), nil
 		}
 		// Reading a json context as jsonb (a `\u0000` / unpaired surrogate raises) is the context's
@@ -4625,14 +4625,14 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		if ov.Kind == ValNull {
+		if ov.kind == ValNull {
 			return NullValue(), nil
 		}
 		tv, err := e.rhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
 		}
-		if tv.Kind == ValNull {
+		if tv.kind == ValNull {
 			return NullValue(), nil
 		}
 		return widthBucketArray(ov, tv, e.collation, m)
@@ -4655,7 +4655,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		// negated carries the NOT keyword: IS NOT DISTINCT FROM (negated) asks "are they
 		// the same?"; IS DISTINCT FROM asks the opposite. Always a definite boolean — never
 		// unknown (the null_safe discipline, functions.md §3).
-		return BoolValue(a.NotDistinctFrom(b) == e.negated), nil
+		return BoolValue(a.notDistinctFrom(b) == e.negated), nil
 	}
 }
 
@@ -4748,10 +4748,10 @@ func evalDateArith(op binaryOp, a, b Value, result scalarType) (Value, error) {
 	if result.IsTimestamp() {
 		var d int32
 		var iv Interval
-		if a.Kind == ValDate {
-			d, iv = int32(a.Int), b.interval()
+		if a.kind == ValDate {
+			d, iv = int32(a.num), b.interval()
 		} else {
-			d, iv = int32(b.Int), a.interval()
+			d, iv = int32(b.num), a.interval()
 		}
 		mid, merr := dateMidnightMicros(d)
 		if merr != nil {
@@ -4765,8 +4765,8 @@ func evalDateArith(op binaryOp, a, b Value, result scalarType) (Value, error) {
 	}
 
 	// date − date → i32 (days between); an ±infinity operand traps 22008.
-	if a.Kind == ValDate && b.Kind == ValDate {
-		x, y := int32(a.Int), int32(b.Int)
+	if a.kind == ValDate && b.kind == ValDate {
+		x, y := int32(a.num), int32(b.num)
 		if x == dateNegInfinity || x == datePosInfinity || y == dateNegInfinity || y == datePosInfinity {
 			return Value{}, dtOflow("cannot subtract infinite dates")
 		}
@@ -4780,10 +4780,10 @@ func evalDateArith(op binaryOp, a, b Value, result scalarType) (Value, error) {
 	// date ± int → date: shift the day count; a ±infinity date stays the same sentinel.
 	var d int32
 	var n int64
-	if a.Kind == ValDate {
-		d, n = int32(a.Int), b.Int
+	if a.kind == ValDate {
+		d, n = int32(a.num), b.num
 	} else {
-		d, n = int32(b.Int), a.Int
+		d, n = int32(b.num), a.num
 	}
 	if d == dateNegInfinity || d == datePosInfinity {
 		return DateValue(d), nil
@@ -4853,19 +4853,19 @@ func evalArith(op binaryOp, x, y int64, result scalarType) (Value, error) {
 // unit for a finite instant (±infinity consult no zone). Shared by the scalar cast and the
 // element-wise T[] → text[] cast.
 func scalarToText(v Value, env *evalEnv, m *costMeter) (string, error) {
-	switch v.Kind {
+	switch v.kind {
 	case ValText, ValJSON, ValJSONPath:
 		return v.str(), nil
 	case ValTimestamptz:
-		if v.Int != negInfinity && v.Int != posInfinity {
+		if v.num != negInfinity && v.num != posInfinity {
 			m.Charge(costs.Timezone)
 			if err := m.Guard(); err != nil {
 				return "", err
 			}
 		}
-		return renderTimestamptzIn(v.Int, env.exec.session.timeZone)
+		return renderTimestamptzIn(v.num, env.exec.session.timeZone)
 	default:
-		return v.Render(), nil
+		return v.String(), nil
 	}
 }
 
@@ -4875,7 +4875,7 @@ func scalarToText(v Value, env *evalEnv, m *costMeter) (string, error) {
 func evalCast(v Value, target scalarType, typmod *decimalTypmod, temporal *temporalTypmod) (Value, error) {
 	// The JSON cast matrix (spec/design/json.md §6.1): text → json validates + stores verbatim
 	// (22P02 on malformed); text → jsonb parses + canonicalizes.
-	if v.Kind == ValText {
+	if v.kind == ValText {
 		if target.IsJson() {
 			if err := validateJSON(v.str()); err != nil {
 				return Value{}, err
@@ -4965,21 +4965,21 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod, temporal *tempo
 	}
 	// timestamp(p) / timestamptz(p) / a qualified interval over a value already of the type (the
 	// typmod scaling cast — timestamp.md §8, interval.md §6.1).
-	if v.Kind == ValTimestamp && target.IsTimestamp() {
-		m, err := adjustTimestampTypmod(v.Int, temporal)
+	if v.kind == ValTimestamp && target.IsTimestamp() {
+		m, err := adjustTimestampTypmod(v.num, temporal)
 		if err != nil {
 			return Value{}, err
 		}
 		return TimestampValue(m), nil
 	}
-	if v.Kind == ValTimestamptz && target.IsTimestamptz() {
-		m, err := adjustTimestampTypmod(v.Int, temporal)
+	if v.kind == ValTimestamptz && target.IsTimestamptz() {
+		m, err := adjustTimestampTypmod(v.num, temporal)
 		if err != nil {
 			return Value{}, err
 		}
 		return TimestamptzValue(m), nil
 	}
-	if v.Kind == ValInterval && target.IsInterval() {
+	if v.kind == ValInterval && target.IsInterval() {
 		iv, err := adjustIntervalTypmod(v.interval(), temporal)
 		if err != nil {
 			return Value{}, err
@@ -4988,7 +4988,7 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod, temporal *tempo
 	}
 	// uuid → bytea (the 16 raw bytes) — the uuid cast slice (casts.toml/types.md §14). uuid → text
 	// is scalarToText.
-	if v.Kind == ValUUID {
+	if v.kind == ValUUID {
 		if target.IsBytea() {
 			return ByteaValue([]byte(v.str())), nil
 		}
@@ -4996,7 +4996,7 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod, temporal *tempo
 	}
 	// bytea → uuid (the uuid cast slice — a jed cast PG lacks): exactly 16 raw bytes; any other
 	// length traps 22P02 (the wrong-width body — no PG code to match).
-	if v.Kind == ValBytea {
+	if v.kind == ValBytea {
 		if target.IsUuid() {
 			if len(v.str()) != 16 {
 				return Value{}, newError(InvalidTextRepresentation,
@@ -5008,7 +5008,7 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod, temporal *tempo
 	}
 	// json → jsonb re-parses + canonicalizes; json → json is the identity (json → text is
 	// scalarToText: the identity on the verbatim bytes).
-	if v.Kind == ValJSON {
+	if v.kind == ValJSON {
 		switch {
 		case target.IsJson():
 			return JSONValue(v.str()), nil
@@ -5024,7 +5024,7 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod, temporal *tempo
 	}
 	// jsonb → json renders the canonical form (jsonb_out); jsonb → jsonb is the identity (jsonb →
 	// text is scalarToText).
-	if v.Kind == ValJSONB {
+	if v.kind == ValJSONB {
 		switch {
 		case target.IsJson():
 			return JSONValue(jsonbOut(v.jsonb())), nil
@@ -5034,7 +5034,7 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod, temporal *tempo
 			panic("BUG: resolver rejects this jsonb cast target")
 		}
 	}
-	if v.Kind == ValBool {
+	if v.kind == ValBool {
 		// boolean → boolean is the identity cast (`x::boolean` on a boolean).
 		if target.IsBool() {
 			return v, nil
@@ -5046,32 +5046,32 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod, temporal *tempo
 		}
 		return IntValue(0), nil
 	}
-	if v.Kind == ValInt {
+	if v.kind == ValInt {
 		// i32 → boolean (the boolean cast slice, casts.toml): 0 → false, any nonzero (incl. negative)
 		// → true. The resolver guarantees the source is i32, so v.Int is already in i32 range.
 		if target.IsBool() {
-			return BoolValue(v.Int != 0), nil
+			return BoolValue(v.num != 0), nil
 		}
 		// int -> float (explicit, lossy; nearest binary, ties-to-even; never traps — float.md §6).
 		if target.IsFloat32() {
-			return Float32Value(intToFloat32(v.Int)), nil
+			return Float32Value(intToFloat32(v.num)), nil
 		}
 		if target.IsFloat64() {
-			return Float64Value(intToFloat64(v.Int)), nil
+			return Float64Value(intToFloat64(v.num)), nil
 		}
 		if target.IsDecimal() {
-			d, err := coerceDecimal(decimalFromInt64(v.Int), typmod)
+			d, err := coerceDecimal(decimalFromInt64(v.num), typmod)
 			if err != nil {
 				return Value{}, err
 			}
 			return DecimalValue(d), nil
 		}
-		if !target.InRange(v.Int) {
+		if !target.InRange(v.num) {
 			return Value{}, overflowErr(target)
 		}
-		return IntValue(v.Int), nil
+		return IntValue(v.num), nil
 	}
-	if v.IsFloat() {
+	if v.isFloat() {
 		f := v.asF64()
 		switch {
 		case target.IsFloat64():
@@ -5118,7 +5118,7 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod, temporal *tempo
 		}
 		return DecimalValue(d), nil
 	}
-	n, ok := v.decimal().ToInt64Round()
+	n, ok := v.decimal().toInt64Round()
 	if !ok || !target.InRange(n) {
 		return Value{}, overflowErr(target)
 	}
@@ -5127,10 +5127,10 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod, temporal *tempo
 
 // toDecimal widens a numeric value to Decimal (an integer operand of decimal arithmetic).
 func toDecimal(v Value) Decimal {
-	if v.Kind == ValDecimal {
+	if v.kind == ValDecimal {
 		return *v.decimal()
 	}
-	return decimalFromInt64(v.Int)
+	return decimalFromInt64(v.num)
 }
 
 // decimalArithWork is the decimal_work W of an arithmetic node — which group-count formula
@@ -5154,14 +5154,14 @@ func decimalArithWork(op binaryOp, a, b Decimal) int64 {
 // including a NULL side, where no decimal compare runs (spec/design/cost.md §3 "decimal_work").
 func decimalCmpWork(a, b Value) int64 {
 	switch {
-	case a.Kind == ValDecimal && b.Kind == ValDecimal:
+	case a.kind == ValDecimal && b.kind == ValDecimal:
 		return workLinear(*a.decimal(), *b.decimal())
-	case a.Kind == ValDecimal && b.Kind == ValInt:
+	case a.kind == ValDecimal && b.kind == ValInt:
 		var buf [3]uint32
-		return workLinear(*a.decimal(), decimalFromInt64Buf(b.Int, &buf))
-	case a.Kind == ValInt && b.Kind == ValDecimal:
+		return workLinear(*a.decimal(), decimalFromInt64Buf(b.num, &buf))
+	case a.kind == ValInt && b.kind == ValDecimal:
 		var buf [3]uint32
-		return workLinear(decimalFromInt64Buf(a.Int, &buf), *b.decimal())
+		return workLinear(decimalFromInt64Buf(a.num, &buf), *b.decimal())
 	default:
 		return 1
 	}
@@ -5175,12 +5175,12 @@ func decimalCmpWork(a, b Value) int64 {
 func varlenCompareWork(a, b Value) int64 {
 	var n int
 	switch {
-	case a.Kind == ValText && b.Kind == ValText:
+	case a.kind == ValText && b.kind == ValText:
 		n = utf8.RuneCountInString(a.str())
 		if m := utf8.RuneCountInString(b.str()); m < n {
 			n = m
 		}
-	case a.Kind == ValBytea && b.Kind == ValBytea:
+	case a.kind == ValBytea && b.kind == ValBytea:
 		n = len(a.str())
 		if len(b.str()) < n {
 			n = len(b.str())
@@ -5263,15 +5263,15 @@ func evalDecimalArith(op binaryOp, a, b Decimal) (Value, error) {
 	)
 	switch op {
 	case opAdd:
-		r, err = a.Add(b)
+		r, err = a.add(b)
 	case opSub:
-		r, err = a.Sub(b)
+		r, err = a.subtract(b)
 	case opMul:
-		r, err = a.Mul(b)
+		r, err = a.mul(b)
 	case opDiv:
-		r, err = a.Div(b)
+		r, err = a.div(b)
 	default: // OpMod
-		r, err = a.Rem(b)
+		r, err = a.rem(b)
 	}
 	if err != nil {
 		return Value{}, err
@@ -5288,16 +5288,16 @@ func jsonGetVerbatim(op jsonGetOp, text string, arg Value) (Value, error) {
 	var steps []verbatimStep
 	switch op {
 	case jgArrow, jgArrowText:
-		if arg.Kind == ValText {
+		if arg.kind == ValText {
 			steps = []verbatimStep{{key: arg.str(), hasKey: true}}
 		} else { // ValInt — resolver guarantees a text/int arg for -> / ->>
-			steps = []verbatimStep{{index: arg.Int, hasIndex: true}}
+			steps = []verbatimStep{{index: arg.num, hasIndex: true}}
 		}
 	default: // jgHashArrow, jgHashArrowText — a text[] path
 		arr := arg.arrayVal()
 		steps = make([]verbatimStep, 0, len(arr.Elements))
 		for _, el := range arr.Elements {
-			if el.Kind == ValNull {
+			if el.kind == ValNull {
 				return NullValue(), nil
 			}
 			idx, ok := jsonPathStepIndex(el.str())
@@ -5360,7 +5360,7 @@ func evalOrChain(e *rExpr, row storedRow, env *evalEnv, m *costMeter) (Value, er
 		return Value{}, err
 	}
 	for i := len(spine) - 1; i >= 0; i-- {
-		if to3(acc) == True {
+		if to3(acc) == tvTrue {
 			return acc, nil
 		}
 		b, err := spine[i].rhs.eval(row, env, m)

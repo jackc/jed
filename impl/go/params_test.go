@@ -49,7 +49,7 @@ func asEngineError(err error, target **EngineError) bool {
 func firstInts(rows [][]Value) []int64 {
 	out := make([]int64, len(rows))
 	for i, r := range rows {
-		out[i] = r[0].Int
+		out[i] = r[0].num
 	}
 	return out
 }
@@ -67,10 +67,10 @@ func TestNestedTextParametersRejectBadEncodingBeforeStoring(t *testing.T) {
 			t.Fatalf("nested encoding: got %s", code)
 		}
 	}
-	if got := queryRows(t, db, "SELECT count(*) FROM t")[0][0].Int; got != 0 {
+	if got := queryRows(t, db, "SELECT count(*) FROM t")[0][0].num; got != 0 {
 		t.Fatalf("stored %d invalid rows", got)
 	}
-	if got := queryRows(t, db, "SELECT $1::text[]", ArrayValue([]Value{TextValue("hé😀")}))[0][0].Render(); got != "{hé😀}" {
+	if got := queryRows(t, db, "SELECT $1::text[]", ArrayValue([]Value{TextValue("hé😀")}))[0][0].String(); got != "{hé😀}" {
 		t.Fatalf("valid unicode: %s", got)
 	}
 }
@@ -91,7 +91,7 @@ func TestByteaHostValueBindsToAdoptedSlot(t *testing.T) {
 	t.Parallel()
 	db := dbWith(t)
 	rows := queryRows(t, db, "SELECT encode($1, 'hex')", ByteaValue([]byte{0xab}))
-	if got := rows[0][0].Render(); got != "ab" {
+	if got := rows[0][0].String(); got != "ab" {
 		t.Fatalf("got %s want ab", got)
 	}
 	if code := paramErrCode(t, db, "SELECT length($1)", ByteaValue([]byte{1, 2})); code != "42804" {
@@ -107,7 +107,7 @@ func TestRangeHostValueBindsCanonicalized(t *testing.T) {
 	three, one := IntValue(3), IntValue(1)
 	inclusive := RangeValue(&RangeVal{Lower: &one, Upper: &three, LowerInc: true, UpperInc: true})
 	rows := queryRows(t, db, "SELECT $1::i32range", inclusive)
-	if got := rows[0][0].Render(); got != "[1,4)" {
+	if got := rows[0][0].String(); got != "[1,4)" {
 		t.Fatalf("got %s want [1,4)", got)
 	}
 	crossed := RangeValue(&RangeVal{Lower: &three, Upper: &one, LowerInc: true})

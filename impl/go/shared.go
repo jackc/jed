@@ -2012,11 +2012,11 @@ func (s *Database) LoadedTimeZones() []TimeZoneInfo { return s.core.env.LoadedTi
 // transactions.md §8). Advances by 1 on every WriteHandle.Commit.
 func (s *Database) Version() uint64 { return s.core.roots.Load().committed.txid }
 
-// OldestLiveTxid is the oldest still-live snapshot version (transactions.md §8) — the Phase-6
+// oldestLiveTxid is the oldest still-live snapshot version (transactions.md §8) — the Phase-6
 // reclamation watermark. With live readers it is the minimum version any of them pinned; with none
 // it is the committed version (nothing older is reachable). The map scan is order-independent (a
 // minimum), so no hash-map iteration order leaks (CLAUDE.md §8).
-func (s *Database) OldestLiveTxid() uint64 {
+func (s *Database) oldestLiveTxid() uint64 {
 	oldest := s.core.roots.Load().committed.txid
 	s.core.liveMu.Lock()
 	defer s.core.liveMu.Unlock()
@@ -2589,21 +2589,21 @@ func (s *Database) committedEngine() *engine {
 	}
 }
 
-// ToImage serializes the whole committed state to a from-scratch on-disk image (the inverse of
+// toImage serializes the whole committed state to a from-scratch on-disk image (the inverse of
 // LoadEngine; spec/fileformat/format.md), used by the byte-level golden round-trip tests and by
 // hosts snapshotting an in-memory database to bytes.
-func (s *Database) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
+func (s *Database) toImage(pageSize uint32, txid uint64) ([]byte, error) {
 	return s.core.roots.Load().committed.ToImage(pageSize, txid)
 }
 
-// Txid is the latest committed transaction id (the on-disk meta txid); equal to Version.
-func (s *Database) Txid() uint64 { return s.core.roots.Load().committed.txid }
+// txid is the latest committed transaction id (the on-disk meta txid); equal to Version.
+func (s *Database) txid() uint64 { return s.core.roots.Load().committed.txid }
 
 // PageSize is the page payload size this database serializes at.
 func (s *Database) PageSize() uint32 { return s.core.pageSize() }
 
-// PageCount is the on-disk page high-water for a file-backed database; 0 in-memory.
-func (s *Database) PageCount() uint32 { return s.core.pageCount() }
+// pageHighWater is the on-disk page high-water for a file-backed database; 0 in-memory.
+func (s *Database) pageHighWater() uint32 { return s.core.pageCount() }
 
 // Path is the backing file path for a file-backed database; "" in-memory.
 func (s *Database) Path() string { return s.core.path() }
@@ -3522,18 +3522,18 @@ func (s *Session) InTransaction() bool { return s.engine.session.tx != nil }
 // committed); file-storage reads go through the shared core (the authoritative state, reflecting every
 // committed write). The *catTable / *compositeType returns are the doc-hidden introspection types. ---
 
-// ToImage serializes the session's committed view to a from-scratch on-disk image (byte-level golden
+// toImage serializes the session's committed view to a from-scratch on-disk image (byte-level golden
 // round-trip, CLAUDE.md §8).
-func (s *Session) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
-	return s.engine.ToImage(pageSize, txid)
+func (s *Session) toImage(pageSize uint32, txid uint64) ([]byte, error) {
+	return s.engine.toImage(pageSize, txid)
 }
 
-// Txid is the backing database's latest committed transaction id (the on-disk meta txid) — the shared
+// txid is the backing database's latest committed transaction id (the on-disk meta txid) — the shared
 // committed cell, not the session's pinned base.
-func (s *Session) Txid() uint64 { return s.core.roots.Load().committed.txid }
+func (s *Session) txid() uint64 { return s.core.roots.Load().committed.txid }
 
-// OldestLiveTxid is the oldest still-live snapshot version (the reclamation watermark, §8).
-func (s *Session) OldestLiveTxid() uint64 {
+// oldestLiveTxid is the oldest still-live snapshot version (the reclamation watermark, §8).
+func (s *Session) oldestLiveTxid() uint64 {
 	oldest := s.core.roots.Load().committed.txid
 	s.core.liveMu.Lock()
 	defer s.core.liveMu.Unlock()
@@ -3548,9 +3548,9 @@ func (s *Session) OldestLiveTxid() uint64 {
 // PageSize is the backing database's page payload size.
 func (s *Session) PageSize() uint32 { return s.core.pageSize() }
 
-// PageCount is the backing file's on-disk page high-water (0 in-memory) — the shared storage state,
+// pageHighWater is the backing file's on-disk page high-water (0 in-memory) — the shared storage state,
 // reflecting every committed write.
-func (s *Session) PageCount() uint32 { return s.core.pageCount() }
+func (s *Session) pageHighWater() uint32 { return s.core.pageCount() }
 
 // Path is the backing file path ("" in-memory).
 func (s *Session) Path() string { return s.core.path() }
@@ -3638,17 +3638,17 @@ func (s *Session) setWorkMemRaw(b int) { s.engine.session.workMem = b }
 // SetDefaultPrivileges replaces the default table-privilege set — the GRANT … ON ALL TABLES default
 // (§5.3).
 func (s *Session) SetDefaultPrivileges(privs PrivilegeSet) {
-	s.engine.session.privileges.SetDefaultTable(privs)
+	s.engine.session.privileges.setDefaultTable(privs)
 }
 
 // Grant grants privs on a specific object (table or function), beyond the default (§5.3).
 func (s *Session) Grant(privs PrivilegeSet, object string) {
-	s.engine.session.privileges.Grant(privs, object)
+	s.engine.session.privileges.grantObject(privs, object)
 }
 
 // Revoke revokes privs from a specific object (revoke wins over grant and the default, §5.3).
 func (s *Session) Revoke(privs PrivilegeSet, object string) {
-	s.engine.session.privileges.Revoke(privs, object)
+	s.engine.session.privileges.revokeObject(privs, object)
 }
 
 // Privileges is read-only access to this session's authorization envelope (§5.3).

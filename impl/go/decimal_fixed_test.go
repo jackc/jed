@@ -87,7 +87,7 @@ func TestFixedDecimalSlotCodec(t *testing.T) {
 		}
 		pos := 0
 		v, err := readInlineBody(ct, tc.slot, &pos, decodeConstruct)
-		if err != nil || pos != len(tc.slot) || v.Kind != ValDecimal || v.decimal().Render() != tc.out {
+		if err != nil || pos != len(tc.slot) || v.kind != ValDecimal || v.decimal().String() != tc.out {
 			t.Fatalf("%s: decoded %v (pos %d, err %v), want %s", tc.in, v, pos, err, tc.out)
 		}
 		if got := encodeValue(ct, v); !bytes.Equal(got, enc) {
@@ -101,13 +101,13 @@ func TestFixedDecimalSlotCodec(t *testing.T) {
 	for _, u := range []int64{math.MinInt64, math.MinInt64 + 1, -1_000_000_000_000_000_000, 1_000_000_000_000_000_000, math.MaxInt64} {
 		v := decimalValueInt64(u, 3)
 		back, ok := v.decimal().unscaledInt64(3)
-		if !ok || back != u || v.decimal().Scale != 3 {
-			t.Fatalf("slot %d: read back %d (ok %v) at scale %d", u, back, ok, v.decimal().Scale)
+		if !ok || back != u || v.decimal().scale != 3 {
+			t.Fatalf("slot %d: read back %d (ok %v) at scale %d", u, back, ok, v.decimal().scale)
 		}
 		want := decimalFromInt64(u)
-		want.Scale = 3
-		if v.decimal().CmpValue(want) != 0 || v.decimal().Neg != (u < 0) {
-			t.Fatalf("slot %d decoded to %s", u, v.decimal().Render())
+		want.scale = 3
+		if v.decimal().Cmp(want) != 0 || v.decimal().neg != (u < 0) {
+			t.Fatalf("slot %d decoded to %s", u, v.decimal().String())
 		}
 	}
 }
@@ -177,7 +177,7 @@ func TestFixedDecimalStatisticsStaySingleValue(t *testing.T) {
 	if got := queryRows(t, s, q); got[0][0].str() != want[0][0].str() || got[0][2].str() != want[0][2].str() {
 		t.Fatalf("after reopen: %v, want %v", got, want)
 	}
-	if got := queryRows(t, s, "SELECT count(*) FROM jed_statistics"); got[0][0].Int != stats[0][0].Int || got[0][0].Int == 0 {
+	if got := queryRows(t, s, "SELECT count(*) FROM jed_statistics"); got[0][0].num != stats[0][0].num || got[0][0].num == 0 {
 		t.Fatalf("statistics after reopen: %v, before %v", got, stats)
 	}
 	// The stored statistics values are the variable-width codec's bytes, not slots.

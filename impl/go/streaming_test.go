@@ -140,7 +140,7 @@ func TestStreamingEarlyExitChargesLess(t *testing.T) {
 	}
 	var prefix []int64
 	for i := 0; i < 3 && rows.Next(); i++ {
-		prefix = append(prefix, rows.Row()[0].Int)
+		prefix = append(prefix, rows.Row()[0].num)
 	}
 	partial := rows.Cost()
 	_ = rows.Close()
@@ -158,8 +158,8 @@ func TestStreamingEarlyExitChargesLess(t *testing.T) {
 func TestStreamingCursorPinsSnapshot(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 3) // version 1, ids 1..=3
-	if db.Version() != 1 || db.OldestLiveTxid() != 1 {
-		t.Fatalf("seed: version=%d oldest=%d", db.Version(), db.OldestLiveTxid())
+	if db.Version() != 1 || db.oldestLiveTxid() != 1 {
+		t.Fatalf("seed: version=%d oldest=%d", db.Version(), db.oldestLiveTxid())
 	}
 	reader := mustSession(db, SessionOptions{})
 	defer reader.Close()
@@ -168,11 +168,11 @@ func TestStreamingCursorPinsSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !rows.Next() || rows.Row()[0].Int != 1 {
+	if !rows.Next() || rows.Row()[0].num != 1 {
 		t.Fatalf("first row != 1")
 	}
-	if db.OldestLiveTxid() != 1 {
-		t.Fatalf("open cursor must pin v1, oldest=%d", db.OldestLiveTxid())
+	if db.oldestLiveTxid() != 1 {
+		t.Fatalf("open cursor must pin v1, oldest=%d", db.oldestLiveTxid())
 	}
 
 	// A concurrent writer repeatedly rebuilds the same rightmost working leaf while the cursor is
@@ -187,14 +187,14 @@ func TestStreamingCursorPinsSnapshot(t *testing.T) {
 	if err := w.commitBlock(); err != nil {
 		t.Fatal(err)
 	}
-	if db.Version() != 2 || db.OldestLiveTxid() != 1 {
-		t.Fatalf("watermark must hold at the cursor's pin: version=%d oldest=%d", db.Version(), db.OldestLiveTxid())
+	if db.Version() != 2 || db.oldestLiveTxid() != 1 {
+		t.Fatalf("watermark must hold at the cursor's pin: version=%d oldest=%d", db.Version(), db.oldestLiveTxid())
 	}
 
 	// Draining the rest sees ONLY the v1 snapshot (ids 2, 3) — not the writer's rows.
 	var rest []int64
 	for rows.Next() {
-		rest = append(rest, rows.Row()[0].Int)
+		rest = append(rest, rows.Row()[0].num)
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
@@ -205,13 +205,13 @@ func TestStreamingCursorPinsSnapshot(t *testing.T) {
 
 	// Closing the cursor releases the pin; the watermark advances.
 	_ = rows.Close()
-	if db.OldestLiveTxid() != 2 {
-		t.Fatalf("closed cursor must release its pin, oldest=%d", db.OldestLiveTxid())
+	if db.oldestLiveTxid() != 2 {
+		t.Fatalf("closed cursor must release its pin, oldest=%d", db.oldestLiveTxid())
 	}
 
 	// A fresh streaming read sees every committed row.
 	fresh, _ := streamResult(t, reader, "SELECT id FROM t ORDER BY id")
-	if len(fresh) != 67 || fresh[0][0].Int != 1 || fresh[66][0].Int != 67 {
+	if len(fresh) != 67 || fresh[0][0].num != 1 || fresh[66][0].num != 67 {
 		t.Fatalf("fresh read endpoints/length = %v/%v/%d, want 1/67/67", fresh[0][0], fresh[len(fresh)-1][0], len(fresh))
 	}
 }
@@ -233,7 +233,7 @@ func TestWriteTransactionCursorStableAcrossLaterInserts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !pinned.Next() || pinned.Row()[0].Int != 1 {
+	if !pinned.Next() || pinned.Row()[0].num != 1 {
 		t.Fatal("first pinned row != 1")
 	}
 	for id := int64(5); id <= 67; id++ {
@@ -243,12 +243,12 @@ func TestWriteTransactionCursorStableAcrossLaterInserts(t *testing.T) {
 	}
 
 	latest, _ := eagerResult(t, writer, "SELECT count(*) FROM t")
-	if len(latest) != 1 || latest[0][0].Int != 67 {
+	if len(latest) != 1 || latest[0][0].num != 67 {
 		t.Fatalf("latest working count = %v, want 67", latest)
 	}
 	var rest []int64
 	for pinned.Next() {
-		rest = append(rest, pinned.Row()[0].Int)
+		rest = append(rest, pinned.Row()[0].num)
 	}
 	if err := pinned.Err(); err != nil {
 		t.Fatal(err)
@@ -263,7 +263,7 @@ func TestWriteTransactionCursorStableAcrossLaterInserts(t *testing.T) {
 	fresh := mustSession(db, SessionOptions{})
 	defer fresh.Close()
 	got, _ := eagerResult(t, fresh, "SELECT count(*) FROM t")
-	if len(got) != 1 || got[0][0].Int != 67 {
+	if len(got) != 1 || got[0][0].num != 67 {
 		t.Fatalf("fresh committed count = %v, want 67", got)
 	}
 }
@@ -307,7 +307,7 @@ func TestDatabaseQueryConvenienceStreams(t *testing.T) {
 	var got [][]int64
 	for rows.Next() {
 		r := rows.Row()
-		got = append(got, []int64{r[0].Int, r[1].Int})
+		got = append(got, []int64{r[0].num, r[1].num})
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
@@ -340,7 +340,7 @@ func TestBareHandleQueryPinsWatermarkUnderReclamation(t *testing.T) {
 		execDB(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", i, i*10))
 	}
 	v0 := db.Version()
-	if got := db.OldestLiveTxid(); got != v0 {
+	if got := db.oldestLiveTxid(); got != v0 {
 		t.Fatalf("idle watermark = %d, want the committed version %d", got, v0)
 	}
 
@@ -353,10 +353,10 @@ func TestBareHandleQueryPinsWatermarkUnderReclamation(t *testing.T) {
 	if !rows.Next() {
 		t.Fatalf("no first row (rows.Err=%v)", rows.Err())
 	}
-	if r := rows.Row(); r[0].Int != 1 || r[1].Int != 10 {
-		t.Fatalf("first row = (%d, %d), want (1, 10)", r[0].Int, r[1].Int)
+	if r := rows.Row(); r[0].num != 1 || r[1].num != 10 {
+		t.Fatalf("first row = (%d, %d), want (1, 10)", r[0].num, r[1].num)
 	}
-	if got := db.OldestLiveTxid(); got != v0 {
+	if got := db.oldestLiveTxid(); got != v0 {
 		t.Fatalf("open bare-handle cursor: watermark = %d, want its pin %d", got, v0)
 	}
 
@@ -365,7 +365,7 @@ func TestBareHandleQueryPinsWatermarkUnderReclamation(t *testing.T) {
 	for i := 0; i < 150; i++ {
 		execDB(t, db, "UPDATE t SET v = v + 1")
 	}
-	if got := db.OldestLiveTxid(); got != v0 {
+	if got := db.oldestLiveTxid(); got != v0 {
 		t.Fatalf("watermark advanced to %d under churn despite the held cursor pin %d", got, v0)
 	}
 	// The gate's observable contract: with the pin held, compaction defers wholesale (canReclaim needs
@@ -378,9 +378,9 @@ func TestBareHandleQueryPinsWatermarkUnderReclamation(t *testing.T) {
 	want := int64(2)
 	for rows.Next() {
 		r := rows.Row()
-		if r[0].Int != want || r[1].Int != want*10 {
+		if r[0].num != want || r[1].num != want*10 {
 			t.Fatalf("SNAPSHOT ISOLATION VIOLATED: drained (%d, %d), want (%d, %d) (the cursor's pages were reclaimed and overwritten)",
-				r[0].Int, r[1].Int, want, want*10)
+				r[0].num, r[1].num, want, want*10)
 		}
 		want++
 	}
@@ -391,7 +391,7 @@ func TestBareHandleQueryPinsWatermarkUnderReclamation(t *testing.T) {
 		t.Fatalf("drained through id %d, want the full pinned snapshot 2..=120", want-1)
 	}
 	_ = rows.Close()
-	if got, v := db.OldestLiveTxid(), db.Version(); got != v {
+	if got, v := db.oldestLiveTxid(), db.Version(); got != v {
 		t.Fatalf("closed cursor: watermark = %d, want the committed version %d", got, v)
 	}
 
@@ -458,7 +458,7 @@ func TestBufferedEarlyExitChargesLess(t *testing.T) {
 	var prefix [][]int64
 	for i := 0; i < 3 && rows.Next(); i++ {
 		r := rows.Row()
-		prefix = append(prefix, []int64{r[0].Int, r[1].Int})
+		prefix = append(prefix, []int64{r[0].num, r[1].num})
 	}
 	partial := rows.Cost()
 	_ = rows.Close()
@@ -478,8 +478,8 @@ func TestBufferedEarlyExitChargesLess(t *testing.T) {
 func TestBufferedCursorPinsSnapshot(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 3) // version 1, ids 1..=3
-	if db.OldestLiveTxid() != 1 {
-		t.Fatalf("seed: oldest=%d", db.OldestLiveTxid())
+	if db.oldestLiveTxid() != 1 {
+		t.Fatalf("seed: oldest=%d", db.oldestLiveTxid())
 	}
 	reader := mustSession(db, SessionOptions{})
 	defer reader.Close()
@@ -490,11 +490,11 @@ func TestBufferedCursorPinsSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !rows.Next() || rows.Row()[0].Int != 10 {
+	if !rows.Next() || rows.Row()[0].num != 10 {
 		t.Fatalf("first row != 10")
 	}
-	if db.OldestLiveTxid() != 1 {
-		t.Fatalf("open buffered cursor must pin v1, oldest=%d", db.OldestLiveTxid())
+	if db.oldestLiveTxid() != 1 {
+		t.Fatalf("open buffered cursor must pin v1, oldest=%d", db.oldestLiveTxid())
 	}
 
 	w := db.writeSession()
@@ -504,14 +504,14 @@ func TestBufferedCursorPinsSnapshot(t *testing.T) {
 	if err := w.commitBlock(); err != nil {
 		t.Fatal(err)
 	}
-	if db.Version() != 2 || db.OldestLiveTxid() != 1 {
-		t.Fatalf("watermark must hold at the cursor's pin: version=%d oldest=%d", db.Version(), db.OldestLiveTxid())
+	if db.Version() != 2 || db.oldestLiveTxid() != 1 {
+		t.Fatalf("watermark must hold at the cursor's pin: version=%d oldest=%d", db.Version(), db.oldestLiveTxid())
 	}
 
 	// Draining the rest sees ONLY the v1 snapshot (v = 20, 30) — not the writer's rows.
 	var rest []int64
 	for rows.Next() {
-		rest = append(rest, rows.Row()[0].Int)
+		rest = append(rest, rows.Row()[0].num)
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
@@ -521,8 +521,8 @@ func TestBufferedCursorPinsSnapshot(t *testing.T) {
 	}
 
 	_ = rows.Close()
-	if db.OldestLiveTxid() != 2 {
-		t.Fatalf("closed buffered cursor must release its pin, oldest=%d", db.OldestLiveTxid())
+	if db.oldestLiveTxid() != 2 {
+		t.Fatalf("closed buffered cursor must release its pin, oldest=%d", db.oldestLiveTxid())
 	}
 }
 
@@ -609,7 +609,7 @@ func TestSortedEarlyExitChargesLess(t *testing.T) {
 	}
 	var prefix []int64
 	for i := 0; i < 3 && rows.Next(); i++ {
-		prefix = append(prefix, rows.Row()[0].Int)
+		prefix = append(prefix, rows.Row()[0].num)
 	}
 	partial := rows.Cost()
 	_ = rows.Close()
@@ -815,8 +815,8 @@ func TestDeferredRunsFullyOnFirstPull(t *testing.T) {
 func TestDeferredCursorPinsSnapshot(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 3) // version 1, ids 1..=3
-	if db.OldestLiveTxid() != 1 {
-		t.Fatalf("seed: oldest=%d", db.OldestLiveTxid())
+	if db.oldestLiveTxid() != 1 {
+		t.Fatalf("seed: oldest=%d", db.oldestLiveTxid())
 	}
 	reader := mustSession(db, SessionOptions{})
 	defer reader.Close()
@@ -827,11 +827,11 @@ func TestDeferredCursorPinsSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !rows.Next() || rows.Row()[0].Int != 10 {
+	if !rows.Next() || rows.Row()[0].num != 10 {
 		t.Fatalf("first row != 10")
 	}
-	if db.OldestLiveTxid() != 1 {
-		t.Fatalf("open deferred cursor must pin v1, oldest=%d", db.OldestLiveTxid())
+	if db.oldestLiveTxid() != 1 {
+		t.Fatalf("open deferred cursor must pin v1, oldest=%d", db.oldestLiveTxid())
 	}
 
 	w := db.writeSession()
@@ -841,14 +841,14 @@ func TestDeferredCursorPinsSnapshot(t *testing.T) {
 	if err := w.commitBlock(); err != nil {
 		t.Fatal(err)
 	}
-	if db.Version() != 2 || db.OldestLiveTxid() != 1 {
-		t.Fatalf("watermark must hold at the cursor's pin: version=%d oldest=%d", db.Version(), db.OldestLiveTxid())
+	if db.Version() != 2 || db.oldestLiveTxid() != 1 {
+		t.Fatalf("watermark must hold at the cursor's pin: version=%d oldest=%d", db.Version(), db.oldestLiveTxid())
 	}
 
 	// Draining the rest sees ONLY the v1 snapshot (v = 20, 30) — not the writer's rows.
 	var rest []int64
 	for rows.Next() {
-		rest = append(rest, rows.Row()[0].Int)
+		rest = append(rest, rows.Row()[0].num)
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
@@ -858,8 +858,8 @@ func TestDeferredCursorPinsSnapshot(t *testing.T) {
 	}
 
 	_ = rows.Close()
-	if db.OldestLiveTxid() != 2 {
-		t.Fatalf("closed deferred cursor must release its pin, oldest=%d", db.OldestLiveTxid())
+	if db.oldestLiveTxid() != 2 {
+		t.Fatalf("closed deferred cursor must release its pin, oldest=%d", db.oldestLiveTxid())
 	}
 }
 
@@ -907,7 +907,7 @@ func TestDeferredSkipsDataModifyingWith(t *testing.T) {
 	}
 	var got []int64
 	for rows.Next() {
-		got = append(got, rows.Row()[0].Int)
+		got = append(got, rows.Row()[0].num)
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
@@ -918,7 +918,7 @@ func TestDeferredSkipsDataModifyingWith(t *testing.T) {
 	}
 	// The write committed: the rows are now visible.
 	after, _ := eagerResult(t, s, "SELECT count(*) FROM t")
-	if len(after) != 1 || after[0][0].Int != 7 {
+	if len(after) != 1 || after[0][0].num != 7 {
 		t.Fatalf("post-write count = %v, want 7", after)
 	}
 }
@@ -1000,7 +1000,7 @@ func TestPreparedQueryBindsParamsAndStreams(t *testing.T) {
 	}
 	// Reusable: a second run with a different param re-streams.
 	pr2, _ := preparedStreamResult(t, s, sql, []Value{IntValue(1)})
-	if len(pr2) != 4 || pr2[0][0].Int != 1 {
+	if len(pr2) != 4 || pr2[0][0].num != 1 {
 		t.Fatalf("reused prepared run = %v, want first id 1", pr2)
 	}
 }
@@ -1034,7 +1034,7 @@ func TestPreparedQueryEarlyExitChargesLess(t *testing.T) {
 	}
 	var prefix []int64
 	for i := 0; i < 3 && rows.Next(); i++ {
-		prefix = append(prefix, rows.Row()[0].Int)
+		prefix = append(prefix, rows.Row()[0].num)
 	}
 	partial := rows.Cost()
 	_ = rows.Close()
@@ -1051,8 +1051,8 @@ func TestPreparedQueryEarlyExitChargesLess(t *testing.T) {
 func TestPreparedQueryPinsSnapshot(t *testing.T) {
 	t.Parallel()
 	db := seededKV(t, 3)
-	if db.OldestLiveTxid() != 1 {
-		t.Fatalf("seed oldest=%d", db.OldestLiveTxid())
+	if db.oldestLiveTxid() != 1 {
+		t.Fatalf("seed oldest=%d", db.oldestLiveTxid())
 	}
 	reader := mustSession(db, SessionOptions{})
 	defer reader.Close()
@@ -1064,11 +1064,11 @@ func TestPreparedQueryPinsSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !rows.Next() || rows.Row()[0].Int != 1 {
+	if !rows.Next() || rows.Row()[0].num != 1 {
 		t.Fatal("first row != 1")
 	}
-	if db.OldestLiveTxid() != 1 {
-		t.Fatalf("open prepared cursor must pin v1, oldest=%d", db.OldestLiveTxid())
+	if db.oldestLiveTxid() != 1 {
+		t.Fatalf("open prepared cursor must pin v1, oldest=%d", db.oldestLiveTxid())
 	}
 
 	w := db.writeSession()
@@ -1078,13 +1078,13 @@ func TestPreparedQueryPinsSnapshot(t *testing.T) {
 	if err := w.commitBlock(); err != nil {
 		t.Fatal(err)
 	}
-	if db.OldestLiveTxid() != 1 {
-		t.Fatalf("watermark must hold at the pin, oldest=%d", db.OldestLiveTxid())
+	if db.oldestLiveTxid() != 1 {
+		t.Fatalf("watermark must hold at the pin, oldest=%d", db.oldestLiveTxid())
 	}
 
 	var rest []int64
 	for rows.Next() {
-		rest = append(rest, rows.Row()[0].Int)
+		rest = append(rest, rows.Row()[0].num)
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
@@ -1093,8 +1093,8 @@ func TestPreparedQueryPinsSnapshot(t *testing.T) {
 		t.Fatalf("frozen snapshot rest = %v, want [2 3]", rest)
 	}
 	_ = rows.Close()
-	if db.OldestLiveTxid() != 2 {
-		t.Fatalf("closed prepared cursor must release its pin, oldest=%d", db.OldestLiveTxid())
+	if db.oldestLiveTxid() != 2 {
+		t.Fatalf("closed prepared cursor must release its pin, oldest=%d", db.oldestLiveTxid())
 	}
 }
 
@@ -1144,7 +1144,7 @@ func TestDatabaseQueryPreparedConvenienceStreams(t *testing.T) {
 	var got [][]int64
 	for rows.Next() {
 		r := rows.Row()
-		got = append(got, []int64{r[0].Int, r[1].Int})
+		got = append(got, []int64{r[0].num, r[1].num})
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
@@ -1185,7 +1185,7 @@ func intRowsEqual(got [][]Value, want [][]int64) bool {
 			return false
 		}
 		for j := range got[i] {
-			if got[i][j].Int != want[i][j] {
+			if got[i][j].num != want[i][j] {
 				return false
 			}
 		}

@@ -483,11 +483,11 @@ func writeSteps(steps []jpStep, out *strings.Builder) {
 			out.WriteString(step.method.name())
 			out.WriteByte('(')
 			if step.method.precision != nil {
-				out.WriteString(step.method.precision.Render())
+				out.WriteString(step.method.precision.String())
 			}
 			if step.method.scale != nil {
 				out.WriteByte(',')
-				out.WriteString(step.method.scale.Render())
+				out.WriteString(step.method.scale.String())
 			}
 			out.WriteByte(')')
 		}
@@ -1064,7 +1064,7 @@ func (cx *jpCtx) headNext(e *jpPathExpr, head *jpHead, current jpItem, base jpBa
 				return jpItem{}, jpBase{}, false, err
 			}
 			if e.unaryOp == jpUnaryMinus {
-				item = jpValItem(JSONNode{Kind: JNumber, Num: n.Num.Negate()})
+				item = jpValItem(JSONNode{Kind: JNumber, Num: n.Num.negate()})
 			}
 			return item, base, true, nil
 		}
@@ -1182,15 +1182,15 @@ func (cx *jpCtx) evalBinary(e *jpPathExpr, current jpItem, base jpBase, last int
 	var v Decimal
 	switch e.arithOp {
 	case jpAdd:
-		v, err = a.Add(b)
+		v, err = a.add(b)
 	case jpSub:
-		v, err = a.Sub(b)
+		v, err = a.subtract(b)
 	case jpMul:
-		v, err = a.Mul(b)
+		v, err = a.mul(b)
 	case jpDiv:
-		v, err = a.Div(b)
+		v, err = a.div(b)
 	default:
-		v, err = a.Rem(b)
+		v, err = a.rem(b)
 	}
 	if err != nil {
 		return jpItem{}, err
@@ -1614,7 +1614,7 @@ func (cx *jpCtx) indexValue(i jpIndex, size int64, current jpItem, base jpBase) 
 		}
 		n = node.Num
 	}
-	v, ok := n.TruncPlaces(0).ToInt64Round()
+	v, ok := n.truncPlaces(0).toInt64Round()
 	if !ok || v < -2147483648 || v > 2147483647 {
 		return 0, newError(InvalidSQLJSONSubscript, "jsonpath array subscript is out of integer range")
 	}
@@ -1853,7 +1853,7 @@ func jpCompareItems(x jpItem, op jpCmpOp, y jpItem) *bool {
 	var ord int
 	switch {
 	case a.Kind == JNumber && b.Kind == JNumber:
-		ord = a.Num.CmpValue(b.Num)
+		ord = a.Num.Cmp(b.Num)
 	case a.Kind == JString && b.Kind == JString:
 		ord = strings.Compare(a.S, b.S)
 	case a.Kind == JBool && b.Kind == JBool:
@@ -1926,11 +1926,11 @@ func jpApplyMethod(m jpMethod, item jpItem, strict bool) (jpItem, error) {
 		var err error
 		switch m.kind {
 		case jmAbs:
-			v = node.Num.Abs()
+			v = node.Num.abs()
 		case jmFloor:
-			v, err = node.Num.Floor()
+			v, err = node.Num.floor()
 		default:
-			v, err = node.Num.Ceil()
+			v, err = node.Num.ceil()
 		}
 		if err != nil {
 			return jpItem{}, err
@@ -1941,7 +1941,7 @@ func jpApplyMethod(m jpMethod, item jpItem, strict bool) (jpItem, error) {
 		// read as a double and converted back the way PostgreSQL's float8_numeric does.
 		switch {
 		case kindIs(JNumber):
-			if _, err := jpFloat8In(m, node.Num.Render()); err != nil {
+			if _, err := jpFloat8In(m, node.Num.String()); err != nil {
 				return jpItem{}, err
 			}
 			return item, nil
@@ -1962,9 +1962,9 @@ func jpApplyMethod(m jpMethod, item jpItem, strict bool) (jpItem, error) {
 		switch {
 		case kindIs(JNumber):
 			// A number rounds half away from zero (numeric → int) and must fit the type.
-			r, ok := node.Num.ToInt64Round()
+			r, ok := node.Num.toInt64Round()
 			if !ok || !st.InRange(r) {
-				return jpItem{}, jpBadArgument(m, node.Num.Render(), ty)
+				return jpItem{}, jpBadArgument(m, node.Num.String(), ty)
 			}
 			v = r
 		case kindIs(JString):
@@ -1984,7 +1984,7 @@ func jpApplyMethod(m jpMethod, item jpItem, strict bool) (jpItem, error) {
 			return item, nil
 		case kindIs(JNumber):
 			// A number must read as an integer (its text through int4 input): nonzero is true.
-			text := node.Num.Render()
+			text := node.Num.String()
 			r, err := parseIntLiteral(text, scalarInt32)
 			if err != nil {
 				return jpItem{}, jpBadArgument(m, text, "boolean")
@@ -2005,7 +2005,7 @@ func jpApplyMethod(m jpMethod, item jpItem, strict bool) (jpItem, error) {
 		var numstr string
 		switch {
 		case kindIs(JNumber):
-			num, numstr = node.Num, node.Num.Render()
+			num, numstr = node.Num, node.Num.String()
 		case kindIs(JString):
 			d, err := jpNumericIn(m, node.S)
 			if err != nil {
@@ -2032,7 +2032,7 @@ func jpApplyMethod(m jpMethod, item jpItem, strict bool) (jpItem, error) {
 		case kindIs(JString):
 			return item, nil
 		case kindIs(JNumber):
-			s = node.Num.Render()
+			s = node.Num.String()
 		case kindIs(JBool):
 			s = "false"
 			if node.B {
@@ -2071,7 +2071,7 @@ func jpFloat8In(m jpMethod, text string) (float64, error) {
 // grammar.md §36), refusing NaN and ±Infinity with their own message.
 func jpNumericIn(m jpMethod, text string) (Decimal, error) {
 	if d, err := parseDecimalLiteral(text); err == nil {
-		if d, err = d.CheckCap(); err == nil {
+		if d, err = d.checkCap(); err == nil {
 			return d, nil
 		}
 	}
@@ -2091,7 +2091,7 @@ func jpNumericIn(m jpMethod, text string) (Decimal, error) {
 // integer digits.
 func jpApplyTypmod(m jpMethod, num Decimal, numstr string) (Decimal, error) {
 	asI32 := func(d Decimal) (int64, bool) {
-		v, ok := d.ToInt64Round()
+		v, ok := d.toInt64Round()
 		return v, ok && v >= -2147483648 && v <= 2147483647
 	}
 	precision, ok := asI32(*m.precision)
@@ -2113,12 +2113,12 @@ func jpApplyTypmod(m jpMethod, num Decimal, numstr string) (Decimal, error) {
 		return Decimal{}, newError(InvalidParameterValue, "NUMERIC scale "+strconv.FormatInt(scale, 10)+
 			" must be between "+strconv.FormatInt(-maxP, 10)+" and "+strconv.FormatInt(maxP, 10))
 	}
-	rounded, err := num.RoundPlaces(scale)
+	rounded, err := num.roundPlaces(scale)
 	if err != nil {
 		return Decimal{}, jpBadArgument(m, numstr, "numeric")
 	}
 	// The digits from the point to the most significant nonzero digit must fit p − s.
-	intDigits := int64(rounded.Precision()) - int64(rounded.Scale)
+	intDigits := int64(rounded.precision()) - int64(rounded.scale)
 	if !rounded.IsZero() && intDigits > precision-scale {
 		return Decimal{}, jpBadArgument(m, numstr, "numeric")
 	}
@@ -2303,7 +2303,7 @@ func pgLayout(n *JSONNode, off int64, offsets map[*JSONNode]int64) int64 {
 // the most to the least significant nonzero group. The short form needs a display scale ≤ 63 and a
 // weight (the leading group's power of 10000) in −64..=63. Zero has no digits.
 func pgNumericSize(d Decimal) int64 {
-	text := strings.TrimPrefix(d.Render(), "-")
+	text := strings.TrimPrefix(d.String(), "-")
 	intPart, frac, _ := strings.Cut(text, ".")
 	digits := intPart + frac
 	first := strings.IndexFunc(digits, func(r rune) bool { return r != '0' })
@@ -2321,7 +2321,7 @@ func pgNumericSize(d Decimal) int64 {
 	weight := floorDiv4(power(first))
 	ndigits := weight - floorDiv4(power(last)) + 1
 	size := int64(8)
-	if d.Scale <= 63 && weight >= -64 && weight <= 63 {
+	if d.scale <= 63 && weight >= -64 && weight <= 63 {
 		size = 6
 	}
 	return size + 2*ndigits
@@ -2334,7 +2334,7 @@ func writeIndex(i jpIndex, out *strings.Builder) {
 	case i.expr != nil:
 		writeExpr(i.expr, false, out)
 	default:
-		out.WriteString(i.number.Render())
+		out.WriteString(i.number.String())
 	}
 }
 
@@ -3110,7 +3110,7 @@ func (p *jpParser) parseNumber() (JSONNode, error) {
 		return JSONNode{}, jpMalformed("invalid number literal")
 	}
 	digits, scale := decimalFromParts(intPart, frac, hasExp, exp)
-	d, err := decimalFromDigitsScale(neg, digits, scale).CheckCap()
+	d, err := decimalFromDigitsScale(neg, digits, scale).checkCap()
 	if err != nil {
 		return JSONNode{}, err
 	}
@@ -3821,7 +3821,7 @@ func (p *jpParser) parseUnary() (jpParsed, error) {
 	p.depth--
 	if arg.primary == jpLiteral && arg.lit.Kind == JNumber && len(arg.steps) == 0 {
 		if op == jpUnaryMinus {
-			arg.lit.Num = arg.lit.Num.Negate()
+			arg.lit.Num = arg.lit.Num.negate()
 		}
 		return jpParsed{expr: arg}, nil
 	}

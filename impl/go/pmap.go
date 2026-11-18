@@ -148,7 +148,7 @@ func (n *pnode) colAtResolved(i, c int) (Value, error) {
 		return pk.valueResolved(c, at)
 	}
 	v := n.vals[n.pi(i)][c]
-	if v.Kind == ValUnfetched {
+	if v.kind == valUnfetched {
 		return resolveUnfetchedSelf(v.unfetched())
 	}
 	return v, nil
@@ -188,15 +188,15 @@ func (n *pnode) smallDecimalAt(i, c int, buf *[2]uint32) (d Decimal, null, ok bo
 		if m >= smallBoxMax {
 			return d, false, false // three limbs: outside any fixed column's typmod, read the long way
 		}
-		d.Scale = uint32(ty.DecScale)
+		d.scale = uint32(ty.DecScale)
 		switch {
 		case m == 0:
 		case m < decBase:
 			buf[0] = uint32(m)
-			d.Neg, d.Limbs = u < 0, buf[:1:1]
+			d.neg, d.limbs = u < 0, buf[:1:1]
 		default:
 			buf[0], buf[1] = uint32(m%decBase), uint32(m/decBase)
-			d.Neg, d.Limbs = u < 0, buf[:2:2]
+			d.neg, d.limbs = u < 0, buf[:2:2]
 		}
 		return d, false, true
 	}
@@ -219,15 +219,15 @@ func (n *pnode) smallDecimalAt(i, c int, buf *[2]uint32) (d Decimal, null, ok bo
 		}
 		v = v*10_000 + uint64(g)
 	}
-	d.Scale = uint32(binary.BigEndian.Uint16(vb[2:]))
+	d.scale = uint32(binary.BigEndian.Uint16(vb[2:]))
 	switch {
 	case v == 0:
 	case v < decBase:
 		buf[0] = uint32(v)
-		d.Neg, d.Limbs = vb[1]&1 != 0, buf[:1:1]
+		d.neg, d.limbs = vb[1]&1 != 0, buf[:1:1]
 	default:
 		buf[0], buf[1] = uint32(v%decBase), uint32(v/decBase)
-		d.Neg, d.Limbs = vb[1]&1 != 0, buf[:2:2]
+		d.neg, d.limbs = vb[1]&1 != 0, buf[:2:2]
 	}
 	return d, false, true
 }

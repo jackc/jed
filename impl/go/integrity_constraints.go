@@ -109,7 +109,7 @@ func (k *integrityChecker) checkColumns(table *catTable, store *tableStore, root
 		for c := range table.Columns {
 			col := &table.Columns[c]
 			v := row[c]
-			if v.Kind == ValNull {
+			if v.kind == ValNull {
 				if notNull[c] {
 					if err := k.add(IntegrityNotNullViolation, table.Name, nil, key, "column "+col.Name+" is NULL"); err != nil {
 						return err
@@ -206,7 +206,7 @@ func (k *integrityChecker) checkCheck(table *catTable, store *tableStore, root p
 			}
 			return k.add(IntegrityCheckError, c.Name, nil, key, err.Error())
 		}
-		if v.Kind == ValBool && !v.boolVal() {
+		if v.kind == ValBool && !v.boolVal() {
 			return k.add(IntegrityCheckViolation, c.Name, nil, key, "the row fails the check")
 		}
 		return nil
@@ -376,7 +376,7 @@ func (k *integrityChecker) checkForeignKey(table *catTable, store *tableStore, r
 	return k.scanRows(root, store.colTypes, 0, func(key []byte, row storedRow) error {
 		nulls := 0
 		for _, c := range fk.Columns {
-			if row[c].Kind == ValNull {
+			if row[c].kind == ValNull {
 				nulls++
 			}
 		}

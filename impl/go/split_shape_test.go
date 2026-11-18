@@ -94,7 +94,7 @@ func TestSplitShapeCostsArePinned(t *testing.T) {
 	// table-interior splits plus a split secondary index. In one working root, overwrite an existing
 	// table row/index entry, append enough rows to split both trees again, and pin the resulting exact
 	// node counts through cost. Rollback must restore the byte-exact committed image and original costs.
-	before, err := shuf.ToImage(256, 1)
+	before, err := shuf.toImage(256, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestSplitShapeCostsArePinned(t *testing.T) {
 	if err := tx.Rollback(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	after, err := shuf.ToImage(256, 1)
+	after, err := shuf.toImage(256, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

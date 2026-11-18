@@ -40,7 +40,7 @@ func bigValueDB(t *testing.T) (dbHandle, string) {
 func TestExternalValueSpansOverflowChainAndRoundTrips(t *testing.T) {
 	t.Parallel()
 	db, big := bigValueDB(t)
-	image, err := db.ToImage(256, 1)
+	image, err := db.toImage(256, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestExternalValueSpansOverflowChainAndRoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Re-serialization is byte-identical (deterministic spill + chain allocation).
-	again, err := loaded.ToImage(256, 1)
+	again, err := loaded.toImage(256, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestSmallValuesNeverSpill(t *testing.T) {
 	db := mustSession(memDB(), SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)")
 	mustExec(t, db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
-	image, err := db.ToImage(256, 1)
+	image, err := db.toImage(256, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestSmallValuesNeverSpill(t *testing.T) {
 func TestLoadReclaimsOnlyDeadOverflowPages(t *testing.T) {
 	t.Parallel()
 	db, _ := bigValueDB(t)
-	image, err := db.ToImage(256, 1)
+	image, err := db.toImage(256, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

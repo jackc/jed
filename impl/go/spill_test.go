@@ -65,20 +65,20 @@ var spillShapes = []string{
 // valueEqual is a NULL-safe, value-canonical equality (NULL == NULL; decimals by value), so the
 // spilling and in-memory results compare exactly even across NULLs (which 3VL Eq3 would not).
 func valueEqual(a, b Value) bool {
-	if a.Kind != b.Kind {
+	if a.kind != b.kind {
 		return false
 	}
-	switch a.Kind {
+	switch a.kind {
 	case ValNull:
 		return true
 	case ValInt, ValTimestamp, ValTimestamptz:
-		return a.Int == b.Int
+		return a.num == b.num
 	case ValBool:
 		return a.boolVal() == b.boolVal()
 	case ValText, ValBytea, ValUUID:
 		return a.str() == b.str()
 	case ValDecimal:
-		return a.decimal().CmpValue(*b.decimal()) == 0
+		return a.decimal().Cmp(*b.decimal()) == 0
 	default:
 		return false
 	}
@@ -272,7 +272,7 @@ func TestSpillingSortIsStableOnTies(t *testing.T) {
 
 	rows, _ := runQuery(t, db, "SELECT id FROM t ORDER BY k")
 	for i := int64(0); i < 100; i++ {
-		if rows[i][0].Kind != ValInt || rows[i][0].Int != i {
+		if rows[i][0].kind != ValInt || rows[i][0].num != i {
 			t.Fatalf("row %d: expected id %d, got %v", i, i, rows[i][0])
 		}
 	}

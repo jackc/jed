@@ -20,7 +20,7 @@ import (
 func hostAdd() *HostFunction {
 	return NewHostFunction("host_add", []string{"i64", "i64"}, "i64",
 		func(args []Value) (Value, error) {
-			return IntValue(args[0].Int + args[1].Int), nil
+			return IntValue(args[0].num + args[1].num), nil
 		}).WithVolatility(VolatilityImmutable).WithCrossCore(true)
 }
 
@@ -80,11 +80,11 @@ func oneVal(t *testing.T, s *Session, sql string) Value {
 func TestHostScalarFunctionOverLiterals(t *testing.T) {
 	t.Parallel()
 	s := dbExt(t, envWith(t, hostAdd()))
-	if v := oneVal(t, s, "SELECT host_add(2, 3)"); v.Int != 5 {
-		t.Fatalf("host_add(2,3) = %v, want 5", v.Int)
+	if v := oneVal(t, s, "SELECT host_add(2, 3)"); v.num != 5 {
+		t.Fatalf("host_add(2,3) = %v, want 5", v.num)
 	}
-	if v := oneVal(t, s, "SELECT host_add(host_add(1, 1), 40)"); v.Int != 42 {
-		t.Fatalf("nested host_add = %v, want 42", v.Int)
+	if v := oneVal(t, s, "SELECT host_add(host_add(1, 1), 40)"); v.num != 42 {
+		t.Fatalf("nested host_add = %v, want 42", v.num)
 	}
 }
 
@@ -94,7 +94,7 @@ func TestHostScalarFunctionOverColumns(t *testing.T) {
 		"CREATE TABLE t (id i32 PRIMARY KEY, a i64, b i64)",
 		"INSERT INTO t VALUES (1, 10, 20), (2, 100, 1)")
 	rows := hostRows(t, s, "SELECT host_add(a, b) FROM t ORDER BY id")
-	if len(rows) != 2 || rows[0][0].Int != 30 || rows[1][0].Int != 101 {
+	if len(rows) != 2 || rows[0][0].num != 30 || rows[1][0].num != 101 {
 		t.Fatalf("host_add(a,b) = %v, want [30 101]", rows)
 	}
 }
@@ -122,8 +122,8 @@ func TestBareNullLiteralFindsNoOverload(t *testing.T) {
 func TestHostOverloadBySignature(t *testing.T) {
 	t.Parallel()
 	s := dbExt(t, envWith(t, hostAdd(), hostAddText()))
-	if v := oneVal(t, s, "SELECT host_add(2, 3)"); v.Int != 5 {
-		t.Fatalf("host_add(2,3) = %v, want 5", v.Int)
+	if v := oneVal(t, s, "SELECT host_add(2, 3)"); v.num != 5 {
+		t.Fatalf("host_add(2,3) = %v, want 5", v.num)
 	}
 	if v := oneVal(t, s, "SELECT host_add('foo', 'bar')"); v.str() != "foobar" {
 		t.Fatalf("host_add('foo','bar') = %q, want foobar", v.str())
@@ -137,8 +137,8 @@ func TestBuiltinWinsOverHostSameSignature(t *testing.T) {
 	hostAbs := NewHostFunction("abs", []string{"i64"}, "i64",
 		func(args []Value) (Value, error) { return IntValue(999), nil })
 	s := dbExt(t, envWith(t, hostAbs))
-	if v := oneVal(t, s, "SELECT abs(-5)"); v.Int != 5 {
-		t.Fatalf("abs(-5) = %v, want 5 (built-in wins)", v.Int)
+	if v := oneVal(t, s, "SELECT abs(-5)"); v.num != 5 {
+		t.Fatalf("abs(-5) = %v, want 5 (built-in wins)", v.num)
 	}
 }
 
@@ -153,8 +153,8 @@ func TestHostTextOverloadWinsOverLiteralAdaptation(t *testing.T) {
 	if v := oneVal(t, s, "SELECT sha256('abc')"); v.str() != "host:abc" {
 		t.Fatalf("sha256('abc') = %q, want host:abc (host text overload wins)", v.str())
 	}
-	if v := oneVal(t, s, "SELECT length(sha256(bytea 'abc'))"); v.Int != 32 {
-		t.Fatalf("length(sha256(bytea 'abc')) = %v, want 32 (built-in)", v.Int)
+	if v := oneVal(t, s, "SELECT length(sha256(bytea 'abc'))"); v.num != 32 {
+		t.Fatalf("length(sha256(bytea 'abc')) = %v, want 32 (built-in)", v.num)
 	}
 }
 
@@ -248,7 +248,7 @@ func TestExplainRendersHostFunctionName(t *testing.T) {
 	found := false
 	for _, r := range rows {
 		for _, v := range r {
-			if v.Kind == ValText && contains(v.str(), "host_add(") {
+			if v.kind == ValText && contains(v.str(), "host_add(") {
 				found = true
 			}
 		}
@@ -263,8 +263,8 @@ func TestNoExtensionsIsUnaffected(t *testing.T) {
 	// The built-in-only path is untouched: an environment with no host functions resolves nothing new, and a call to a
 	// would-be host name is 42883.
 	s := dbExt(t, NewEnvironment())
-	if v := oneVal(t, s, "SELECT abs(-7)"); v.Int != 7 {
-		t.Fatalf("abs(-7) = %v, want 7", v.Int)
+	if v := oneVal(t, s, "SELECT abs(-7)"); v.num != 7 {
+		t.Fatalf("abs(-7) = %v, want 7", v.num)
 	}
 	wantErr(t, s, "SELECT host_add(1, 2)", "42883")
 	// No Environment option (a fresh empty environment) behaves the same.
@@ -295,7 +295,7 @@ func contains(haystack, needle string) bool {
 // its identity; Immutable + a component id are the two admission requirements (§8.1).
 func geoHash(component string, version uint32) *HostFunction {
 	return NewHostFunction("geo_hash", []string{"i64"}, "i64",
-		func(args []Value) (Value, error) { return IntValue(args[0].Int * 10), nil }).
+		func(args []Value) (Value, error) { return IntValue(args[0].num * 10), nil }).
 		WithVolatility(VolatilityImmutable).WithCrossCore(true).
 		WithComponentID(component).WithSemanticVersion(version)
 }
@@ -309,7 +309,7 @@ func geoIDs(t *testing.T, q valueQuerier, sql string) []int64 {
 	}
 	ids := make([]int64, 0, len(out.Rows))
 	for _, r := range out.Rows {
-		ids = append(ids, r[0].Int)
+		ids = append(ids, r[0].num)
 	}
 	return ids
 }
@@ -345,7 +345,7 @@ func TestHostFuncVolatileInIndexRejected(t *testing.T) {
 	// The latent-bug fix: a volatile host function used to leak silently into an index expression (the
 	// immutability gate was purely syntactic and did not see host functions). Now 42P17.
 	volatile := NewHostFunction("geo_hash", []string{"i64"}, "i64",
-		func(args []Value) (Value, error) { return IntValue(args[0].Int * 10), nil }).
+		func(args []Value) (Value, error) { return IntValue(args[0].num * 10), nil }).
 		WithComponentID("com.example/geo_hash") // Volatile by default
 	s := dbExt(t, envWith(t, volatile), "CREATE TABLE t (a i64)")
 	wantErr(t, s, "CREATE INDEX ix ON t (geo_hash(a))", "42P17")
@@ -355,7 +355,7 @@ func TestHostFuncUnversionedInIndexRejected(t *testing.T) {
 	t.Parallel()
 	// Immutable but no component identity → cannot persist a sound dependency (42P17).
 	unversioned := NewHostFunction("geo_hash", []string{"i64"}, "i64",
-		func(args []Value) (Value, error) { return IntValue(args[0].Int * 10), nil }).
+		func(args []Value) (Value, error) { return IntValue(args[0].num * 10), nil }).
 		WithVolatility(VolatilityImmutable)
 	s := dbExt(t, envWith(t, unversioned), "CREATE TABLE t (a i64)")
 	wantErr(t, s, "CREATE INDEX ix ON t (geo_hash(a))", "42P17")
@@ -461,7 +461,7 @@ func TestHostFuncIndexReopenMissingFunction(t *testing.T) {
 // distinct under v1's a * 10 can collide — the UNIQUE re-check REINDEX performs.
 func geoHashCoarse(component string, version uint32) *HostFunction {
 	return NewHostFunction("geo_hash", []string{"i64"}, "i64",
-		func(args []Value) (Value, error) { return IntValue(args[0].Int / 10), nil }).
+		func(args []Value) (Value, error) { return IntValue(args[0].num / 10), nil }).
 		WithVolatility(VolatilityImmutable).WithCrossCore(true).
 		WithComponentID(component).WithSemanticVersion(version)
 }
@@ -526,7 +526,7 @@ func TestHostFuncIndexReindexRefusals(t *testing.T) {
 	// The new implementation is no longer IMMUTABLE: 42P17, as CREATE INDEX would say.
 	func() {
 		volatile := NewHostFunction("geo_hash", []string{"i64"}, "i64",
-			func(args []Value) (Value, error) { return IntValue(args[0].Int * 10), nil }).
+			func(args []Value) (Value, error) { return IntValue(args[0].num * 10), nil }).
 			WithComponentID("com.example/geo_hash").WithSemanticVersion(2)
 		db := openGeoFile(t, path, envWith(t, volatile))
 		defer db.Close()
@@ -572,10 +572,10 @@ func twiceBatched(calls *hostCalls, vol Volatility, failAt int64) *HostFunction 
 		func(args [][]Value, out []Value) ([]Value, error) {
 			calls.record(len(args[0]))
 			for _, v := range args[0] {
-				if v.Int == failAt {
-					return out, newError(InvalidParameterValue, fmt.Sprintf("host_twice refuses %d", v.Int))
+				if v.num == failAt {
+					return out, newError(InvalidParameterValue, fmt.Sprintf("host_twice refuses %d", v.num))
 				}
-				out = append(out, IntValue(v.Int*2))
+				out = append(out, IntValue(v.num*2))
 			}
 			return out, nil
 		}).WithVolatility(vol).WithCost(5)
@@ -586,10 +586,10 @@ func twiceRow(calls *hostCalls, failAt int64) *HostFunction {
 	return NewHostFunction("host_twice", []string{"i64"}, "i64",
 		func(args []Value) (Value, error) {
 			calls.record(1)
-			if args[0].Int == failAt {
-				return Value{}, newError(InvalidParameterValue, fmt.Sprintf("host_twice refuses %d", args[0].Int))
+			if args[0].num == failAt {
+				return Value{}, newError(InvalidParameterValue, fmt.Sprintf("host_twice refuses %d", args[0].num))
 			}
-			return IntValue(args[0].Int * 2), nil
+			return IntValue(args[0].num * 2), nil
 		}).WithVolatility(VolatilityImmutable).WithCost(5)
 }
 
@@ -621,12 +621,12 @@ func TestHostBatchKernelCalledOncePerChunk(t *testing.T) {
 		t.Fatalf("got %d rows, want 2500", len(rows))
 	}
 	for _, r := range rows {
-		id := r[0].Int
+		id := r[0].num
 		if id%10 == 0 {
 			if !r[1].IsNull() {
 				t.Fatalf("row %d: got %v, want NULL", id, r[1])
 			}
-		} else if r[1].Kind != ValInt || r[1].Int != id*2 {
+		} else if r[1].kind != ValInt || r[1].num != id*2 {
 			t.Fatalf("row %d: got %v, want %d", id, r[1], id*2)
 		}
 	}
@@ -751,7 +751,7 @@ func TestHostBatchThroughStreamingCursorMatches(t *testing.T) {
 	if len(rows) != 1100 {
 		t.Fatalf("got %d rows, want 1100", len(rows))
 	}
-	if rows[0][0].Int != 2 || !rows[9][0].IsNull() {
+	if rows[0][0].num != 2 || !rows[9][0].IsNull() {
 		t.Fatalf("rows[0] = %v, rows[9] = %v, want 2 and NULL", rows[0], rows[9])
 	}
 	if got := calls.get(); !reflect.DeepEqual(got, []int{922, 68}) {
@@ -801,11 +801,11 @@ func TestHostBatchKernelServesALoneCall(t *testing.T) {
 	// one-row batch.
 	calls := &hostCalls{}
 	s := batchDB(t, twiceBatched(calls, VolatilityImmutable, -1), 5)
-	if v := oneVal(t, s, "SELECT host_twice(21)"); v.Int != 42 {
+	if v := oneVal(t, s, "SELECT host_twice(21)"); v.num != 42 {
 		t.Fatalf("host_twice(21) = %v, want 42", v)
 	}
 	rows := hostRows(t, s, "SELECT id FROM t WHERE host_twice(a) = 6")
-	if len(rows) != 1 || rows[0][0].Int != 3 {
+	if len(rows) != 1 || rows[0][0].num != 3 {
 		t.Fatalf("WHERE host_twice(a) = 6 → %v, want [[3]]", rows)
 	}
 	if got := calls.get(); !reflect.DeepEqual(got, []int{1, 1, 1, 1, 1, 1}) {
@@ -833,8 +833,8 @@ func TestHostZeroArgBatchKernelIsNeverPrefetched(t *testing.T) {
 		t.Fatalf("got %d rows, want 30", len(rows))
 	}
 	for _, r := range rows {
-		if r[1].Kind != ValInt || r[1].Int != 7 {
-			t.Fatalf("row %d: got %v, want 7", r[0].Int, r[1])
+		if r[1].kind != ValInt || r[1].num != 7 {
+			t.Fatalf("row %d: got %v, want 7", r[0].num, r[1])
 		}
 	}
 	if got := len(calls.get()); got != 30 {
@@ -847,7 +847,7 @@ func TestHostZeroArgBatchKernelIsNeverPrefetched(t *testing.T) {
 func hostNarrow(name, result string, f func(int64) int64) *HostFunction {
 	return NewHostFunction(name, []string{"i64"}, result,
 		func(args []Value) (Value, error) {
-			return IntValue(f(args[0].Int)), nil
+			return IntValue(f(args[0].num)), nil
 		}).WithVolatility(VolatilityImmutable)
 }
 
@@ -871,7 +871,7 @@ func TestOutOfRangeIntegerResultIs22003(t *testing.T) {
 		"SELECT host_i32(-2147483648)":         -2147483648,
 		"SELECT host_i64(9223372036854775807)": 9223372036854775807,
 	} {
-		if v := oneVal(t, s, sql); v.Int != want {
+		if v := oneVal(t, s, sql); v.num != want {
 			t.Fatalf("%s = %v, want %d", sql, v, want)
 		}
 	}
@@ -904,7 +904,7 @@ func scaleBatched() *HostFunction {
 	return NewHostBatchFunction("host_scale", []string{"i64"}, "i32",
 		func(args [][]Value, out []Value) ([]Value, error) {
 			for _, v := range args[0] {
-				out = append(out, IntValue(v.Int*100_000_000))
+				out = append(out, IntValue(v.num*100_000_000))
 			}
 			return out, nil
 		}).WithVolatility(VolatilityImmutable)
@@ -979,7 +979,7 @@ func TestHostBatchStreamingScanReadsAheadOneWindowPerChunk(t *testing.T) {
 		calls := &hostCalls{}
 		s := batchDB(t, twiceBatched(calls, VolatilityImmutable, -1), 2500)
 		rows := batchRowsVia(t, s, "SELECT id, host_twice(a) FROM t ORDER BY id", materialized)
-		if len(rows) != 2500 || rows[6][0].Int != 7 || rows[6][1].Int != 14 || !rows[9][1].IsNull() {
+		if len(rows) != 2500 || rows[6][0].num != 7 || rows[6][1].num != 14 || !rows[9][1].IsNull() {
 			t.Fatalf("materialized=%v: rows[6] = %v, rows[9] = %v of %d", materialized, rows[6], rows[9], len(rows))
 		}
 		if got, want := calls.get(), windowCalls(2500); !reflect.DeepEqual(got, want) {
@@ -1029,7 +1029,7 @@ func TestHostBatchStreamingSortReadsAhead(t *testing.T) {
 		calls := &hostCalls{}
 		s := batchDB(t, twiceBatched(calls, VolatilityImmutable, -1), 2500)
 		rows := batchRowsVia(t, s, "SELECT a, host_twice(a) FROM t ORDER BY a DESC", materialized)
-		if rows[250][0].Int != 2499 || rows[250][1].Int != 4998 {
+		if rows[250][0].num != 2499 || rows[250][1].num != 4998 {
 			t.Fatalf("materialized=%v: rows[250] = %v, want [2499 4998]", materialized, rows[250])
 		}
 		want := []int{6}
@@ -1229,14 +1229,14 @@ func TestHostBatchStreamingScanStorageErrorsMatchRowKernel(t *testing.T) {
 // (the default): a CHECK has no volatility gate (§7.1.2), only a component-identity requirement.
 func scaledGeo(component string, version uint32, factor int64) *HostFunction {
 	return NewHostFunction("geo_hash", []string{"i64"}, "i64",
-		func(args []Value) (Value, error) { return IntValue(args[0].Int * factor), nil }).
+		func(args []Value) (Value, error) { return IntValue(args[0].num * factor), nil }).
 		WithComponentID(component).WithSemanticVersion(version)
 }
 
 // unversionedGeo is geo_hash(i64) -> i64 = a * 10 with NO component identity.
 func unversionedGeo() *HostFunction {
 	return NewHostFunction("geo_hash", []string{"i64"}, "i64",
-		func(args []Value) (Value, error) { return IntValue(args[0].Int * 10), nil })
+		func(args []Value) (Value, error) { return IntValue(args[0].num * 10), nil })
 }
 
 func wantHostCode(t *testing.T, q valueQuerier, sql, code string) {
@@ -1263,7 +1263,7 @@ func TestHostFuncCheckAdmission(t *testing.T) {
 	// ...but a DEFAULT has no admission rule: any host function, any volatility, no identity.
 	run(t, s, "CREATE TABLE d (id i64 PRIMARY KEY, b i64 DEFAULT geo_hash(5))")
 	run(t, s, "INSERT INTO d (id) VALUES (1)")
-	if got := oneVal(t, s, "SELECT b FROM d"); got.Int != 50 {
+	if got := oneVal(t, s, "SELECT b FROM d"); got.num != 50 {
 		t.Fatalf("host-function default = %v, want 50", got)
 	}
 	// A VOLATILE but versioned host function is admitted into a CHECK and enforced.
@@ -1390,10 +1390,10 @@ func TestHostFuncCheckUnrelatedStatements(t *testing.T) {
 func TestHostFuncCheckAlterTypeRecollects(t *testing.T) {
 	t.Parallel()
 	lim32 := NewHostFunction("lim", []string{"i32"}, "i32",
-		func(args []Value) (Value, error) { return IntValue(args[0].Int), nil }).WithComponentID("a/lim")
+		func(args []Value) (Value, error) { return IntValue(args[0].num), nil }).WithComponentID("a/lim")
 	lim64 := func() *HostFunction {
 		return NewHostFunction("lim", []string{"i64"}, "i64",
-			func(args []Value) (Value, error) { return IntValue(args[0].Int), nil }).WithComponentID("b/lim")
+			func(args []Value) (Value, error) { return IntValue(args[0].num), nil }).WithComponentID("b/lim")
 	}
 	path := filepath.Join(t.TempDir(), "hostfunc_check_retype.jed")
 	createGeoFile(t, path, envWith(t, lim32, lim64()),
@@ -1449,7 +1449,7 @@ func TestHostFuncCheckErrorPrecedesDefault(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "hostfunc_check_default_order.jed")
 	lim := NewHostFunction("lim", []string{"i64"}, "i64",
-		func(args []Value) (Value, error) { return IntValue(args[0].Int), nil })
+		func(args []Value) (Value, error) { return IntValue(args[0].num), nil })
 	createGeoFile(t, path, envWith(t, scaledGeo("com.example/geo_hash", 1, 10), lim),
 		"CREATE TABLE t (id i64 PRIMARY KEY, a i64, b i64 DEFAULT lim(1), CHECK (geo_hash(a) < 100))")
 	// A stale check (XX002) and a missing default function (42883): the check resolves first.
@@ -1464,7 +1464,7 @@ func TestHostFuncCheckErrorPrecedesDefault(t *testing.T) {
 
 // coercionKind is the value kind a kernel received: the kernel only ever sees its declared types.
 func coercionKind(v Value) string {
-	switch v.Kind {
+	switch v.kind {
 	case ValInt:
 		return "int"
 	case ValDecimal:
@@ -1510,7 +1510,7 @@ func coercionDB(t *testing.T, funcs ...*HostFunction) *Session {
 func wantText(t *testing.T, s *Session, sql, want string) {
 	t.Helper()
 	v := oneVal(t, s, sql)
-	if v.Kind != ValText || v.str() != want {
+	if v.kind != ValText || v.str() != want {
 		t.Fatalf("%q = %v, want %q", sql, v, want)
 	}
 }
@@ -1589,7 +1589,7 @@ func TestCoercionBuiltinWinsATie(t *testing.T) {
 	t.Parallel()
 	// sin(0): the built-in sin(float) and a host sin(f64) both score 4 — the built-in wins.
 	s := coercionDB(t, coercionProbe("sin", []string{"f64"}, "host"))
-	if v := oneVal(t, s, "SELECT sin(0)"); v.Kind != ValFloat64 || v.F64() != 0 {
+	if v := oneVal(t, s, "SELECT sin(0)"); v.kind != ValFloat64 || v.f64() != 0 {
 		t.Fatalf("sin(0) = %v, want f64 0", v)
 	}
 }

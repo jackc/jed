@@ -17,11 +17,11 @@ func TestAlterAddColumnRewriteMatchesFreshTableBytes(t *testing.T) {
 	uqRun(t, fresh, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7)")
 	uqRun(t, fresh, "INSERT INTO t (id) VALUES (1), (2)")
 
-	a, err := altered.ToImage(8192, 1)
+	a, err := altered.toImage(8192, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := fresh.ToImage(8192, 1)
+	b, err := fresh.toImage(8192, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,11 +41,11 @@ func TestAlterDropColumnRewriteMatchesFreshTableBytes(t *testing.T) {
 	uqRun(t, fresh, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7)")
 	uqRun(t, fresh, "INSERT INTO t VALUES (1, 7), (2, 8)")
 
-	a, err := altered.ToImage(8192, 1)
+	a, err := altered.toImage(8192, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := fresh.ToImage(8192, 1)
+	b, err := fresh.toImage(8192, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestAlterTypeAndPrimaryKeyRewritesMatchFreshTableBytes(t *testing.T) {
 		for _, sql := range sqls {
 			uqRun(t, db, sql)
 		}
-		out, err := db.ToImage(8192, 1)
+		out, err := db.toImage(8192, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -103,7 +103,7 @@ func TestRenameRewriteQuotesTheSubstitutedName(t *testing.T) {
 	if got := texts(tbl); !slices.Equal(got, want) {
 		t.Fatalf("check texts = %q, want %q", got, want)
 	}
-	image, err := db.ToImage(8192, 1)
+	image, err := db.toImage(8192, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

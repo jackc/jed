@@ -224,7 +224,7 @@ func guardedScanIDs(image []byte) ([]int64, error) {
 	}
 	ids := make([]int64, len(rows))
 	for i, row := range rows {
-		ids[i] = row[0].Int
+		ids[i] = row[0].num
 	}
 	return ids, nil
 }
@@ -236,7 +236,7 @@ func renderRows(rows [][]Value) [][]string {
 	for i, row := range rows {
 		cells := make([]string, len(row))
 		for j, v := range row {
-			cells[j] = v.Render()
+			cells[j] = v.String()
 		}
 		out[i] = cells
 	}

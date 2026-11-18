@@ -35,14 +35,14 @@ func TestBooleanPrimaryKeyCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Rows) != 1 || out.Rows[0][0].Int != 20 {
+	if len(out.Rows) != 1 || out.Rows[0][0].num != 20 {
 		t.Fatalf("k = TRUE got %v, want [20]", out.Rows)
 	}
 	out, err = queryOutcome(db, "SELECT v FROM t WHERE k = FALSE", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Rows) != 1 || out.Rows[0][0].Int != 10 {
+	if len(out.Rows) != 1 || out.Rows[0][0].num != 10 {
 		t.Fatalf("k = FALSE got %v, want [10]", out.Rows)
 	}
 
@@ -76,8 +76,8 @@ func TestBooleanCompositePrimaryKey(t *testing.T) {
 		t.Fatalf("got %d rows, want %d", len(rows), len(want))
 	}
 	for i, r := range rows {
-		if r[0].Int != want[i].a || r[1].boolVal() != want[i].b {
-			t.Fatalf("row %d = (%d,%v), want (%d,%v)", i, r[0].Int, r[1].boolVal(), want[i].a, want[i].b)
+		if r[0].num != want[i].a || r[1].boolVal() != want[i].b {
+			t.Fatalf("row %d = (%d,%v), want (%d,%v)", i, r[0].num, r[1].boolVal(), want[i].a, want[i].b)
 		}
 	}
 }
@@ -97,7 +97,7 @@ func TestBooleanSecondaryIndex(t *testing.T) {
 	}
 	ids := make([]int64, 0, len(out.Rows))
 	for _, r := range out.Rows {
-		ids = append(ids, r[0].Int)
+		ids = append(ids, r[0].num)
 	}
 	slices.Sort(ids)
 	if !slices.Equal(ids, []int64{1, 4}) {

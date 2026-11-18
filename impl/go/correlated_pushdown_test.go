@@ -43,7 +43,7 @@ func mustIds(t *testing.T, db dbHandle, sql string) []int64 {
 	}
 	got := make([]int64, len(out.Rows))
 	for i, r := range out.Rows {
-		got[i] = r[0].Int
+		got[i] = r[0].num
 	}
 	return got
 }

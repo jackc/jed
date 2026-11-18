@@ -24,7 +24,7 @@ func attachmentRows(t *testing.T, db *Database) [][2]int64 {
 	rows := queryRows(t, mustSession(db, SessionOptions{}), "SELECT id, v FROM a.t ORDER BY id")
 	out := make([][2]int64, len(rows))
 	for i, row := range rows {
-		out[i] = [2]int64{row[0].Int, row[1].Int}
+		out[i] = [2]int64{row[0].num, row[1].num}
 	}
 	return out
 }
@@ -155,7 +155,7 @@ func TestFailedLaterAttachmentLeavesEarlierAttachmentIntact(t *testing.T) {
 		}
 		return 0
 	}))
-	if n := queryRows(t, mustSession(db, SessionOptions{}), "SELECT count(*) FROM t")[0][0].Int; n != 6 {
+	if n := queryRows(t, mustSession(db, SessionOptions{}), "SELECT count(*) FROM t")[0][0].num; n != 6 {
 		t.Fatalf("main rows = %d want 6", n)
 	}
 }

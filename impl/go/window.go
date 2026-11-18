@@ -16,26 +16,26 @@ import (
 
 // or3 is three-valued OR (Kleene): used to build <= / >= from < / > and =, so a NULL
 // operand yields UNKNOWN rather than a wrong FALSE (CLAUDE.md §4).
-func or3(a, b ThreeValued) ThreeValued {
-	if a == True || b == True {
-		return True
+func or3(a, b threeValued) threeValued {
+	if a == tvTrue || b == tvTrue {
+		return tvTrue
 	}
-	if a == Unknown || b == Unknown {
-		return Unknown
+	if a == tvUnknown || b == tvUnknown {
+		return tvUnknown
 	}
-	return False
+	return tvFalse
 }
 
 // not3 is the Kleene NOT: True<->False, Unknown stays Unknown. Used to build `<>` as the
 // negation of `=`, so a NULL operand still yields UNKNOWN (`NULL <> NULL`), not a wrong True.
-func not3(a ThreeValued) ThreeValued {
+func not3(a threeValued) threeValued {
 	switch a {
-	case True:
-		return False
-	case False:
-		return True
+	case tvTrue:
+		return tvFalse
+	case tvFalse:
+		return tvTrue
 	default: // Unknown
-		return Unknown
+		return tvUnknown
 	}
 }
 
@@ -65,10 +65,10 @@ func sortRows[R ~[]Value](rows []R, order []orderSlot, acct queryAccount, m *cos
 // clamped to [0, np] before index arithmetic so a huge literal offset cannot overflow int — any
 // offset >= np already saturates the bound to the partition edge. Mirrors Rust's i128 widening.
 func offsetCount(v Value, np int) int {
-	if v.Int > int64(np) {
+	if v.num > int64(np) {
 		return np
 	}
-	return int(v.Int)
+	return int(v.num)
 }
 
 // rangeVVsBound returns the sign of v - (cur ∓ off) for a RANGE value offset (window.md §6),
@@ -82,25 +82,25 @@ func offsetCount(v Value, np int) int {
 // already trapped at resolve), so cur ∓ off never produces NaN itself. subtract chooses cur - off vs
 // cur + off. Mirrors Rust's range_v_vs_bound.
 func rangeVVsBound(v, cur, off Value, subtract bool) (int, error) {
-	if cur.Kind == ValInt {
-		b := big.NewInt(cur.Int)
+	if cur.kind == ValInt {
+		b := big.NewInt(cur.num)
 		if subtract {
-			b.Sub(b, big.NewInt(off.Int))
+			b.Sub(b, big.NewInt(off.num))
 		} else {
-			b.Add(b, big.NewInt(off.Int))
+			b.Add(b, big.NewInt(off.num))
 		}
-		return big.NewInt(v.Int).Cmp(b), nil
+		return big.NewInt(v.num).Cmp(b), nil
 	}
 	// Float key: widen to f64 (PG computes in_range_float*_float8's sum in float8 even for an f32
 	// key) and compare in the float total order.
-	if cur.IsFloat() {
+	if cur.isFloat() {
 		c := cur.asF64()
 		x := v.asF64()
 		var b float64
 		if subtract {
-			b = c - off.F64()
+			b = c - off.f64()
 		} else {
-			b = c + off.F64()
+			b = c + off.f64()
 		}
 		return floatTotalCmp(x, b), nil
 	}
@@ -109,14 +109,14 @@ func rangeVVsBound(v, cur, off Value, subtract bool) (int, error) {
 		err error
 	)
 	if subtract {
-		b, err = cur.decimal().Sub(*off.decimal())
+		b, err = cur.decimal().subtract(*off.decimal())
 	} else {
-		b, err = cur.decimal().Add(*off.decimal())
+		b, err = cur.decimal().add(*off.decimal())
 	}
 	if err != nil {
 		return 0, err
 	}
-	return v.decimal().CmpValue(b), nil
+	return v.decimal().Cmp(b), nil
 }
 
 // frameCtx holds one partition's peer-group structure (window.md §3/§6), shared across every row's
@@ -674,7 +674,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 						results[ri] = NullValue()
 					}
 				default:
-					nbuckets := nv.Int
+					nbuckets := nv.num
 					if nbuckets <= 0 {
 						return newError(InvalidArgumentForNtile, "argument of ntile must be greater than zero")
 					}
@@ -735,7 +735,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 					if ov.IsNull() {
 						offsetNull = true
 					} else {
-						offset = ov.Int
+						offset = ov.num
 					}
 				} else {
 					offset = 1
@@ -793,7 +793,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 					if err != nil {
 						return false, err
 					}
-					return v.IsTrue(), nil
+					return v.isTrue(), nil
 				}
 				if spec.frame == nil {
 					// DEFAULT frame (window.md §6): RANGE UNBOUNDED PRECEDING TO CURRENT ROW with a
@@ -1038,8 +1038,8 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 					}
 					if nv.IsNull() {
 						nthNull = true
-					} else if nv.Int >= 1 {
-						nth = int(nv.Int)
+					} else if nv.num >= 1 {
+						nth = int(nv.num)
 					} else {
 						return newError(InvalidArgumentForNthValue, "argument of nth_value must be greater than zero")
 					}
@@ -1190,7 +1190,7 @@ func windowCollKeys(rows []storedRow, order []orderSlot, charge *stateCharge, me
 			if k.collation == nil {
 				continue
 			}
-			if v := row[k.idx]; v.Kind == ValText || v.Kind == ValArray {
+			if v := row[k.idx]; v.kind == ValText || v.kind == ValArray {
 				sk, err := collationSortKey(k.collation, v)
 				if err != nil {
 					return nil, err
@@ -1309,7 +1309,7 @@ func collationKeysForRow[R ~[]Value](row R, order []orderSlot, m *costMeter) ([]
 		if k.collation == nil {
 			continue
 		}
-		if v := row[k.idx]; v.Kind == ValText || v.Kind == ValArray {
+		if v := row[k.idx]; v.kind == ValText || v.kind == ValArray {
 			sk, err := collationSortKey(k.collation, v)
 			if err != nil {
 				return nil, err
@@ -1370,14 +1370,14 @@ func cmpDecorated[R ~[]Value](akeys [][]byte, arow R, bkeys [][]byte, brow R, or
 // (the PostgreSQL model), which surfaces as the parse-time default nullsFirst = descending.
 func keyCmp(a, b Value, descending, nullsFirst bool) int {
 	switch {
-	case a.Kind == ValNull && b.Kind == ValNull:
+	case a.kind == ValNull && b.kind == ValNull:
 		return 0
-	case a.Kind == ValNull:
+	case a.kind == ValNull:
 		if nullsFirst {
 			return -1
 		}
 		return 1
-	case b.Kind == ValNull:
+	case b.kind == ValNull:
 		if nullsFirst {
 			return 1
 		}
@@ -1399,34 +1399,34 @@ func keyCmp(a, b Value, descending, nullsFirst bool) int {
 // <0, 0, >0.
 func valueCmp(a, b Value) int {
 	switch {
-	case a.Kind == ValInt && b.Kind == ValInt:
-		return cmpInt64(a.Int, b.Int)
-	case a.Kind == ValDecimal && b.Kind == ValDecimal:
-		return a.decimal().CmpValue(*b.decimal())
-	case a.Kind == ValText && b.Kind == ValText:
+	case a.kind == ValInt && b.kind == ValInt:
+		return cmpInt64(a.num, b.num)
+	case a.kind == ValDecimal && b.kind == ValDecimal:
+		return a.decimal().Cmp(*b.decimal())
+	case a.kind == ValText && b.kind == ValText:
 		return strings.Compare(a.str(), b.str())
-	case a.Kind == ValBytea && b.Kind == ValBytea:
+	case a.kind == ValBytea && b.kind == ValBytea:
 		// bytea is held in Str (raw bytes); strings.Compare is unsigned byte order.
 		return strings.Compare(a.str(), b.str())
-	case a.Kind == ValUUID && b.Kind == ValUUID:
+	case a.kind == ValUUID && b.kind == ValUUID:
 		// uuid's 16 raw bytes are held in Str; strings.Compare is unsigned byte order.
 		return strings.Compare(a.str(), b.str())
-	case a.Kind == ValBool && b.Kind == ValBool:
+	case a.kind == ValBool && b.kind == ValBool:
 		return cmpInt64(newOrderKey(a), newOrderKey(b))
-	case a.Kind == ValTimestamp && b.Kind == ValTimestamp:
-		return cmpInt64(a.Int, b.Int)
-	case a.Kind == ValTimestamptz && b.Kind == ValTimestamptz:
-		return cmpInt64(a.Int, b.Int)
-	case a.Kind == ValDate && b.Kind == ValDate:
-		return cmpInt64(a.Int, b.Int)
-	case a.Kind == ValInterval && b.Kind == ValInterval:
+	case a.kind == ValTimestamp && b.kind == ValTimestamp:
+		return cmpInt64(a.num, b.num)
+	case a.kind == ValTimestamptz && b.kind == ValTimestamptz:
+		return cmpInt64(a.num, b.num)
+	case a.kind == ValDate && b.kind == ValDate:
+		return cmpInt64(a.num, b.num)
+	case a.kind == ValInterval && b.kind == ValInterval:
 		// Intervals order by the canonical 128-bit span (spec/design/interval.md §2).
-		return a.interval().SpanCmp(b.interval())
-	case a.IsFloat() && b.IsFloat():
+		return a.interval().spanCmp(b.interval())
+	case a.isFloat() && b.isFloat():
 		// The PG float8 TOTAL order: -0 = +0, NaN = NaN, NaN largest (spec/design/float.md §3).
 		// Mixed widths widen to f64 (lossless). Drives ORDER BY / MIN / MAX / DISTINCT / GROUP BY.
 		return floatTotalCmp(a.asF64(), b.asF64())
-	case a.Kind == ValComposite && b.Kind == ValComposite:
+	case a.kind == ValComposite && b.kind == ValComposite:
 		// A composite sorts lexicographically, NULLs-last per field (the composite sort key —
 		// spec/design/composite.md §5): the first non-equal field decides, recursing through keyCmp
 		// so per-field NULL placement and nested composites are handled uniformly. The caller's
@@ -1439,7 +1439,7 @@ func valueCmp(a, b Value) int {
 			}
 		}
 		return cmpInt64(int64(len(x)), int64(len(y)))
-	case a.Kind == ValArray && b.Kind == ValArray:
+	case a.kind == ValArray && b.kind == ValArray:
 		// An array sorts by the PG array_cmp total order (spec/design/array.md §5): element-wise over
 		// the flattened elements (NULLs-last per element, recursing through keyCmp), then fewer
 		// elements first, then smaller ndim, then per dimension (length, then lower bound).
@@ -1464,16 +1464,16 @@ func valueCmp(a, b Value) int {
 			}
 		}
 		return 0
-	case a.Kind == ValRange && b.Kind == ValRange:
+	case a.kind == ValRange && b.kind == ValRange:
 		// A range sorts by the PG range_cmp total order (spec/design/ranges.md §6): `empty` below every
 		// non-empty, then lower bound, then upper bound (accounting for infinity/inclusivity). Kept
 		// identical to value.Lt3/Gt3's range arm so `<` and ORDER BY never disagree.
 		return rangeTotalCmp(a.rangeVal(), b.rangeVal())
-	case a.Kind == ValJSONB && b.Kind == ValJSONB:
+	case a.kind == ValJSONB && b.kind == ValJSONB:
 		// jsonb sorts by PG's total btree order (spec/design/json.md §5); kept identical to
 		// value.Lt3/Gt3's jsonb arm so `<` and ORDER BY never disagree. (json never sorts — the
 		// resolver rejects it 42883.)
-		return a.jsonb().Cmp(b.jsonb())
+		return a.jsonb().cmp(b.jsonb())
 	default:
 		// Cross-family arms exist only for totality — ORDER BY is over a single typed column,
 		// so a mixed pair is unreachable. A fixed family order keeps the comparator total.
@@ -1493,19 +1493,19 @@ func cmpInt64(x, y int64) int {
 }
 
 func newOrderKey(v Value) int64 {
-	if v.Kind == ValBool {
+	if v.kind == ValBool {
 		if v.boolVal() {
 			return 1
 		}
 		return 0
 	}
-	return v.Int
+	return v.num
 }
 
 // familyRank is a fixed total order across value families, for the unreachable cross-family
 // case of valueCmp (ORDER BY is single-column-typed).
 func familyRank(v Value) int {
-	switch v.Kind {
+	switch v.kind {
 	case ValNull:
 		return 0
 	case ValBool:

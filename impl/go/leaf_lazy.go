@@ -268,7 +268,7 @@ func storedSame(ty colType, v Value, p *packedLeaf, c, i int) bool {
 		return v.IsNull() && null
 	}
 	if r.width > 0 {
-		if v.Kind == ValUnfetched {
+		if v.kind == valUnfetched {
 			return false
 		}
 		if forEligible(ty) {
@@ -279,7 +279,7 @@ func storedSame(ty colType, v Value, p *packedLeaf, c, i int) bool {
 	}
 	str := stringPayload(ty)
 	var u *unfetchedValue
-	if v.Kind == ValUnfetched {
+	if v.kind == valUnfetched {
 		u = v.unfetched()
 		if u.Form != 0x00 {
 			return false

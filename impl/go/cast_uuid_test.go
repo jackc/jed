@@ -19,7 +19,7 @@ func TestUuidToByteaIsThe16Bytes(t *testing.T) {
 	t.Parallel()
 	db := mustSession(memDB(), SessionOptions{})
 	v := castOne(t, db, "SELECT '550e8400-e29b-41d4-a716-446655440000'::uuid::bytea")
-	if v.Kind != ValBytea || v.str() != uuid16 {
+	if v.kind != ValBytea || v.str() != uuid16 {
 		t.Fatalf("uuid::bytea = %v, want the 16 bytes", v)
 	}
 }
@@ -29,7 +29,7 @@ func TestByteaToUuidIsThe16Bytes(t *testing.T) {
 	t.Parallel()
 	db := mustSession(memDB(), SessionOptions{})
 	v := castOne(t, db, "SELECT '\\x550e8400e29b41d4a716446655440000'::bytea::uuid")
-	if v.Kind != ValUUID || v.str() != uuid16 {
+	if v.kind != ValUUID || v.str() != uuid16 {
 		t.Fatalf("bytea::uuid = %v, want the 16 bytes", v)
 	}
 }
@@ -59,16 +59,16 @@ func TestUuidByteaRoundTripThroughColumns(t *testing.T) {
 		"INSERT INTO t VALUES (1, '550e8400-e29b-41d4-a716-446655440000', "+
 			"'\\x550e8400e29b41d4a716446655440000'), (2, NULL, NULL)",
 	)
-	if v := castOne(t, db, "SELECT u::bytea FROM t WHERE id = 1"); v.Kind != ValBytea || v.str() != uuid16 {
+	if v := castOne(t, db, "SELECT u::bytea FROM t WHERE id = 1"); v.kind != ValBytea || v.str() != uuid16 {
 		t.Fatalf("u::bytea = %v, want the 16 bytes", v)
 	}
-	if v := castOne(t, db, "SELECT b::uuid FROM t WHERE id = 1"); v.Kind != ValUUID || v.str() != uuid16 {
+	if v := castOne(t, db, "SELECT b::uuid FROM t WHERE id = 1"); v.kind != ValUUID || v.str() != uuid16 {
 		t.Fatalf("b::uuid = %v, want the 16 bytes", v)
 	}
-	if v := castOne(t, db, "SELECT u::bytea FROM t WHERE id = 2"); v.Kind != ValNull {
+	if v := castOne(t, db, "SELECT u::bytea FROM t WHERE id = 2"); v.kind != ValNull {
 		t.Fatalf("NULL u::bytea = %v, want NULL", v)
 	}
-	if v := castOne(t, db, "SELECT b::uuid FROM t WHERE id = 2"); v.Kind != ValNull {
+	if v := castOne(t, db, "SELECT b::uuid FROM t WHERE id = 2"); v.kind != ValNull {
 		t.Fatalf("NULL b::uuid = %v, want NULL", v)
 	}
 }
@@ -84,10 +84,10 @@ func TestTextUuidSmoke(t *testing.T) {
 		"INSERT INTO t VALUES (2, 'not-a-uuid', NULL)",
 	)
 	// an UPPERCASE text value casts to the same 16 bytes (renders lowercase)
-	if v := castOne(t, db, "SELECT s::uuid FROM t WHERE id = 1"); v.Kind != ValUUID || v.str() != uuid16 {
+	if v := castOne(t, db, "SELECT s::uuid FROM t WHERE id = 1"); v.kind != ValUUID || v.str() != uuid16 {
 		t.Fatalf("s::uuid = %v, want the 16 bytes", v)
 	}
-	if v := castOne(t, db, "SELECT u::text FROM t WHERE id = 1"); v.Kind != ValText ||
+	if v := castOne(t, db, "SELECT u::text FROM t WHERE id = 1"); v.kind != ValText ||
 		v.str() != "550e8400-e29b-41d4-a716-446655440000" {
 		t.Fatalf("u::text = %v, want canonical lowercase", v)
 	}

@@ -1231,7 +1231,7 @@ func resolveRangeBound(b frameBound, kt dataType) (resolvedBound, error) {
 			}
 			return IntValue(e.Literal.Int), nil
 		case literalDecimal:
-			if e.Literal.Dec.Neg && !e.Literal.Dec.IsZero() {
+			if e.Literal.Dec.neg && !e.Literal.Dec.IsZero() {
 				return Value{}, newError(InvalidPrecedingOrFollowingSize,
 					"frame starting or ending offset must not be negative")
 			}

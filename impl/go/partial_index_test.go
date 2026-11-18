@@ -25,7 +25,7 @@ func TestPartialUniqueConstrainsOnlyQualifyingAndPersists(t *testing.T) {
 		t.Fatalf("two active rows sharing amt: want 23505, got %s", code)
 	}
 	// Round-trip: the v27 catalog re-parses the predicate, and it still enforces + exempts.
-	img, err := db.ToImage(256, 1)
+	img, err := db.toImage(256, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestPartialPlannerGatesOnPredicateConjunct(t *testing.T) {
 		rows := queryRows(t, db, sql)
 		var s string
 		for _, r := range rows {
-			s += r[2].Render() + "\n"
+			s += r[2].String() + "\n"
 		}
 		return s
 	}
@@ -66,7 +66,7 @@ func TestPartialPlannerGatesOnPredicateConjunct(t *testing.T) {
 	}
 	// Rows are correct either way (the residual filter re-applies the full WHERE).
 	rows := queryRows(t, db, "SELECT id FROM pt WHERE status = 'active' AND amt = 10")
-	if len(rows) != 1 || rows[0][0].Render() != "1" {
+	if len(rows) != 1 || rows[0][0].String() != "1" {
 		t.Fatalf("want only the active amt=10 row (id 1), got %v", rows)
 	}
 }
@@ -96,7 +96,7 @@ func TestPartialIntrospectionShowsPredicate(t *testing.T) {
 	mustExec(t, db, "CREATE INDEX ipart ON t (a) WHERE s = 'x'")
 	mustExec(t, db, "CREATE INDEX ifull ON t (a)")
 	part := queryRows(t, db, "SELECT predicate FROM jed_indexes WHERE name = 'ipart'")
-	if len(part) != 1 || !strings.Contains(part[0][0].Render(), "x") {
+	if len(part) != 1 || !strings.Contains(part[0][0].String(), "x") {
 		t.Fatalf("partial predicate text: got %v", part)
 	}
 	full := queryRows(t, db, "SELECT predicate FROM jed_indexes WHERE name = 'ifull'")

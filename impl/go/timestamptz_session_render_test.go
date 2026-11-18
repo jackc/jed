@@ -40,8 +40,8 @@ func TestSessionRenderFollowsTheCurrentZone(t *testing.T) {
 	db := dbWith(t)
 	v := sessionRenderOne(t, db, "SELECT ARRAY[timestamptz '2024-01-15 12:00:00+00', timestamptz 'infinity']")
 	// The default session zone is UTC: the session render equals the canonical render.
-	if got := mustSessionRender(t, db, v); got != v.Render() {
-		t.Fatalf("UTC session render %q, canonical %q", got, v.Render())
+	if got := mustSessionRender(t, db, v); got != v.String() {
+		t.Fatalf("UTC session render %q, canonical %q", got, v.String())
 	}
 	// The value is zone-free; the render reads the zone in effect when it is called. The POSIX
 	// fixed-offset spelling '+05:00' is UTC-5.
@@ -58,7 +58,7 @@ func TestSessionRenderFollowsTheCurrentZone(t *testing.T) {
 		t.Fatalf("-05:30: got %q, want %q", got, want)
 	}
 	// The canonical render stays zone-free whatever the session zone.
-	if got, want := v.Render(), `{"2024-01-15 12:00:00+00",infinity}`; got != want {
+	if got, want := v.String(), `{"2024-01-15 12:00:00+00",infinity}`; got != want {
 		t.Fatalf("canonical: got %q, want %q", got, want)
 	}
 	// A value with no timestamptz renders the same either way.
@@ -99,7 +99,7 @@ func TestSessionRenderAtTheInt64ExtremeIs22008(t *testing.T) {
 	// reading of a finite instant within five hours of it overflows (timezones.md §6).
 	db := dbWith(t)
 	v := sessionRenderOne(t, db, "SELECT timestamptz '294247-01-10 04:00:00+00'")
-	if got, want := v.Render(), "294247-01-10 04:00:00+00"; got != want {
+	if got, want := v.String(), "294247-01-10 04:00:00+00"; got != want {
 		t.Fatalf("canonical: got %q, want %q", got, want)
 	}
 	if err := db.SetTimeZone("-05:00"); err != nil {
@@ -131,7 +131,7 @@ func TestExplainKeepsTheCanonicalUTCConstant(t *testing.T) {
 	var lines []string
 	for _, r := range out.Rows {
 		for _, v := range r {
-			if v.Kind == ValText {
+			if v.kind == ValText {
 				lines = append(lines, v.str())
 			}
 		}

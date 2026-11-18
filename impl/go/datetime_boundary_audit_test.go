@@ -24,7 +24,7 @@ func TestTimestampFiniteBoundaryConstruction(t *testing.T) {
 		{"SELECT timestamp '294247-01-10 04:00:54.775806'", math.MaxInt64 - 1},
 	} {
 		rows := query(t, db, tc.sql)
-		if got := rows[0][0].Int; got != tc.want {
+		if got := rows[0][0].num; got != tc.want {
 			t.Errorf("%s: got %d, want %d", tc.sql, got, tc.want)
 		}
 	}
@@ -52,7 +52,7 @@ func TestDateTruncFiniteBoundary(t *testing.T) {
 		for _, unit := range []string{"microseconds", "milliseconds", "second"} {
 			sql := fmt.Sprintf("SELECT date_trunc('%s', %s '290309-12-21 19:59:06 BC')", unit, typ)
 			rows := query(t, db, sql)
-			if got := rows[0][0].Int; got != math.MinInt64+775808 {
+			if got := rows[0][0].num; got != math.MinInt64+775808 {
 				t.Errorf("%s: got %d", sql, got)
 			}
 		}
@@ -67,7 +67,7 @@ func TestTimestampMonthShiftPreservesEarliestFiniteSecond(t *testing.T) {
 		for _, shift := range []string{"- interval '1 month'", "+ interval '-1 month'"} {
 			sql := fmt.Sprintf("SELECT %s '290308-01-21 19:59:05.224193 BC' %s", typ, shift)
 			rows := query(t, db, sql)
-			if got := rows[0][0].Int; got != math.MinInt64+1 {
+			if got := rows[0][0].num; got != math.MinInt64+1 {
 				t.Errorf("%s: got %d, want %d", sql, got, int64(math.MinInt64+1))
 			}
 		}

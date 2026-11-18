@@ -31,6 +31,7 @@ import (
 	"iter"
 	"math"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 )
@@ -358,10 +359,10 @@ func (r *Rows) Int(col int) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if v.Kind != ValInt {
+	if v.kind != ValInt {
 		return 0, typeErr(v, "int")
 	}
-	return v.Int, nil
+	return v.num, nil
 }
 
 // Text returns column col as a string.
@@ -370,7 +371,7 @@ func (r *Rows) Text(col int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if v.Kind != ValText {
+	if v.kind != ValText {
 		return "", typeErr(v, "text")
 	}
 	return v.str(), nil
@@ -382,7 +383,7 @@ func (r *Rows) Bool(col int) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if v.Kind != ValBool {
+	if v.kind != ValBool {
 		return false, typeErr(v, "bool")
 	}
 	return v.boolVal(), nil
@@ -403,7 +404,7 @@ func (r *Rows) Bytes(col int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if v.Kind != ValBytea && v.Kind != ValUUID {
+	if v.kind != ValBytea && v.kind != ValUUID {
 		return nil, typeErr(v, "bytea")
 	}
 	return []byte(v.str()), nil
@@ -412,7 +413,7 @@ func (r *Rows) Bytes(col int) ([]byte, error) {
 // IsNull reports whether column col of the current row is SQL NULL.
 func (r *Rows) IsNull(col int) bool {
 	v, err := r.col(col)
-	return err == nil && v.Kind == ValNull
+	return err == nil && v.kind == ValNull
 }
 
 // Value returns column col of the current row as the raw engine Value (full fidelity).
@@ -559,7 +560,7 @@ type Null[T any] struct {
 
 // ScanJed receives a Value: NULL clears Valid, anything else scans into Val.
 func (n *Null[T]) ScanJed(v Value) error {
-	if v.Kind == ValNull {
+	if v.kind == ValNull {
 		var z T
 		n.Val, n.Valid = z, false
 		return nil
@@ -672,6 +673,12 @@ func toValue(a any) (Value, error) {
 
 // ───────────────────────────── scan conversion (Value → *T) ─────────────────────────────
 
+// Scan converts v into dest, a pointer, as Rows.Scan converts a column. Besides the Rows.Scan
+// destinations it accepts *ArrayVal for an array, *RangeVal for a range, *JSONNode for jsonb, and
+// *[]Value for a composite's fields; the result is a copy the caller may modify. NULL into a
+// plain pointer is an error: use *Null[T], *any, *Value, or a Scanner.
+func (v Value) Scan(dest any) error { return scanOne(v, dest) }
+
 func scanOne(v Value, dest any) error {
 	if s, ok := dest.(Scanner); ok {
 		return s.ScanJed(v)
@@ -694,7 +701,7 @@ func assignValue(v Value, dest any) error {
 	if s, ok := dest.(Scanner); ok {
 		return s.ScanJed(v)
 	}
-	if v.Kind == ValNull {
+	if v.kind == ValNull {
 		return fmt.Errorf("NULL into %T (use *jed.Null[T], *any, or a Scanner)", dest)
 	}
 	switch d := dest.(type) {
@@ -732,17 +739,17 @@ func assignValue(v Value, dest any) error {
 		}
 		*d = int16(n)
 	case *bool:
-		if v.Kind != ValBool {
+		if v.kind != ValBool {
 			return typeErr(v, "bool")
 		}
 		*d = v.boolVal()
 	case *string:
-		if v.Kind != ValText {
+		if v.kind != ValText {
 			return typeErr(v, "string")
 		}
 		*d = v.str()
 	case *[]byte:
-		if v.Kind != ValBytea && v.Kind != ValUUID {
+		if v.kind != ValBytea && v.kind != ValUUID {
 			return typeErr(v, "[]byte")
 		}
 		*d = []byte(v.str())
@@ -759,12 +766,12 @@ func assignValue(v Value, dest any) error {
 		}
 		*d = float32(f)
 	case *Decimal:
-		if v.Kind != ValDecimal {
+		if v.kind != ValDecimal {
 			return typeErr(v, "decimal")
 		}
 		*d = *v.decimal()
 	case *Interval:
-		if v.Kind != ValInterval {
+		if v.kind != ValInterval {
 			return typeErr(v, "interval")
 		}
 		*d = v.interval()
@@ -774,6 +781,27 @@ func assignValue(v Value, dest any) error {
 			return err
 		}
 		*d = t
+	case *ArrayVal:
+		if v.kind != ValArray {
+			return typeErr(v, "ArrayVal")
+		}
+		a := v.arrayVal()
+		*d = ArrayVal{Dims: slices.Clone(a.Dims), Lbounds: slices.Clone(a.Lbounds), Elements: slices.Clone(a.Elements)}
+	case *RangeVal:
+		if v.kind != ValRange {
+			return typeErr(v, "RangeVal")
+		}
+		*d = *v.rangeVal()
+	case *JSONNode:
+		if v.kind != ValJSONB {
+			return typeErr(v, "JSONNode")
+		}
+		*d = v.jsonb().clone()
+	case *[]Value:
+		if v.kind != ValComposite {
+			return typeErr(v, "[]Value")
+		}
+		*d = slices.Clone(*v.composite())
 	default:
 		return fmt.Errorf("unsupported Scan destination %T", dest)
 	}
@@ -781,11 +809,11 @@ func assignValue(v Value, dest any) error {
 }
 
 func valueToAny(v Value) any {
-	switch v.Kind {
+	switch v.kind {
 	case ValNull:
 		return nil
 	case ValInt:
-		return v.Int
+		return v.num
 	case ValBool:
 		return v.boolVal()
 	case ValText:
@@ -799,9 +827,9 @@ func valueToAny(v Value) any {
 	case ValInterval:
 		return v.interval()
 	case ValFloat32:
-		return v.F32()
+		return v.f32()
 	case ValFloat64:
-		return v.F64()
+		return v.f64()
 	case ValTimestamp, ValTimestamptz, ValDate:
 		// An infinite value has no time.Time form (asTime): it stays the raw Value.
 		if t, err := asTime(v); err == nil {
@@ -815,20 +843,20 @@ func valueToAny(v Value) any {
 }
 
 func asInt(v Value) (int64, error) {
-	if v.Kind != ValInt {
+	if v.kind != ValInt {
 		return 0, typeErr(v, "int")
 	}
-	return v.Int, nil
+	return v.num, nil
 }
 
 func asFloat(v Value) (float64, error) {
-	switch v.Kind {
+	switch v.kind {
 	case ValFloat64:
-		return v.F64(), nil
+		return v.f64(), nil
 	case ValFloat32:
-		return float64(v.F32()), nil
+		return float64(v.f32()), nil
 	case ValInt:
-		return float64(v.Int), nil
+		return float64(v.num), nil
 	default:
 		return 0, typeErr(v, "float")
 	}
@@ -840,13 +868,13 @@ func asFloat(v Value) (float64, error) {
 // date in the year ±292 277): Values() returns such a cell as its raw Value instead (valueToAny).
 func asTime(v Value) (time.Time, error) {
 	if isInfiniteTemporal(v) {
-		return time.Time{}, fmt.Errorf("cannot scan an infinite %s into time.Time", kindName(v.Kind))
+		return time.Time{}, fmt.Errorf("cannot scan an infinite %s into time.Time", kindName(v.kind))
 	}
-	switch v.Kind {
+	switch v.kind {
 	case ValTimestamp, ValTimestamptz:
-		return time.UnixMicro(v.Int).UTC(), nil
+		return time.UnixMicro(v.num).UTC(), nil
 	case ValDate:
-		return time.Unix(int64(int32(v.Int))*86400, 0).UTC(), nil
+		return time.Unix(int64(int32(v.num))*86400, 0).UTC(), nil
 	default:
 		return time.Time{}, typeErr(v, "time.Time")
 	}
@@ -854,11 +882,11 @@ func asTime(v Value) (time.Time, error) {
 
 // isInfiniteTemporal reports whether v is a ±infinity timestamp, timestamptz, or date.
 func isInfiniteTemporal(v Value) bool {
-	switch v.Kind {
+	switch v.kind {
 	case ValTimestamp, ValTimestamptz:
-		return v.Int == negInfinity || v.Int == posInfinity
+		return v.num == negInfinity || v.num == posInfinity
 	case ValDate:
-		return int32(v.Int) == dateNegInfinity || int32(v.Int) == datePosInfinity
+		return int32(v.num) == dateNegInfinity || int32(v.num) == datePosInfinity
 	default:
 		return false
 	}
@@ -901,7 +929,7 @@ func hostTimeParam(v Value, ty *scalarType) (Value, error) {
 			return TimestamptzValue(micros), err
 		}
 	}
-	return TimestamptzValue(v.Int), nil
+	return TimestamptzValue(v.num), nil
 }
 
 // UnixMicro wraps outside the i64 microsecond range. Verify the conversion
@@ -915,7 +943,7 @@ func checkedHostTimeMicros(t time.Time) (int64, error) {
 }
 
 func typeErr(v Value, want string) error {
-	return fmt.Errorf("cannot scan %s into %s", kindName(v.Kind), want)
+	return fmt.Errorf("cannot scan %s into %s", kindName(v.kind), want)
 }
 
 // kindName is a short label for a ValueKind, for Scan/typed-accessor error messages.

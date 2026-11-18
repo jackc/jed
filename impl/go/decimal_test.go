@@ -25,7 +25,7 @@ func mustRender(d Decimal, err error) string {
 	if err != nil {
 		panic(err)
 	}
-	return d.Render()
+	return d.String()
 }
 
 func TestDecimalRenderPreservesScale(t *testing.T) {
@@ -35,7 +35,7 @@ func TestDecimalRenderPreservesScale(t *testing.T) {
 		"-0.013": "-0.013", "123": "123", ".5": "0.5", "100": "100",
 	}
 	for in, want := range cases {
-		if got := dec(in).Render(); got != want {
+		if got := dec(in).String(); got != want {
 			t.Errorf("dec(%q).Render() = %q, want %q", in, got, want)
 		}
 	}
@@ -44,25 +44,25 @@ func TestDecimalRenderPreservesScale(t *testing.T) {
 func TestDecimalNoNegativeZero(t *testing.T) {
 	t.Parallel()
 	for _, s := range []string{"0", "-0", "-0.00"} {
-		if dec(s).Neg {
+		if dec(s).neg {
 			t.Errorf("dec(%q) should not be negative", s)
 		}
 	}
-	r, _ := dec("1.0").Sub(dec("1.0"))
-	if r.Render() != "0.0" || r.Neg {
-		t.Errorf("1.0 - 1.0 = %q neg=%v, want 0.0 +0", r.Render(), r.Neg)
+	r, _ := dec("1.0").subtract(dec("1.0"))
+	if r.String() != "0.0" || r.neg {
+		t.Errorf("1.0 - 1.0 = %q neg=%v, want 0.0 +0", r.String(), r.neg)
 	}
 }
 
 func TestDecimalValueEqualityIgnoresScale(t *testing.T) {
 	t.Parallel()
-	if dec("1.5").CmpValue(dec("1.50")) != 0 {
+	if dec("1.5").Cmp(dec("1.50")) != 0 {
 		t.Error("1.5 should equal 1.50 by value")
 	}
-	if dec("10").CmpValue(dec("10.0")) != 0 {
+	if dec("10").Cmp(dec("10.0")) != 0 {
 		t.Error("10 should equal 10.0 by value")
 	}
-	if dec("1.5").CmpValue(dec("1.6")) == 0 {
+	if dec("1.5").Cmp(dec("1.6")) == 0 {
 		t.Error("1.5 != 1.6")
 	}
 }
@@ -71,11 +71,11 @@ func TestDecimalOrdering(t *testing.T) {
 	t.Parallel()
 	asc := []string{"-10", "-1", "0", "0.5", "1", "10"}
 	for i := 0; i+1 < len(asc); i++ {
-		if dec(asc[i]).CmpValue(dec(asc[i+1])) >= 0 {
+		if dec(asc[i]).Cmp(dec(asc[i+1])) >= 0 {
 			t.Errorf("%s should be < %s", asc[i], asc[i+1])
 		}
 	}
-	if dec("1.23").CmpValue(dec("1.2")) <= 0 {
+	if dec("1.23").Cmp(dec("1.2")) <= 0 {
 		t.Error("1.23 should be > 1.2")
 	}
 }
@@ -88,10 +88,10 @@ func TestDecimalAddSubMul(t *testing.T) {
 			t.Errorf("got %q, want %q", got, want)
 		}
 	}
-	check(mustRender(dec("1.50").Add(dec("1.5"))), "3.00")
-	check(mustRender(dec("1.234").Sub(dec("1.2"))), "0.034")
-	check(mustRender(dec("1.50").Mul(dec("1.5"))), "2.250")
-	check(mustRender(dec("2.0").Mul(dec("3.000"))), "6.0000")
+	check(mustRender(dec("1.50").add(dec("1.5"))), "3.00")
+	check(mustRender(dec("1.234").subtract(dec("1.2"))), "0.034")
+	check(mustRender(dec("1.50").mul(dec("1.5"))), "2.250")
+	check(mustRender(dec("2.0").mul(dec("3.000"))), "6.0000")
 }
 
 func TestDecimalDivisionScaleAndRounding(t *testing.T) {
@@ -105,7 +105,7 @@ func TestDecimalDivisionScaleAndRounding(t *testing.T) {
 		{"100", "7", "14.2857142857142857"},
 	}
 	for _, c := range cases {
-		if got := mustRender(dec(c.a).Div(dec(c.b))); got != c.want {
+		if got := mustRender(dec(c.a).div(dec(c.b))); got != c.want {
 			t.Errorf("%s / %s = %q, want %q", c.a, c.b, got, c.want)
 		}
 	}
@@ -119,7 +119,7 @@ func TestDecimalModulo(t *testing.T) {
 		{"5.50", "2.0", "1.50"},
 	}
 	for _, c := range cases {
-		if got := mustRender(dec(c.a).Rem(dec(c.b))); got != c.want {
+		if got := mustRender(dec(c.a).rem(dec(c.b))); got != c.want {
 			t.Errorf("%s %% %s = %q, want %q", c.a, c.b, got, c.want)
 		}
 	}
@@ -140,7 +140,7 @@ func TestDecimalRoundingHalfAway(t *testing.T) {
 		{"9.5", 0, "10"},
 	}
 	for _, c := range cases {
-		if got := dec(c.in).RoundToScale(c.scale).Render(); got != c.render {
+		if got := dec(c.in).roundToScale(c.scale).String(); got != c.render {
 			t.Errorf("round(%s, %d) = %q, want %q", c.in, c.scale, got, c.render)
 		}
 	}
@@ -148,10 +148,10 @@ func TestDecimalRoundingHalfAway(t *testing.T) {
 
 func TestDecimalDivZeroTraps(t *testing.T) {
 	t.Parallel()
-	if _, err := dec("1").Div(dec("0")); err == nil || err.(*EngineError).Code() != "22012" {
+	if _, err := dec("1").div(dec("0")); err == nil || err.(*EngineError).Code() != "22012" {
 		t.Errorf("1/0 should trap 22012, got %v", err)
 	}
-	if _, err := dec("1").Rem(dec("0")); err == nil || err.(*EngineError).Code() != "22012" {
+	if _, err := dec("1").rem(dec("0")); err == nil || err.(*EngineError).Code() != "22012" {
 		t.Errorf("1%%0 should trap 22012, got %v", err)
 	}
 }
@@ -170,7 +170,7 @@ func TestDecimalToInt64Round(t *testing.T) {
 		{"100000000000000000000000000000", 0, false},
 	}
 	for _, c := range cases {
-		got, ok := dec(c.in).ToInt64Round()
+		got, ok := dec(c.in).toInt64Round()
 		if ok != c.ok || (ok && got != c.want) {
 			t.Errorf("%s.ToInt64Round() = (%d,%v), want (%d,%v)", c.in, got, ok, c.want, c.ok)
 		}
@@ -181,13 +181,13 @@ func TestDecimalCodecRoundTrip(t *testing.T) {
 	t.Parallel()
 	for _, s := range []string{"0", "1.50", "-12345.6789", "100000000.000001", "999999999999"} {
 		d := dec(s)
-		neg, scale, groups := d.ToCodec()
+		neg, scale, groups := d.toCodec()
 		back := decimalFromCodec(neg, scale, groups)
-		if back.Render() != d.Render() {
-			t.Errorf("codec round trip %s = %q", s, back.Render())
+		if back.String() != d.String() {
+			t.Errorf("codec round trip %s = %q", s, back.String())
 		}
 	}
-	if _, _, groups := dec("0.00").ToCodec(); len(groups) != 0 {
+	if _, _, groups := dec("0.00").toCodec(); len(groups) != 0 {
 		t.Error("zero should carry no groups")
 	}
 }
@@ -197,9 +197,9 @@ func TestDecimalBigMultiplicationExact(t *testing.T) {
 	// 38-digit * 38-digit (76 digits) fits no int128; the limb path is exact.
 	a := dec("12345678901234567890123456789012345678")
 	b := dec("99999999999999999999999999999999999999")
-	r, err := a.Mul(b)
-	if err != nil || r.Precision() != 76 {
-		t.Errorf("product precision = %d (err %v), want 76", r.Precision(), err)
+	r, err := a.mul(b)
+	if err != nil || r.precision() != 76 {
+		t.Errorf("product precision = %d (err %v), want 76", r.precision(), err)
 	}
 }
 
@@ -228,7 +228,7 @@ func decOne(t *testing.T, db dbHandle, sql string) string {
 	if len(rows) != 1 || len(rows[0]) != 1 {
 		t.Fatalf("%q: expected one cell, got %v", sql, rows)
 	}
-	return rows[0][0].Render()
+	return rows[0][0].String()
 }
 
 func TestDecimalOnDiskRoundTripEndToEnd(t *testing.T) {
@@ -238,7 +238,7 @@ func TestDecimalOnDiskRoundTripEndToEnd(t *testing.T) {
 		"CREATE TABLE t (id i32 PRIMARY KEY, money numeric(10,2), free numeric)",
 		"INSERT INTO t VALUES (1, 1.5, -12345.6789), (2, 0, 0.00), (3, 100, NULL)",
 	)
-	image, err := db.ToImage(8192, 1)
+	image, err := db.toImage(8192, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +246,7 @@ func TestDecimalOnDiskRoundTripEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	again, _ := loaded.ToImage(8192, 1)
+	again, _ := loaded.toImage(8192, 1)
 	if string(again) != string(image) {
 		t.Error("re-serialization is not byte-identical")
 	}
@@ -268,25 +268,25 @@ func TestDecimalOnDiskRoundTripEndToEnd(t *testing.T) {
 func TestSumAccumulatorChecksOnlyFinalCap(t *testing.T) {
 	t.Parallel()
 	a := decimalFromDigitsScale(false, strings.Repeat("9", decimalMaxIntDigits), 0)
-	if _, err := a.CheckCap(); err != nil {
+	if _, err := a.checkCap(); err != nil {
 		t.Fatalf("a should be exactly at the cap, got %v", err)
 	}
 	// Capped Add (standalone arithmetic) still traps at the cap — unchanged contract.
-	if _, err := a.Add(a); err == nil || err.(*EngineError).Code() != "22003" {
+	if _, err := a.add(a); err == nil || err.(*EngineError).Code() != "22003" {
 		t.Fatalf("a + a (capped) = %v, want 22003", err)
 	}
 	// Uncapped fold may exceed the cap intermediately and NOT trap...
-	over := a.AddUncapped(a) // 2·a, one digit over the cap
+	over := a.addUncapped(a) // 2·a, one digit over the cap
 	// ...then come back in range, so the FINAL check passes and the value is exact.
-	back, err := over.AddUncapped(a.Negate()).CheckCap()
+	back, err := over.addUncapped(a.negate()).checkCap()
 	if err != nil {
 		t.Fatalf("sum back in range should pass the final cap, got %v", err)
 	}
-	if back.CmpValue(a) != 0 {
-		t.Errorf("folded value = %s, want a", back.Render())
+	if back.Cmp(a) != 0 {
+		t.Errorf("folded value = %s, want a", back.String())
 	}
 	// A final result genuinely over the cap still traps 22003 (PG's make_result).
-	if _, err := over.CheckCap(); err == nil || err.(*EngineError).Code() != "22003" {
+	if _, err := over.checkCap(); err == nil || err.(*EngineError).Code() != "22003" {
 		t.Fatalf("over-cap final = %v, want 22003", err)
 	}
 }
@@ -345,30 +345,30 @@ func TestDecimalEncodeKeyOrderPreserving(t *testing.T) {
 	// The expected order is ss with the duplicate (1.5 == 1.50) collapsed in place; assert each
 	// adjacent pair is non-decreasing by CmpValue and that key order agrees.
 	for i := 1; i < len(byKey); i++ {
-		if byKey[i-1].CmpValue(byKey[i]) > 0 {
+		if byKey[i-1].Cmp(byKey[i]) > 0 {
 			t.Fatalf("key order disagrees with value order at %d: %s before %s",
-				i, byKey[i-1].Render(), byKey[i].Render())
+				i, byKey[i-1].String(), byKey[i].String())
 		}
 	}
 	// Scale-independence: equal values produce identical key bytes.
 	for _, p := range [][2]string{{"1.5", "1.50"}, {"100", "100.00"}, {"0", "0.000"}} {
-		if !bytesEqual(dec(p[0]).EncodeKey(), dec(p[1]).EncodeKey()) {
+		if !bytesEqual(dec(p[0]).encodeKey(), dec(p[1]).encodeKey()) {
 			t.Fatalf("scale-independence broken: %s vs %s", p[0], p[1])
 		}
 	}
 	// Zero is the single class byte; negatives sort below it, positives above.
-	if z := dec("0").EncodeKey(); len(z) != 1 || z[0] != 0x04 {
+	if z := dec("0").encodeKey(); len(z) != 1 || z[0] != 0x04 {
 		t.Fatalf("zero key = %v, want [4]", z)
 	}
-	if !(bytesCompare(dec("-1").EncodeKey(), dec("0").EncodeKey()) < 0) ||
-		!(bytesCompare(dec("0").EncodeKey(), dec("1").EncodeKey()) < 0) {
+	if !(bytesCompare(dec("-1").encodeKey(), dec("0").encodeKey()) < 0) ||
+		!(bytesCompare(dec("0").encodeKey(), dec("1").encodeKey()) < 0) {
 		t.Fatalf("sign-class ordering broken")
 	}
 }
 
 func sortDecimalsByKey(ds []Decimal) {
 	for i := 1; i < len(ds); i++ {
-		for j := i; j > 0 && bytesCompare(ds[j-1].EncodeKey(), ds[j].EncodeKey()) > 0; j-- {
+		for j := i; j > 0 && bytesCompare(ds[j-1].encodeKey(), ds[j].encodeKey()) > 0; j-- {
 			ds[j-1], ds[j] = ds[j], ds[j-1]
 		}
 	}
@@ -406,7 +406,7 @@ func TestDecimalEncodeKeyExactBytes(t *testing.T) {
 		"-1.5": {0x03, 0x7F, 0xFF, 0xFF, 0xFE, 0xFD, 0xCC, 0xFF},
 	}
 	for s, w := range want {
-		if got := dec(s).EncodeKey(); !bytesEqual(got, w) {
+		if got := dec(s).encodeKey(); !bytesEqual(got, w) {
 			t.Errorf("EncodeKey(%s) = % x, want % x", s, got, w)
 		}
 	}

@@ -304,7 +304,7 @@ func (db *engine) searchCycleRows(plan *searchCyclePlan, exprs []*rExpr, filter 
 			if err != nil {
 				return nil, 0, err
 			}
-			if v.Kind != ValBool || !v.boolVal() {
+			if v.kind != ValBool || !v.boolVal() {
 				continue
 			}
 		}

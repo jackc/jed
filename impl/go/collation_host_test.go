@@ -22,7 +22,7 @@ func texts(t *testing.T, rows [][]Value) []string {
 	t.Helper()
 	out := make([]string, len(rows))
 	for i, r := range rows {
-		if r[0].Kind != ValText {
+		if r[0].kind != ValText {
 			t.Fatalf("expected text, got %v", r[0])
 		}
 		out[i] = r[0].str()
@@ -431,7 +431,7 @@ func TestUpgradeCollationsClearsSkew(t *testing.T) {
 	skewed := *loaded
 	skewed.UnicodeVersion = "0.0.0"
 	db.engine.committed.collations["unicode"] = &skewed
-	image, err := db.ToImage(8192, 1)
+	image, err := db.toImage(8192, 1)
 	if err != nil {
 		t.Fatalf("serialize skewed statistics: %v", err)
 	}
@@ -536,7 +536,7 @@ func arrayTexts(t *testing.T, rows [][]Value) []string {
 	t.Helper()
 	out := make([]string, len(rows))
 	for i, r := range rows {
-		if r[0].Kind != ValArray {
+		if r[0].kind != ValArray {
 			t.Fatalf("expected an array, got %v", r[0])
 		}
 		out[i] = arrayOut(r[0].arrayVal())

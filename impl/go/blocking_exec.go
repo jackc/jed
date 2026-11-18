@@ -560,7 +560,7 @@ func (db *engine) blockingOrder(p *selectPlan, rows *rowSpool, env *evalEnv, m *
 			if err := chargeSortKey(m, key, k.collation); err != nil {
 				return err
 			}
-			if k.collation != nil && (key.Kind == ValText || key.Kind == ValArray) {
+			if k.collation != nil && (key.kind == ValText || key.kind == ValArray) {
 				b, err := collationSortKey(k.collation, key)
 				if err != nil {
 					return err

@@ -1250,19 +1250,19 @@ func pointPromotable(key, elem scalarType) bool {
 // already of the key's type, pass through unchanged.
 func pointValue(keyType scalarType, v Value) (Value, bool) {
 	switch {
-	case v.Kind == ValNull:
+	case v.kind == ValNull:
 		return v, true
-	case keyType.IsInteger() && v.Kind == ValInt:
-		return v, keyType.InRange(v.Int)
-	case keyType.IsInteger() && v.Kind == ValDecimal:
+	case keyType.IsInteger() && v.kind == ValInt:
+		return v, keyType.InRange(v.num)
+	case keyType.IsInteger() && v.kind == ValDecimal:
 		d := *v.decimal()
-		n, ok := d.ToInt64Round()
-		if !ok || decimalFromInt64(n).CmpValue(d) != 0 || !keyType.InRange(n) {
+		n, ok := d.toInt64Round()
+		if !ok || decimalFromInt64(n).Cmp(d) != 0 || !keyType.InRange(n) {
 			return Value{}, false
 		}
 		return IntValue(n), true
-	case keyType.IsDecimal() && v.Kind == ValInt:
-		return DecimalValue(decimalFromInt64(v.Int)), true
+	case keyType.IsDecimal() && v.kind == ValInt:
+		return DecimalValue(decimalFromInt64(v.num)), true
 	}
 	return v, true
 }
@@ -1305,7 +1305,7 @@ func arrayPointKeys(keyType scalarType, src *rExpr, params []Value, outer []stor
 			v = left[src.index]
 		}
 	}
-	if v.Kind != ValArray {
+	if v.kind != ValArray {
 		return nil, true
 	}
 	return valuePointKeys(keyType, v.arrayVal().Elements, coll), true
@@ -2870,7 +2870,7 @@ func arrayQueryTerms(strategy ginStrategy, elem scalarType, qv Value) ginQuery {
 		// so the bound is provably empty (gin.md §6). c may be a different numeric type than the
 		// elements (an integer against decimal[], a decimal against i32[]); ginQueryTerm converts it to
 		// the element type or reports that no element can equal it.
-		if qv.Kind == ValNull {
+		if qv.kind == ValNull {
 			return ginQuery{kind: ginQueryEmpty}
 		}
 		t, ok := ginQueryTerm(elem, qv)
@@ -2879,7 +2879,7 @@ func arrayQueryTerms(strategy ginStrategy, elem scalarType, qv Value) ginQuery {
 		}
 		terms = append(terms, t)
 	} else {
-		if qv.Kind != ValArray {
+		if qv.kind != ValArray {
 			return ginQuery{kind: ginQueryEmpty} // a NULL whole-array (or non-array) query → provably empty
 		}
 		// unmatchable: a query element no stored element can equal (an f64 not exactly an f32 against
@@ -2888,7 +2888,7 @@ func arrayQueryTerms(strategy ginStrategy, elem scalarType, qv Value) ginQuery {
 		unmatchable := false
 		seen := make(map[string]bool)
 		for _, el := range qv.arrayVal().Elements {
-			if el.Kind == ValNull {
+			if el.kind == ValNull {
 				hasNull = true // a NULL element carries no term
 				continue
 			}
@@ -2993,7 +2993,7 @@ func (db *engine) ginGather(store *tableStore, gb *ginBoundPlan, arms []*ginTree
 // falls back to the full scan, else the keys' terms ALL. The gather is lossy; the residual operator
 // rechecks every candidate.
 func jsonbQueryTerms(strategy ginStrategy, qv Value) ginQuery {
-	if qv.Kind == ValNull {
+	if qv.kind == ValNull {
 		return ginQuery{kind: ginQueryEmpty} // every strategy is strict: a NULL query operand matches nothing
 	}
 	var terms [][]byte
@@ -3002,7 +3002,7 @@ func jsonbQueryTerms(strategy ginStrategy, qv Value) ginQuery {
 		// `@?` / `@@` (gin.md §2.2): the tree PostgreSQL extracts from the path, or the full scan when
 		// nothing is extractable. The path text is a jsonpath value's canonical text, already compiled
 		// at resolve; a term never depends on the environment's casing table.
-		if qv.Kind != ValJSONPath {
+		if qv.kind != ValJSONPath {
 			return ginQuery{kind: ginQueryEmpty}
 		}
 		path, err := compile(qv.str(), nil)
@@ -3015,7 +3015,7 @@ func jsonbQueryTerms(strategy ginStrategy, qv Value) ginQuery {
 		}
 		return ginQuery{kind: ginQueryGather, tree: tree}
 	case ginJsonbContains:
-		if qv.Kind != ValJSONB {
+		if qv.kind != ValJSONB {
 			return ginQuery{kind: ginQueryEmpty}
 		}
 		terms = ginJsonbIndexTerms(qv.jsonb())
@@ -3023,16 +3023,16 @@ func jsonbQueryTerms(strategy ginStrategy, qv Value) ginQuery {
 			return ginQuery{kind: ginQueryFullScan} // a term-less Q is contained by rows the index cannot enumerate
 		}
 	case ginJsonbExists:
-		if qv.Kind != ValText {
+		if qv.kind != ValText {
 			return ginQuery{kind: ginQueryEmpty}
 		}
 		terms = [][]byte{ginJsonbKeyTerm(qv.str())}
 	default: // ginJsonbExistsAny / ginJsonbExistsAll — a text[] of keys
-		if qv.Kind != ValArray {
+		if qv.kind != ValArray {
 			return ginQuery{kind: ginQueryEmpty}
 		}
 		for _, el := range qv.arrayVal().Elements {
-			if el.Kind == ValNull {
+			if el.kind == ValNull {
 				continue // a NULL key is skipped (json-sql-functions.md §1.2)
 			}
 			terms = append(terms, ginJsonbKeyTerm(el.str()))
@@ -3063,29 +3063,29 @@ func jsonbQueryTerms(strategy ginStrategy, qv Value) ginQuery {
 // takes the shared element term (ginElementTerm), which never collates or fails.
 func ginQueryTerm(elem scalarType, v Value) ([]byte, bool) {
 	switch {
-	case elem == scalarDecimal && v.Kind == ValInt:
-		return ginElementTerm(elem, DecimalValue(decimalFromInt64(v.Int))), true
-	case elem.IsInteger() && v.Kind == ValDecimal:
+	case elem == scalarDecimal && v.kind == ValInt:
+		return ginElementTerm(elem, DecimalValue(decimalFromInt64(v.num))), true
+	case elem.IsInteger() && v.kind == ValDecimal:
 		d := *v.decimal()
-		if d.TruncToScale(0).CmpValue(d) != 0 {
+		if d.truncToScale(0).Cmp(d) != 0 {
 			return nil, false
 		}
-		n, ok := d.ToInt64Round()
+		n, ok := d.toInt64Round()
 		if !ok || !elem.InRange(n) {
 			return nil, false
 		}
 		return ginElementTerm(elem, IntValue(n)), true
-	case elem.IsInteger() && v.Kind == ValInt && !elem.InRange(v.Int):
+	case elem.IsInteger() && v.kind == ValInt && !elem.InRange(v.num):
 		return nil, false
-	case elem == scalarFloat32 && v.Kind == ValFloat64:
-		x := v.F64()
+	case elem == scalarFloat32 && v.kind == ValFloat64:
+		x := v.f64()
 		narrowed := float32(x)
 		if !math.IsNaN(x) && float64(narrowed) != x {
 			return nil, false
 		}
 		return encodeFloat32Key(math.Float32bits(narrowed)), true
-	case elem == scalarFloat64 && v.Kind == ValFloat32:
-		return encodeFloat64Key(math.Float64bits(float64(v.F32()))), true
+	case elem == scalarFloat64 && v.kind == ValFloat32:
+		return encodeFloat64Key(math.Float64bits(float64(v.f32()))), true
 	}
 	return ginElementTerm(elem, v), true
 }
@@ -3115,7 +3115,7 @@ func (db *engine) gistBoundRows(tableName string, gb *gistBoundPlan, query *rExp
 	var gq gistQuery
 	if gb.strategy == gistEqual {
 		// scalar `=` (gist.md §6): encode the constant to its order-preserving key bytes.
-		if qv.Kind == ValNull {
+		if qv.kind == ValNull {
 			return nil, 0, 0, nil
 		}
 		k, e := encodeKeyValue(gb.scalarType, qv, nil)
@@ -3124,7 +3124,7 @@ func (db *engine) gistBoundRows(tableName string, gb *gistBoundPlan, query *rExp
 		}
 		gq = gistQuery{skey: k}
 	} else {
-		if qv.Kind != ValRange {
+		if qv.kind != ValRange {
 			return nil, 0, 0, nil // a NULL (or non-range) query is never TRUE (both && and @>)
 		}
 		qr := qv.rangeVal()
@@ -3676,13 +3676,13 @@ func encodeBoundKey(pkType scalarType, src *rExpr, params []Value, outer []store
 	case reConstBytea:
 		return encodeTerminated(src.cBytea), false, true
 	case reConstDecimal:
-		return src.cDec.EncodeKey(), false, true
+		return src.cDec.encodeKey(), false, true
 	case reConstFloat32:
 		return encodeFloat32Key(math.Float32bits(float32(src.cFloat))), false, true
 	case reConstFloat64:
 		return encodeFloat64Key(math.Float64bits(src.cFloat)), false, true
 	case reConstInterval:
-		return src.cIv.EncodeKey(), false, true
+		return src.cIv.encodeKey(), false, true
 	case reParam:
 		return encodeValueKey(pkType, params[src.index], coll)
 	case reOuterColumn:
@@ -3734,7 +3734,7 @@ func encodeValueKey(pkType scalarType, v Value, coll *compiledCollation) (key []
 	// type, as an `= ANY` element is (pointValue, cost.md §3): an integer is the equal decimal; a
 	// decimal is that integer when it is integral and in range, else it equals no key (ok=false: an
 	// empty equality, a dropped range half-bound).
-	if (pkType.IsDecimal() && v.Kind == ValInt) || (pkType.IsInteger() && v.Kind == ValDecimal) {
+	if (pkType.IsDecimal() && v.kind == ValInt) || (pkType.IsInteger() && v.kind == ValDecimal) {
 		pv, ok := pointValue(pkType, v)
 		if !ok {
 			return nil, false, false
@@ -3751,30 +3751,30 @@ func encodeValueKey(pkType scalarType, v Value, coll *compiledCollation) (key []
 	case pkType.IsBytea():
 		return encodeTerminated([]byte(v.str())), false, true
 	case pkType.IsDecimal():
-		if v.Kind != ValDecimal {
+		if v.kind != ValDecimal {
 			return nil, false, false // mismatched param kind: drop this half-bound (sound widening)
 		}
-		return v.decimal().EncodeKey(), false, true
+		return v.decimal().encodeKey(), false, true
 	case pkType.IsInterval():
-		if v.Kind != ValInterval {
+		if v.kind != ValInterval {
 			return nil, false, false // mismatched param kind: drop this half-bound (sound widening)
 		}
-		return v.interval().EncodeKey(), false, true
+		return v.interval().encodeKey(), false, true
 	case pkType.IsFloat():
-		if pkType == scalarFloat32 && v.Kind == ValFloat32 {
-			return encodeFloat32Key(math.Float32bits(v.F32())), false, true
+		if pkType == scalarFloat32 && v.kind == ValFloat32 {
+			return encodeFloat32Key(math.Float32bits(v.f32())), false, true
 		}
-		if pkType == scalarFloat64 && v.Kind == ValFloat64 {
-			return encodeFloat64Key(math.Float64bits(v.F64())), false, true
+		if pkType == scalarFloat64 && v.kind == ValFloat64 {
+			return encodeFloat64Key(math.Float64bits(v.f64())), false, true
 		}
 		return nil, false, false
 	case pkType.IsInteger():
-		if !pkType.InRange(v.Int) {
+		if !pkType.InRange(v.num) {
 			return nil, false, false
 		}
-		return encodeInt(pkType, v.Int), false, true
+		return encodeInt(pkType, v.num), false, true
 	default: // timestamp / timestamptz / date
-		return encodeInt(pkType, v.Int), false, true
+		return encodeInt(pkType, v.num), false, true
 	}
 }
 

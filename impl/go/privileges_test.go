@@ -132,7 +132,7 @@ func TestLeastGreatestCarryNoExecutePrivilege(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LEAST/GREATEST must not require function EXECUTE: %v", err)
 	}
-	if out.Rows[0][0].Int != 1 || out.Rows[0][1].Int != 3 {
+	if out.Rows[0][0].num != 1 || out.Rows[0][1].num != 3 {
 		t.Fatalf("got %v want [[1 3]]", out.Rows)
 	}
 }

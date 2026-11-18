@@ -91,22 +91,22 @@ func TestLiteralBeyondI32ToBoolOverflows(t *testing.T) {
 func TestBoolI32RoundTripSmoke(t *testing.T) {
 	t.Parallel()
 	db := mustSession(memDB(), SessionOptions{})
-	if v := castOne(t, db, "SELECT CAST(TRUE AS i32)"); v.Kind != ValInt || v.Int != 1 {
+	if v := castOne(t, db, "SELECT CAST(TRUE AS i32)"); v.kind != ValInt || v.num != 1 {
 		t.Fatalf("CAST(TRUE AS i32) = %v, want 1", v)
 	}
-	if v := castOne(t, db, "SELECT FALSE::int"); v.Kind != ValInt || v.Int != 0 {
+	if v := castOne(t, db, "SELECT FALSE::int"); v.kind != ValInt || v.num != 0 {
 		t.Fatalf("FALSE::int = %v, want 0", v)
 	}
-	if v := castOne(t, db, "SELECT CAST(0 AS boolean)"); v.Kind != ValBool || v.boolVal() {
+	if v := castOne(t, db, "SELECT CAST(0 AS boolean)"); v.kind != ValBool || v.boolVal() {
 		t.Fatalf("CAST(0 AS boolean) = %v, want false", v)
 	}
-	if v := castOne(t, db, "SELECT (-7)::boolean"); v.Kind != ValBool || !v.boolVal() {
+	if v := castOne(t, db, "SELECT (-7)::boolean"); v.kind != ValBool || !v.boolVal() {
 		t.Fatalf("(-7)::boolean = %v, want true", v)
 	}
-	if v := castOne(t, db, "SELECT CAST(NULL AS boolean)"); v.Kind != ValNull {
+	if v := castOne(t, db, "SELECT CAST(NULL AS boolean)"); v.kind != ValNull {
 		t.Fatalf("CAST(NULL AS boolean) = %v, want NULL", v)
 	}
-	if v := castOne(t, db, "SELECT 7::boolean::int"); v.Kind != ValInt || v.Int != 1 {
+	if v := castOne(t, db, "SELECT 7::boolean::int"); v.kind != ValInt || v.num != 1 {
 		t.Fatalf("7::boolean::int = %v, want 1", v)
 	}
 }

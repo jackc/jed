@@ -224,10 +224,10 @@ func (f *hostFuncEntry) callBatch(args [][]Value, n int) ([]Value, error) {
 // only ever sees values of its declared types. needed is false when v is already of that type.
 func (f *hostFuncEntry) coerceArg(i int, v Value) (out Value, needed bool) {
 	switch {
-	case f.argTypes[i] == scalarDecimal && v.Kind == ValInt:
-		return DecimalValue(decimalFromInt64(v.Int)), true
-	case f.argTypes[i] == scalarFloat64 && v.Kind == ValFloat32:
-		return Float64Value(float64(v.F32())), true
+	case f.argTypes[i] == scalarDecimal && v.kind == ValInt:
+		return DecimalValue(decimalFromInt64(v.num)), true
+	case f.argTypes[i] == scalarFloat64 && v.kind == ValFloat32:
+		return Float64Value(float64(v.f32())), true
 	}
 	return v, false
 }
@@ -398,7 +398,7 @@ func sameHostSig(a, b []scalarType) bool {
 // the host owns its consequences, CLAUDE.md §13, but jed's codecs/comparators must never see a type
 // violation). NULL is always valid (a strict function may still return NULL for non-null args).
 func valueMatchesResult(v Value, ty scalarType) bool {
-	switch v.Kind {
+	switch v.kind {
 	case ValNull:
 		return true
 	case ValInt:

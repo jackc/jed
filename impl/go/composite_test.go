@@ -77,7 +77,7 @@ func queryRendered(t *testing.T, db dbHandle, sql string) [][]string {
 	for i, r := range rows {
 		out[i] = make([]string, len(r))
 		for j, v := range r {
-			out[i][j] = v.Render()
+			out[i][j] = v.String()
 		}
 	}
 	return out
@@ -111,7 +111,7 @@ func TestCompositeValuesPersistThroughImage(t *testing.T) {
 	runComposite(t, db, "CREATE TABLE p (id i32 PRIMARY KEY, home addr)")
 	runComposite(t, db, "INSERT INTO p VALUES (1, ROW('Main', 90210))")
 	runComposite(t, db, "INSERT INTO p VALUES (2, ROW('Oak', NULL))")
-	image, err := db.ToImage(256, 1)
+	image, err := db.toImage(256, 1)
 	if err != nil {
 		t.Fatalf("serialize: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestTypesPersistThroughImage(t *testing.T) {
 	runComposite(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, n i32)")
 	runComposite(t, db, "INSERT INTO t VALUES (1, 10)")
 
-	image, err := db.ToImage(256, 1)
+	image, err := db.toImage(256, 1)
 	if err != nil {
 		t.Fatalf("serialize: %v", err)
 	}
@@ -301,7 +301,7 @@ func TestCompositeWithArrayFieldImageRoundtrip(t *testing.T) {
 	runComposite(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, p poly)")
 	runComposite(t, db, "INSERT INTO t VALUES (1, ROW('a', ARRAY[1, 2, 3]))")
 	runComposite(t, db, "INSERT INTO t VALUES (2, ROW('b', NULL))")
-	image, err := db.ToImage(256, 1)
+	image, err := db.toImage(256, 1)
 	if err != nil {
 		t.Fatalf("serialize: %v", err)
 	}
@@ -329,7 +329,7 @@ func TestCompositeWithArrayOfCompositeField(t *testing.T) {
 	runComposite(t, db, "CREATE TYPE person AS (name text, homes addr[])")
 	runComposite(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, who person)")
 	runComposite(t, db, `INSERT INTO t VALUES (1, ROW('jo', '{"(Main,1)","(Oak,2)"}'))`)
-	image, err := db.ToImage(256, 1)
+	image, err := db.toImage(256, 1)
 	if err != nil {
 		t.Fatalf("serialize: %v", err)
 	}

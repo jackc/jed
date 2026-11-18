@@ -23,8 +23,8 @@ func TestCreateTableAsBindsParameters(t *testing.T) {
 	}
 	rows := queryRows(t, sess, "SELECT id, name, tag FROM t ORDER BY id")
 	if len(rows) != 2 ||
-		rows[0][0].Int != 2 || rows[0][1].str() != "b" || rows[0][2].str() != "x" ||
-		rows[1][0].Int != 3 || rows[1][1].str() != "c" || rows[1][2].str() != "x" {
+		rows[0][0].num != 2 || rows[0][1].str() != "b" || rows[0][2].str() != "x" ||
+		rows[1][0].num != 3 || rows[1][1].str() != "c" || rows[1][2].str() != "x" {
 		t.Fatalf("t rows = %v, want (2,b,x), (3,c,x)", rows)
 	}
 	// A missing parameter is the query's own count mismatch, and nothing is created.
@@ -69,7 +69,7 @@ func TestCreateTableAsBindsParameters(t *testing.T) {
 	if _, err := queryOutcome(sess, sql, []Value{IntValue(1)}); err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
-	if rows := queryRows(t, sess, "SELECT id FROM y"); len(rows) != 1 || rows[0][0].Int != 1 {
+	if rows := queryRows(t, sess, "SELECT id FROM y"); len(rows) != 1 || rows[0][0].num != 1 {
 		t.Fatalf("y rows = %v, want (1)", rows)
 	}
 	// The column-definition form is plain DDL: it takes no parameters.

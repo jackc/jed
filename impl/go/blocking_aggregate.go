@@ -77,16 +77,16 @@ func blockingAccInto(a *acc, spec aggSpec, r storedRow, zone zoneRef) {
 	*a = acc{plan: spec.plan, jsonTypes: spec.jsonTypes, jsonZone: zone}
 	switch spec.plan {
 	case planCountStar, planCount:
-		a.count = r[0].Int
+		a.count = r[0].num
 	case planSumInt:
-		a.sumInt = r[0].Int
+		a.sumInt = r[0].num
 		a.seen = r[1].boolVal()
 	case planSumDecimal:
 		a.sumDec = *r[0].decimal()
 		a.seen = r[1].boolVal()
 	case planAvg:
 		a.sumDec = *r[0].decimal()
-		a.count = r[1].Int
+		a.count = r[1].num
 	case planMin, planMax:
 		a.collation = spec.collation
 		if !r[0].IsNull() {
@@ -102,19 +102,19 @@ func blockingAccFromRow(spec aggSpec, r storedRow, zone zoneRef) *acc {
 	}
 	switch a.plan {
 	case planCountStar, planCount, planRegrCount:
-		a.count = r[0].Int
+		a.count = r[0].num
 	case planSumInt:
-		a.sumInt = r[0].Int
+		a.sumInt = r[0].num
 		a.seen = r[1].boolVal()
 	case planSumDecimal:
 		a.sumDec = *r[0].decimal()
 		a.seen = r[1].boolVal()
 	case planAvg:
 		a.sumDec = *r[0].decimal()
-		a.count = r[1].Int
+		a.count = r[1].num
 	case planSumFloat32, planSumFloat64, planAvgFloat32, planAvgFloat64:
 		f := a.floatSum
-		f.total, f.count = r[0].F64(), r[1].Int
+		f.total, f.count = r[0].f64(), r[1].num
 		f.sawNaN, f.sawPosInf, f.sawNegInf = r[2].boolVal(), r[3].boolVal(), r[4].boolVal()
 	case planMin, planMax, planBoolAnd, planBoolOr, planBitAnd, planBitOr, planBitXor:
 		if !r[0].IsNull() {
@@ -125,17 +125,17 @@ func blockingAccFromRow(spec aggSpec, r storedRow, zone zoneRef) *acc {
 		planArrayAgg, planStringAgg:
 		a.seen = r[0].boolVal()
 	case planVarPop, planVarSamp, planStddevSamp, planStddevPop:
-		a.exact = momentsExact{n: r[0].Int, sx: *r[1].decimal(), sxx: *r[2].decimal()}
+		a.exact = momentsExact{n: r[0].num, sx: *r[1].decimal(), sxx: *r[2].decimal()}
 	case planVarPopFloat, planVarSampFloat, planStddevSampFloat, planStddevPopFloat:
-		a.float = momentsFloat{n: r[0].F64(), sx: r[1].F64(), sxx: r[2].F64()}
+		a.float = momentsFloat{n: r[0].f64(), sx: r[1].f64(), sxx: r[2].f64()}
 	case planCovarPop, planCovarSamp, planCorr, planRegrAvgx, planRegrAvgy, planRegrSxx, planRegrSyy, planRegrSxy, planRegrSlope, planRegrIntercept, planRegrR2:
-		a.pairs = pairsFloat{n: r[0].F64(), sx: r[1].F64(), sxx: r[2].F64(), sy: r[3].F64(), syy: r[4].F64(), sxy: r[5].F64()}
+		a.pairs = pairsFloat{n: r[0].f64(), sx: r[1].f64(), sxx: r[2].f64(), sy: r[3].f64(), syy: r[4].f64(), sxy: r[5].f64()}
 	case planArrayAggArray:
 		a.seen = r[0].boolVal()
-		if n := int(r[1].Int); n > 0 {
+		if n := int(r[1].num); n > 0 {
 			a.arrDims, a.arrLbounds = make([]int, n), make([]int32, n)
 			for i := 0; i < n; i++ {
-				a.arrDims[i], a.arrLbounds[i] = int(r[2+2*i].Int), int32(r[3+2*i].Int)
+				a.arrDims[i], a.arrLbounds[i] = int(r[2+2*i].num), int32(r[3+2*i].num)
 			}
 		}
 	}
@@ -227,14 +227,14 @@ func (db *engine) blockingAggregate(p *selectPlan, rows *rowSpool, env *evalEnv,
 						return err
 					}
 				}
-				group := uint64(state[0].Int)
+				group := uint64(state[0].num)
 				for si, spec := range p.aggSpecs {
 					if spec.filter != nil {
 						v, err := spec.filter.eval(row, env, m)
 						if err != nil {
 							return err
 						}
-						if !v.IsTrue() {
+						if !v.isTrue() {
 							continue
 						}
 					}
@@ -317,7 +317,7 @@ func (db *engine) blockingAggregate(p *selectPlan, rows *rowSpool, env *evalEnv,
 				if err != nil {
 					return err
 				}
-				group := uint64(state[0].Int)
+				group := uint64(state[0].num)
 				out := make(storedRow, 0, len(p.groupKeys)+len(p.aggSpecs)+len(p.groupingSpecs))
 				for _, src := range gs.slotSrc {
 					if src < 0 {
@@ -741,6 +741,6 @@ func (db *engine) blockingOrderedSet(a *acc, fraction *Value, collections *hashR
 			}
 			return IntervalValue(v), nil
 		}
-		return Float64Value(lo.F64() + (position-float64(first))*(hi.F64()-lo.F64())), nil
+		return Float64Value(lo.f64() + (position-float64(first))*(hi.f64()-lo.f64())), nil
 	})
 }

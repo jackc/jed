@@ -22,7 +22,7 @@ func countVia(t *testing.T, db *Database) int64 {
 	if err != nil {
 		t.Fatalf("count query: %v", err)
 	}
-	return out.Rows[0][0].Int
+	return out.Rows[0][0].num
 }
 
 func TestFileBackedRoundtripAndReopen(t *testing.T) {

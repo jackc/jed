@@ -135,14 +135,14 @@ func TestFileStorageLimitMeasuresLivePages(t *testing.T) {
 		t.Fatalf("full storage %d", full)
 	}
 	// A delete lowers the measure at once; the file keeps its high-water and free pages.
-	highWater := db.PageCount()
+	highWater := db.pageHighWater()
 	storageExec(t, s, "DELETE FROM t WHERE id >= 100")
 	half := mustStorageBytes(t, db, "main")
 	if half >= full {
 		t.Fatalf("storage after delete %d, want < %d", half, full)
 	}
-	if db.PageCount() < highWater {
-		t.Fatalf("page count %d fell below the high-water %d", db.PageCount(), highWater)
+	if db.pageHighWater() < highWater {
+		t.Fatalf("page count %d fell below the high-water %d", db.pageHighWater(), highWater)
 	}
 
 	// The setter limits the file from the next commit; a rejected commit writes nothing.

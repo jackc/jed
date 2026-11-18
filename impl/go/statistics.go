@@ -539,33 +539,33 @@ func statisticsValueBlindRows(current *currentColumnStatistics, op binaryOp, rel
 // Other mismatched families use the deterministic row-count fallback instead of entering a key
 // encoder whose value/type agreement is an internal invariant.
 func statisticsKeyValue(value Value, ty dataType) (Value, bool) {
-	if value.Kind == ValNull {
+	if value.kind == ValNull {
 		return Value{}, false
 	}
 	if ty.Range != nil {
-		return value, value.Kind == ValRange
+		return value, value.kind == ValRange
 	}
 	if ty.Comp != nil || ty.Array != nil || ty.Record != nil {
 		return Value{}, false
 	}
-	if ty.Scalar == scalarDecimal && value.Kind == ValInt {
-		return DecimalValue(decimalFromInt64(value.Int)), true
+	if ty.Scalar == scalarDecimal && value.kind == ValInt {
+		return DecimalValue(decimalFromInt64(value.num)), true
 	}
-	ok := (ty.Scalar.IsInteger() && value.Kind == ValInt) ||
-		(ty.Scalar == scalarBool && value.Kind == ValBool) ||
-		(ty.Scalar == scalarText && value.Kind == ValText) ||
-		(ty.Scalar == scalarDecimal && value.Kind == ValDecimal) ||
-		(ty.Scalar == scalarBytea && value.Kind == ValBytea) ||
-		(ty.Scalar == scalarUuid && value.Kind == ValUUID) ||
-		(ty.Scalar == scalarTimestamp && value.Kind == ValTimestamp) ||
-		(ty.Scalar == scalarTimestamptz && value.Kind == ValTimestamptz) ||
-		(ty.Scalar == scalarDate && value.Kind == ValDate) ||
-		(ty.Scalar == scalarInterval && value.Kind == ValInterval) ||
-		(ty.Scalar == scalarFloat32 && value.Kind == ValFloat32) ||
-		(ty.Scalar == scalarFloat64 && value.Kind == ValFloat64) ||
-		(ty.Scalar == scalarJson && value.Kind == ValJSON) ||
-		(ty.Scalar == scalarJsonb && value.Kind == ValJSONB) ||
-		(ty.Scalar == scalarJsonPath && value.Kind == ValJSONPath)
+	ok := (ty.Scalar.IsInteger() && value.kind == ValInt) ||
+		(ty.Scalar == scalarBool && value.kind == ValBool) ||
+		(ty.Scalar == scalarText && value.kind == ValText) ||
+		(ty.Scalar == scalarDecimal && value.kind == ValDecimal) ||
+		(ty.Scalar == scalarBytea && value.kind == ValBytea) ||
+		(ty.Scalar == scalarUuid && value.kind == ValUUID) ||
+		(ty.Scalar == scalarTimestamp && value.kind == ValTimestamp) ||
+		(ty.Scalar == scalarTimestamptz && value.kind == ValTimestamptz) ||
+		(ty.Scalar == scalarDate && value.kind == ValDate) ||
+		(ty.Scalar == scalarInterval && value.kind == ValInterval) ||
+		(ty.Scalar == scalarFloat32 && value.kind == ValFloat32) ||
+		(ty.Scalar == scalarFloat64 && value.kind == ValFloat64) ||
+		(ty.Scalar == scalarJson && value.kind == ValJSON) ||
+		(ty.Scalar == scalarJsonb && value.kind == ValJSONB) ||
+		(ty.Scalar == scalarJsonPath && value.kind == ValJSONPath)
 	return value, ok
 }
 
@@ -804,7 +804,7 @@ func (db *engine) statisticsLeafSelectivity(expr *rExpr, rel scopeRel) (selectiv
 		}
 		seen, rows, hasNull := make(map[string]bool), int64(0), false
 		for _, value := range expr.list {
-			if value.Kind == ValNull {
+			if value.kind == ValNull {
 				hasNull = true
 				continue
 			}
@@ -1411,7 +1411,7 @@ func (db *engine) executeAnalyze(analyze *analyzeStmt) (outcome, error) {
 			if analyzedRows < math.MaxInt64 {
 				analyzedRows++
 			}
-			if value.Kind == ValNull {
+			if value.kind == ValNull {
 				if nullCount < math.MaxInt64 {
 					nullCount++
 				}

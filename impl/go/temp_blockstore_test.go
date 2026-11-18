@@ -94,7 +94,7 @@ func TestSessionLocalTempZeroFileWrites(t *testing.T) {
 	}
 	mustExec(t, db, "CREATE TABLE p (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO p VALUES (1)")
-	baseTxid, basePages := db.Txid(), db.PageCount()
+	baseTxid, basePages := db.txid(), db.pageHighWater()
 
 	mustExec(t, db, "CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)")
 	pad := strings.Repeat("q", 40)
@@ -104,9 +104,9 @@ func TestSessionLocalTempZeroFileWrites(t *testing.T) {
 	for k := 0; k < 40; k++ {
 		mustExec(t, db, fmt.Sprintf("UPDATE lt SET pad = 'u%d' WHERE id = 20", k))
 	}
-	if db.Txid() != baseTxid || db.PageCount() != basePages {
+	if db.txid() != baseTxid || db.pageHighWater() != basePages {
 		t.Fatalf("session-local temp writes touched the file: txid %d->%d, pageCount %d->%d",
-			baseTxid, db.Txid(), basePages, db.PageCount())
+			baseTxid, db.txid(), basePages, db.pageHighWater())
 	}
 	// The temp data is nonetheless present and correct (it lives in the temp store).
 	if n := len(queryRows(t, db, "SELECT id FROM lt")); n != 40 {

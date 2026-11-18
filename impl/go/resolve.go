@@ -1135,7 +1135,7 @@ func bindParamsWithLabels(supplied []Value, types []colType, labels []string, iz
 // such value is ever compared, stored, or rendered. The ergonomic binder (toValue) checks a Go string
 // the same way; this covers a Value a host builds itself.
 func checkHostParam(v Value) error {
-	switch v.Kind {
+	switch v.kind {
 	case ValText:
 		_, err := decodeUTF8Text(v.str())
 		return err
@@ -1168,7 +1168,7 @@ func checkHostParam(v Value) error {
 // a Go []time.Time (every element a host time) re-coerces each element to the array's scalar element
 // type; any other value is returned as is.
 func hostTimeArrayParam(v Value, ty colType) (Value, error) {
-	if v.Kind != ValArray || ty.Elem == nil || !ty.Elem.isScalar() {
+	if v.kind != ValArray || ty.Elem == nil || !ty.Elem.isScalar() {
 		return v, nil
 	}
 	elems := v.arrayVal().Elements
@@ -1198,7 +1198,7 @@ func hostTimeArrayParam(v Value, ty colType) (Value, error) {
 // assigned to the type is; a range value is canonicalized as a range constructor's result is; every
 // other value takes the storage coercion of a column of the type.
 func bindContainerParam(v Value, ty colType, label string, iz *inputZone) (Value, error) {
-	if v.Kind == ValText {
+	if v.kind == ValText {
 		switch {
 		case ty.Elem != nil:
 			return coerceStringToArray(v.str(), *ty.Elem, iz)
@@ -1213,7 +1213,7 @@ func bindContainerParam(v Value, ty colType, label string, iz *inputZone) (Value
 			return coerceRecordTextToValue(v.str(), ty, iz)
 		}
 	}
-	if v.Kind == ValRange && ty.RangeElem != nil {
+	if v.kind == ValRange && ty.RangeElem != nil {
 		rv := v.rangeVal()
 		if rv.Empty {
 			return v, nil
@@ -2740,7 +2740,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 			if ctx != nil && ctx.IsFloat() {
 				return floatConstFromDecimal(e.Literal.Dec, *ctx)
 			}
-			d, err := e.Literal.Dec.CheckCap()
+			d, err := e.Literal.Dec.checkCap()
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -4463,7 +4463,7 @@ func collatedArrayCmp(coll *compiledCollation, a, b *ArrayVal, m *costMeter) (in
 	}
 	for i := 0; i < n; i++ {
 		x, y := a.Elements[i], b.Elements[i]
-		xn, yn := x.Kind == ValNull, y.Kind == ValNull
+		xn, yn := x.kind == ValNull, y.kind == ValNull
 		switch {
 		case xn && yn:
 			continue
@@ -4493,7 +4493,7 @@ func collatedArrayCmp(coll *compiledCollation, a, b *ArrayVal, m *costMeter) (in
 // text value's UCA sort key, a text[] value's collated array key (encoding.md §2.14 — memcmp-ordered
 // exactly like collatedArrayCmp), nil for NULL. An unmapped code point is 0A000.
 func collationSortKey(coll *compiledCollation, v Value) ([]byte, error) {
-	switch v.Kind {
+	switch v.kind {
 	case ValText:
 		return sortKey(coll, v.str())
 	case ValArray:
@@ -4507,7 +4507,7 @@ func collationSortKey(coll *compiledCollation, v Value) ([]byte, error) {
 // text[] (collatedValueCmp, unmetered), else by the value order — the min/max fold and the
 // hypothetical-set key comparison.
 func collatedOrValueCmp(coll *compiledCollation, a, b Value) (int, error) {
-	if coll != nil && ((a.Kind == ValText && b.Kind == ValText) || (a.Kind == ValArray && b.Kind == ValArray)) {
+	if coll != nil && ((a.kind == ValText && b.kind == ValText) || (a.kind == ValArray && b.kind == ValArray)) {
 		return collatedValueCmp(coll, a, b, nil)
 	}
 	return valueCmp(a, b), nil
@@ -4517,7 +4517,7 @@ func collatedOrValueCmp(coll *compiledCollation, a, b Value) (int, error) {
 // key, text[] element-wise (collatedArrayCmp, metered when m is non-nil). The caller handles NULL and
 // charges a text pair's collate itself.
 func collatedValueCmp(coll *compiledCollation, a, b Value, m *costMeter) (int, error) {
-	if a.Kind == ValArray {
+	if a.kind == ValArray {
 		return collatedArrayCmp(coll, a.arrayVal(), b.arrayVal(), m)
 	}
 	return collatedCmp(coll, a.str(), b.str())
@@ -4937,8 +4937,8 @@ func resolveIntOrDecimalPair(s *scope, name string, lhs, rhs exprNode, ag *aggCt
 // valueToDecimal returns a non-NULL integer/decimal value as a Decimal (the integer→decimal
 // promotion gcd/lcm/div use).
 func valueToDecimal(v Value) Decimal {
-	if v.Kind == ValInt {
-		return decimalFromInt64(v.Int)
+	if v.kind == ValInt {
+		return decimalFromInt64(v.num)
 	}
 	return *v.decimal()
 }
@@ -4967,19 +4967,19 @@ func gcdI64(a, b int64) (int64, bool) {
 // max(sₐ, s_b) (PG numeric gcd). The values share a fixed scale through the chain, so it reduces to
 // an integer gcd and terminates; the final pad to the target scale is exact.
 func gcdDecimal(a, b Decimal) (Decimal, error) {
-	target := a.Scale
-	if b.Scale > target {
-		target = b.Scale
+	target := a.scale
+	if b.scale > target {
+		target = b.scale
 	}
 	x, y := a, b
 	for !y.IsZero() {
-		r, err := x.Rem(y)
+		r, err := x.rem(y)
 		if err != nil {
 			return Decimal{}, err
 		}
 		x, y = y, r
 	}
-	return x.Abs().RoundToScale(target), nil
+	return x.abs().roundToScale(target), nil
 }
 
 // lcmI64 is the lcm of two int64, NON-NEGATIVE: |a/gcd·b| with checked arithmetic. ok is false on
@@ -5010,26 +5010,26 @@ func lcmI64(a, b int64) (int64, bool) {
 // lcmDecimal is the lcm of two decimals, NON-NEGATIVE at scale max(sₐ, s_b): |a/gcd·b| (the a/gcd
 // division is exact). lcm(_, 0) = 0. A magnitude over the decimal value cap traps 22003 via the mul.
 func lcmDecimal(a, b Decimal) (Decimal, error) {
-	target := a.Scale
-	if b.Scale > target {
-		target = b.Scale
+	target := a.scale
+	if b.scale > target {
+		target = b.scale
 	}
 	if a.IsZero() || b.IsZero() {
-		return Decimal{Scale: target}, nil // zero at the target scale (empty Limbs)
+		return Decimal{scale: target}, nil // zero at the target scale (empty Limbs)
 	}
 	g, err := gcdDecimal(a, b)
 	if err != nil {
 		return Decimal{}, err
 	}
-	q, err := a.Div(g)
+	q, err := a.div(g)
 	if err != nil {
 		return Decimal{}, err
 	}
-	prod, err := q.Mul(b)
+	prod, err := q.mul(b)
 	if err != nil {
 		return Decimal{}, err
 	}
-	return prod.Abs().RoundToScale(target), nil
+	return prod.abs().roundToScale(target), nil
 }
 
 // satAdd1 is n+1 saturating at MaxInt64 (so an out-of-int4 count+1 stays out of range for the

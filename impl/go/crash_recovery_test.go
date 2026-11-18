@@ -35,7 +35,7 @@ func seedTwoRows(t *testing.T, path string) (*engine, uint64) {
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1)")
 	mustExec(t, db, "INSERT INTO t VALUES (2)")
-	return db, db.Txid()
+	return db, db.txid()
 }
 
 // sortedIDs returns t's ids ascending (the B-tree scan is key-ordered, but sort to be order-robust).
@@ -90,8 +90,8 @@ func TestCrashMidBodyRecoversPrior(t *testing.T) {
 
 	db = reopen(t, path)
 	defer db.Close()
-	if db.Txid() != prior {
-		t.Fatalf("should fall back to the prior snapshot, got txid %d (prior %d)", db.Txid(), prior)
+	if db.txid() != prior {
+		t.Fatalf("should fall back to the prior snapshot, got txid %d (prior %d)", db.txid(), prior)
 	}
 	if got := sortedIDs(t, db); !equalIDs(got, []int64{1, 2}) {
 		t.Fatalf("prior snapshot should be intact, got %v", got)
@@ -108,8 +108,8 @@ func TestTornBodyPageRecoversPrior(t *testing.T) {
 
 	db = reopen(t, path)
 	defer db.Close()
-	if db.Txid() != prior {
-		t.Fatalf("torn body page is never referenced, expected prior txid %d, got %d", prior, db.Txid())
+	if db.txid() != prior {
+		t.Fatalf("torn body page is never referenced, expected prior txid %d, got %d", prior, db.txid())
 	}
 	if got := sortedIDs(t, db); !equalIDs(got, []int64{1, 2}) {
 		t.Fatalf("prior snapshot should be intact, got %v", got)
@@ -130,8 +130,8 @@ func TestCrashBeforeRecoverySyncRecoversPrior(t *testing.T) {
 
 	db = reopen(t, path)
 	defer db.Close()
-	if db.Txid() != prior {
-		t.Fatalf("expected prior txid %d, got %d", prior, db.Txid())
+	if db.txid() != prior {
+		t.Fatalf("expected prior txid %d, got %d", prior, db.txid())
 	}
 	if got := sortedIDs(t, db); !equalIDs(got, []int64{1, 2}) {
 		t.Fatalf("prior snapshot should be intact, got %v", got)
@@ -148,8 +148,8 @@ func TestCrashBetweenSyncsRecoversPrior(t *testing.T) {
 
 	db = reopen(t, path)
 	defer db.Close()
-	if db.Txid() != prior {
-		t.Fatalf("durable-but-unreferenced body should reopen at prior txid %d, got %d", prior, db.Txid())
+	if db.txid() != prior {
+		t.Fatalf("durable-but-unreferenced body should reopen at prior txid %d, got %d", prior, db.txid())
 	}
 	if got := sortedIDs(t, db); !equalIDs(got, []int64{1, 2}) {
 		t.Fatalf("prior snapshot should be intact, got %v", got)
@@ -167,8 +167,8 @@ func TestTornMetaWriteFallsBackToPrior(t *testing.T) {
 
 	db = reopen(t, path)
 	defer db.Close()
-	if db.Txid() != prior {
-		t.Fatalf("torn meta slot should be rejected → fall back to prior txid %d, got %d", prior, db.Txid())
+	if db.txid() != prior {
+		t.Fatalf("torn meta slot should be rejected → fall back to prior txid %d, got %d", prior, db.txid())
 	}
 	if got := sortedIDs(t, db); !equalIDs(got, []int64{1, 2}) {
 		t.Fatalf("prior snapshot should be intact, got %v", got)
@@ -187,16 +187,16 @@ func TestCrashBeforeMetaSyncIsAtomic(t *testing.T) {
 	db = reopen(t, path)
 	defer db.Close()
 	got := sortedIDs(t, db)
-	if db.Txid() == prior {
+	if db.txid() == prior {
 		if !equalIDs(got, []int64{1, 2}) {
 			t.Fatalf("prior snapshot (meta lost) should be {1,2}, got %v", got)
 		}
-	} else if db.Txid() == prior+1 {
+	} else if db.txid() == prior+1 {
 		if !equalIDs(got, []int64{1, 2, 3}) {
 			t.Fatalf("new snapshot (meta survived) should be {1,2,3}, got %v", got)
 		}
 	} else {
-		t.Fatalf("txid should be prior %d or prior+1, got %d", prior, db.Txid())
+		t.Fatalf("txid should be prior %d or prior+1, got %d", prior, db.txid())
 	}
 }
 
@@ -210,8 +210,8 @@ func TestRecoveryThenFreeListReuseStaysConsistent(t *testing.T) {
 	// Crash between the syncs → reopen at the prior two-row snapshot.
 	insertWithFault(t, db, commitFault{point: faultMetaWrite, tearBytes: -1})
 	db = reopen(t, path)
-	if db.Txid() != prior {
-		t.Fatalf("expected prior txid %d, got %d", prior, db.Txid())
+	if db.txid() != prior {
+		t.Fatalf("expected prior txid %d, got %d", prior, db.txid())
 	}
 	if got := sortedIDs(t, db); !equalIDs(got, []int64{1, 2}) {
 		t.Fatalf("expected {1,2} after recovery, got %v", got)
@@ -222,7 +222,7 @@ func TestRecoveryThenFreeListReuseStaysConsistent(t *testing.T) {
 	mustExec(t, db, "INSERT INTO t VALUES (4)")
 	mustExec(t, db, "DELETE FROM t WHERE id = 1")
 	mustExec(t, db, "INSERT INTO t VALUES (5)")
-	pageCountAfter := db.PageCount()
+	pageCountAfter := db.pageHighWater()
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +243,7 @@ func TestRecoveryThenFreeListReuseStaysConsistent(t *testing.T) {
 	if got := sortedIDs(t, db); !equalIDs(got, []int64{3, 4, 5, 6}) {
 		t.Fatalf("expected {3,4,5,6}, got %v", got)
 	}
-	if db.PageCount() > pageCountAfter+4 {
-		t.Fatalf("free-list reuse should keep the file bounded after recovery (was %d, now %d)", pageCountAfter, db.PageCount())
+	if db.pageHighWater() > pageCountAfter+4 {
+		t.Fatalf("free-list reuse should keep the file bounded after recovery (was %d, now %d)", pageCountAfter, db.pageHighWater())
 	}
 }

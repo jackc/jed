@@ -115,7 +115,7 @@ func TestForeignKeyParentUpdateEndStateSwap(t *testing.T) {
 	}
 	for _, child := range []string{"cc", "ci"} {
 		out, err := queryOutcome(db, "SELECT id, pc FROM "+child+" ORDER BY id", nil)
-		if err != nil || len(out.Rows) != 2 || out.Rows[0][1].Int != 200 || out.Rows[1][1].Int != 100 {
+		if err != nil || len(out.Rows) != 2 || out.Rows[0][1].num != 200 || out.Rows[1][1].num != 100 {
 			t.Fatalf("%s cascaded swap rows: %v, err=%v", child, out.Rows, err)
 		}
 	}
@@ -162,13 +162,13 @@ func TestForeignKeyActionPreservesMainScopeAcrossTempOverlap(t *testing.T) {
 	if len(persistentRows) != 0 {
 		t.Fatalf("persistent child rows after cascade = %v, want empty (temp rows %v)", persistentRows, tempRows)
 	}
-	if len(tempRows) != 1 || tempRows[0][0].Int != 99 || tempRows[0][1].str() != "keep" {
+	if len(tempRows) != 1 || tempRows[0][0].num != 99 || tempRows[0][1].str() != "keep" {
 		t.Fatalf("temp shadow rows after main cascade = %v, want [[99 keep]]", tempRows)
 	}
 	if out, err := queryOutcome(persistent, "SELECT id FROM ci", nil); err != nil || len(out.Rows) != 0 {
 		t.Fatalf("persistent indexed child rows after cascade = %v, err=%v, want empty", out.Rows, err)
 	}
-	if out, err := queryOutcome(shadowed, "SELECT temp_id FROM ci", nil); err != nil || len(out.Rows) != 1 || out.Rows[0][0].Int != 98 {
+	if out, err := queryOutcome(shadowed, "SELECT temp_id FROM ci", nil); err != nil || len(out.Rows) != 1 || out.Rows[0][0].num != 98 {
 		t.Fatalf("temp indexed shadow rows after main cascade = %v, err=%v, want [[98]]", out.Rows, err)
 	}
 }

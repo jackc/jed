@@ -95,12 +95,12 @@ func (pv *Privileges) IsPermissive() bool {
 	return pv.defaultTable == PrivSetAllTable && len(pv.grant) == 0 && len(pv.revoke) == 0
 }
 
-// SetDefaultTable replaces the default table-privilege set (the GRANT … ON ALL TABLES default). A
+// setDefaultTable replaces the default table-privilege set (the GRANT … ON ALL TABLES default). A
 // read-only session is PrivSetEmpty.With(PrivSelect).
-func (pv *Privileges) SetDefaultTable(privs PrivilegeSet) { pv.defaultTable = privs }
+func (pv *Privileges) setDefaultTable(privs PrivilegeSet) { pv.defaultTable = privs }
 
-// Grant adds privs to object's grant delta (beyond the default).
-func (pv *Privileges) Grant(privs PrivilegeSet, object string) {
+// grantObject adds privs to object's grant delta (beyond the default).
+func (pv *Privileges) grantObject(privs PrivilegeSet, object string) {
 	if pv.grant == nil {
 		pv.grant = map[string]PrivilegeSet{}
 	}
@@ -108,8 +108,8 @@ func (pv *Privileges) Grant(privs PrivilegeSet, object string) {
 	pv.grant[key] = pv.grant[key].Union(privs)
 }
 
-// Revoke adds privs to object's revoke delta (revoke wins over grant and the default).
-func (pv *Privileges) Revoke(privs PrivilegeSet, object string) {
+// revokeObject adds privs to object's revoke delta (revoke wins over grant and the default).
+func (pv *Privileges) revokeObject(privs PrivilegeSet, object string) {
 	if pv.revoke == nil {
 		pv.revoke = map[string]PrivilegeSet{}
 	}

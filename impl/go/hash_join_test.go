@@ -21,7 +21,7 @@ func TestHashJoinRejectsForcedHashCollisions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got[0][1].Int != 20 || got[1][1].Int != 21 {
+	if len(got) != 2 || got[0][1].num != 20 || got[1][1].num != 21 {
 		t.Fatalf("collision probe returned %#v", got)
 	}
 }

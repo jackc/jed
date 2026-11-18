@@ -1943,7 +1943,7 @@ func evalChecks(checks []namedCheck, relation string, row storedRow, env *evalEn
 		if err != nil {
 			return err
 		}
-		if v.Kind == ValBool && !v.boolVal() {
+		if v.kind == ValBool && !v.boolVal() {
 			e := newCheckViolation(relation, c.name)
 			if env.exec != nil {
 				e.withDetail(env.exec.failingRowDetail(relation, row))

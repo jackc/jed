@@ -165,7 +165,7 @@ func queryScalar(r *jed.Session, sql string) (string, error) {
 	if !rows.Next() {
 		return "", fmt.Errorf("no row from %q", sql)
 	}
-	return rows.Row()[0].Render(), nil
+	return rows.Row()[0].String(), nil
 }
 
 // --- setup + the final check (shared by both modes) ------------------------------------------
@@ -200,14 +200,16 @@ func checkFinal(db *jed.Database, fin *stressFinal) (checksum string, ok bool, e
 	for rows.Next() {
 		ints := make([]int64, 0, len(rows.Row()))
 		for _, v := range rows.Row() {
-			switch v.Kind {
+			switch v.Kind() {
 			case jed.ValInt:
-				sum.Int(v.Int)
-				ints = append(ints, v.Int)
+				var n int64
+				_ = v.Scan(&n)
+				sum.Int(n)
+				ints = append(ints, n)
 			case jed.ValNull:
 				sum.Null()
 			default:
-				return "", false, fmt.Errorf("stress final query must return integer columns, got kind %d", v.Kind)
+				return "", false, fmt.Errorf("stress final query must return integer columns, got kind %d", v.Kind())
 			}
 		}
 		sum.EndRow()

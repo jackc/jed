@@ -73,7 +73,7 @@ func TestUnchangedCommits(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			version := db.Txid()
+			version := db.txid()
 			count.writes, count.syncs, count.grows = 0, 0, 0
 			if mode != "auto" && mode != "script" {
 				if err := s.beginBlockCtx(context.Background(), true); err != nil {
@@ -109,8 +109,8 @@ func TestUnchangedCommits(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if db.Txid() != version+delta {
-				t.Fatalf("txid: %d -> %d, wanted delta %d", version, db.Txid(), delta)
+			if db.txid() != version+delta {
+				t.Fatalf("txid: %d -> %d, wanted delta %d", version, db.txid(), delta)
 			}
 			if delta == 0 {
 				after, err := os.ReadFile(path)
@@ -126,14 +126,14 @@ func TestUnchangedCommits(t *testing.T) {
 		})
 	}
 	// Scoped callbacks share the same commit path and release the gate for the next writer.
-	version := db.Txid()
+	version := db.txid()
 	count.writes, count.syncs = 0, 0
 	for _, body := range []func(*Transaction) error{func(*Transaction) error { return nil }, func(tx *Transaction) error { var n int; return tx.QueryRow(context.Background(), "SELECT 1").Scan(&n) }} {
 		if err := db.update(context.Background(), body); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if db.Txid() != version || count.writes != 0 || count.syncs != 0 {
+	if db.txid() != version || count.writes != 0 || count.syncs != 0 {
 		t.Fatal("callback persisted")
 	}
 }
@@ -195,7 +195,7 @@ func TestAttachmentCommitLeavesMainUntouched(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	version := db.Txid()
+	version := db.txid()
 	// Main is a candidate write domain but no rows match. Only the attachment may persist.
 	if err := s.beginBlockCtx(context.Background(), true); err != nil {
 		t.Fatal(err)
@@ -212,7 +212,7 @@ func TestAttachmentCommitLeavesMainUntouched(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(before, after) || db.Txid() != version || mainCount.writes != 0 || mainCount.syncs != 0 {
+	if !bytes.Equal(before, after) || db.txid() != version || mainCount.writes != 0 || mainCount.syncs != 0 {
 		t.Fatal("attachment commit rewrote main")
 	}
 	if attCount.writes == 0 || attCount.syncs == 0 {
@@ -234,7 +234,7 @@ func TestAttachmentCommitLeavesMainUntouched(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer re.Close()
-	if rows := queryRows(t, re, "SELECT id FROM t"); len(rows) != 1 || rows[0][0].Int != 1 {
+	if rows := queryRows(t, re, "SELECT id FROM t"); len(rows) != 1 || rows[0][0].num != 1 {
 		t.Fatalf("reopened attachment: %v", rows)
 	}
 }

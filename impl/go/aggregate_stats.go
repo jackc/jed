@@ -50,8 +50,8 @@ func (s *momentsExact) fold(v Value, m *costMeter) error {
 	if err := m.Guard(); err != nil {
 		return err
 	}
-	s.sx = s.sx.AddUncapped(x)
-	s.sxx = s.sxx.AddUncapped(x2)
+	s.sx = s.sx.addUncapped(x)
+	s.sxx = s.sxx.addUncapped(x2)
 	s.n++
 	return nil
 }
@@ -65,9 +65,9 @@ func (s *momentsExact) variance(sample, stddev bool) (Value, error) {
 		return NullValue(), nil
 	}
 	n := decimalFromInt64(s.n)
-	rscale := int64(s.sx.Scale) * 2
+	rscale := int64(s.sx.scale) * 2
 	numerator := n.mulVar(s.sxx, rscale).sub(s.sx.mulVar(s.sx, rscale))
-	if numerator.Neg || numerator.IsZero() {
+	if numerator.neg || numerator.IsZero() {
 		return DecimalValue(decimalFromInt64(0)), nil
 	}
 	denominator := decimalFromInt64(s.n - 1)
@@ -85,7 +85,7 @@ func (s *momentsExact) variance(sample, stddev bool) (Value, error) {
 			return NullValue(), err
 		}
 	}
-	result, err = result.CheckCap()
+	result, err = result.checkCap()
 	if err != nil {
 		return NullValue(), err
 	}

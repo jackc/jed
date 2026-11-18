@@ -106,7 +106,7 @@ func run() int {
 	}
 
 	supported := map[string]bool{}
-	for _, c := range jed.SupportedCapabilities {
+	for _, c := range jed.SupportedCapabilitiesForTesting() {
 		supported[c] = true
 	}
 

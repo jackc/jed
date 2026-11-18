@@ -1203,7 +1203,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 						if ferr != nil {
 							return emitter{}, ferr
 						}
-						if !fv.IsTrue() {
+						if !fv.isTrue() {
 							continue
 						}
 					}
@@ -2477,10 +2477,10 @@ func inMembership(lv Value, list []Value, negated bool, m *costMeter) (Value, er
 		if err := m.Step(); err != nil {
 			return Value{}, err
 		}
-		switch lv.Eq3(v) {
-		case True:
+		switch lv.eq3(v) {
+		case tvTrue:
 			anyMatch = true
-		case Unknown:
+		case tvUnknown:
 			anyNull = true
 		}
 	}
@@ -2516,20 +2516,20 @@ func widthBucketArray(operand, thresholds Value, collation *compiledCollation, m
 		return Value{}, newError(ArraySubscriptError, "thresholds must be one-dimensional array")
 	}
 	for _, e := range arr.Elements {
-		if e.Kind == ValNull {
+		if e.kind == ValNull {
 			return Value{}, newError(NullValueNotAllowed, "thresholds array must not contain NULLs")
 		}
 	}
 	left, right := 0, len(arr.Elements)
-	if (operand.Kind == ValFloat32 && math.IsNaN(float64(operand.F32()))) ||
-		(operand.Kind == ValFloat64 && math.IsNaN(operand.F64())) {
+	if (operand.kind == ValFloat32 && math.IsNaN(float64(operand.f32()))) ||
+		(operand.kind == ValFloat64 && math.IsNaN(operand.f64())) {
 		return IntValue(int64(right)), nil
 	}
 	for left < right {
 		mid := (left + right) / 2
 		t := arr.Elements[mid]
 		m.Charge(costs.OperatorEval)
-		collated := collation != nil && operand.Kind == ValText && t.Kind == ValText
+		collated := collation != nil && operand.kind == ValText && t.kind == ValText
 		if collated {
 			m.Charge(costs.Collate * int64(utf8.RuneCountInString(operand.str())+utf8.RuneCountInString(t.str())))
 		} else {
@@ -2546,14 +2546,14 @@ func widthBucketArray(operand, thresholds Value, collation *compiledCollation, m
 			if c, err = collatedCmp(collation, operand.str(), t.str()); err != nil {
 				return Value{}, err
 			}
-		case operand.Kind == ValInt && t.Kind == ValDecimal:
-			c = decimalFromInt64(operand.Int).CmpValue(*t.decimal())
-		case operand.Kind == ValDecimal && t.Kind == ValInt:
-			c = operand.decimal().CmpValue(decimalFromInt64(t.Int))
-		case operand.Kind == ValFloat32 && t.Kind == ValFloat64:
-			c = floatTotalCmp(float64(operand.F32()), t.F64())
-		case operand.Kind == ValFloat64 && t.Kind == ValFloat32:
-			c = floatTotalCmp(operand.F64(), float64(t.F32()))
+		case operand.kind == ValInt && t.kind == ValDecimal:
+			c = decimalFromInt64(operand.num).Cmp(*t.decimal())
+		case operand.kind == ValDecimal && t.kind == ValInt:
+			c = operand.decimal().Cmp(decimalFromInt64(t.num))
+		case operand.kind == ValFloat32 && t.kind == ValFloat64:
+			c = floatTotalCmp(float64(operand.f32()), t.f64())
+		case operand.kind == ValFloat64 && t.kind == ValFloat32:
+			c = floatTotalCmp(operand.f64(), float64(t.f32()))
 		default:
 			c = valueCmp(operand, t)
 		}
@@ -2581,7 +2581,7 @@ func widthBucketArray(operand, thresholds Value, collation *compiledCollation, m
 // (spec/design/collation.md §1 "IN / ANY / ALL"): an ORDERING comparison of two text (or text[])
 // values sorts by it, charging collate per code point exactly like a collated reCompare.
 func quantifiedMembership(op binaryOp, all, rowWise bool, lv, av Value, collation *compiledCollation, m *costMeter) (Value, error) {
-	if av.Kind == ValNull {
+	if av.kind == ValNull {
 		return NullValue(), nil
 	}
 	anyNull := false
@@ -2591,9 +2591,9 @@ func quantifiedMembership(op binaryOp, all, rowWise bool, lv, av Value, collatio
 		if err := m.Step(); err != nil {
 			return Value{}, err
 		}
-		var tv ThreeValued
+		var tv threeValued
 		if collation != nil && (op == opLt || op == opGt || op == opLe || op == opGe) &&
-			lv.Kind == ValText && e.Kind == ValText {
+			lv.kind == ValText && e.kind == ValText {
 			m.Charge(costs.Collate * int64(utf8.RuneCountInString(lv.str())+utf8.RuneCountInString(e.str())))
 			if err := m.Step(); err != nil {
 				return Value{}, err
@@ -2613,12 +2613,12 @@ func quantifiedMembership(op binaryOp, all, rowWise bool, lv, av Value, collatio
 			default: // OpGe
 				res = c >= 0
 			}
-			tv = False
+			tv = tvFalse
 			if res {
-				tv = True
+				tv = tvTrue
 			}
 		} else if collation != nil && (op == opLt || op == opGt || op == opLe || op == opGe) &&
-			lv.Kind == ValArray && e.Kind == ValArray {
+			lv.kind == ValArray && e.kind == ValArray {
 			// Two text[] values (an array-valued `x op ANY/ALL (SELECT …)`) walk their element pairs
 			// under the collation, charging collate per compared pair (collation.md §11).
 			c, err := collatedArrayCmp(collation, lv.arrayVal(), e.arrayVal(), m)
@@ -2636,9 +2636,9 @@ func quantifiedMembership(op binaryOp, all, rowWise bool, lv, av Value, collatio
 			default: // OpGe
 				res = c >= 0
 			}
-			tv = False
+			tv = tvFalse
 			if res {
-				tv = True
+				tv = tvTrue
 			}
 		} else if rowWise {
 			tv = rowCmp3(op, lv, e)
@@ -2646,17 +2646,17 @@ func quantifiedMembership(op binaryOp, all, rowWise bool, lv, av Value, collatio
 			tv = quantifiedCmp3(op, lv, e)
 		}
 		switch tv {
-		case True:
+		case tvTrue:
 			// ANY short-circuits TRUE; ALL keeps going (TRUE is its neutral element).
 			if !all {
 				return BoolValue(true), nil
 			}
-		case False:
+		case tvFalse:
 			// ALL short-circuits FALSE; ANY keeps going (FALSE is its neutral element).
 			if all {
 				return BoolValue(false), nil
 			}
-		case Unknown:
+		case tvUnknown:
 			anyNull = true
 		}
 	}
@@ -2671,20 +2671,20 @@ func quantifiedMembership(op binaryOp, all, rowWise bool, lv, av Value, collatio
 // rowCmp3 is the row-constructor three-valued comparison `x op e` (composite.md §5): the same
 // Eq3/Lt3/Gt3 decomposition reCompare evaluates, so a NULL field at the deciding position is
 // UNKNOWN (PostgreSQL's row comparison against a subquery row).
-func rowCmp3(op binaryOp, x, e Value) ThreeValued {
+func rowCmp3(op binaryOp, x, e Value) threeValued {
 	switch op {
 	case opEq:
-		return x.Eq3(e)
+		return x.eq3(e)
 	case opNe:
-		return not3(x.Eq3(e))
+		return not3(x.eq3(e))
 	case opLt:
-		return x.Lt3(e)
+		return x.lt3(e)
 	case opGt:
-		return x.Gt3(e)
+		return x.gt3(e)
 	case opLe:
-		return or3(x.Lt3(e), x.Eq3(e))
+		return or3(x.lt3(e), x.eq3(e))
 	default: // OpGe
-		return or3(x.Gt3(e), x.Eq3(e))
+		return or3(x.gt3(e), x.eq3(e))
 	}
 }
 
@@ -2700,10 +2700,10 @@ func rowCmp3(op binaryOp, x, e Value) ThreeValued {
 // composite elements (array.md §5). A whole-element NULL is still UNKNOWN — the operator stays strict
 // at the value level — so the resolver-guaranteed same-type pair is composite-vs-composite or
 // composite-vs-NULL.
-func quantifiedCmp3(op binaryOp, x, e Value) ThreeValued {
-	if x.Kind == ValComposite || e.Kind == ValComposite {
-		if x.Kind == ValNull || e.Kind == ValNull {
-			return Unknown
+func quantifiedCmp3(op binaryOp, x, e Value) threeValued {
+	if x.kind == ValComposite || e.kind == ValComposite {
+		if x.kind == ValNull || e.kind == ValNull {
+			return tvUnknown
 		}
 		ord := valueCmp(x, e)
 		var matched bool
@@ -2722,28 +2722,28 @@ func quantifiedCmp3(op binaryOp, x, e Value) ThreeValued {
 			matched = ord >= 0
 		}
 		if matched {
-			return True
+			return tvTrue
 		}
-		return False
+		return tvFalse
 	}
-	if x.Kind == ValFloat32 && e.Kind == ValFloat64 {
-		x = Float64Value(float64(x.F32()))
-	} else if x.Kind == ValFloat64 && e.Kind == ValFloat32 {
-		e = Float64Value(float64(e.F32()))
+	if x.kind == ValFloat32 && e.kind == ValFloat64 {
+		x = Float64Value(float64(x.f32()))
+	} else if x.kind == ValFloat64 && e.kind == ValFloat32 {
+		e = Float64Value(float64(e.f32()))
 	}
 	switch op {
 	case opEq:
-		return x.Eq3(e)
+		return x.eq3(e)
 	case opNe:
-		return not3(x.Eq3(e))
+		return not3(x.eq3(e))
 	case opLt:
-		return x.Lt3(e)
+		return x.lt3(e)
 	case opGt:
-		return x.Gt3(e)
+		return x.gt3(e)
 	case opLe:
-		return or3(x.Lt3(e), x.Eq3(e))
+		return or3(x.lt3(e), x.eq3(e))
 	default: // OpGe
-		return or3(x.Gt3(e), x.Eq3(e))
+		return or3(x.gt3(e), x.eq3(e))
 	}
 }
 
@@ -2759,13 +2759,13 @@ func subqueryRowValue(row storedRow, rowValued bool) Value {
 // valueToRExpr builds the constant rExpr for a folded subquery value (§26). The static type is
 // carried separately (the node's Type), so a NULL value here is just reConstNull.
 func valueToRExpr(v Value) *rExpr {
-	switch v.Kind {
+	switch v.kind {
 	case ValInt:
-		return &rExpr{kind: reConstInt, cInt: v.Int}
+		return &rExpr{kind: reConstInt, cInt: v.num}
 	case ValFloat32:
-		return &rExpr{kind: reConstFloat32, cFloat: float64(v.F32())}
+		return &rExpr{kind: reConstFloat32, cFloat: float64(v.f32())}
 	case ValFloat64:
-		return &rExpr{kind: reConstFloat64, cFloat: v.F64()}
+		return &rExpr{kind: reConstFloat64, cFloat: v.f64()}
 	case ValBool:
 		return &rExpr{kind: reConstBool, cBool: v.boolVal()}
 	case ValText:
@@ -2777,11 +2777,11 @@ func valueToRExpr(v Value) *rExpr {
 	case ValUUID:
 		return &rExpr{kind: reConstUuid, cBytea: []byte(v.str())}
 	case ValTimestamp:
-		return &rExpr{kind: reConstTimestamp, cInt: v.Int}
+		return &rExpr{kind: reConstTimestamp, cInt: v.num}
 	case ValTimestamptz:
-		return &rExpr{kind: reConstTimestamptz, cInt: v.Int}
+		return &rExpr{kind: reConstTimestamptz, cInt: v.num}
 	case ValDate:
-		return &rExpr{kind: reConstDate, cInt: v.Int}
+		return &rExpr{kind: reConstDate, cInt: v.num}
 	case ValInterval:
 		return &rExpr{kind: reConstInterval, cIv: v.interval()}
 	case ValComposite:
@@ -2957,12 +2957,12 @@ func writeRowKey(b *rowKeyBuilder, row []Value) {
 		if i > 0 {
 			b.WriteByte('|')
 		}
-		switch v.Kind {
+		switch v.kind {
 		case ValNull:
 			b.WriteByte('n')
 		case ValInt:
 			b.WriteByte('i')
-			b.WriteString(strconv.FormatInt(v.Int, 10))
+			b.WriteString(strconv.FormatInt(v.num, 10))
 		case ValBool:
 			b.WriteByte('b')
 			if v.boolVal() {
@@ -2981,7 +2981,7 @@ func writeRowKey(b *rowKeyBuilder, row []Value) {
 			// Value-canonical key so 1.5 and 1.50 collapse to one DISTINCT bucket
 			// (spec/design/decimal.md §5).
 			b.WriteByte('d')
-			b.WriteString(v.decimal().CanonicalString())
+			b.WriteString(v.decimal().canonicalString())
 		case ValBytea:
 			// Length-prefix the raw bytes (held in Str; a distinct 'y' tag, so a bytea never
 			// collides with a text value of the same bytes).
@@ -3001,22 +3001,22 @@ func writeRowKey(b *rowKeyBuilder, row []Value) {
 			// for the same instant (e.g. 12:00:00 and 12:00:00.0) share the int, so they bucket
 			// together; the infinity sentinels are ordinary int values with their own buckets.
 			b.WriteByte('s')
-			b.WriteString(strconv.FormatInt(v.Int, 10))
+			b.WriteString(strconv.FormatInt(v.num, 10))
 		case ValTimestamptz:
 			// The i64 UTC-instant micros (held in Int), under a distinct 'z' tag: offsets are
 			// already normalized to UTC at parse, so +00 and +05-of-the-same-instant bucket together.
 			b.WriteByte('z')
-			b.WriteString(strconv.FormatInt(v.Int, 10))
+			b.WriteString(strconv.FormatInt(v.num, 10))
 		case ValDate:
 			// The i32 day count (held in Int), under a distinct 'd' tag.
 			b.WriteByte('d')
-			b.WriteString(strconv.FormatInt(v.Int, 10))
+			b.WriteString(strconv.FormatInt(v.num, 10))
 		case ValInterval:
 			// The canonical 128-bit span as a decimal string, under a distinct 'v' tag, so
 			// span-equal intervals ('1 mon' / '30 days' / '720:00:00') collapse to one DISTINCT/
 			// GROUP BY bucket while each value still renders its own fields (spec/design/interval.md §2).
 			b.WriteByte('v')
-			b.WriteString(v.interval().Span().String())
+			b.WriteString(v.interval().span().String())
 		case ValFloat32, ValFloat64:
 			// Float DISTINCT / GROUP BY uses the §3 total order's equivalence classes: -0 → +0 and
 			// ALL NaNs collapse to one bucket (spec/design/float.md §3). Key on the CANONICAL form —
@@ -3081,7 +3081,7 @@ func writeRowKey(b *rowKeyBuilder, row []Value) {
 			// canonical text render keeps the scale and would split them).
 			b.WriteByte('B')
 			writeJsonbDistinctKey(&b.b, v.jsonb())
-		case ValUnfetched:
+		case valUnfetched:
 			// A key is always built from resolved values (large-values.md §16).
 			panic("BUG: an unfetched value reached a dedup or grouping key")
 		}

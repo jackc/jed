@@ -26,7 +26,7 @@ func TestIncrReclaimReaderHoldsOnlyNewerGenerations(t *testing.T) {
 		execDB(t, db, fmt.Sprintf("UPDATE t SET v = repeat('b', 30) WHERE id = %d", 1+i%200))
 	}
 	st := db.core.storage
-	steady := db.PageCount()
+	steady := db.pageHighWater()
 	rd := db.readSession()
 	pinned, err := countOf(db, rd)
 	if err != nil {
@@ -48,7 +48,7 @@ func TestIncrReclaimReaderHoldsOnlyNewerGenerations(t *testing.T) {
 		t.Fatalf("pinned reader sees %d rows (err %v), want %d", n, err, pinned)
 	}
 	rd.Close()
-	grown := db.PageCount()
+	grown := db.pageHighWater()
 	if grown <= steady {
 		t.Fatalf("the file did not grow under the pin (%d → %d): the test does not exercise the gate", steady, grown)
 	}
@@ -64,7 +64,7 @@ func TestIncrReclaimReaderHoldsOnlyNewerGenerations(t *testing.T) {
 	if leaked != 0 {
 		t.Fatalf("%d dead pages left unlisted", leaked)
 	}
-	if after := db.PageCount(); after > grown {
+	if after := db.pageHighWater(); after > grown {
 		t.Fatalf("the file kept growing after the reader closed: %d → %d", grown, after)
 	}
 }

@@ -36,7 +36,7 @@ func TestComparisonsProjectBooleans(t *testing.T) {
 	if got := scalar(t, db, "SELECT TRUE FROM t WHERE id = 1"); got != BoolValue(true) {
 		t.Errorf("TRUE = %v", got)
 	}
-	if BoolValue(true).Render() != "true" || BoolValue(false).Render() != "false" {
+	if BoolValue(true).String() != "true" || BoolValue(false).String() != "false" {
 		t.Errorf("boolean render mismatch")
 	}
 }

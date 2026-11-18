@@ -101,7 +101,7 @@ func TestBlockingSpoolAndHashStateStayBounded(t *testing.T) {
 	}
 	for i := 0; i < 500; i++ {
 		r, ok, err := state.get([]Value{IntValue(int64(i))})
-		if err != nil || !ok || r[0].Int != int64(i) {
+		if err != nil || !ok || r[0].num != int64(i) {
 			t.Fatalf("state %d: %v %v %v", i, r, ok, err)
 		}
 	}
@@ -169,10 +169,10 @@ func TestBlockingVariableAggregatesSpill(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if plan == planPercentileDisc && v.Int != 149 {
+			if plan == planPercentileDisc && v.num != 149 {
 				t.Fatalf("percentile: %v", v)
 			}
-			if plan == planMode && v.Int != 0 {
+			if plan == planMode && v.num != 0 {
 				t.Fatalf("stable mode: %v", v)
 			}
 			if plan == planJsonbObjectAgg && len(v.jsonb().Obj) != 17 {
@@ -275,10 +275,10 @@ func TestBlockingSortCompactsRunsAndSpillCollisionOrder(t *testing.T) {
 		if !ok {
 			break
 		}
-		if r[0].Int == key && r[1].Int < previous {
+		if r[0].num == key && r[1].num < previous {
 			t.Fatal("compaction broke stable ties")
 		}
-		key, previous = r[0].Int, r[1].Int
+		key, previous = r[0].num, r[1].num
 	}
 	// Spilled hash rows keep each hash's insertion order, interleaved with other hashes.
 	h := newHashRows(&engine{spill: osSpillHost{dir: dir}, session: newSession(NewEnvironment())})
@@ -298,7 +298,7 @@ func TestBlockingSortCompactsRunsAndSpillCollisionOrder(t *testing.T) {
 	}
 	var index int64
 	if err := h.each(collision, func(r storedRow) error {
-		if r[0].Int != index {
+		if r[0].num != index {
 			t.Fatalf("bucket order %v want %d", r, index)
 		}
 		index += 3
@@ -368,7 +368,7 @@ func TestRejectedReservationsSpillInsteadOfFailing(t *testing.T) {
 	}
 	var seen int
 	if err := spool.each(func(r storedRow) error {
-		if r[0].Int != int64(seen) {
+		if r[0].num != int64(seen) {
 			t.Fatalf("spool order %v want %d", r, seen)
 		}
 		seen++
@@ -376,12 +376,12 @@ func TestRejectedReservationsSpillInsteadOfFailing(t *testing.T) {
 	}); err != nil || seen != 100 {
 		t.Fatalf("spool replay %d %v", seen, err)
 	}
-	if r, ok, err := state.get([]Value{IntValue(42)}); err != nil || !ok || r[0].Int != 42 {
+	if r, ok, err := state.get([]Value{IntValue(42)}); err != nil || !ok || r[0].num != 42 {
 		t.Fatalf("state lookup %v %v %v", r, ok, err)
 	}
 	seen = 0
 	if err := rows.each(7, func(r storedRow) error {
-		if r[0].Int != int64(seen) {
+		if r[0].num != int64(seen) {
 			t.Fatalf("hash rows order %v want %d", r, seen)
 		}
 		seen++
@@ -403,10 +403,10 @@ func TestRejectedReservationsSpillInsteadOfFailing(t *testing.T) {
 		if !ok {
 			break
 		}
-		if r[0].Int < key || (r[0].Int == key && r[1].Int < position) {
+		if r[0].num < key || (r[0].num == key && r[1].num < position) {
 			t.Fatal("rejection runs broke the stable sort")
 		}
-		key, position = r[0].Int, r[1].Int
+		key, position = r[0].num, r[1].num
 		count++
 	}
 	if count != 100 {

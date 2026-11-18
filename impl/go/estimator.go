@@ -423,7 +423,7 @@ func predicateSelectivity(expr *rExpr) selectivityExpr {
 		hasNull := false
 		for i, v := range expr.list {
 			elems[i] = valueToRExpr(v)
-			hasNull = hasNull || v.Kind == ValNull
+			hasNull = hasNull || v.kind == ValNull
 		}
 		if !expr.negated {
 			return equalityDisjunction(elems)
@@ -638,9 +638,9 @@ func estimatorLiteralCmp(a, b *rExpr) (int, bool) {
 	case reConstBytea:
 		return bytes.Compare(a.cBytea, b.cBytea), true
 	case reConstDecimal:
-		return a.cDec.CmpValue(b.cDec), true
+		return a.cDec.Cmp(b.cDec), true
 	case reConstInterval:
-		return a.cIv.SpanCmp(b.cIv), true
+		return a.cIv.spanCmp(b.cIv), true
 	case reConstFloat32, reConstFloat64:
 		return floatTotalCmp(a.cFloat, b.cFloat), true
 	default:
@@ -906,7 +906,7 @@ func estimatorPointElement(keyType scalarType, elem *rExpr) *rExpr {
 	if !ok {
 		return &rExpr{kind: reConstNull}
 	}
-	if point.Kind == v.Kind {
+	if point.kind == v.kind {
 		return elem
 	}
 	return valueToRExpr(point)
@@ -2008,7 +2008,7 @@ func estimateNumericSeriesRows(args []*rExpr) int64 {
 	}
 	var scale uint32
 	for _, v := range vals {
-		scale = max(scale, v.Scale)
+		scale = max(scale, v.scale)
 	}
 	var u [3]int64
 	for i, v := range vals {

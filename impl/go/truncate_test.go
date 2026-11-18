@@ -42,10 +42,10 @@ func TestTrailingTruncationShrinksAFileAfterADelete(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "truncate.jed")
 	db := createCompactFile(t, path)
 	growAndShrink(t, db)
-	peak := db.PageCount()
+	peak := db.pageHighWater()
 	peakLength := fileLength(t, path)
 	churn(t, db, 600, "a")
-	pc := db.PageCount()
+	pc := db.pageHighWater()
 	// The dropped table is about two thirds of the peak (the file holds its live pages plus the last
 	// commit's writes: incremental-reclaim.md).
 	if pc*2 > peak {
@@ -73,8 +73,8 @@ func TestTrailingTruncationShrinksAFileAfterADelete(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer re.Close()
-	if re.PageCount() != pc {
-		t.Fatalf("reopened page count %d, want %d", re.PageCount(), pc)
+	if re.pageHighWater() != pc {
+		t.Fatalf("reopened page count %d, want %d", re.pageHighWater(), pc)
 	}
 	rows2, cost2 := rowsAndCost(t, re, compactProbe)
 	if fmt.Sprint(rows2) != fmt.Sprint(rows) || cost2 != cost || countRows(t, re, "t") != count {
@@ -91,13 +91,13 @@ func TestTrailingTruncationWaitsForAnOlderReader(t *testing.T) {
 	// A reader pinned at the post-delete version keeps every page of that version, so the free list
 	// may not be reused and nothing is truncated while it is open: the high-water never goes down.
 	reader := db.readSession()
-	high := db.PageCount()
+	high := db.pageHighWater()
 	s := mustSession(db, SessionOptions{})
 	for k := 0; k < 400; k++ {
 		if _, err := queryOutcome(s, fmt.Sprintf("UPDATE t SET n = %d WHERE id = %d", k, 1+k%100), nil); err != nil {
 			t.Fatal(err)
 		}
-		if pc := db.PageCount(); pc < high {
+		if pc := db.pageHighWater(); pc < high {
 			t.Fatalf("commit %d lowered the high-water from %d to %d under a pinned reader", k, high, pc)
 		} else {
 			high = pc
@@ -106,8 +106,8 @@ func TestTrailingTruncationWaitsForAnOlderReader(t *testing.T) {
 	reader.Close()
 	s.Close()
 	churn(t, db, 600, "b")
-	if db.PageCount() >= high {
-		t.Fatalf("after the reader closed, truncation should resume: %d pages, %d before", db.PageCount(), high)
+	if db.pageHighWater() >= high {
+		t.Fatalf("after the reader closed, truncation should resume: %d pages, %d before", db.pageHighWater(), high)
 	}
 	if got := countRows(t, db, "t"); got != 100 {
 		t.Fatalf("count %d", got)
@@ -153,19 +153,19 @@ func TestTrailingTruncationWaitsForTheFlushUnderSynchronousOff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	peak := db.PageCount()
+	peak := db.pageHighWater()
 	s = mustSession(db, SessionOptions{})
 	if _, err := queryOutcome(s, "DROP TABLE big", nil); err != nil {
 		t.Fatal(err)
 	}
 	deferred := false
 	for k := 0; k < 1500; k++ {
-		before, high, pendingBefore := fileLength(t, path), db.PageCount(), pendingCount(db)
+		before, high, pendingBefore := fileLength(t, path), db.pageHighWater(), pendingCount(db)
 		sql := fmt.Sprintf("UPDATE t SET pad = 'r%d' || repeat('y', 200), n = n + 7 WHERE id = %d", k, 1+k%100)
 		if _, err := queryOutcome(s, sql, nil); err != nil {
 			t.Fatalf("%q: %v", sql, err)
 		}
-		pc, length, pending := db.PageCount(), fileLength(t, path), pendingCount(db)
+		pc, length, pending := db.pageHighWater(), fileLength(t, path), pendingCount(db)
 		peak = max(peak, pc)
 		if pendingBefore > 0 && pc < high {
 			t.Fatalf("commit %d lowered the high-water from %d to %d inside a pending batch", k, high, pc)
@@ -178,7 +178,7 @@ func TestTrailingTruncationWaitsForTheFlushUnderSynchronousOff(t *testing.T) {
 		}
 	}
 	s.Close()
-	pc := db.PageCount()
+	pc := db.pageHighWater()
 	// The dropped table is about two thirds of the peak (the file holds its live pages plus the last
 	// commit's writes: incremental-reclaim.md).
 	if pc*2 > peak {
@@ -198,7 +198,7 @@ func TestTrailingTruncationWaitsForTheFlushUnderSynchronousOff(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer re.Close()
-	if re.PageCount() != pc || countRows(t, re, "t") != 100 {
-		t.Fatalf("reopened page count %d (want %d), %d rows", re.PageCount(), pc, countRows(t, re, "t"))
+	if re.pageHighWater() != pc || countRows(t, re, "t") != 100 {
+		t.Fatalf("reopened page count %d (want %d), %d rows", re.pageHighWater(), pc, countRows(t, re, "t"))
 	}
 }

@@ -53,11 +53,11 @@ func TestSkipFsyncRoundTrips(t *testing.T) {
 		t.Fatalf("got %d rows, want 40", len(rows))
 	}
 	// id=2 is even, so v = 20 + 1 = 21 after the UPDATE; id=1 is odd, v = 10.
-	if rows[0][0].Int != 1 || rows[0][1].Int != 10 {
-		t.Fatalf("row id=1: got (%d, %d), want (1, 10)", rows[0][0].Int, rows[0][1].Int)
+	if rows[0][0].num != 1 || rows[0][1].num != 10 {
+		t.Fatalf("row id=1: got (%d, %d), want (1, 10)", rows[0][0].num, rows[0][1].num)
 	}
-	if rows[1][0].Int != 2 || rows[1][1].Int != 21 {
-		t.Fatalf("row id=2: got (%d, %d), want (2, 21)", rows[1][0].Int, rows[1][1].Int)
+	if rows[1][0].num != 2 || rows[1][1].num != 21 {
+		t.Fatalf("row id=2: got (%d, %d), want (2, 21)", rows[1][0].num, rows[1][1].num)
 	}
 }
 

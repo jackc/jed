@@ -57,7 +57,7 @@ func renderSorted(rows [][]Value) []string {
 			if j > 0 {
 				out[i] += "|"
 			}
-			out[i] += v.Render()
+			out[i] += v.String()
 		}
 	}
 	slices.Sort(out)

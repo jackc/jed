@@ -16,7 +16,7 @@ import (
 func idsInKeyOrder(db *Session, table string) []int64 {
 	var ids []int64
 	for _, r := range db.rowsInKeyOrder(table) {
-		ids = append(ids, r[0].Int)
+		ids = append(ids, r[0].num)
 	}
 	return ids
 }
@@ -106,7 +106,7 @@ func TestCompositeSecondaryIndexAndImageRoundtrip(t *testing.T) {
 		"INSERT INTO t VALUES (2, ROW('Elm', 100))",
 		"INSERT INTO t VALUES (3, ROW('Main', 5))",
 	)
-	image, err := db.ToImage(256, 1)
+	image, err := db.toImage(256, 1)
 	if err != nil {
 		t.Fatalf("ToImage: %v", err)
 	}

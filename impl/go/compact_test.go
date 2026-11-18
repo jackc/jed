@@ -75,7 +75,7 @@ func compactCode(t *testing.T, err error) string {
 func countRows(t *testing.T, db *Database, table string) int64 {
 	t.Helper()
 	rows, _ := rowsAndCost(t, db, "SELECT count(*) FROM "+table)
-	return rows[0][0].Int
+	return rows[0][0].num
 }
 
 func TestFileCompactionReturnsDeadPagesAndKeepsRowsAndCosts(t *testing.T) {
@@ -83,7 +83,7 @@ func TestFileCompactionReturnsDeadPagesAndKeepsRowsAndCosts(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "compact-file.jed")
 	db := createCompactFile(t, path)
 	growAndShrink(t, db)
-	beforePages := db.PageCount()
+	beforePages := db.pageHighWater()
 	beforeVersion := db.Version()
 	rows, cost := rowsAndCost(t, db, compactProbe)
 	count := countRows(t, db, "t")
@@ -92,7 +92,7 @@ func TestFileCompactionReturnsDeadPagesAndKeepsRowsAndCosts(t *testing.T) {
 		t.Fatalf("compact: %v", err)
 	}
 
-	afterPages := db.PageCount()
+	afterPages := db.pageHighWater()
 	if afterPages*4 >= beforePages {
 		t.Fatalf("compaction returns dead pages: %d -> %d", beforePages, afterPages)
 	}
@@ -118,7 +118,7 @@ func TestFileCompactionReturnsDeadPagesAndKeepsRowsAndCosts(t *testing.T) {
 	}
 
 	// The compacted file is the from-scratch image of the committed snapshot at the new version.
-	image, err := db.ToImage(compactPage, db.Version())
+	image, err := db.toImage(compactPage, db.Version())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +258,7 @@ func TestCompactionPreconditionsFailWithoutWriting(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "compact-preconditions.jed")
 	db := createCompactFile(t, path)
 	growAndShrink(t, db)
-	pages := db.PageCount()
+	pages := db.pageHighWater()
 
 	if code := compactCode(t, db.Compact(context.Background(), "nope")); code != "42704" {
 		t.Fatalf("unknown name: %s, want 42704", code)
@@ -300,8 +300,8 @@ func TestCompactionPreconditionsFailWithoutWriting(t *testing.T) {
 	s.Close()
 	writer.Close()
 
-	if db.PageCount() != pages {
-		t.Fatalf("a refused compaction wrote: page count %d -> %d", pages, db.PageCount())
+	if db.pageHighWater() != pages {
+		t.Fatalf("a refused compaction wrote: page count %d -> %d", pages, db.pageHighWater())
 	}
 	if err := db.Compact(context.Background(), "main"); err != nil {
 		t.Fatal(err)

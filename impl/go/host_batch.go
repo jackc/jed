@@ -79,9 +79,9 @@ func triviallyEvaluable(e *rExpr) bool {
 func unfetchedArg(a *rExpr, row storedRow, env *evalEnv) bool {
 	switch a.kind {
 	case reColumn:
-		return row[a.index].Kind == ValUnfetched
+		return row[a.index].kind == valUnfetched
 	case reOuterColumn:
-		return env.outer[len(env.outer)-a.level][a.index].Kind == ValUnfetched
+		return env.outer[len(env.outer)-a.level][a.index].kind == valUnfetched
 	default:
 		return false
 	}
@@ -222,7 +222,7 @@ rows:
 			if !unfetched {
 				v, err = a.eval(row, env, scratch)
 			}
-			if unfetched || err != nil || v.Kind == ValNull {
+			if unfetched || err != nil || v.kind == ValNull {
 				for jj := range j { // drop this row's arguments already gathered
 					cols[jj] = cols[jj][:batchRows]
 				}

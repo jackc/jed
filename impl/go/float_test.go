@@ -27,8 +27,8 @@ func TestFloatValueCodecRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("f64 decode %v: %v", f, err)
 		}
-		if got.Kind != ValFloat64 {
-			t.Fatalf("f64 %v: kind %v", f, got.Kind)
+		if got.kind != ValFloat64 {
+			t.Fatalf("f64 %v: kind %v", f, got.kind)
 		}
 		// Compare by BITS. Storage preserves the original pattern verbatim (incl -0's sign bit) EXCEPT
 		// for NaN, which canonicalizes to the single quiet pattern 0x7FF8…000 (float.md §10).
@@ -37,8 +37,8 @@ func TestFloatValueCodecRoundTrip(t *testing.T) {
 		if math.IsNaN(f) {
 			want = 0x7FF8000000000000
 		}
-		if uint64(got.Int) != want {
-			t.Errorf("f64 %v: bits %#016x != %#016x", f, uint64(got.Int), want)
+		if uint64(got.num) != want {
+			t.Errorf("f64 %v: bits %#016x != %#016x", f, uint64(got.num), want)
 		}
 	}
 	cases32 := []float32{
@@ -57,8 +57,8 @@ func TestFloatValueCodecRoundTrip(t *testing.T) {
 		if math.IsNaN(float64(f)) {
 			want = 0x7FC00000 // NaN canonicalizes on store (float.md §10)
 		}
-		if got.Kind != ValFloat32 || uint32(got.Int) != want {
-			t.Errorf("f32 %v: bits %#08x != %#08x", f, uint32(got.Int), want)
+		if got.kind != ValFloat32 || uint32(got.num) != want {
+			t.Errorf("f32 %v: bits %#08x != %#08x", f, uint32(got.num), want)
 		}
 	}
 }
@@ -75,7 +75,7 @@ func TestFloatImageRoundTrip(t *testing.T) {
 		"INSERT INTO f VALUES (2, '-0', '-Infinity')",
 		"INSERT INTO f VALUES (3, 'Infinity', '3.141592653589793')",
 	)
-	img, err := db.ToImage(4096, 1)
+	img, err := db.toImage(4096, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,14 +87,14 @@ func TestFloatImageRoundTrip(t *testing.T) {
 	if len(rows) != 3 {
 		t.Fatalf("got %d rows", len(rows))
 	}
-	if rows[0][0].F32() != 1.5 || !math.IsNaN(rows[0][1].F64()) {
-		t.Errorf("row 1: a=%v b=%v", rows[0][0].Render(), rows[0][1].Render())
+	if rows[0][0].f32() != 1.5 || !math.IsNaN(rows[0][1].f64()) {
+		t.Errorf("row 1: a=%v b=%v", rows[0][0].String(), rows[0][1].String())
 	}
-	if rows[1][0].F32() != 0 || !math.Signbit(float64(rows[1][0].F32())) || !math.IsInf(rows[1][1].F64(), -1) {
-		t.Errorf("row 2: a=%v b=%v (want -0, -Infinity)", rows[1][0].Render(), rows[1][1].Render())
+	if rows[1][0].f32() != 0 || !math.Signbit(float64(rows[1][0].f32())) || !math.IsInf(rows[1][1].f64(), -1) {
+		t.Errorf("row 2: a=%v b=%v (want -0, -Infinity)", rows[1][0].String(), rows[1][1].String())
 	}
-	if !math.IsInf(float64(rows[2][0].F32()), 1) {
-		t.Errorf("row 3: a=%v, want Infinity", rows[2][0].Render())
+	if !math.IsInf(float64(rows[2][0].f32()), 1) {
+		t.Errorf("row 3: a=%v, want Infinity", rows[2][0].String())
 	}
 }
 
@@ -107,10 +107,10 @@ func TestFloatStoredNegZeroPreservesBits(t *testing.T) {
 		"INSERT INTO f VALUES (2, '0')",
 	)
 	// -0 renders "-0", +0 renders "0" — the bits round-tripped through storage.
-	if got := query(t, db, "SELECT x FROM f WHERE id = 1")[0][0].Render(); got != "-0" {
+	if got := query(t, db, "SELECT x FROM f WHERE id = 1")[0][0].String(); got != "-0" {
 		t.Errorf("stored -0 rendered %q, want -0", got)
 	}
-	if got := query(t, db, "SELECT x FROM f WHERE id = 2")[0][0].Render(); got != "0" {
+	if got := query(t, db, "SELECT x FROM f WHERE id = 2")[0][0].String(); got != "0" {
 		t.Errorf("stored +0 rendered %q, want 0", got)
 	}
 }
@@ -175,8 +175,8 @@ func TestFloatMixedWidthArithmeticPromotes(t *testing.T) {
 	if out.ColumnTypes[0] != "f64" {
 		t.Errorf("f32 + f64 result type = %s, want f64", out.ColumnTypes[0])
 	}
-	if got := out.Rows[0][0]; got.Kind != ValFloat64 || got.F64() != 3.75 {
-		t.Errorf("1.5 + 2.25 = %v, want 3.75 (f64)", got.Render())
+	if got := out.Rows[0][0]; got.kind != ValFloat64 || got.f64() != 3.75 {
+		t.Errorf("1.5 + 2.25 = %v, want 3.75 (f64)", got.String())
 	}
 }
 
@@ -188,8 +188,8 @@ func TestFloat32ImplicitWidenStoresIntoFloat64Column(t *testing.T) {
 	if err != nil {
 		t.Fatalf("f32 → f64 column store: %v", err)
 	}
-	if got.Kind != ValFloat64 || got.F64() != 1.5 {
-		t.Errorf("f32 1.5 widened = %v (kind %v)", got.Render(), got.Kind)
+	if got.kind != ValFloat64 || got.f64() != 1.5 {
+		t.Errorf("f32 1.5 widened = %v (kind %v)", got.String(), got.kind)
 	}
 	if !assignableTo(resolvedType{kind: rtFloat32}, scalarFloat64) {
 		t.Errorf("f32 should be assignable to a f64 column")
@@ -215,7 +215,7 @@ func TestExactDecimalFromFloatMatchesParseRoundTrip(t *testing.T) {
 			t.Fatalf("exact decimal of %v failed to reparse: %v", f, err)
 		}
 		if back != f {
-			t.Errorf("exactDecimalFromFloat64(%v) = %s → reparsed %v", f, d.Render(), back)
+			t.Errorf("exactDecimalFromFloat64(%v) = %s → reparsed %v", f, d.String(), back)
 		}
 	}
 }
@@ -304,12 +304,12 @@ func TestFloatLiteralParsing(t *testing.T) {
 		"f64 'inf'":       math.Inf(1),
 	}
 	for sql, want := range good {
-		got := query(t, db, "SELECT "+sql)[0][0].F64()
+		got := query(t, db, "SELECT "+sql)[0][0].f64()
 		if got != want && !(math.IsInf(want, 0) && got == want) {
 			t.Errorf("%s = %v, want %v", sql, got, want)
 		}
 	}
-	if r := query(t, db, "SELECT f64 'NaN'"); !math.IsNaN(r[0][0].F64()) {
+	if r := query(t, db, "SELECT f64 'NaN'"); !math.IsNaN(r[0][0].f64()) {
 		t.Errorf("f64 'NaN' should parse to NaN")
 	}
 	// Malformed → 22P02; out of range → 22003.

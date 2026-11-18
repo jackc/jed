@@ -26,7 +26,7 @@ const reclaimPS = int64(256)
 // track this, not the file length: the file is preallocated in chunks ahead of the high-water
 // (spec/design/pager.md §7), so its physical size no longer equals pageCount*pageSize.
 func reclaimPageCount(db *engine) int64 {
-	return int64(db.PageCount())
+	return int64(db.pageHighWater())
 }
 
 // padOf returns the pad text of the row with id, and whether it exists.
@@ -267,8 +267,8 @@ func TestTornCommitAfterReuseFallsBackToPriorSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if db.Txid() != priorTxid {
-		t.Fatalf("should fall back to the prior committed snapshot, got txid %d want %d", db.Txid(), priorTxid)
+	if db.txid() != priorTxid {
+		t.Fatalf("should fall back to the prior committed snapshot, got txid %d want %d", db.txid(), priorTxid)
 	}
 	if got, _ := padOf(t, db, 11); got != orig11 {
 		t.Fatalf("the torn commit's row-11 update should have vanished: got %q want %q", got, orig11)

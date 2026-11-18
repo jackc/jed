@@ -33,7 +33,7 @@ func genInts(t *testing.T, db dbHandle, sql string) []int64 {
 		if len(r) != 1 {
 			t.Fatalf("%q: expected one column, got %d", sql, len(r))
 		}
-		out[i] = r[0].Int
+		out[i] = r[0].num
 	}
 	return out
 }
@@ -91,7 +91,7 @@ func TestGenerateSeriesParam(t *testing.T) {
 	}
 	got := make([]int64, len(out.Rows))
 	for i, r := range out.Rows {
-		got[i] = r[0].Int
+		got[i] = r[0].num
 	}
 	eqGenInts(t, got, []int64{1, 2, 3}, "param")
 }
