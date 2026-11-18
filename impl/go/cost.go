@@ -219,10 +219,10 @@ func (m *costMeter) Step() error {
 	return m.Guard()
 }
 
-// stepsBeforeCheckpoint bounds a run of equal-cost steps that can finish before
-// either a cancellation poll or a cost guard could fire. The caller executes
-// the boundary step normally. units must be positive.
-func (m *costMeter) stepsBeforeCheckpoint(limit int, units int64) int {
+// stepsBeforeCheckpoint bounds the number of steps before a poll or cost ceiling.
+// maxUnits is a positive upper bound on the cost of one step. The caller
+// executes the boundary step normally.
+func (m *costMeter) stepsBeforeCheckpoint(limit int, maxUnits int64) int {
 	if m.cancel != nil {
 		if m.cancelSteps == 0 {
 			return 0
@@ -230,21 +230,21 @@ func (m *costMeter) stepsBeforeCheckpoint(limit int, units int64) int {
 		limit = min(limit, 256-int(m.cancelSteps))
 	}
 	if h, limited := m.headroom(); limited {
-		if h <= units {
+		if h <= maxUnits {
 			return 0
 		}
-		limit = int(min(int64(limit), (h-1)/units))
+		limit = int(min(int64(limit), (h-1)/maxUnits))
 	}
 	return limit
 }
 
 // chargeStepsBeforeCheckpoint accounts for n completed steps within the bound
 // above, preserving the sampling phase that n calls to Step would leave.
-func (m *costMeter) chargeStepsBeforeCheckpoint(n int, units int64) {
+func (m *costMeter) chargeStepsBeforeCheckpoint(n int, totalUnits int64) {
 	if n == 0 {
 		return
 	}
-	m.Charge(int64(n) * units)
+	m.Charge(totalUnits)
 	if m.cancel != nil {
 		m.cancelSteps += uint8(n)
 	}

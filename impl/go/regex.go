@@ -1303,7 +1303,38 @@ func (p *regexProgram) skipLiteralMisses(input []rune, m *costMeter) int {
 	for n < limit && input[n] != literal {
 		n++
 	}
-	m.chargeStepsBeforeCheckpoint(n, perRune)
+	m.chargeStepsBeforeCheckpoint(n, int64(n)*perRune)
+	return n
+}
+
+// skipFalseStarts advances only over input that returns the ordered thread list
+// to [prefixPC, 1]. A candidate stays with the VM until its failure is proved.
+func (p *regexProgram) skipFalseStarts(input []rune, m *costMeter) int {
+	pc := p.prefixPC
+	first := p.insts[pc].ch
+	base := int64(pc+1) * costs.RegexStep
+	limit := m.stepsBeforeCheckpoint(min(len(input), 4096), base+costs.RegexStep)
+	n, advances := 0, 0
+scan:
+	for n < limit {
+		if input[n] != first {
+			n++
+			continue
+		}
+		for matched := 1; ; matched++ {
+			if n+matched == limit || input[n+matched] == first || p.insts[pc+matched].op != opChar {
+				break scan
+			}
+			if input[n+matched] != p.insts[pc+matched].ch {
+				// The matched literals each reached one extra Char. The
+				// mismatch kills the candidate without creating another.
+				advances += matched
+				n += matched + 1
+				break
+			}
+		}
+	}
+	m.chargeStepsBeforeCheckpoint(n, int64(n)*base+int64(advances)*costs.RegexStep)
 	return n
 }
 
@@ -1340,7 +1371,7 @@ func skipOverlappingStarts[C any, R capRep[C]](p *regexProgram, seen *regexSeen,
 	if n == 0 {
 		return 0
 	}
-	m.chargeStepsBeforeCheckpoint(n, perRune)
+	m.chargeStepsBeforeCheckpoint(n, int64(n)*perRune)
 	// Oldest first: copying from a younger thread preserves its original history.
 	// Threads seeded during the batch have consumed width-i runes by its end.
 	for i := 0; i <= width; i++ {
@@ -1371,9 +1402,14 @@ func pikeSearch[C any, R capRep[C]](p *regexProgram, seen *regexSeen, input []ru
 	}
 
 	for sp := start; sp <= length; {
-		if p.prefixPC != 0 && len(clist) == 2 && clist[0].pc == p.prefixPC && clist[1].pc == 1 &&
-			sp < length && input[sp] != p.insts[p.prefixPC].ch {
-			if n := p.skipLiteralMisses(input[sp:], m); n > 0 {
+		if p.prefixPC != 0 && len(clist) == 2 && clist[0].pc == p.prefixPC && clist[1].pc == 1 && sp < length {
+			var n int
+			if input[sp] != p.insts[p.prefixPC].ch {
+				n = p.skipLiteralMisses(input[sp:], m)
+			} else if p.insts[p.prefixPC+1].op == opChar {
+				n = p.skipFalseStarts(input[sp:], m)
+			}
+			if n > 0 {
 				sp += n
 				// The wrapper starts a fresh thread at sp. Only its leading
 				// Saves survive the skipped positions; pc 1 still has unset slots.

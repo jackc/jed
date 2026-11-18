@@ -374,3 +374,19 @@ input = "猫猫猫猫猫猫犬"
 matched = true
 caps = [[3, 7], [3, 7], [3, 7]]
 steps = 74
+
+# Each nxxxxx has one extra literal advance beyond its six wrapper transitions.
+[[case]]
+pattern = "needle[0-9]+"
+input = "nxxxxxnxxxxx"
+matched = false
+caps = []
+steps = 66
+
+# Five advances in the first failed candidate, then one in the second.
+[[case]]
+pattern = "needle[0-9]+"
+input = "needlxnxxxxx"
+matched = false
+caps = []
+steps = 70

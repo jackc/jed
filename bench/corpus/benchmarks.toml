@@ -3191,6 +3191,23 @@ iterations = 100
 seed = 4220
 expect_rows_per_iter = 1
 
+[[bench]]
+name = "regex_false_starts"
+description = "Search repeated nxxxxx for a literal prefix followed by digits"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT id FROM regex_false_inputs WHERE subject ~ 'needle[0-9]+' ORDER BY id"
+setup_sql = [
+  "DROP TABLE IF EXISTS regex_false_inputs",
+  "CREATE TABLE regex_false_inputs (id integer PRIMARY KEY, subject text)",
+  "INSERT INTO regex_false_inputs VALUES (1, repeat('nxxxxx', 10923)), (2, repeat('nxxxxx', 10923) || 'needle42')"
+]
+warmup = 10
+iterations = 100
+seed = 4220
+expect_rows_per_iter = 1
+
 # Capture-tracking regex over the same 10k notes: a global regexp_replace whose two groups the
 # template reorders and repeats, so every match records capture slots (the persistent capture-slot
 # tree, spec/design/regex.md §4.1) and expands the template (cost.md §8.1). Each match adds one

@@ -157,6 +157,24 @@ All four before/after answer checksums matched. Each core still polls at every o
 position when cancellation is active. With a finite statement or lifetime limit, each batch stops
 before the position that can trip the ceiling.
 
+**Go false starts (2026-11-18).** For `needle[0-9]+`, a failed start in `nxxxxx` adds one
+literal advance to the six ordinary wrapper transitions. The Go VM scans these failures
+together and charges all 31 steps per block. Median precompiled predicate times across three
+samples, Core Ultra 9 285K, Go 1.27.1, `mise run bench:regex-go` with `-cpu 1`. Subjects
+were already runes for jed and strings for Go regexp.
+
+| Input | Go before | Go after | Go regexp | jed cost per match |
+|---|---:|---:|---:|---:|
+| 341 × `nxxxxx`, then `needle42` | 17.63 µs | 0.763 µs | 0.400 µs | 10,624 |
+| 10,923 × `nxxxxx`, miss | 553.8 µs | 16.74 µs | 10.83 µs | 338,617 |
+| 10,923 × `nxxxxx`, then `needle42` | 556.6 µs | 16.99 µs | 10.46 µs | 338,666 |
+| 341 × `needlx`, then `needle42` | 54.40 µs | 0.946 µs | 0.412 µs | 11,988 |
+
+The optimized jed predicates reported zero allocations after warmup, with identical costs
+before and after. The `regex_false_starts` SQL lane reads both long subjects from a scratch
+table and returns the id of the match. One 100-iteration run per revision measured 1.807 →
+0.344 ms per query with matching checksums.
+
 **Variable-width scan result (2026-10-13).** Track A4 ([packed-leaf.md §11](packed-leaf.md)) lets the
 columnar lanes read text, bytea, and array columns in place. The seven `varscan_*` lanes run over a
 100k-row scratch table (nullable text, `text[]`, `bytea`; no secondary index); `gin_stats_common_tag`

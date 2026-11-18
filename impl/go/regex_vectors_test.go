@@ -311,6 +311,13 @@ func TestRegexLiteralPrefixCheckpoints(t *testing.T) {
 		start            int
 	}{
 		{"needle", "abcneedxneedleneedle", 1},
+		{"needle[0-9]+", "nxxxxxnxxxxx", 0},
+		{"needle[0-9]+", "nxxxxxnxxxxxn", 0},
+		{"(needle)([0-9]+)", "needle!needlxneednneedle42", 1},
+		{"(?:needle)+z", "needleneedlxneedleneedlez", 0},
+		{"((猫犬鳥))[0-9]+", "😀猫犬鹿猫犬猫猫犬鳥42", 1},
+		{"((((((((needle))))))))", strings.Repeat("nxxxxx", 684) + "needle", 0},
+		{"needle[0-9]+", strings.Repeat("nxxxxx", 1400) + "needle42", 0},
 		{"aaab", "aaaaaaaaaa", 0},
 		{"aaab", "xxaaaaab", 2},
 		{"aaab", "aaaaaxaaaab", 1},
@@ -373,11 +380,25 @@ func TestRegexLiteralPrefixCheckpoints(t *testing.T) {
 		} else {
 			for _, pos := range []int64{255, 256, 4095, 4096, 8192} {
 				check(0, 19+4+5*pos, 0, nil)
+				if tc.pattern == "needle[0-9]+" {
+					// Each nxxxxx block costs 31, plus the initial four states.
+					full := 31*(pos/6) + 5*(pos%6)
+					if pos%6 != 0 {
+						full++ // the partial block includes its initial n
+					}
+					check(7+4+full, 0, 0, nil)
+					check(0, 19+4+full, 250, open)
+				}
 				if tc.pattern == "aaab" {
 					// After priming, N copies of a cost 8*N+1 including the seed.
 					check(0, 19+8*pos+1, 7, open)
 				}
 			}
+		}
+		if tc.pattern == "needle[0-9]+" {
+			// The second block's n advances to e at poll eight's preceding step.
+			// Poll eight and both ceilings fall due on the following x.
+			check(53, 65, 249, closed)
 		}
 		if tc.pattern == "aaab" {
 			// Poll and both ceilings fall due on the fifth a.

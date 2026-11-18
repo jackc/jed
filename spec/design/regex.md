@@ -347,7 +347,23 @@ the transition by charging the single position's full cost and running its norma
 before examining the next code point. This also preserves the first crossed ceiling and the
 partial cost reported on abort.
 
-A second shortcut applies when `w` consecutive copies of the same literal start at pc `k`,
+The same two-thread state can also skip **failed literal starts**. Suppose a candidate
+advances through `a` consecutive `Char` instructions, then fails at the next `Char`.
+If the first literal never occurs again in that span (including the mismatching code point),
+the wrapper starts no competing candidate. After the mismatch only the fresh literal and
+wrapper threads remain. Each of the `a+1` input positions costs `k+1` wrapper states;
+each of the `a` advances explores one additional literal state. For example, matching
+`needle[0-9]+` against `nxxxxx` costs 31 steps after the initial closure: six positions
+at five steps each, plus one advance to the first `e`.
+
+A scan can combine completed failures and ordinary misses. It bounds lookahead by at most
+`k+2` states per position when computing checkpoint headroom. If it encounters an
+overlapping start, a nonliteral instruction, or the scan boundary before proving a failure,
+the ordinary VM resumes at that candidate's start with its capture history intact.
+Only the final candidate in a batch may be inspected without being consumed. Its inspected
+interior contains no other start, so the additional lookahead is linear in the input length.
+
+The overlap shortcut applies when `w` consecutive copies of the same literal start at pc `k`,
 followed by a different literal at `k+w`. Suppose the parked pcs are exactly `k+w, …, k, 1`
 in priority order. On another copy of the repeated character the oldest start dies, the next
 `w` threads each advance one instruction, and the wrapper seeds a fresh start. This reproduces

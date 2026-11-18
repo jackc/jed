@@ -71,3 +71,16 @@ query B nosort
 SELECT 'aaaaaaaa' ~ 'aaab' FROM one
 ----
 false
+
+# A budget that expires while the second false start is being explored.
+# max_cost: 60
+statement error 54P01
+SELECT 'nxxxxxnxxxxx' ~ 'needle[0-9]+' FROM one
+
+# 14 instructions, 66 explored states and 4 scan/operator/output units.
+# max_cost: 85
+# cost: 84
+query B nosort
+SELECT 'nxxxxxnxxxxx' ~ 'needle[0-9]+' FROM one
+----
+false
