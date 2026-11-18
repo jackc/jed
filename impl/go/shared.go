@@ -1998,29 +1998,29 @@ func databaseOver(c *sharedCore) *Database {
 
 // Environment returns the handle's Environment (spec/design/environment.md §6) — the one every
 // session, attachment, and temp domain of this database uses.
-func (s *Database) Environment() *Environment { return s.core.env }
+func (db *Database) Environment() *Environment { return db.core.env }
 
 // LoadedCollations introspects the handle Environment's loaded collation set (collation.md §4.2),
 // ascending by name. C is built in and not listed.
-func (s *Database) LoadedCollations() []CollationInfo { return s.core.env.LoadedCollations() }
+func (db *Database) LoadedCollations() []CollationInfo { return db.core.env.LoadedCollations() }
 
 // LoadedTimeZones introspects the handle Environment's loaded zone set (timezones.md §3.3),
 // ascending by name. UTC and fixed offsets are built in and not listed.
-func (s *Database) LoadedTimeZones() []TimeZoneInfo { return s.core.env.LoadedTimeZones() }
+func (db *Database) LoadedTimeZones() []TimeZoneInfo { return db.core.env.LoadedTimeZones() }
 
 // Version is the committed version currently published (the monotonic commit counter,
 // transactions.md §8). Advances by 1 on every WriteHandle.Commit.
-func (s *Database) Version() uint64 { return s.core.roots.Load().committed.txid }
+func (db *Database) Version() uint64 { return db.core.roots.Load().committed.txid }
 
 // oldestLiveTxid is the oldest still-live snapshot version (transactions.md §8) — the Phase-6
 // reclamation watermark. With live readers it is the minimum version any of them pinned; with none
 // it is the committed version (nothing older is reachable). The map scan is order-independent (a
 // minimum), so no hash-map iteration order leaks (CLAUDE.md §8).
-func (s *Database) oldestLiveTxid() uint64 {
-	oldest := s.core.roots.Load().committed.txid
-	s.core.liveMu.Lock()
-	defer s.core.liveMu.Unlock()
-	for v := range s.core.live {
+func (db *Database) oldestLiveTxid() uint64 {
+	oldest := db.core.roots.Load().committed.txid
+	db.core.liveMu.Lock()
+	defer db.core.liveMu.Unlock()
+	for v := range db.core.live {
 		if v < oldest {
 			oldest = v
 		}
@@ -2580,43 +2580,43 @@ func (c *sharedCore) compactLocked(lname, name string, rekey *rekeyTarget) error
 // committedEngine builds a transient read engine over the latest committed snapshot for catalog
 // introspection (the shared-core analogue of Rust's Engine::from_snapshot). Not a session — it pins
 // nothing and never writes.
-func (s *Database) committedEngine() *engine {
-	rt := s.core.roots.Load()
+func (db *Database) committedEngine() *engine {
+	rt := db.core.roots.Load()
 	return &engine{
 		committed: rt.committed,
-		pageSize:  s.core.pageSize(),
-		session:   newSession(s.core.env),
+		pageSize:  db.core.pageSize(),
+		session:   newSession(db.core.env),
 	}
 }
 
 // toImage serializes the whole committed state to a from-scratch on-disk image (the inverse of
 // LoadEngine; spec/fileformat/format.md), used by the byte-level golden round-trip tests and by
 // hosts snapshotting an in-memory database to bytes.
-func (s *Database) toImage(pageSize uint32, txid uint64) ([]byte, error) {
-	return s.core.roots.Load().committed.ToImage(pageSize, txid)
+func (db *Database) toImage(pageSize uint32, txid uint64) ([]byte, error) {
+	return db.core.roots.Load().committed.ToImage(pageSize, txid)
 }
 
 // txid is the latest committed transaction id (the on-disk meta txid); equal to Version.
-func (s *Database) txid() uint64 { return s.core.roots.Load().committed.txid }
+func (db *Database) txid() uint64 { return db.core.roots.Load().committed.txid }
 
 // PageSize is the page payload size this database serializes at.
-func (s *Database) PageSize() uint32 { return s.core.pageSize() }
+func (db *Database) PageSize() uint32 { return db.core.pageSize() }
 
 // pageHighWater is the on-disk page high-water for a file-backed database; 0 in-memory.
-func (s *Database) pageHighWater() uint32 { return s.core.pageCount() }
+func (db *Database) pageHighWater() uint32 { return db.core.pageCount() }
 
 // Path is the backing file path for a file-backed database; "" in-memory.
-func (s *Database) Path() string { return s.core.path() }
+func (db *Database) Path() string { return db.core.path() }
 
 // setSpillDirForTest overrides the host scratch directory for per-core spill tests and the conformance
 // harness's forced temp-spill mode (setSpillDirForTooling). Production file hosts install os.TempDir at
 // open/create; keeping this a tooling hook keeps the configurable spill-target follow-on out of the
 // embedding API. Sessions minted afterwards inherit it.
-func (s *Database) setSpillDirForTest(dir string) {
+func (db *Database) setSpillDirForTest(dir string) {
 	// A sealed scratch target stays sealed (spec/design/encryption.md §6).
-	st := s.core.storage
+	st := db.core.storage
 	encrypt := (st.paging != nil && st.paging.codec() != nil) || (st.spill != nil && spillEncrypts(st.spill))
-	st.spill = sealScratch(osSpillHost{dir: dir}, encrypt, s.core.env)
+	st.spill = sealScratch(osSpillHost{dir: dir}, encrypt, db.core.env)
 }
 
 // setSpillDirForTooling gives db (and the sessions minted from it afterwards) a spill directory — the
@@ -2625,24 +2625,24 @@ func (s *Database) setSpillDirForTest(dir string) {
 func setSpillDirForTooling(db *Database, dir string) { db.setSpillDirForTest(dir) }
 
 // ReadOnly reports whether this database was opened read-only. In-memory databases are writable.
-func (s *Database) ReadOnly() bool { return s.core.readOnlyMode() }
+func (db *Database) ReadOnly() bool { return db.core.readOnlyMode() }
 
 // ReadSession opens a READ ONLY session over a consistent snapshot (spec/design/session.md §2.4,
 // transactions.md §10). Pins the committed roots now (a lock-free Load) and registers the version in
 // the live set; the session serves reads from that snapshot for its life — lock-free, never blocked
 // by and never blocking a writer — and a write through it is 25006. The caller must Close it to
 // deregister (advancing the watermark), idiomatically `defer s.Close()`. (The old SharedDB.Read().)
-func (s *Database) readSession() *Session {
-	rt, v, gen, atts := s.core.pinLatestAll() // atomic load+register (transactions.md §8): no load→register gap
+func (db *Database) readSession() *Session {
+	rt, v, gen, atts := db.core.pinLatestAll() // atomic load+register (transactions.md §8): no load→register gap
 	snap := rt.committed
 	// Reads never mutate the snapshot (a write is rejected before dispatch), so the engine shares the
 	// immutable pinned snapshot directly — no clone. The attached roots are pinned together (§5).
-	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: newSession(s.core.env)}
-	engine.core = s.core
+	engine := &engine{committed: snap, pageSize: db.core.pageSize(), path: db.core.storage.path, spill: db.core.storage.spill, session: newSession(db.core.env)}
+	engine.core = db.core
 	engine.attachedCommitted = rt.attached
 	engine.readOnly = true // the executor rejects writes (25006) / poisons a read-only block
-	refresh := s.core.hasSharedCoordinator()
-	return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, pinGen: gen, pinAtts: atts, roleGen: gen, baseVersion: v, refreshOnNextRead: refresh, planEpoch: s.core.planEpochNow()}
+	refresh := db.core.hasSharedCoordinator()
+	return &Session{core: db.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, pinGen: gen, pinAtts: atts, roleGen: gen, baseVersion: v, refreshOnNextRead: refresh, planEpoch: db.core.planEpochNow()}
 }
 
 // WriteSession opens a READ WRITE session with an eager open write block (spec/design/session.md
@@ -2651,25 +2651,25 @@ func (s *Database) readSession() *Session {
 // set. Statements run with full transaction semantics (read-your-writes, failed-block poisoning);
 // Commit publishes the working set, Rollback / Close discards it and releases the gate. (The old
 // SharedDB.Write().)
-func (s *Database) writeSession() *Session {
-	if s.core.readOnlyMode() {
+func (db *Database) writeSession() *Session {
+	if db.core.readOnlyMode() {
 		// A read-only file has no writer (api.md §2.1); a "write" session degrades to a pinned
 		// read-only one — a write through it is 25006, mirroring PostgreSQL hot standby.
-		return s.readSession()
+		return db.readSession()
 	}
-	if err := s.core.acquireWriter(0); err != nil {
-		failed := s.readSession()
+	if err := db.core.acquireWriter(0); err != nil {
+		failed := db.readSession()
 		failed.pendingErr = err
 		return failed
 	}
-	rt := s.core.roots.Load()
+	rt := db.core.roots.Load()
 	base := rt.committed
 	// committed is the immutable base (the writer mutates only working, which beginTx clones off it).
-	engine := &engine{committed: base, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: newSession(s.core.env)}
-	engine.core = s.core
-	engine.attachedCommitted = s.core.writerView(rt)
+	engine := &engine{committed: base, pageSize: db.core.pageSize(), path: db.core.storage.path, spill: db.core.storage.spill, session: newSession(db.core.env)}
+	engine.core = db.core
+	engine.attachedCommitted = db.core.writerView(rt)
 	_, _ = engine.beginTx(true, true)
-	return &Session{core: s.core, engine: engine, access: accessReadWrite, gateHeld: true, baseVersion: base.txid, roleGen: s.core.writerGen(), planEpoch: s.core.planEpochNow()}
+	return &Session{core: db.core, engine: engine, access: accessReadWrite, gateHeld: true, baseVersion: base.txid, roleGen: db.core.writerGen(), planEpoch: db.core.planEpochNow()}
 }
 
 // Session mints an ADDITIONAL configured session over this database (spec/design/session.md
@@ -2679,34 +2679,34 @@ func (s *Database) writeSession() *Session {
 // publishes, and releases it; BEGIN/COMMIT/ROLLBACK open and end an explicit block. (The old
 // Engine.NewSession swap → an independent owns-its-Engine session.)
 // An invalid TimeZone or negative LockTimeout returns 22023 and no session.
-func (s *Database) Session(opts SessionOptions) (*Session, error) {
-	state, err := newSessionWithOptions(opts, s.core.env)
+func (db *Database) Session(opts SessionOptions) (*Session, error) {
+	state, err := newSessionWithOptions(opts, db.core.env)
 	if err != nil {
 		return nil, err
 	}
-	return s.sessionWithState(state), nil
+	return db.sessionWithState(state), nil
 }
 
 // sessionWithState attaches already validated state to the shared database.
-func (s *Database) sessionWithState(state sessionState) *Session {
+func (db *Database) sessionWithState(state sessionState) *Session {
 	// A read-only file-backed core mints read-only sessions (a write is 25006); it pins the committed
 	// version in the watermark like a read session (atomic load+register, §8). A writable core mints the
 	// autocommit lazy-gate one — no persistent pin (each autocommit read pins per statement).
-	if s.core.readOnlyMode() {
-		rt, v, gen, atts := s.core.pinLatestAll()
-		engine := &engine{committed: rt.committed, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: state}
-		engine.core = s.core
+	if db.core.readOnlyMode() {
+		rt, v, gen, atts := db.core.pinLatestAll()
+		engine := &engine{committed: rt.committed, pageSize: db.core.pageSize(), path: db.core.storage.path, spill: db.core.storage.spill, session: state}
+		engine.core = db.core
 		engine.attachedCommitted = rt.attached
 		engine.readOnly = true // the executor enforces read-only too (rejects BEGIN READ WRITE, poisons a read-only block)
-		refresh := s.core.hasSharedCoordinator()
-		return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, pinGen: gen, pinAtts: atts, roleGen: gen, baseVersion: v, refreshOnNextRead: refresh, planEpoch: s.core.planEpochNow()}
+		refresh := db.core.hasSharedCoordinator()
+		return &Session{core: db.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, pinGen: gen, pinAtts: atts, roleGen: gen, baseVersion: v, refreshOnNextRead: refresh, planEpoch: db.core.planEpochNow()}
 	}
-	rt := s.core.roots.Load()
+	rt := db.core.roots.Load()
 	snap := rt.committed
-	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: state}
-	engine.core = s.core
+	engine := &engine{committed: snap, pageSize: db.core.pageSize(), path: db.core.storage.path, spill: db.core.storage.spill, session: state}
+	engine.core = db.core
 	engine.attachedCommitted = rt.attached
-	return &Session{core: s.core, engine: engine, access: accessReadWrite, baseVersion: snap.txid, planEpoch: s.core.planEpochNow()}
+	return &Session{core: db.core, engine: engine, access: accessReadWrite, baseVersion: snap.txid, planEpoch: db.core.planEpochNow()}
 }
 
 // --- Bare convenience methods (CLAUDE.md §2 / spec/design/session.md §2.4): each mints a FRESH

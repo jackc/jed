@@ -3,17 +3,17 @@ package jed
 // White-box catalog access stays in the test build. Applications use SQL catalogs.
 
 // table inspects the latest committed table definition for white-box tests.
-func (s *Database) table(name string) (*catTable, bool) { return s.committedEngine().table(name) }
+func (db *Database) table(name string) (*catTable, bool) { return db.committedEngine().table(name) }
 
 // compositeType is the definition of composite type name in the latest committed snapshot, or nil.
-func (s *Database) compositeType(name string) *compositeType {
-	return s.committedEngine().compositeType(name)
+func (db *Database) compositeType(name string) *compositeType {
+	return db.committedEngine().compositeType(name)
 }
 
 // rowsInKeyOrder is a white-box test helper (CLAUDE.md §10): all rows of persistent table name in
 // primary-key order from the latest committed snapshot. Not the embedding API.
-func (s *Database) rowsInKeyOrder(name string) []storedRow {
-	return s.committedEngine().rowsInKeyOrder(name)
+func (db *Database) rowsInKeyOrder(name string) []storedRow {
+	return db.committedEngine().rowsInKeyOrder(name)
 }
 
 // table is the definition of table name (exact name) as this session sees it, or false.
