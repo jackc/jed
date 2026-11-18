@@ -2,7 +2,7 @@
 # persistent array, a tree of 16-slot leaves, so a Save copies only the path to the slot it sets. The
 # small patterns elsewhere fit in one leaf; these 300-group patterns have 602 slots, three levels, so
 # every group must still report its own span from its own leaf. Oracle-checked against PostgreSQL.
-# requires: query.select_no_from, query.set_returning, func.array, func.regexp_match, func.regexp_matches, func.regexp_replace, func.regexp_substr, func.regexp_instr, types.array, types.i32, types.text, null.three_valued
+# requires: expr.regex_match, query.aggregates, query.select_no_from, query.set_returning, func.array, func.regexp_match, func.regexp_matches, func.regexp_replace, func.regexp_substr, func.regexp_instr, types.array, types.i32, types.text, null.three_valued
 
 query I nosort
 SELECT cardinality(regexp_match(repeat('ab', 150), repeat('(a)(b)', 150)))
@@ -59,3 +59,11 @@ a
 b
 a
 b
+
+# NoREC: counting rows selected by the boolean predicate agrees with counting
+# non-NULL capture results over all rows. Both see partial and complete matches.
+query B nosort
+SELECT (SELECT count(*) FROM generate_series(1, 16) g WHERE repeat('a', g) ~ repeat('(a)', 12))
+     = (SELECT count(regexp_match(repeat('a', g), repeat('(a)', 12))) FROM generate_series(1, 16) g)
+----
+true

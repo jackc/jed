@@ -89,14 +89,15 @@ func (c *regexClass) admits(r rune) bool {
 // group count (excluding group 0, the whole match), plus the shape of its capture-slot trees (capShape)
 // and a pool of dedup sets (regexSeen) that its searches reuse.
 type regexProgram struct {
-	insts        []regexInst
-	classes      []regexClass
-	ngroups      int
-	capDepth     int
-	capLeafLen   int
-	prefixPC     int // first literal after the ordinary wrapper and initial Saves, or zero
-	overlapWidth int // leading identical Char instructions followed by a different Char
-	seenPool     sync.Pool
+	insts            []regexInst
+	classes          []regexClass
+	ngroups          int
+	capDepth         int
+	capLeafLen       int
+	prefixPC         int // first literal after the ordinary wrapper and initial Saves, or zero
+	overlapWidth     int // leading identical Char instructions followed by a different Char
+	predicateLiteral []regexLiteralStep
+	seenPool         sync.Pool
 }
 
 func (p *regexProgram) ninst() int { return len(p.insts) }
@@ -998,6 +999,9 @@ func compileRegexWrapped(pattern string, mode regexMode, wrapper regexWrapper) (
 		}
 		if prog.insts[pc].op == opChar {
 			prog.prefixPC = pc
+			if p.ngroups > 0 {
+				prog.predicateLiteral = compilePredicateLiteral(prog.insts, pc)
+			}
 			end := pc + 1
 			for prog.insts[end].op == opChar && prog.insts[end].ch == prog.insts[pc].ch {
 				end++
@@ -1234,8 +1238,109 @@ func (p *regexProgram) takeSeen() *regexSeen {
 	return &regexSeen{marks: make([]uint32, len(p.insts))}
 }
 
+// Each entry describes the prefix ending at this character (regex.md §4).
+type regexLiteralStep struct {
+	ch     rune
+	border int // length of its longest proper border
+	states int // total states visited by the advance and all its borders
+}
+
+func compilePredicateLiteral(insts []regexInst, first int) []regexLiteralStep {
+	last := len(insts) - 1 // Match
+	count := 0
+	internalSave := false
+	for pc := first; pc < last; pc++ {
+		switch insts[pc].op {
+		case opChar:
+			count++
+			if pc > first && insts[pc-1].op == opSave {
+				internalSave = true
+			}
+		case opSave:
+		default:
+			return nil
+		}
+	}
+	if !internalSave {
+		return nil // keep the existing literal-prefix shortcuts for surrounding groups
+	}
+	steps := make([]regexLiteralStep, count)
+	pc := first
+	for i := range steps {
+		next := pc + 1
+		for insts[next].op == opSave {
+			next++
+		}
+		step := regexLiteralStep{ch: insts[pc].ch, states: next - pc}
+		if i > 0 {
+			step.border = advanceLiteral(steps, steps[i-1].border, step.ch)
+			if step.border > 0 {
+				step.states += steps[step.border-1].states
+			}
+		}
+		steps[i] = step
+		pc = next
+	}
+	return steps
+}
+
+func advanceLiteral(steps []regexLiteralStep, matched int, ch rune) int {
+	for matched > 0 && steps[matched].ch != ch {
+		matched = steps[matched-1].border
+	}
+	if steps[matched].ch == ch {
+		return matched + 1
+	}
+	return 0
+}
+
+func (p *regexProgram) matchPredicateLiteral(input []rune, m *costMeter) (bool, error) {
+	m.Charge(int64(p.prefixPC) * costs.RegexStep)
+	matched := 0
+	for pos := 0; pos < len(input) && matched < len(p.predicateLiteral); {
+		// At most one visit per instruction per position. Batch only positions
+		// strictly before either ceiling and the next cancellation poll.
+		n := m.stepsBeforeCheckpoint(min(len(input)-pos, 4096), int64(len(p.insts))*costs.RegexStep)
+		start := pos
+		end := pos + max(n, 1)
+		states := 0
+		for pos < end && matched < len(p.predicateLiteral) {
+			if matched == 0 {
+				for pos < end && input[pos] != p.predicateLiteral[0].ch {
+					pos++
+				}
+				if pos == end {
+					break
+				}
+			}
+			matched = advanceLiteral(p.predicateLiteral, matched, input[pos])
+			if matched > 0 {
+				states += p.predicateLiteral[matched-1].states
+			}
+			pos++
+		}
+		states += (pos - start) * (p.prefixPC + 1)
+		units := int64(states) * costs.RegexStep
+		if n == 0 {
+			m.Charge(units)
+			if err := m.Step(); err != nil {
+				return false, err
+			}
+		} else {
+			m.chargeStepsBeforeCheckpoint(pos-start, units)
+		}
+	}
+	if err := m.Step(); err != nil { // Match or EOF
+		return false, err
+	}
+	return matched == len(p.predicateLiteral), nil
+}
+
 // isMatch reports whether the pattern matches somewhere in input (the `~` operator).
 func (p *regexProgram) isMatch(input []rune, m *costMeter) (bool, error) {
+	if p.predicateLiteral != nil {
+		return p.matchPredicateLiteral(input, m)
+	}
 	seen := p.takeSeen()
 	defer p.seenPool.Put(seen)
 	_, ok, err := pikeSearch[noCaps, noCaps](p, seen, input, 0, nil, nil, m)

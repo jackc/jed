@@ -84,3 +84,16 @@ query B nosort
 SELECT 'nxxxxxnxxxxx' ~ 'needle[0-9]+' FROM one
 ----
 false
+
+# The twelve groups contribute Save states even in a boolean predicate.
+# max_cost: 200
+statement error 54P01
+SELECT 'aaaaaaaaaaaa' ~ '(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)' FROM one
+
+# 42 compiled instructions, 311 explored states and 4 scan/operator/output units.
+# max_cost: 358
+# cost: 357
+query B nosort
+SELECT 'aaaaaaaaaaaa' ~ '(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)' FROM one
+----
+true

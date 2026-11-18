@@ -375,6 +375,21 @@ at its own code-point offset. The same cost and cancellation boundaries apply. T
 VM handles the position that breaks the run, including a match of the following literal,
 and the end-of-input checkpoint.
 
+For a boolean search whose entire body is a nonempty fixed literal interleaved with
+capture saves, the active starts can be represented by the longest literal prefix ending
+at the current position. Every other advanced start is a nonempty proper suffix of that
+prefix that is itself a prefix (a border). A Knuth–Morris–Pratt failure table enumerates
+these borders and finds the next longest prefix in amortized linear time over the input.
+
+For a prefix of length `i`, advancing its last character visits the subsequent saves and
+the next parked instruction (a `Char` or the final `Match`). Their count is the distance
+between the two instruction addresses. Precompute the sum of this distance and the sum
+for the longest proper border, with sum zero for the empty prefix. The instruction ranges
+for the advanced starts are disjoint. Seed the search at cost `k` and charge each consumed
+position `k+1` wrapper states plus the precomputed sum for its new longest prefix.
+A full match has the earliest surviving start because every match has the same length.
+Both a full match and exhaustion still perform the VM's final zero-charge checkpoint.
+
 ### 4.1 Capture slots — a persistent array
 
 `regex_step` is the meter's only measure of match work, so each step must stand for a bounded

@@ -410,3 +410,69 @@ func TestRegexLiteralPrefixCheckpoints(t *testing.T) {
 		}
 	}
 }
+
+func TestRegexGroupedLiteralPredicateCheckpoints(t *testing.T) {
+	closed := make(chan struct{})
+	close(closed)
+	open := make(chan struct{})
+	for _, tc := range []struct{ pattern, subject string }{
+		{strings.Repeat("(a)", 12), "aaaaaaaaaaaax"},
+		{"(ab)(aba)(c)", "abababababac"},
+		{"()((猫)犬)()(猫)()", "😀猫猫犬猫"},
+		{"(aaa)(b)", ""},
+		{"(a)(a)(a)(b)", strings.Repeat("a", 8200) + "b"},
+		{"(a)(b)", strings.Repeat("x", 8200) + "a"},
+	} {
+		p, err := compileRegex(tc.pattern)
+		if err != nil || p.predicateLiteral == nil {
+			t.Fatalf("%q: missing literal table: %v", tc.pattern, err)
+		}
+		input := []rune(tc.subject)
+		type result struct {
+			match             bool
+			err               error
+			accrued, lifetime int64
+			phase             uint8
+		}
+		run := func(fast bool, stmt, life int64, cancel <-chan struct{}, phase uint8) result {
+			total := int64(19)
+			m := costMeter{Accrued: 7, Limit: stmt, lifetimeTotal: &total, lifetimeLimit: life, cancel: cancel, cancelSteps: phase}
+			var ok bool
+			var err error
+			if fast {
+				ok, err = p.isMatch(input, &m)
+			} else {
+				seen := p.takeSeen()
+				defer p.seenPool.Put(seen)
+				_, ok, err = pikeSearch[noCaps, noCaps](p, seen, input, 0, nil, nil, &m)
+			}
+			return result{ok, err, m.Accrued, total, m.cancelSteps}
+		}
+		check := func(stmt, life int64, cancel <-chan struct{}, phase uint8) {
+			t.Helper()
+			got, want := run(true, stmt, life, cancel, phase), run(false, stmt, life, cancel, phase)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("%q limits %d/%d phase %d: got %+v, want %+v", tc.pattern, stmt, life, phase, got, want)
+			}
+		}
+		check(0, 0, nil, 0)
+		check(0, 0, open, 7)
+		for _, phase := range []uint8{0, 1, 244, 250, 255} {
+			check(0, 0, closed, phase)
+			check(78, 90, closed, phase)
+		}
+		if len(input) < 100 {
+			end := run(false, 0, 0, nil, 0).accrued + 1
+			for stmt := int64(7); stmt <= end; stmt++ {
+				check(stmt, 0, nil, 0)
+				for delta := int64(11); delta <= 13; delta++ {
+					check(stmt, stmt+delta, open, 249)
+				}
+			}
+		} else {
+			for _, budget := range []int64{256, 4095, 4096, 8192, 30000} {
+				check(0, budget, open, 255)
+			}
+		}
+	}
+}

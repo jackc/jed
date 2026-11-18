@@ -31,6 +31,9 @@ func BenchmarkRegexPredicate(b *testing.B) {
 		{"dense_starts_long", "aaab", strings.Repeat("a", 65536), false},
 		{"dense_starts_late_hit", "aaab", strings.Repeat("a", 65536) + "b", true},
 		{"groups", strings.Repeat("(a)", 12), strings.Repeat("a", 12), true},
+		{"groups_short_miss", strings.Repeat("(a)", 12), strings.Repeat("a", 11), false},
+		{"groups_mixed", "(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)", "xxabcdefghijkxabcdefghijkl", true},
+		{"groups_overlapping_miss", strings.Repeat("(a)", 11) + "(b)", strings.Repeat("a", 2048), false},
 		{"wide_class", class.String(), strings.Repeat("界", 256), false},
 	} {
 		b.Run(tc.name, func(b *testing.B) {

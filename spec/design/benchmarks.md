@@ -192,6 +192,22 @@ All four costs agreed across cores and revisions. Over 100 timed queries in
 to 0.624 ms. Both returned the same matching row and checksum as before. These timings use
 the default unlimited budget and an unarmed cancellation check.
 
+**Go grouped literal predicates (2026-11-18).** Median ns per precompiled boolean match
+over three samples on the same host with Go 1.27.1 and `mise run bench:regex-go`.
+jed used rune slices and accrued both statement and lifetime cost. Go regexp used strings.
+Both reported zero allocations per match after warmup.
+
+| Twelve-group case | Go before | Go after | Go regexp | jed steps |
+|---|---:|---:|---:|---:|
+| Twelve `(a)` groups, exact hit | 1,326 | 17.2 | 71.4 | 311 |
+| Same pattern, eleven-character miss | 1,141 | 16.8 | 1.49 | 269 |
+| Groups `(a)` through `(l)`, partial match then hit | 866 | 29.4 | 74.7 | 230 |
+| Eleven `(a)` groups then `(b)`, miss on 2,048 copies of `a` | 328,050 | 2,853 | 452 | 79,712 |
+
+The `regex_group_predicate` SQL benchmark counts 5,000 hits among 10,000 rows.
+Across 50 measured queries per revision, mean time fell from 14.81 to 1.28 ms
+with matching checksums.
+
 **Variable-width scan result (2026-10-13).** Track A4 ([packed-leaf.md §11](packed-leaf.md)) lets the
 columnar lanes read text, bytea, and array columns in place. The seven `varscan_*` lanes run over a
 100k-row scratch table (nullable text, `text[]`, `bytea`; no secondary index); `gin_stats_common_tag`
