@@ -222,7 +222,7 @@ func TestParseStageErrorsPoisonAnOpenBlock(t *testing.T) {
 func TestCloseAttachDetachNeverWaitForAnOpenWriteBlock(t *testing.T) {
 	t.Parallel()
 	db := memDB()
-	if err := db.Attach("aux", AttachMemory(), false); err != nil {
+	if err := db.Attach(context.Background(), "aux", AttachMemory(), AttachOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	s := mustSession(db, SessionOptions{})
@@ -236,7 +236,7 @@ func TestCloseAttachDetachNeverWaitForAnOpenWriteBlock(t *testing.T) {
 	if c := ctxCode(t, db.Close()); c != "55006" {
 		t.Fatalf("Close with an open write block: want 55006, got %s", c)
 	}
-	if c := ctxCode(t, db.Attach("more", AttachMemory(), false)); c != "55006" {
+	if c := ctxCode(t, db.Attach(context.Background(), "more", AttachMemory(), AttachOptions{})); c != "55006" {
 		t.Fatalf("Attach with an open write block: want 55006, got %s", c)
 	}
 	if c := ctxCode(t, db.Detach("aux")); c != "55006" {
@@ -249,7 +249,7 @@ func TestCloseAttachDetachNeverWaitForAnOpenWriteBlock(t *testing.T) {
 	if n := txCount(t, s, "t"); n != 1 {
 		t.Fatalf("rows = %d want 1", n)
 	}
-	if err := db.Attach("more", AttachMemory(), false); err != nil {
+	if err := db.Attach(context.Background(), "more", AttachMemory(), AttachOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Detach("aux"); err != nil {

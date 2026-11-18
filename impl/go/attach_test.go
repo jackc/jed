@@ -41,7 +41,7 @@ func attachErrCode(t *testing.T, s *Session, sql string) string {
 func TestAttachLifecycle(t *testing.T) {
 	t.Parallel()
 	db := memDB()
-	if err := db.Attach("mydb", AttachMemory(), false); err != nil {
+	if err := db.Attach(context.Background(), "mydb", AttachMemory(), AttachOptions{}); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
 	s := mustSession(db, SessionOptions{})
@@ -94,7 +94,7 @@ func TestAttachLifecycle(t *testing.T) {
 func TestAttachmentWorkingRootsAndCursorsDoNotAlias(t *testing.T) {
 	t.Parallel()
 	db := memDB()
-	if err := db.Attach("work", AttachMemory(), false); err != nil {
+	if err := db.Attach(context.Background(), "work", AttachMemory(), AttachOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	s := mustSession(db, SessionOptions{})
@@ -163,7 +163,7 @@ func TestAttachmentWorkingRootsAndCursorsDoNotAlias(t *testing.T) {
 func TestAttachReadOnlyRejectsWrites(t *testing.T) {
 	t.Parallel()
 	db := memDB()
-	if err := db.Attach("ro", AttachMemory(), true); err != nil {
+	if err := db.Attach(context.Background(), "ro", AttachMemory(), AttachOptions{ReadOnly: true}); err != nil {
 		t.Fatalf("attach read-only: %v", err)
 	}
 	s := mustSession(db, SessionOptions{})
@@ -188,7 +188,7 @@ func TestAttachReadOnlyRejectsWrites(t *testing.T) {
 func TestDetachInUseIs55006(t *testing.T) {
 	t.Parallel()
 	db := memDB()
-	if err := db.Attach("mydb", AttachMemory(), false); err != nil {
+	if err := db.Attach(context.Background(), "mydb", AttachMemory(), AttachOptions{}); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
 	reader := db.readSession() // pins the committed roots in the live registry
@@ -208,11 +208,11 @@ func TestDetachInUseIs55006(t *testing.T) {
 func TestAttachNameErrors(t *testing.T) {
 	t.Parallel()
 	db := memDB()
-	if err := db.Attach("mydb", AttachMemory(), false); err != nil {
+	if err := db.Attach(context.Background(), "mydb", AttachMemory(), AttachOptions{}); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
 	for _, name := range []string{"main", "temp", "mydb"} {
-		if err := db.Attach(name, AttachMemory(), false); err == nil {
+		if err := db.Attach(context.Background(), name, AttachMemory(), AttachOptions{}); err == nil {
 			t.Fatalf("attach %q: want 42710, got nil", name)
 		} else if code := err.(*EngineError).Code(); code != "42710" {
 			t.Fatalf("attach %q: want 42710, got %s", name, code)
@@ -221,7 +221,7 @@ func TestAttachNameErrors(t *testing.T) {
 	// Host-API names are exact (grammar.md §3): a different letter case is a different name, so it
 	// collides with neither a reserved scope nor an existing attachment.
 	for _, name := range []string{"MAIN", "Temp", "MyDB"} {
-		if err := db.Attach(name, AttachMemory(), false); err != nil {
+		if err := db.Attach(context.Background(), name, AttachMemory(), AttachOptions{}); err != nil {
 			t.Fatalf("attach %q: %v", name, err)
 		}
 	}
@@ -265,7 +265,7 @@ func TestAttachFileReadOnlyCrossRead(t *testing.T) {
 		"INSERT INTO city VALUES (1, 'Ada'), (2, 'Bos')")
 
 	db := memDB()
-	if err := db.Attach("ref", AttachFile(ref), true); err != nil {
+	if err := db.Attach(context.Background(), "ref", AttachFile(ref, AttachFileOptions{}), AttachOptions{ReadOnly: true}); err != nil {
 		t.Fatalf("attach file read-only: %v", err)
 	}
 	defer db.Detach("ref")
@@ -313,7 +313,7 @@ func TestAttachFileReadWritePersistsAcrossReopen(t *testing.T) {
 	work := makeFileDB(t, dir, "work.jed", 0) // an empty writable file to attach
 
 	db := memDB()
-	if err := db.Attach("work", AttachFile(work), false); err != nil {
+	if err := db.Attach(context.Background(), "work", AttachFile(work, AttachFileOptions{}), AttachOptions{}); err != nil {
 		t.Fatalf("attach file read-write: %v", err)
 	}
 	s := mustSession(db, SessionOptions{})
@@ -361,7 +361,7 @@ func TestAttachFileCompositeColumnDML(t *testing.T) {
 		"INSERT INTO loc VALUES (1, ROW('Main', 5), 100), (2, ROW('Elm', 9), 200), (3, ROW('Oak', 1), 300)")
 
 	db := memDB() // the main database has no `addr` type
-	if err := db.Attach("work", AttachFile(work), false); err != nil {
+	if err := db.Attach(context.Background(), "work", AttachFile(work, AttachFileOptions{}), AttachOptions{}); err != nil {
 		t.Fatalf("attach file read-write: %v", err)
 	}
 	defer db.Detach("work")
@@ -402,7 +402,7 @@ func TestAttachFileOneDurableWriter(t *testing.T) {
 		t.Fatalf("open file main: %v", err)
 	}
 	defer db.Close()
-	if err := db.Attach("extra", AttachFile(extra), false); err != nil {
+	if err := db.Attach(context.Background(), "extra", AttachFile(extra, AttachFileOptions{}), AttachOptions{}); err != nil {
 		t.Fatalf("attach extra file: %v", err)
 	}
 	defer db.Detach("extra")
@@ -444,7 +444,7 @@ func TestAttachFileWithMemoryMainMultiWrite(t *testing.T) {
 	t.Parallel()
 	work := makeFileDB(t, t.TempDir(), "work.jed", 0, "CREATE TABLE w (id i32 PRIMARY KEY)")
 	db := memDB() // in-memory main — not durable
-	if err := db.Attach("work", AttachFile(work), false); err != nil {
+	if err := db.Attach(context.Background(), "work", AttachFile(work, AttachFileOptions{}), AttachOptions{}); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
 	defer func() { db.Detach("work"); db.Close() }()
@@ -472,7 +472,7 @@ func TestAttachFilePageSizeIndependent(t *testing.T) {
 	dir := t.TempDir()
 	small := makeFileDB(t, dir, "small.jed", 256) // a 256-byte-page file, unlike the 4096 default main
 	db := memDB()
-	if err := db.Attach("small", AttachFile(small), false); err != nil {
+	if err := db.Attach(context.Background(), "small", AttachFile(small, AttachFileOptions{}), AttachOptions{}); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
 	s := mustSession(db, SessionOptions{})
@@ -510,7 +510,7 @@ func TestAttachFileReattach(t *testing.T) {
 	db := memDB()
 	defer db.Close()
 	for i := 0; i < 3; i++ {
-		if err := db.Attach("ref", AttachFile(ref), true); err != nil {
+		if err := db.Attach(context.Background(), "ref", AttachFile(ref, AttachFileOptions{}), AttachOptions{ReadOnly: true}); err != nil {
 			t.Fatalf("attach #%d: %v", i, err)
 		}
 		s := mustSession(db, SessionOptions{})
@@ -532,13 +532,13 @@ func TestAttachFileMissingIs58P01(t *testing.T) {
 	db := memDB()
 	defer db.Close()
 	path := filepath.Join(t.TempDir(), "nope.jed")
-	if err := db.Attach("x", AttachFile(path), true); err == nil {
+	if err := db.Attach(context.Background(), "x", AttachFile(path, AttachFileOptions{}), AttachOptions{ReadOnly: true}); err == nil {
 		t.Fatal("attach missing file: want an error, got nil")
 	} else if code := err.(*EngineError).Code(); code != "58P01" {
 		t.Fatalf("attach missing file: want 58P01, got %s", code)
 	}
 	// The failed attach left no registry entry — the name is free.
-	if err := db.Attach("x", AttachMemory(), false); err != nil {
+	if err := db.Attach(context.Background(), "x", AttachMemory(), AttachOptions{}); err != nil {
 		t.Fatalf("re-attach after failed file attach: %v", err)
 	}
 }
@@ -550,7 +550,7 @@ func TestAttachFileMissingIs58P01(t *testing.T) {
 func TestAttachNamesAreExact(t *testing.T) {
 	t.Parallel()
 	db := memDB()
-	if err := db.Attach("Reports", AttachMemory(), false); err != nil {
+	if err := db.Attach(context.Background(), "Reports", AttachMemory(), AttachOptions{}); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
 	s := mustSession(db, SessionOptions{})
@@ -561,7 +561,7 @@ func TestAttachNamesAreExact(t *testing.T) {
 		t.Fatalf("quoted qualifier = %v", got)
 	}
 	wantErr(t, s, "SELECT id FROM Reports.sales", "42P01") // a bare qualifier folds to reports
-	if err := db.Attach("reports", AttachMemory(), false); err != nil {
+	if err := db.Attach(context.Background(), "reports", AttachMemory(), AttachOptions{}); err != nil {
 		t.Fatalf("a lowercase attach name is distinct from Reports: %v", err)
 	}
 	attachExec(t, s, "CREATE TABLE REPORTS.sales (id i32 PRIMARY KEY)")

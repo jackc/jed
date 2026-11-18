@@ -83,8 +83,10 @@ type serviceRole struct {
 
 // serviceHandoff is a handle's page-service state that outlives its roles.
 type serviceHandoff struct {
-	host lockHost
-	path string
+	// openDone cancels the opening election (Attach's ctx); cleared once the open returns.
+	openDone <-chan struct{}
+	host     lockHost
+	path     string
 	// opts are the handle's open options: promotion opens the file with them.
 	opts      OpenOptions
 	ownership Ownership

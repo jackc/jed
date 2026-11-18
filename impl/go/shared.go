@@ -1755,7 +1755,7 @@ type Database struct {
 // AttachSource selects the backing for a database attached via Database.Attach
 // (spec/design/attached-databases.md §4). A MEMORY source is a fresh, empty in-memory database
 // (Slice 1b); a FILE source opens an existing single-file jed database on disk (Slice 2). Build one
-// with AttachMemory() or AttachFile(path).
+// with AttachMemory() or AttachFile(path, AttachFileOptions{}).
 type AttachSource struct {
 	file            bool   // false = in-memory (Slice 1b); true = file-backed (Slice 2)
 	path            string // the file path, when file is true
@@ -1777,15 +1777,9 @@ type AttachFileOptions struct {
 // AttachMemory returns a source for a fresh, empty in-memory attachment (attached-databases.md §6).
 func AttachMemory() AttachSource { return AttachSource{} }
 
-// AttachFile returns a source for a file-backed attachment: an existing single-file jed database at
-// path (attached-databases.md §4, Slice 2). The file's own page size is honored (each attachment is
-// its own page space, §2). Combine with readOnly=true (the natural reference-database mode) to open it
-// O_RDONLY as well as reject every write (25006); readOnly=false opens it O_RDWR so DDL/DML can target
-// it (subject to the one-durable-writer rule, §5).
-func AttachFile(path string) AttachSource { return AttachFileWithOptions(path, AttachFileOptions{}) }
-
-// AttachFileWithOptions returns a coordinated file attachment source with explicit lock settings.
-func AttachFileWithOptions(path string, opts AttachFileOptions) AttachSource {
+// AttachFile returns a source for an existing database file at path. The file keeps its own page
+// size. The zero AttachFileOptions uses the default locking.
+func AttachFile(path string, opts AttachFileOptions) AttachSource {
 	return AttachSource{file: true, path: path, locking: opts.Locking, fileLockTimeout: opts.FileLockTimeout}
 }
 
@@ -1973,7 +1967,7 @@ func Open(path string, opts OpenOptions) (*Database, error) {
 	if mode == LockingAuto {
 		return openServiceDatabase(path, opts)
 	}
-	coordinator, real, err := prepareOpenCoordinator(path, mode, durationMillisPtr(opts.FileLockTimeout))
+	coordinator, real, err := prepareOpenCoordinator(path, mode, durationMillisPtr(opts.FileLockTimeout), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -2055,17 +2049,28 @@ func (db *Database) StorageBytes(name string) (int64, error) {
 	return st.storageBytes(), nil
 }
 
-// Attach adds a database named `name` to this handle, reachable by the database qualifier `name.table`
-// (spec/design/attached-databases.md §4). Attaching is a HOST-API act, never SQL — an untrusted,
-// SQL-only session cannot attach anything (the pure-SQL safety spine, §4/§13). `source` is either
-// AttachMemory() (a fresh, empty in-memory database) or AttachFile(path) (an existing single-file jed
-// database on disk, Slice 2 — its committed state becomes the attachment's initial root, its own page
-// size honored). `readOnly` attaches it read-only: every write to it (DML or DDL) is 25006, it never
-// competes for the one-durable-writer slot (§5), and a file source is additionally opened O_RDONLY
-// (defense in depth). The name is exact; it must not name a reserved database (`main` / `temp`)
-// or one already attached (42710). Opening a file surfaces the same host/file codes as opening `main`
-// (58P01/58P02/XX001/…, hosts.md §4). Publishing the new attachment root is atomic under the writer gate.
-func (db *Database) Attach(name string, source AttachSource, readOnly bool) error {
+// AttachOptions configures Database.Attach.
+type AttachOptions struct {
+	// ReadOnly rejects every write to the attached database with SQLSTATE 25006. A read-only
+	// attachment never competes for the writer slot, and a file is opened without write access.
+	ReadOnly bool
+}
+
+// Attach makes source reachable as database name, so SQL can qualify its tables as name.table.
+// Attaching is only possible through the host API, never from SQL. The name must not be main,
+// temp, or an existing attachment (SQLSTATE 42710). Opening a file can fail as Open does
+// (58P01, XX001, …). ctx bounds the wait for the file's lock; a canceled wait returns SQLSTATE
+// 57014.
+func (db *Database) Attach(ctx context.Context, name string, source AttachSource, opts AttachOptions) error {
+	done := contextDone(ctx)
+	if err := doneErr(done); err != nil {
+		return contextError(ctx, err)
+	}
+	return contextError(ctx, db.attach(name, source, opts.ReadOnly, done))
+}
+
+// attach is Attach after its entry check; done abandons the file-lock wait.
+func (db *Database) attach(name string, source AttachSource, readOnly bool, done <-chan struct{}) error {
 	if source.fileLockTimeout != nil {
 		if err := validateDuration("FileLockTimeout", *source.fileLockTimeout); err != nil {
 			return err
@@ -2096,7 +2101,7 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 		// Under the page service the attachment is owner or page client of its file, elected as an open
 		// is (page-service.md §5.5).
 		var err error
-		svc, svcPath, err = db.core.openServiceAttachment(name, source.path, source, readOnly)
+		svc, svcPath, err = db.core.openServiceAttachment(name, source.path, source, readOnly, done)
 		if err != nil {
 			return err
 		}
@@ -2111,7 +2116,7 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 	} else if source.file {
 		var real string
 		var err error
-		coordinator, real, err = prepareOpenCoordinator(source.path, locking, durationMillisPtr(source.fileLockTimeout))
+		coordinator, real, err = prepareOpenCoordinator(source.path, locking, durationMillisPtr(source.fileLockTimeout), done)
 		if err != nil {
 			return err
 		}
@@ -2282,7 +2287,10 @@ func (db *Database) Detach(name string) error {
 // and costs are unchanged. Never waits: 42704 for a name that is not attached, 25006 for a read-only
 // database, and 55006 while a write transaction or reader is open on this handle or another process
 // has the file open. A host-API act — not metered and not reachable from SQL.
-func (db *Database) Compact(name string) error {
+func (db *Database) Compact(ctx context.Context, name string) error {
+	if err := doneErr(contextDone(ctx)); err != nil {
+		return contextError(ctx, err)
+	}
 	return db.compact(name, name, nil)
 }
 
@@ -2308,7 +2316,11 @@ type rekeyTarget struct {
 // the page service only the owner rekeys, with no client pinning a snapshot; a client connected
 // meanwhile fails 28P04 at its next transaction (28P02 when the file was encrypted) and must reopen. A
 // host-API act — not reachable from SQL.
-func (db *Database) Rekey(name string, cred *Credential, kdf Argon2Params) error {
+func (db *Database) Rekey(ctx context.Context, name string, cred *Credential, kdf Argon2Params) error {
+	done := contextDone(ctx)
+	if err := doneErr(done); err != nil {
+		return contextError(ctx, err)
+	}
 	c := db.core
 	if name != "main" {
 		att := c.attachment(name)
@@ -2349,6 +2361,10 @@ func (db *Database) Rekey(name string, cred *Credential, kdf Argon2Params) error
 			return err
 		}
 	}
+	// The key derivation can take a second; a cancel during it stops before the rewrite.
+	if err := doneErr(done); err != nil {
+		return contextError(ctx, err)
+	}
 	return db.compact(name, name, &rekeyTarget{codec: target})
 }
 
@@ -2362,7 +2378,11 @@ func (db *Database) Rekey(name string, cred *Credential, kdf Argon2Params) error
 // Never waits: 42704 for a name that is not attached, 25006 for a read-only database, 55000 for an
 // in-memory database, 28P03 for a plaintext file, 55006 while a write transaction is open, and 22023
 // for Argon2id parameters out of range. A host-API act — not reachable from SQL.
-func (db *Database) ChangeCredential(name string, cred *Credential, kdf Argon2Params) error {
+func (db *Database) ChangeCredential(ctx context.Context, name string, cred *Credential, kdf Argon2Params) error {
+	done := contextDone(ctx)
+	if err := doneErr(done); err != nil {
+		return contextError(ctx, err)
+	}
 	c := db.core
 	var readOnly bool
 	var service *Database
@@ -2381,7 +2401,7 @@ func (db *Database) ChangeCredential(name string, cred *Credential, kdf Argon2Pa
 	}
 	// A file attachment under the page service changes its credential through its own handle.
 	if service != nil {
-		return service.ChangeCredential("main", cred, kdf)
+		return service.ChangeCredential(ctx, "main", cred, kdf)
 	}
 	st, err := c.withStorage(name)
 	if err != nil {
@@ -2412,6 +2432,9 @@ func (db *Database) ChangeCredential(name string, cred *Credential, kdf Argon2Pa
 	block, err := codec.rewrap(cred, kdf)
 	if err != nil {
 		return err
+	}
+	if err := doneErr(done); err != nil {
+		return contextError(ctx, err) // canceled during the key derivation: nothing written
 	}
 	if !c.writeMu.TryLock() {
 		return newError(ObjectInUse, `cannot change the credential of database "`+name+`" while a write transaction is open`)
@@ -2731,12 +2754,12 @@ func (db *Database) Prepare(sql string) (*PreparedStatement, error) {
 	return s.Prepare(sql)
 }
 
-// UpgradeCollations runs the COLLATION UPGRADE migration on the live database (collation.md §12),
-// returning the number of re-pinned collations. Mints a fresh write session for the migration.
-func (db *Database) UpgradeCollations() (int, error) {
+// UpgradeCollations re-pins every collation whose stored version differs from the loaded Unicode
+// data and returns how many it re-pinned; see Session.UpgradeCollations.
+func (db *Database) UpgradeCollations(ctx context.Context) (int, error) {
 	s := db.sessionWithState(newSession(db.core.env))
 	defer s.Close()
-	return s.UpgradeCollations()
+	return s.UpgradeCollations(ctx)
 }
 
 // Close closes the backing store (an in-memory store's close is a no-op). The bare convenience
@@ -3536,20 +3559,23 @@ func (s *Session) LoadedCollations() []CollationInfo { return s.engine.LoadedCol
 // LoadedTimeZones are the host-loaded time zones currently in effect (timezones.md §3.3).
 func (s *Session) LoadedTimeZones() []TimeZoneInfo { return s.engine.LoadedTimeZones() }
 
-// SetDefaultCollation sets the per-database default collation for new text columns (collation.md §4);
-// 2C000 for an unknown collation. The default is committed snapshot state (persisted as the is_default
-// flag), so outside a block this COMMITS — take the gate, re-pin the latest committed, set, publish —
-// so the change survives the next statement's re-pin and is visible to it (exactly like an autocommit
-// write). A read-only session rejects it (25006).
-func (s *Session) SetDefaultCollation(name string) error {
+// SetDefaultCollation sets the database's default collation for new text columns. An unknown
+// collation fails with SQLSTATE 2C000. The default is stored in the database, so outside a
+// transaction this commits a write: ctx bounds the wait for the writer slot. Inside a transaction
+// it takes effect when the transaction commits. A read-only session fails with SQLSTATE 25006.
+func (s *Session) SetDefaultCollation(ctx context.Context, name string) error {
+	done := contextDone(ctx)
+	if err := doneErr(done); err != nil {
+		return contextError(ctx, err)
+	}
 	if s.access == accessReadOnly {
 		return newError(ReadOnlySQLTransaction, "cannot set the default collation on a read-only session")
 	}
 	if s.engine.session.tx != nil {
 		return s.engine.SetDefaultCollation(name) // part of the open block; publishes on its commit
 	}
-	if err := s.core.acquireWriter(s.engine.session.lockTimeoutMs); err != nil {
-		return err
+	if err := s.core.acquireWriterCancel(s.engine.session.lockTimeoutMs, done); err != nil {
+		return contextError(ctx, err)
 	}
 	s.gateHeld = true
 	s.refreshCommitted()
@@ -3660,11 +3686,14 @@ func (s *Session) SetMaxTempStorageBytes(bytes int) { s.engine.session.maxTempSt
 // ResetVars clears every session variable — PostgreSQL's RESET ALL for the variable map (§6.1).
 func (s *Session) ResetVars() { s.engine.session.ResetVars() }
 
-// UpgradeCollations runs the COLLATION UPGRADE migration (spec/design/collation.md §12) on this
-// session's committed state: re-pin every version-skewed collation to the loaded bundle's version,
-// clearing the skew so the affected objects become read-write again. Returns the count upgraded. A
-// write op — it routes through the lazy writer gate and publishes through the shared core on change.
-func (s *Session) UpgradeCollations() (int, error) {
+// UpgradeCollations re-pins every collation whose stored version differs from the loaded Unicode
+// data, so the objects that use it become writable again, and returns how many it re-pinned.
+// Outside a transaction it commits a write: ctx bounds the wait for the writer slot.
+func (s *Session) UpgradeCollations(ctx context.Context) (int, error) {
+	done := contextDone(ctx)
+	if err := doneErr(done); err != nil {
+		return 0, contextError(ctx, err)
+	}
 	if s.access == accessReadOnly {
 		return 0, newError(ReadOnlySQLTransaction, "cannot upgrade collations on a read-only snapshot")
 	}
@@ -3673,8 +3702,8 @@ func (s *Session) UpgradeCollations() (int, error) {
 		return s.engine.UpgradeCollations()
 	}
 	// Autocommit: take the lazy gate, upgrade the latest committed, publish on change (§2.4).
-	if err := s.core.acquireWriter(s.engine.session.lockTimeoutMs); err != nil {
-		return 0, err
+	if err := s.core.acquireWriterCancel(s.engine.session.lockTimeoutMs, done); err != nil {
+		return 0, contextError(ctx, err)
 	}
 	s.gateHeld = true
 	s.refreshCommitted()

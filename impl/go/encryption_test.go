@@ -179,13 +179,13 @@ func TestEncryptedCredentialsFailClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer host.Close()
-	if err := host.Attach("m", AttachMemory().WithCredential(encKey()), false); encCode(err) != "55000" {
+	if err := host.Attach(context.Background(), "m", AttachMemory().WithCredential(encKey()), AttachOptions{}); encCode(err) != "55000" {
 		t.Fatalf("in-memory attachment: %v", err)
 	}
-	if err := host.Attach("e", AttachFile(path).WithCredential(encKey()), false); encCode(err) != "55000" {
+	if err := host.Attach(context.Background(), "e", AttachFile(path, AttachFileOptions{}).WithCredential(encKey()), AttachOptions{}); encCode(err) != "55000" {
 		t.Fatalf("encrypted attachment to a spilling handle: %v", err)
 	}
-	if err := host.Attach("p", AttachFile(plain).WithCredential(encKey()), false); encCode(err) != "28P03" {
+	if err := host.Attach(context.Background(), "p", AttachFile(plain, AttachFileOptions{}).WithCredential(encKey()), AttachOptions{}); encCode(err) != "28P03" {
 		t.Fatalf("credential for a plaintext attachment: %v", err)
 	}
 }
@@ -321,7 +321,7 @@ func TestEncryptedCompactionKeepsTheKeyAndReseals(t *testing.T) {
 		t.Fatal(err)
 	}
 	keyBlock := append([]byte(nil), raw[2*encPage:4*encPage]...)
-	if err := db.Compact("main"); err != nil {
+	if err := db.Compact(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
 	if got := fmt.Sprint(encRows(t, db, encSummary)); got != before {
@@ -431,7 +431,7 @@ func TestEncryptedDatabaseBacksUpInBothForms(t *testing.T) {
 		_ = cdb.Close()
 	}
 	// After a credential change the copy carries the new key block.
-	if err := db.ChangeCredential("main", KeyCredential(filledKey(5)), Argon2Params{}); err != nil {
+	if err := db.ChangeCredential(context.Background(), "main", KeyCredential(filledKey(5)), Argon2Params{}); err != nil {
 		t.Fatal(err)
 	}
 	dest := filepath.Join(dir, "enc_backup_changed.jed")
@@ -504,7 +504,7 @@ func TestEncryptedChangingTheCredentialRewrapsTheKeyBlockOnly(t *testing.T) {
 	}
 	body := raw[4*encPage:]
 	pass := PassphraseCredential("new phrase")
-	if err := db.ChangeCredential("main", pass, encSmallKDF); err != nil {
+	if err := db.ChangeCredential(context.Background(), "main", pass, encSmallKDF); err != nil {
 		t.Fatal(err)
 	}
 	// The handle keeps working, and no body page was rewritten.
@@ -535,7 +535,7 @@ func TestEncryptedChangingTheCredentialRewrapsTheKeyBlockOnly(t *testing.T) {
 		t.Fatalf("reopened %s, want %s", got, before)
 	}
 	// A second change, back to a host key, and a write after it.
-	if err := db.ChangeCredential("main", KeyCredential(filledKey(7)), Argon2Params{}); err != nil {
+	if err := db.ChangeCredential(context.Background(), "main", KeyCredential(filledKey(7)), Argon2Params{}); err != nil {
 		t.Fatal(err)
 	}
 	mustExec(t, db, "INSERT INTO t VALUES (6000, 'after', NULL, NULL)")
@@ -566,7 +566,7 @@ func TestEncryptedCredentialChangeErrors(t *testing.T) {
 		{"temp", newCred, Argon2Params{}, "42704"},
 		{"main", PassphraseCredential("p"), Argon2Params{MemoryKiB: 1, Iterations: 1, Parallelism: 1}, "22023"},
 	} {
-		if got := encCode(db.ChangeCredential(c.name, c.cred, c.kdf)); got != c.want {
+		if got := encCode(db.ChangeCredential(context.Background(), c.name, c.cred, c.kdf)); got != c.want {
 			t.Fatalf("%s: %q, want %s", c.name, got, c.want)
 		}
 	}
@@ -578,7 +578,7 @@ func TestEncryptedCredentialChangeErrors(t *testing.T) {
 	if _, err := writer.Exec(t.Context(), "INSERT INTO t VALUES (1)"); err != nil {
 		t.Fatal(err)
 	}
-	if got := encCode(db.ChangeCredential("main", newCred, Argon2Params{})); got != "55006" {
+	if got := encCode(db.ChangeCredential(context.Background(), "main", newCred, Argon2Params{})); got != "55006" {
 		t.Fatalf("under an open writer: %q", got)
 	}
 	if err := writer.rollbackBlock(); err != nil {
@@ -591,7 +591,7 @@ func TestEncryptedCredentialChangeErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := encCode(ro.ChangeCredential("main", newCred, Argon2Params{})); got != "25006" {
+	if got := encCode(ro.ChangeCredential(context.Background(), "main", newCred, Argon2Params{})); got != "25006" {
 		t.Fatalf("read-only: %q", got)
 	}
 	_ = ro.Close()
@@ -601,7 +601,7 @@ func TestEncryptedCredentialChangeErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer memory.Close()
-	if got := encCode(memory.ChangeCredential("main", newCred, Argon2Params{})); got != "55000" {
+	if got := encCode(memory.ChangeCredential(context.Background(), "main", newCred, Argon2Params{})); got != "55000" {
 		t.Fatalf("in-memory: %q", got)
 	}
 	plain, err := Create(CreateOptions{Path: filepath.Join(dir, "enc_change_plain.jed"), PageSize: encPage, SkipFsync: true})
@@ -609,7 +609,7 @@ func TestEncryptedCredentialChangeErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer plain.Close()
-	if got := encCode(plain.ChangeCredential("main", newCred, Argon2Params{})); got != "28P03" {
+	if got := encCode(plain.ChangeCredential(context.Background(), "main", newCred, Argon2Params{})); got != "28P03" {
 		t.Fatalf("plaintext: %q", got)
 	}
 }
@@ -624,10 +624,10 @@ func TestEncryptedAttachmentChangesItsOwnCredential(t *testing.T) {
 	_ = db.Close()
 	// An encrypted attachment joins a handle whose scratch files are sealed: an encrypted main.
 	main := encCreate(t, filepath.Join(dir, "enc_change_main.jed"), KeyCredential(filledKey(3)))
-	if err := main.Attach("other", AttachFile(path).WithCredential(encKey()), false); err != nil {
+	if err := main.Attach(context.Background(), "other", AttachFile(path, AttachFileOptions{}).WithCredential(encKey()), AttachOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := main.ChangeCredential("other", KeyCredential(filledKey(4)), Argon2Params{}); err != nil {
+	if err := main.ChangeCredential(context.Background(), "other", KeyCredential(filledKey(4)), Argon2Params{}); err != nil {
 		t.Fatal(err)
 	}
 	_ = main.Close()
@@ -655,7 +655,7 @@ func TestEncryptedInterruptedCredentialChangeLeavesExactlyOneCredential(t *testi
 	old = append([]byte(nil), old...)
 	newKey := KeyCredential(filledKey(8))
 	db = encMustOpen(t, path, encKey())
-	if err := db.ChangeCredential("main", newKey, Argon2Params{}); err != nil {
+	if err := db.ChangeCredential(context.Background(), "main", newKey, Argon2Params{}); err != nil {
 		t.Fatal(err)
 	}
 	_ = db.Close()
@@ -826,7 +826,9 @@ func TestScratchEncryptionGatesEncryptedAttachments(t *testing.T) {
 		}
 		return db
 	}
-	attach := func(db *Database) error { return db.Attach("e", AttachFile(enc).WithCredential(encKey()), false) }
+	attach := func(db *Database) error {
+		return db.Attach(context.Background(), "e", AttachFile(enc, AttachFileOptions{}).WithCredential(encKey()), AttachOptions{})
+	}
 	p := plain("enc_scratch_p1.jed", ScratchEncryptionAuto)
 	if err := attach(p); encCode(err) != "55000" {
 		t.Fatalf("plaintext scratch: %v", err)
@@ -872,7 +874,7 @@ func TestEncryptedRekeyRotatesEncryptsAndDecrypts(t *testing.T) {
 	before := fmt.Sprint(encRows(t, db, encSummary))
 
 	// Encrypt the plaintext file in place.
-	if err := db.Rekey("main", encKey(), Argon2Params{}); err != nil {
+	if err := db.Rekey(context.Background(), "main", encKey(), Argon2Params{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := fmt.Sprint(encRows(t, db, encSummary)); got != before {
@@ -898,7 +900,7 @@ func TestEncryptedRekeyRotatesEncryptsAndDecrypts(t *testing.T) {
 
 	// Rotate: a new data key under a passphrase; the old key no longer opens the file.
 	pass := PassphraseCredential("rotated")
-	if err := db.Rekey("main", pass, encSmallKDF); err != nil {
+	if err := db.Rekey(context.Background(), "main", pass, encSmallKDF); err != nil {
 		t.Fatal(err)
 	}
 	_ = db.Close()
@@ -921,7 +923,7 @@ func TestEncryptedRekeyRotatesEncryptsAndDecrypts(t *testing.T) {
 	}
 
 	// Decrypt.
-	if err := db.Rekey("main", nil, Argon2Params{}); err != nil {
+	if err := db.Rekey(context.Background(), "main", nil, Argon2Params{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := encRows(t, db, "SELECT note FROM t WHERE id = 7000"); got[0][0] != "after-encrypt" {
@@ -949,7 +951,7 @@ func TestEncryptedRekeyErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := encCode(plain.Rekey("main", encKey(), Argon2Params{})); got != "55000" {
+	if got := encCode(plain.Rekey(context.Background(), "main", encKey(), Argon2Params{})); got != "55000" {
 		t.Fatalf("plaintext scratch: %q", got)
 	}
 	_ = plain.Close()
@@ -958,12 +960,12 @@ func TestEncryptedRekeyErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := served.Rekey("main", encKey(), Argon2Params{}); err != nil {
+	if err := served.Rekey(context.Background(), "main", encKey(), Argon2Params{}); err != nil {
 		t.Fatalf("served: %v", err)
 	}
 	_ = served.Close()
 	small := encSealedHandle(t, filepath.Join(dir, "enc_rekey_small.jed"), nil, 512)
-	if got := encCode(small.Rekey("main", encKey(), Argon2Params{})); got != "0A000" {
+	if got := encCode(small.Rekey(context.Background(), "main", encKey(), Argon2Params{})); got != "0A000" {
 		t.Fatalf("small page: %q", got)
 	}
 	_ = small.Close()
@@ -971,12 +973,12 @@ func TestEncryptedRekeyErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := encCode(memory.Rekey("main", encKey(), Argon2Params{})); got != "55000" {
+	if got := encCode(memory.Rekey(context.Background(), "main", encKey(), Argon2Params{})); got != "55000" {
 		t.Fatalf("in-memory: %q", got)
 	}
 	db := encSealedHandle(t, filepath.Join(dir, "enc_rekey_err.jed"), encKey(), encPage)
 	defer db.Close()
-	if got := encCode(db.Rekey("nope", encKey(), Argon2Params{})); got != "42704" {
+	if got := encCode(db.Rekey(context.Background(), "nope", encKey(), Argon2Params{})); got != "42704" {
 		t.Fatalf("unknown name: %q", got)
 	}
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
@@ -990,7 +992,7 @@ func TestEncryptedRekeyErrors(t *testing.T) {
 	if !rows.Next() {
 		t.Fatal("no rows")
 	}
-	if got := encCode(db.Rekey("main", nil, Argon2Params{})); got != "55006" {
+	if got := encCode(db.Rekey(context.Background(), "main", nil, Argon2Params{})); got != "55006" {
 		t.Fatalf("under a reader: %q", got)
 	}
 	_ = rows.Close()
@@ -1016,7 +1018,7 @@ func TestEncryptedRekeyTheTargetCannotStoreLeavesTheFileUntouched(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = db.Rekey("main", encKey(), Argon2Params{})
+	err = db.Rekey(context.Background(), "main", encKey(), Argon2Params{})
 	if err == nil {
 		t.Fatal("the key does not fit the encrypted layout")
 	}
@@ -1042,7 +1044,7 @@ func TestEncryptedSeededRekeyWritesIdenticalBytes(t *testing.T) {
 		path := filepath.Join(dir, name)
 		db := encSealedHandle(t, path, encKey(), encPage)
 		encPopulate(t, db)
-		if err := db.Rekey("main", KeyCredential(filledKey(6)), Argon2Params{}); err != nil {
+		if err := db.Rekey(context.Background(), "main", KeyCredential(filledKey(6)), Argon2Params{}); err != nil {
 			t.Fatal(err)
 		}
 		_ = db.Close()
@@ -1078,7 +1080,7 @@ func TestEncryptedLargeRekeySpillsItsScratchDomain(t *testing.T) {
 	const probe = "SELECT count(*), max(s), sum(length(s)) FROM big"
 	want := fmt.Sprint(encRows(t, db, probe))
 	spills := tempSpillsForTooling()
-	if err := db.Rekey("main", KeyCredential(filledKey(2)), Argon2Params{}); err != nil {
+	if err := db.Rekey(context.Background(), "main", KeyCredential(filledKey(2)), Argon2Params{}); err != nil {
 		t.Fatal(err)
 	}
 	if tempSpillsForTooling() <= spills {

@@ -9,6 +9,7 @@ package jed
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -190,7 +191,7 @@ func TestEncryptedGoldenRekeyIndexTable(t *testing.T) {
 	for a := 150; a >= 1; a-- {
 		mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d, i32range(%d, %d))", a, a*3, a, a+5))
 	}
-	if err := db.Rekey("main", encGoldenKey(), Argon2Params{}); err != nil {
+	if err := db.Rekey(context.Background(), "main", encGoldenKey(), Argon2Params{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {

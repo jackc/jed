@@ -84,7 +84,7 @@ func TestStorageLimitOptionsAndGauge(t *testing.T) {
 	}
 
 	// An in-memory attachment's limit, set on attach or later.
-	if err := db.Attach("aux", AttachMemory().WithMaxStorageBytes(storagePage), false); err != nil {
+	if err := db.Attach(context.Background(), "aux", AttachMemory().WithMaxStorageBytes(storagePage), AttachOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if code := storageExecCode(s, "CREATE TABLE aux.a (id i32 PRIMARY KEY, v text)"); code != "54P06" {
@@ -230,7 +230,7 @@ func TestFileStorageLimitCountsEveryLiveStructure(t *testing.T) {
 	storageExec(t, s, "INSERT INTO u SELECT id, v FROM t")
 	storageExec(t, s, "DROP TABLE t")
 	before := mustStorageBytes(t, db, "main")
-	if err := db.Compact("main"); err != nil {
+	if err := db.Compact(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
 	// Compaction renumbers pages but keeps every live one.
@@ -253,7 +253,7 @@ func TestFileAttachmentStorageLimit(t *testing.T) {
 	}
 	host := memDB()
 	defer host.Close()
-	if err := host.Attach("f", AttachFile(path).WithMaxStorageBytes(4*storagePage), false); err != nil {
+	if err := host.Attach(context.Background(), "f", AttachFile(path, AttachFileOptions{}).WithMaxStorageBytes(4*storagePage), AttachOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	s := mustSession(host, SessionOptions{})
@@ -293,7 +293,7 @@ func TestFileAttachmentStorageLimit(t *testing.T) {
 
 func TestStorageLimitMultiRootRejectionPacksNoAttachment(t *testing.T) {
 	db := memDB()
-	if err := db.Attach("aux", AttachMemory(), false); err != nil {
+	if err := db.Attach(context.Background(), "aux", AttachMemory(), AttachOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	s := mustSession(db, SessionOptions{})

@@ -27,7 +27,7 @@ func serializeMemory(t *testing.T) *Database {
 
 func mustSerialize(t *testing.T, db *Database, name string) []byte {
 	t.Helper()
-	out, err := db.Serialize(name)
+	out, err := db.Serialize(context.Background(), name)
 	if err != nil {
 		t.Fatalf("serialize %s: %v", name, err)
 	}
@@ -156,7 +156,7 @@ func TestDeserializeRawFileBytes(t *testing.T) {
 
 func TestSerializeAttachmentsByName(t *testing.T) {
 	db := serializeMemory(t)
-	if err := db.Attach("scratch", AttachMemory(), false); err != nil {
+	if err := db.Attach(context.Background(), "scratch", AttachMemory(), AttachOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	serializeExec(t, db, "CREATE TABLE scratch.u (id i32 PRIMARY KEY)")
@@ -166,7 +166,7 @@ func TestSerializeAttachmentsByName(t *testing.T) {
 		t.Fatalf("attachment copy rows %v", rows)
 	}
 	for _, name := range []string{"nope", "temp"} {
-		_, err := db.Serialize(name)
+		_, err := db.Serialize(context.Background(), name)
 		if c := compactCode(t, err); c != "42704" {
 			t.Fatalf("serialize %s: %s, want 42704", name, c)
 		}
@@ -176,7 +176,7 @@ func TestSerializeAttachmentsByName(t *testing.T) {
 func TestSerializeEncryptedAndMalformedInputsFail(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "encrypted.jed")
 	db := encCreate(t, path, encKey())
-	_, err := db.Serialize("main")
+	_, err := db.Serialize(context.Background(), "main")
 	if c := compactCode(t, err); c != "0A000" {
 		t.Fatalf("serialize encrypted: %s, want 0A000", c)
 	}

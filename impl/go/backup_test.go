@@ -84,7 +84,7 @@ func TestCompactedBackupIsTheCompactedFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	backup := readFile(t, dest)
-	if err := db.Compact("main"); err != nil {
+	if err := db.Compact(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
 	compacted, _ := committedImage(t, path)

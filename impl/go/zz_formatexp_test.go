@@ -879,7 +879,7 @@ func expOne(t *testing.T, dir string, pageSize uint32, detail bool) expRun {
 	if detail {
 		expReport(t, db, path)
 	}
-	if err := db.Compact("main"); err != nil {
+	if err := db.Compact(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
 	st, _ = os.Stat(path)
@@ -1102,7 +1102,7 @@ func TestCommitWriteExperiment(t *testing.T) {
 		phase(tag+": insert (append)", s, "INSERT INTO orders VALUES ($1, 77, 'paid', '2026-01-01 00:00:00+00', 12.50, 'USD', true, NULL)", 2000, func() int64 { next++; return next })
 	}
 	run("after load")
-	if err := db.Compact("main"); err != nil {
+	if err := db.Compact(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
 	if pf := os.Getenv("JED_FORMAT_EXP_PROF"); pf != "" {
@@ -1386,7 +1386,7 @@ func TestLookupExperiment(t *testing.T) {
 	os.RemoveAll(path + ".lock")
 	db := expBuild(t, path, DefaultPageSize)
 	defer func() { db.Close(); os.Remove(path) }()
-	if err := db.Compact("main"); err != nil {
+	if err := db.Compact(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
 	s := mustSession(db, SessionOptions{})

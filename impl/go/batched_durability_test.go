@@ -526,7 +526,7 @@ func TestRelaxedDeadlineIsPerDatabase(t *testing.T) {
 	if err := created.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Attach("o", AttachFile(other), false); err != nil {
+	if err := db.Attach(context.Background(), "o", AttachFile(other, AttachFileOptions{}), AttachOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	attached := func() *storage {
@@ -580,7 +580,7 @@ func TestRelaxedStoragePrecheckIgnoresTheDeadline(t *testing.T) {
 			}
 			db = relaxedDBTimed(t, path, 512, true, interval, env)
 		}
-		if err := db.Attach("m", AttachMemory(), false); err != nil {
+		if err := db.Attach(context.Background(), "m", AttachMemory(), AttachOptions{}); err != nil {
 			t.Fatal(err)
 		}
 		mustExecDB(t, db, "CREATE TABLE t (id i64 PRIMARY KEY, v text)")

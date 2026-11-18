@@ -55,7 +55,7 @@ func scheduleDB(header []string) *jed.Database {
 	db := memDB()
 	for _, line := range header {
 		if name, ok := parseAttachDirective(line); ok {
-			if err := db.Attach(name, jed.AttachMemory(), false); err != nil {
+			if err := db.Attach(context.Background(), name, jed.AttachMemory(), jed.AttachOptions{}); err != nil {
 				panic("concurrency # attach: " + name + ": " + err.Error())
 			}
 		} else if bytes, name, ok := parseMaxStorageBytesDirective(line); ok {

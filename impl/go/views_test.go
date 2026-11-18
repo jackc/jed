@@ -8,6 +8,7 @@ package jed
 // accessor the CLI dump uses. Mirrors impl/rust/tests/views.rs.
 
 import (
+	"context"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -223,7 +224,7 @@ func TestViewsSurviveCommitReopenAndCompaction(t *testing.T) {
 	}
 	s.Close()
 	// Compaction streams the from-scratch image, view entries included (api.md §2.6).
-	if err := db.Compact("main"); err != nil {
+	if err := db.Compact(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -273,7 +274,7 @@ func TestAttachedDatabaseViews(t *testing.T) {
 		"CREATE VIEW v AS SELECT a FROM t")
 
 	db := memDB()
-	if err := db.Attach("reports", AttachFile(ref), false); err != nil {
+	if err := db.Attach(context.Background(), "reports", AttachFile(ref, AttachFileOptions{}), AttachOptions{}); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
 	defer db.Detach("reports")

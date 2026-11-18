@@ -84,7 +84,7 @@ func TestFailedMainPersistLeavesInMemoryAttachmentIntact(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if err := db.Attach("a", AttachMemory(), false); err != nil {
+	if err := db.Attach(context.Background(), "a", AttachMemory(), AttachOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	s := mustSession(db, SessionOptions{})
@@ -123,7 +123,7 @@ func TestFailedLaterAttachmentLeavesEarlierAttachmentIntact(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"a", "b"} {
-		if err := db.Attach(name, AttachMemory(), false); err != nil {
+		if err := db.Attach(context.Background(), name, AttachMemory(), AttachOptions{}); err != nil {
 			t.Fatal(err)
 		}
 	}

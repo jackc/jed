@@ -48,13 +48,15 @@ end
 
 def go_file
   out = +"// #{HEADER}\n\npackage jed\n\n"
-  out << "// Integrity-check finding kinds (spec/design/integrity-check.md §4).\nconst (\n"
-  findings.each { |f| out << "\t// Integrity#{pascal(f['kind'])}: #{f['description']}\n\tIntegrity#{pascal(f['kind'])} = \"#{f['kind']}\"\n" }
-  out << ")\n\n// Integrity-check skip reasons (spec/design/integrity-check.md §3.5).\nconst (\n"
-  skips.each { |s| out << "\t// IntegritySkip#{pascal(s['reason'])}: #{s['description']}\n\tIntegritySkip#{pascal(s['reason'])} = \"#{s['reason']}\"\n" }
-  out << ")\n\n// integrityFindingKinds lists every finding kind, in registry order.\nvar integrityFindingKinds = []string{\n"
+  out << "// IntegrityKind names what an [IntegrityFinding] found wrong. Its string form is the registered\n// finding kind, identical in every core.\ntype IntegrityKind string\n\n"
+  out << "// IntegritySkipReason names why an [IntegritySkip] could not check an object. Its string form is\n// the registered skip reason, identical in every core.\ntype IntegritySkipReason string\n\n"
+  out << "// Integrity-check finding kinds.\nconst (\n"
+  findings.each { |f| out << "\t// Integrity#{pascal(f['kind'])}: #{f['description']}\n\tIntegrity#{pascal(f['kind'])} IntegrityKind = \"#{f['kind']}\"\n" }
+  out << ")\n\n// Integrity-check skip reasons.\nconst (\n"
+  skips.each { |s| out << "\t// IntegritySkip#{pascal(s['reason'])}: #{s['description']}\n\tIntegritySkip#{pascal(s['reason'])} IntegritySkipReason = \"#{s['reason']}\"\n" }
+  out << ")\n\n// integrityFindingKinds lists every finding kind, in registry order.\nvar integrityFindingKinds = []IntegrityKind{\n"
   findings.each { |f| out << "\tIntegrity#{pascal(f['kind'])},\n" }
-  out << "}\n\n// integritySkipReasons lists every skip reason, in registry order.\nvar integritySkipReasons = []string{\n"
+  out << "}\n\n// integritySkipReasons lists every skip reason, in registry order.\nvar integritySkipReasons = []IntegritySkipReason{\n"
   skips.each { |s| out << "\tIntegritySkip#{pascal(s['reason'])},\n" }
   out << "}\n"
 end

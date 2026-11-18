@@ -32,6 +32,9 @@ type electOptions struct {
 	opts       OpenOptions
 	env        *Environment
 	held       *pageCodec
+	// done, when non-nil, abandons the election with 57014 once closed (Attach's ctx). Only the
+	// opening election carries one; a later re-election never does.
+	done <-chan struct{}
 }
 
 // electService runs the election for the database at path (already resolved as prepareOpenCoordinator
@@ -56,7 +59,7 @@ func electService(host lockHost, path string, timeoutOpt *uint64, readOnly bool,
 		return serviceElection{}, err
 	}
 	deadline := fileLockDeadline(host, timeoutOpt)
-	if err := lockUntil(host, files.arrival, false, deadline, path, false); err != nil {
+	if err := lockUntil(host, files.arrival, false, deadline, path, false, eo.done); err != nil {
 		return fail(err)
 	}
 	if err := host.validateMarker(path); err != nil {
@@ -107,6 +110,10 @@ func electService(host lockHost, path string, timeoutOpt *uint64, readOnly bool,
 				_ = host.unlock(files.arrival)
 				return fail(err)
 			}
+		}
+		if err := doneErr(eo.done); err != nil {
+			_ = host.unlock(files.arrival)
+			return fail(err)
 		}
 		if err := checkLockDeadline(host, deadline, path, false); err != nil {
 			_ = host.unlock(files.arrival)
@@ -163,7 +170,7 @@ func openServiceDatabase(path string, opts OpenOptions) (*Database, error) {
 // wins. claim is false when the caller already holds the process-local path claim.
 func openServiceWith(h *serviceHandoff, claim bool) (*Database, error) {
 	opts := h.opts
-	election, err := electService(h.host, h.path, durationMillisPtr(opts.FileLockTimeout), opts.ReadOnly, electOptions{never: opts.Ownership == OwnershipNever, reelect: !claim, opts: opts, env: opts.Environment})
+	election, err := electService(h.host, h.path, durationMillisPtr(opts.FileLockTimeout), opts.ReadOnly, electOptions{never: opts.Ownership == OwnershipNever, reelect: !claim, opts: opts, env: opts.Environment, done: h.openDone})
 	if err != nil {
 		return nil, err
 	}

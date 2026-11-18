@@ -1275,7 +1275,7 @@ func TestColumnCodecExperiment(t *testing.T) {
 	os.Remove(path)
 	os.RemoveAll(path + ".lock")
 	db := expBuild(t, path, DefaultPageSize)
-	if err := db.Compact("main"); err != nil {
+	if err := db.Compact(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
 	cols, pages := ccCollect(t, db)

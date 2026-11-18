@@ -62,7 +62,7 @@ func integrityContract(r IntegrityReport) string {
 		Rows      uint64    `json:"rows"`
 	}{Findings: []finding{}, Truncated: r.Truncated, Skipped: []skip{}, Pages: r.Pages, Rows: r.Rows}
 	for _, f := range r.Findings {
-		g := finding{Kind: f.Kind, Database: f.Database, Page: f.Page}
+		g := finding{Kind: string(f.Kind), Database: f.Database, Page: f.Page}
 		if f.Object != "" {
 			o := f.Object
 			g.Object = &o
@@ -74,7 +74,7 @@ func integrityContract(r IntegrityReport) string {
 		out.Findings = append(out.Findings, g)
 	}
 	for _, s := range r.Skipped {
-		out.Skipped = append(out.Skipped, skip(s))
+		out.Skipped = append(out.Skipped, skip{Object: s.Object, Reason: string(s.Reason)})
 	}
 	b, _ := json.MarshalIndent(out, "", "  ")
 	return string(b)
@@ -134,7 +134,7 @@ func TestIntegrityFixtures(t *testing.T) {
 				var want IntegrityReport
 				want.Truncated, want.Pages, want.Rows = run.Report.Truncated, run.Report.Pages, run.Report.Rows
 				for _, f := range run.Report.Findings {
-					g := IntegrityFinding{Kind: f.Kind, Database: f.Database, Page: f.Page}
+					g := IntegrityFinding{Kind: IntegrityKind(f.Kind), Database: f.Database, Page: f.Page}
 					if f.Object != nil {
 						g.Object = *f.Object
 					}
@@ -144,7 +144,7 @@ func TestIntegrityFixtures(t *testing.T) {
 					want.Findings = append(want.Findings, g)
 				}
 				for _, s := range run.Report.Skipped {
-					want.Skipped = append(want.Skipped, IntegritySkip{Object: s.Object, Reason: s.Reason})
+					want.Skipped = append(want.Skipped, IntegritySkip{Object: s.Object, Reason: IntegritySkipReason(s.Reason)})
 				}
 				if g, w := integrityContract(got), integrityContract(want); g != w {
 					t.Errorf("%s/%d:\n got: %s\nwant: %s", run.Level, run.MaxFindings, g, w)
@@ -243,37 +243,44 @@ func TestIntegrityKindsRegistered(t *testing.T) {
 		text += string(src)
 	}
 	consts := map[string]string{
-		IntegrityMetaInvalid: "IntegrityMetaInvalid", IntegrityManifestPageMismatch: "IntegrityManifestPageMismatch",
-		IntegrityCatalogPageCorrupt: "IntegrityCatalogPageCorrupt", IntegrityCatalogMismatch: "IntegrityCatalogMismatch",
-		IntegritySequenceOutOfRange: "IntegritySequenceOutOfRange", IntegrityPageOutOfRange: "IntegrityPageOutOfRange",
-		IntegrityPageReachedTwice: "IntegrityPageReachedTwice", IntegrityPageCorrupt: "IntegrityPageCorrupt",
-		IntegrityPageTypeWrong: "IntegrityPageTypeWrong", IntegrityTreeDepthUneven: "IntegrityTreeDepthUneven",
-		IntegrityKeysUnordered: "IntegrityKeysUnordered", IntegritySeparatorViolation: "IntegritySeparatorViolation",
-		IntegrityRowKeyNotPrimaryKey: "IntegrityRowKeyNotPrimaryKey", IntegrityValueUndecodable: "IntegrityValueUndecodable",
-		IntegrityOverflowChainCorrupt: "IntegrityOverflowChainCorrupt", IntegrityRowCountMismatch: "IntegrityRowCountMismatch",
-		IntegrityLiveCountMismatch: "IntegrityLiveCountMismatch", IntegrityFreeListCorrupt: "IntegrityFreeListCorrupt",
-		IntegrityFreePageOutOfRange: "IntegrityFreePageOutOfRange", IntegrityFreePageDuplicate: "IntegrityFreePageDuplicate",
-		IntegrityFreePageLive: "IntegrityFreePageLive", IntegrityFreePageManifestDependency: "IntegrityFreePageManifestDependency",
-		IntegrityIndexEntryMissing: "IntegrityIndexEntryMissing", IntegrityIndexEntryCountMismatch: "IntegrityIndexEntryCountMismatch",
-		IntegrityIndexEntryError: "IntegrityIndexEntryError", IntegrityGistBoundsViolation: "IntegrityGistBoundsViolation",
-		IntegrityNotNullViolation: "IntegrityNotNullViolation", IntegrityTypmodViolation: "IntegrityTypmodViolation",
-		IntegrityCheckViolation: "IntegrityCheckViolation", IntegrityCheckError: "IntegrityCheckError",
-		IntegrityUniqueViolation: "IntegrityUniqueViolation", IntegrityForeignKeyViolation: "IntegrityForeignKeyViolation",
-		IntegritySkipTableUnreadable: "IntegritySkipTableUnreadable", IntegritySkipIndexUnreadable: "IntegritySkipIndexUnreadable",
-		IntegritySkipUnparsableDefinition: "IntegritySkipUnparsableDefinition",
-		IntegritySkipMissingHostFunction:  "IntegritySkipMissingHostFunction",
-		IntegritySkipMissingLoadedData:    "IntegritySkipMissingLoadedData",
+		string(IntegrityMetaInvalid): "IntegrityMetaInvalid", string(IntegrityManifestPageMismatch): "IntegrityManifestPageMismatch",
+		string(IntegrityCatalogPageCorrupt): "IntegrityCatalogPageCorrupt", string(IntegrityCatalogMismatch): "IntegrityCatalogMismatch",
+		string(IntegritySequenceOutOfRange): "IntegritySequenceOutOfRange", string(IntegrityPageOutOfRange): "IntegrityPageOutOfRange",
+		string(IntegrityPageReachedTwice): "IntegrityPageReachedTwice", string(IntegrityPageCorrupt): "IntegrityPageCorrupt",
+		string(IntegrityPageTypeWrong): "IntegrityPageTypeWrong", string(IntegrityTreeDepthUneven): "IntegrityTreeDepthUneven",
+		string(IntegrityKeysUnordered): "IntegrityKeysUnordered", string(IntegritySeparatorViolation): "IntegritySeparatorViolation",
+		string(IntegrityRowKeyNotPrimaryKey): "IntegrityRowKeyNotPrimaryKey", string(IntegrityValueUndecodable): "IntegrityValueUndecodable",
+		string(IntegrityOverflowChainCorrupt): "IntegrityOverflowChainCorrupt", string(IntegrityRowCountMismatch): "IntegrityRowCountMismatch",
+		string(IntegrityLiveCountMismatch): "IntegrityLiveCountMismatch", string(IntegrityFreeListCorrupt): "IntegrityFreeListCorrupt",
+		string(IntegrityFreePageOutOfRange): "IntegrityFreePageOutOfRange", string(IntegrityFreePageDuplicate): "IntegrityFreePageDuplicate",
+		string(IntegrityFreePageLive): "IntegrityFreePageLive", string(IntegrityFreePageManifestDependency): "IntegrityFreePageManifestDependency",
+		string(IntegrityIndexEntryMissing): "IntegrityIndexEntryMissing", string(IntegrityIndexEntryCountMismatch): "IntegrityIndexEntryCountMismatch",
+		string(IntegrityIndexEntryError): "IntegrityIndexEntryError", string(IntegrityGistBoundsViolation): "IntegrityGistBoundsViolation",
+		string(IntegrityNotNullViolation): "IntegrityNotNullViolation", string(IntegrityTypmodViolation): "IntegrityTypmodViolation",
+		string(IntegrityCheckViolation): "IntegrityCheckViolation", string(IntegrityCheckError): "IntegrityCheckError",
+		string(IntegrityUniqueViolation): "IntegrityUniqueViolation", string(IntegrityForeignKeyViolation): "IntegrityForeignKeyViolation",
+		string(IntegritySkipTableUnreadable): "IntegritySkipTableUnreadable", string(IntegritySkipIndexUnreadable): "IntegritySkipIndexUnreadable",
+		string(IntegritySkipUnparsableDefinition): "IntegritySkipUnparsableDefinition",
+		string(IntegritySkipMissingHostFunction):  "IntegritySkipMissingHostFunction",
+		string(IntegritySkipMissingLoadedData):    "IntegritySkipMissingLoadedData",
 	}
 	for value, ident := range consts {
 		if !strings.Contains(text, ident) {
 			t.Errorf("integrity.go does not emit %s", ident)
 		}
-		if !slices.Contains(integrityFindingKinds, value) && !slices.Contains(integritySkipReasons, value) {
+		if !slices.Contains(integrityFindingKinds, IntegrityKind(value)) && !slices.Contains(integritySkipReasons, IntegritySkipReason(value)) {
 			t.Errorf("%s (%q) is not registered", ident, value)
 		}
 	}
 	// No kind or reason is spelled as a literal: every one goes through a generated constant.
-	for _, kind := range append(append([]string(nil), integrityFindingKinds...), integritySkipReasons...) {
+	var names []string
+	for _, k := range integrityFindingKinds {
+		names = append(names, string(k))
+	}
+	for _, r := range integritySkipReasons {
+		names = append(names, string(r))
+	}
+	for _, kind := range names {
 		if strings.Contains(text, `"`+kind+`"`) {
 			t.Errorf("integrity.go spells %q as a literal", kind)
 		}
@@ -282,6 +289,7 @@ func TestIntegrityKindsRegistered(t *testing.T) {
 	api := map[string]bool{
 		"Integrity": true, "IntegrityLevel": true, "IntegrityFull": true, "IntegrityQuick": true, "IntegrityUnlimited": true,
 		"IntegrityCheckOptions": true, "IntegrityFinding": true, "IntegritySkip": true, "IntegrityReport": true, "IntegrityCheck": true,
+		"IntegrityKind": true, "IntegritySkipReason": true,
 	}
 	known := map[string]bool{}
 	for _, ident := range consts {
@@ -374,7 +382,7 @@ func TestIntegrityHostSurface(t *testing.T) {
 	}
 
 	// An in-memory attachment checks too.
-	if err := db.Attach("scratch", AttachMemory(), false); err != nil {
+	if err := db.Attach(context.Background(), "scratch", AttachMemory(), AttachOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	s := mustSession(db, SessionOptions{})
@@ -433,8 +441,8 @@ func damagePage(t *testing.T, path string, pageSize int, page uint32, offset int
 	}
 }
 
-func integrityKinds(r IntegrityReport) []string {
-	var out []string
+func integrityKinds(r IntegrityReport) []IntegrityKind {
+	var out []IntegrityKind
 	for _, f := range r.Findings {
 		out = append(out, f.Kind)
 	}
@@ -519,7 +527,7 @@ func TestIntegrityLiveDamage(t *testing.T) {
 			t.Fatal(err)
 		}
 		kinds := integrityKinds(report)
-		if !slices.Equal(kinds, []string{IntegrityPageCorrupt, IntegrityPageCorrupt}) || len(report.Skipped) != 1 ||
+		if !slices.Equal(kinds, []IntegrityKind{IntegrityPageCorrupt, IntegrityPageCorrupt}) || len(report.Skipped) != 1 ||
 			report.Skipped[0].Reason != IntegritySkipTableUnreadable {
 			t.Fatalf("got %v %+v", kinds, report.Skipped)
 		}
@@ -557,7 +565,7 @@ func TestIntegrityDepthCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	kinds := integrityKinds(k.report)
-	if !slices.Equal(kinds, []string{IntegrityPageCorrupt, IntegrityPageReachedTwice}) || w.readable || k.reachedN != 1 || k.report.Rows != 0 {
+	if !slices.Equal(kinds, []IntegrityKind{IntegrityPageCorrupt, IntegrityPageReachedTwice}) || w.readable || k.reachedN != 1 || k.report.Rows != 0 {
 		t.Fatalf("got %v readable %v reached %d rows %d", kinds, w.readable, k.reachedN, k.report.Rows)
 	}
 	g := &integrityGist{k: k, object: "g", leafDepth: -1, readable: true}

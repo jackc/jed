@@ -12,6 +12,7 @@ package jed
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -162,7 +163,7 @@ func TestChainSharingReadButUnassignedValuesKeepTheirChains(t *testing.T) {
 		return out
 	}
 	first := costs()
-	if err := host.Compact("main"); err != nil {
+	if err := host.Compact(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
 	if after := costs(); !reflect.DeepEqual(first, after) {

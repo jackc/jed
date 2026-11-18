@@ -1,6 +1,9 @@
 package jed
 
-import "errors"
+import (
+	"context"
+	"errors"
+)
 
 // DeserializeOptions are the handle settings of an in-memory database built from bytes
 // (spec/design/api.md §2.8). Its page size and contents come from the image.
@@ -47,7 +50,10 @@ func Deserialize(data []byte, opts DeserializeOptions) (*Database, error) {
 // transaction's uncommitted changes never are. Errors: 42704 for a name that is not attached (and
 // for temp), 0A000 for an encrypted database (the export would be plaintext). A host-API act — not
 // metered and not reachable from SQL.
-func (db *Database) Serialize(name string) ([]byte, error) {
+func (db *Database) Serialize(ctx context.Context, name string) ([]byte, error) {
+	if err := doneErr(contextDone(ctx)); err != nil {
+		return nil, contextError(ctx, err)
+	}
 	c := db.core
 	var att *attachment
 	if name != "main" {
@@ -57,7 +63,7 @@ func (db *Database) Serialize(name string) ([]byte, error) {
 		}
 		if att.svc != nil {
 			// A file attachment under the page service is exported through its own handle.
-			return att.svc.Serialize("main")
+			return att.svc.Serialize(ctx, "main")
 		}
 	}
 	var rt *roots

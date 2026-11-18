@@ -59,7 +59,7 @@ type IntegrityCheckOptions struct {
 // cross-core contract.
 type IntegrityFinding struct {
 	// Kind is a registered finding kind (spec/integrity/findings.toml; the Integrity* constants).
-	Kind string
+	Kind IntegrityKind
 	// Database is the name the check was called with.
 	Database string
 	// Object is the table, index, or sequence the finding is about; "" when there is none.
@@ -77,7 +77,7 @@ type IntegritySkip struct {
 	// Object is the index (or table) the check skipped.
 	Object string
 	// Reason is a registered skip reason (the IntegritySkip* constants).
-	Reason string
+	Reason IntegritySkipReason
 }
 
 // IntegrityReport is the result of an integrity check (§2).
@@ -471,7 +471,7 @@ func (k *integrityChecker) run(generation func() error) (IntegrityReport, error)
 func integrityPage(p uint32) *uint32 { return &p }
 
 // add records a finding, or ends the check (errIntegrityTruncated) when the limit is reached.
-func (k *integrityChecker) add(kind, object string, page *uint32, key []byte, detail string) error {
+func (k *integrityChecker) add(kind IntegrityKind, object string, page *uint32, key []byte, detail string) error {
 	if k.max > 0 && len(k.report.Findings) == k.max {
 		k.report.Truncated = true
 		return errIntegrityTruncated
@@ -483,7 +483,7 @@ func (k *integrityChecker) add(kind, object string, page *uint32, key []byte, de
 	return nil
 }
 
-func (k *integrityChecker) skip(object, reason string) {
+func (k *integrityChecker) skip(object string, reason IntegritySkipReason) {
 	k.report.Skipped = append(k.report.Skipped, IntegritySkip{Object: object, Reason: reason})
 }
 
@@ -904,7 +904,7 @@ func (k *integrityChecker) engine() *engine {
 // prevents its agreement check (§3.5), in the registered order: its stored text does not parse; a host
 // function it pinned is not registered at that component and version; a collation or time zone it
 // depends on is not loaded or is at another version.
-func (k *integrityChecker) resolveForAgreement(table *catTable, def indexDef) (resolvedIndex, string, error) {
+func (k *integrityChecker) resolveForAgreement(table *catTable, def indexDef) (resolvedIndex, IntegritySkipReason, error) {
 	if def.unparsed() {
 		return resolvedIndex{}, IntegritySkipUnparsableDefinition, nil
 	}
@@ -1259,7 +1259,7 @@ func (w *integrityTree) checkRow(page uint32, leaf *paxLeaf, i int, key []byte) 
 // integrityChainStop is an overflow pointer the walk must not follow: out of the body range or
 // already reached. The finding names that page and the row.
 type integrityChainStop struct {
-	kind string
+	kind IntegrityKind
 	page uint32
 }
 
@@ -1681,7 +1681,8 @@ func (k *integrityChecker) checkFreeList() error {
 	}
 	seen := make([]uint64, len(k.reached))
 	for _, p := range entries {
-		var kind, detail string
+		var kind IntegrityKind
+		var detail string
 		switch {
 		case !k.inRange(p):
 			kind, detail = IntegrityFreePageOutOfRange, fmt.Sprintf("free page %d outside [%d, %d)", p, k.first, k.gen.meta.pageCount)

@@ -10,6 +10,7 @@ package jed
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -1266,7 +1267,7 @@ func viewOptionsTableDB(t *testing.T) *Session {
 // its metadata entry is emitted because the schema references it. Must match the Ruby COLLATION_TABLE.
 func collationTableDB(t *testing.T) *Session {
 	db := mustSession(newInMemoryWithPageSize(goldenPageSize, goldenEnv()), SessionOptions{})
-	if err := db.SetDefaultCollation("unicode"); err != nil { // loaded — no import
+	if err := db.SetDefaultCollation(context.Background(), "unicode"); err != nil { // loaded — no import
 		t.Fatalf("set default: %v", err)
 	}
 	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "unicode", `+

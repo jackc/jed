@@ -68,7 +68,7 @@ func (c *sharedCore) attachedRoot(name string) *snapshot {
 // (page-service.md §5.5), through the handle's own lock and file hosts. The inner handle takes the
 // handle's ownership preference and owner limits when main is under the page service, the defaults
 // otherwise.
-func (c *sharedCore) openServiceAttachment(name, path string, source AttachSource, readOnly bool) (*Database, string, error) {
+func (c *sharedCore) openServiceAttachment(name, path string, source AttachSource, readOnly bool, done <-chan struct{}) (*Database, string, error) {
 	host, files, spill, background := osLocks, c.storage.files, c.storage.spill, true
 	if h := c.handoff; h != nil {
 		host, files, spill, background = h.host, h.files, h.spill, h.background
@@ -114,7 +114,9 @@ func (c *sharedCore) openServiceAttachment(name, path string, source AttachSourc
 	}
 	h := newServiceHandoff(host, real, opts)
 	h.files, h.spill, h.background = files, spill, background
+	h.openDone = done
 	inner, err := openServiceWith(h, true)
+	h.openDone = nil
 	if err != nil {
 		return nil, "", err
 	}

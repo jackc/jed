@@ -181,7 +181,7 @@ func TestAttachmentCommitLeavesMainUntouched(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if err := db.Attach("a", AttachFile(attached), false); err != nil {
+	if err := db.Attach(context.Background(), "a", AttachFile(attached, AttachFileOptions{}), AttachOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	s := mustSession(db, SessionOptions{})

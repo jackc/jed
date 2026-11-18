@@ -146,7 +146,7 @@ func TestDurationOptionsRejectNegativeBeforeIO(t *testing.T) {
 	}
 	db := memDB()
 	defer db.Close()
-	requireInvalidOption(t, db.Attach("aux", AttachFileWithOptions("/nonexistent/jed-test-file", AttachFileOptions{FileLockTimeout: &negative}), false))
+	requireInvalidOption(t, db.Attach(context.Background(), "aux", AttachFile("/nonexistent/jed-test-file", AttachFileOptions{FileLockTimeout: &negative}), AttachOptions{}))
 }
 
 func TestLockTimeoutDurations(t *testing.T) {

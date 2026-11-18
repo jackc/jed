@@ -824,7 +824,7 @@ func (r *simRunner) attach(name string) error {
 		locking = LockingAuto
 	}
 	d := r.dbs[name]
-	return r.db.Attach(name, AttachFileWithOptions(d.file, AttachFileOptions{Locking: locking}).WithCredential(r.credential(d)), false)
+	return r.db.Attach(context.Background(), name, AttachFile(d.file, AttachFileOptions{Locking: locking}).WithCredential(r.credential(d)), AttachOptions{})
 }
 
 // openProc starts process pid. A service trace elects it through the simulated lock host and
@@ -2218,11 +2218,11 @@ func (r *simRunner) stepCompact(i int, name string, rekey bool, target int) {
 	var err error
 	if rekey {
 		d.keyChange = &simKeyChange{old: d.key, next: target, entryPending: !r.fs.entryDurable(d.file)}
-		if err = r.db.Rekey(name, simCredential(target), Argon2Params{}); err == nil {
+		if err = r.db.Rekey(context.Background(), name, simCredential(target), Argon2Params{}); err == nil {
 			d.key = target
 		}
 	} else {
-		err = r.db.Compact(name)
+		err = r.db.Compact(context.Background(), name)
 	}
 	now := r.dbVersion(d)
 	dbField := ""
@@ -2278,7 +2278,7 @@ func (r *simRunner) stepChangeKey(i int, name string, n int) {
 	}
 	base := r.dbVersion(d)
 	d.keyChange = &simKeyChange{old: d.key, next: n, entryPending: !r.fs.entryDurable(d.file)}
-	if err := r.db.ChangeCredential(name, simKeys[n], Argon2Params{}); err != nil {
+	if err := r.db.ChangeCredential(context.Background(), name, simKeys[n], Argon2Params{}); err != nil {
 		code := simCode(err)
 		if strings.HasPrefix(code, "non-engine") {
 			r.fail(i, "%s", code)

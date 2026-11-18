@@ -189,7 +189,7 @@ func TestDefaultCollationInheritedByUnannotatedColumn(t *testing.T) {
 		t.Fatalf("fresh default: got %q", db.DefaultCollation())
 	}
 	run(t, db, `CREATE TABLE before (id i32 PRIMARY KEY, name text)`)
-	if err := db.SetDefaultCollation("unicode"); err != nil {
+	if err := db.SetDefaultCollation(context.Background(), "unicode"); err != nil {
 		t.Fatalf("set default: %v", err)
 	}
 	if db.DefaultCollation() != "unicode" {
@@ -217,10 +217,10 @@ func TestSetDefaultUnknownIs42704(t *testing.T) {
 	t.Parallel()
 	env := loadFixtureBundle(t)
 	db := mustSession(memDBIn(env), SessionOptions{})
-	if err := db.SetDefaultCollation("nope"); err == nil || err.(*EngineError).Code() != "42704" {
+	if err := db.SetDefaultCollation(context.Background(), "nope"); err == nil || err.(*EngineError).Code() != "42704" {
 		t.Fatalf("set default unknown: want 42704, got %v", err)
 	}
-	if err := db.SetDefaultCollation("C"); err != nil { // C always resolves (resets to byte order)
+	if err := db.SetDefaultCollation(context.Background(), "C"); err != nil { // C always resolves (resets to byte order)
 		t.Fatalf("set default C: %v", err)
 	}
 }
@@ -446,7 +446,7 @@ func TestUpgradeCollationsClearsSkew(t *testing.T) {
 		t.Fatal("skewed statistics must be unavailable to the estimator")
 	}
 
-	n, err := db.UpgradeCollations()
+	n, err := db.UpgradeCollations(context.Background())
 	if err != nil {
 		t.Fatalf("upgrade: %v", err)
 	}
@@ -469,7 +469,7 @@ func TestUpgradeCollationsClearsSkew(t *testing.T) {
 	if _, err := queryOutcome(db, `INSERT INTO t VALUES ('c')`, nil); err != nil {
 		t.Fatalf("writable after upgrade: %v", err)
 	}
-	if n, err := db.UpgradeCollations(); err != nil || n != 0 {
+	if n, err := db.UpgradeCollations(context.Background()); err != nil || n != 0 {
 		t.Fatalf("idempotent no-op: got (%d, %v), want (0, nil)", n, err)
 	}
 }
@@ -501,10 +501,10 @@ func TestCollationHostOpsRejectedInReadOnlyOrFailedBlock(t *testing.T) {
 	if err := db.beginBlockCtx(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SetDefaultCollation("unicode"); err == nil || err.(*EngineError).Code() != "25006" {
+	if err := db.SetDefaultCollation(context.Background(), "unicode"); err == nil || err.(*EngineError).Code() != "25006" {
 		t.Fatalf("read-only block set default: want 25006, got %v", err)
 	}
-	if _, err := db.UpgradeCollations(); err == nil || err.(*EngineError).Code() != "25006" {
+	if _, err := db.UpgradeCollations(context.Background()); err == nil || err.(*EngineError).Code() != "25006" {
 		t.Fatalf("read-only block upgrade: want 25006, got %v", err)
 	}
 	if err := db.commitBlock(); err != nil {
@@ -516,10 +516,10 @@ func TestCollationHostOpsRejectedInReadOnlyOrFailedBlock(t *testing.T) {
 	if _, err := queryOutcome(db, "SELECT * FROM absent", nil); err == nil {
 		t.Fatal("expected failure")
 	}
-	if err := db.SetDefaultCollation("unicode"); err == nil || err.(*EngineError).Code() != "25P02" {
+	if err := db.SetDefaultCollation(context.Background(), "unicode"); err == nil || err.(*EngineError).Code() != "25P02" {
 		t.Fatalf("failed block set default: want 25P02, got %v", err)
 	}
-	if _, err := db.UpgradeCollations(); err == nil || err.(*EngineError).Code() != "25P02" {
+	if _, err := db.UpgradeCollations(context.Background()); err == nil || err.(*EngineError).Code() != "25P02" {
 		t.Fatalf("failed block upgrade: want 25P02, got %v", err)
 	}
 	if err := db.rollbackBlock(); err != nil {

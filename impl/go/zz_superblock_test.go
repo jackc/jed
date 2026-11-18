@@ -180,7 +180,7 @@ func TestSuperBlockExperiment(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		db = expBuild(t, path, DefaultPageSize)
 		expExtra(t, db)
-		if err := db.Compact("main"); err != nil {
+		if err := db.Compact(context.Background(), "main"); err != nil {
 			t.Fatal(err)
 		}
 	} else if db, err = Open(path, OpenOptions{}); err != nil {

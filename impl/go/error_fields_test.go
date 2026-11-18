@@ -342,7 +342,7 @@ func TestErrorFieldsPositionHintSharedCases(t *testing.T) {
 		}
 		handle := memDBIn(env)
 		for _, name := range c.attach {
-			if err := handle.Attach(name, AttachMemory(), false); err != nil {
+			if err := handle.Attach(context.Background(), name, AttachMemory(), AttachOptions{}); err != nil {
 				t.Fatalf("%s: attach %q: %v", c.name, name, err)
 			}
 		}

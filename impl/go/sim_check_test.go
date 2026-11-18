@@ -44,7 +44,7 @@ func simIntegrity(image []byte, want uint64, cred *Credential) (live, pages, fre
 	if !report.OK() {
 		var lines []string
 		for _, f := range report.Findings {
-			line := f.Kind
+			line := string(f.Kind)
 			if f.Object != "" {
 				line += " " + f.Object
 			}

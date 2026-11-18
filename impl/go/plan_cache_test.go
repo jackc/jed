@@ -381,7 +381,7 @@ func TestInsertCacheInvalidationIdentities(t *testing.T) {
 	}
 
 	base := memDB()
-	if err := base.Attach("aux", AttachMemory(), false); err != nil {
+	if err := base.Attach(context.Background(), "aux", AttachMemory(), AttachOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	attachedSession := mustSession(base, SessionOptions{})
@@ -397,7 +397,7 @@ func TestInsertCacheInvalidationIdentities(t *testing.T) {
 	if err := base.Detach("aux"); err != nil {
 		t.Fatal(err)
 	}
-	if err := base.Attach("aux", AttachMemory(), false); err != nil {
+	if err := base.Attach(context.Background(), "aux", AttachMemory(), AttachOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	mustExec(t, attachedSession, "CREATE TABLE aux.t (id i32 PRIMARY KEY, v i32)")
@@ -485,7 +485,7 @@ func TestInsertCacheCollationUpgradeInvalidates(t *testing.T) {
 	skewed := *loaded
 	skewed.UnicodeVersion = "0.0.0"
 	s.engine.committed.collations["unicode"] = &skewed
-	if n, err := s.UpgradeCollations(); err != nil || n != 1 {
+	if n, err := s.UpgradeCollations(context.Background()); err != nil || n != 1 {
 		t.Fatalf("upgrade = (%d, %v), want (1, nil)", n, err)
 	}
 	if _, err := prepOutcome(s, stmt, []Value{IntValue(2), TextValue("b")}); err != nil {
@@ -730,7 +730,7 @@ func TestPlanCacheEstimatorRevisionRollback(t *testing.T) {
 func TestPlanCacheAttachmentEstimatorSignature(t *testing.T) {
 	t.Parallel()
 	base := memDB()
-	if err := base.Attach("aux", AttachMemory(), false); err != nil {
+	if err := base.Attach(context.Background(), "aux", AttachMemory(), AttachOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	db := mustSession(base, SessionOptions{})
@@ -768,7 +768,7 @@ func TestPlanCacheAttachmentEstimatorSignature(t *testing.T) {
 	if err := base.Detach("aux"); err != nil {
 		t.Fatal(err)
 	}
-	if err := base.Attach("aux", AttachMemory(), false); err != nil {
+	if err := base.Attach(context.Background(), "aux", AttachMemory(), AttachOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	mustExec(t, db, "CREATE TABLE aux.t (id i32 PRIMARY KEY, v i32)")

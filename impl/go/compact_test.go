@@ -88,7 +88,7 @@ func TestFileCompactionReturnsDeadPagesAndKeepsRowsAndCosts(t *testing.T) {
 	rows, cost := rowsAndCost(t, db, compactProbe)
 	count := countRows(t, db, "t")
 
-	if err := db.Compact("main"); err != nil {
+	if err := db.Compact(context.Background(), "main"); err != nil {
 		t.Fatalf("compact: %v", err)
 	}
 
@@ -154,14 +154,14 @@ func TestCompactionOfACompactFileIsAFixedPoint(t *testing.T) {
 	db := createCompactFile(t, path)
 	defer db.Close()
 	growAndShrink(t, db)
-	if err := db.Compact("main"); err != nil {
+	if err := db.Compact(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
 	first, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Compact("main"); err != nil {
+	if err := db.Compact(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
 	second, err := os.ReadFile(path)
@@ -202,7 +202,7 @@ func TestInMemoryCompactionLowersStorageBytes(t *testing.T) {
 	}
 	rows, cost := rowsAndCost(t, db, compactProbe)
 	version := db.Version()
-	if err := db.Compact("main"); err != nil {
+	if err := db.Compact(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
 	after, err := db.StorageBytes("main")
@@ -241,7 +241,7 @@ func TestPreparedStatementsSurviveCompaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Compact("main"); err != nil {
+	if err := db.Compact(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
 	after, err := prepOutcome(s, stmt, []Value{IntValue(3)})
@@ -260,16 +260,16 @@ func TestCompactionPreconditionsFailWithoutWriting(t *testing.T) {
 	growAndShrink(t, db)
 	pages := db.PageCount()
 
-	if code := compactCode(t, db.Compact("nope")); code != "42704" {
+	if code := compactCode(t, db.Compact(context.Background(), "nope")); code != "42704" {
 		t.Fatalf("unknown name: %s, want 42704", code)
 	}
-	if code := compactCode(t, db.Compact("temp")); code != "42704" {
+	if code := compactCode(t, db.Compact(context.Background(), "temp")); code != "42704" {
 		t.Fatalf("temp: %s, want 42704", code)
 	}
 
 	// A pinned reader blocks it, and so does an open cursor.
 	reader := db.readSession()
-	if code := compactCode(t, db.Compact("main")); code != "55006" {
+	if code := compactCode(t, db.Compact(context.Background(), "main")); code != "55006" {
 		t.Fatalf("pinned reader: %s, want 55006", code)
 	}
 	reader.Close()
@@ -281,7 +281,7 @@ func TestCompactionPreconditionsFailWithoutWriting(t *testing.T) {
 	if !rows.Next() {
 		t.Fatal("expected a row")
 	}
-	if code := compactCode(t, db.Compact("main")); code != "55006" {
+	if code := compactCode(t, db.Compact(context.Background(), "main")); code != "55006" {
 		t.Fatalf("open cursor: %s, want 55006", code)
 	}
 	rows.Close()
@@ -291,7 +291,7 @@ func TestCompactionPreconditionsFailWithoutWriting(t *testing.T) {
 	if err := writer.beginBlockCtx(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
-	if code := compactCode(t, db.Compact("main")); code != "55006" {
+	if code := compactCode(t, db.Compact(context.Background(), "main")); code != "55006" {
 		t.Fatalf("open write transaction: %s, want 55006", code)
 	}
 	if err := writer.rollbackBlock(); err != nil {
@@ -303,7 +303,7 @@ func TestCompactionPreconditionsFailWithoutWriting(t *testing.T) {
 	if db.PageCount() != pages {
 		t.Fatalf("a refused compaction wrote: page count %d -> %d", pages, db.PageCount())
 	}
-	if err := db.Compact("main"); err != nil {
+	if err := db.Compact(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -315,7 +315,7 @@ func TestCompactionPreconditionsFailWithoutWriting(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ro.Close()
-	if code := compactCode(t, ro.Compact("main")); code != "25006" {
+	if code := compactCode(t, ro.Compact(context.Background(), "main")); code != "25006" {
 		t.Fatalf("read-only handle: %s, want 25006", code)
 	}
 }
@@ -332,10 +332,10 @@ func TestAttachmentsCompactIndependently(t *testing.T) {
 	}
 	db := memDB()
 	defer db.Close()
-	if err := db.Attach("work", AttachFile(work), false); err != nil {
+	if err := db.Attach(context.Background(), "work", AttachFile(work, AttachFileOptions{}), AttachOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Attach("scratch", AttachMemory(), false); err != nil {
+	if err := db.Attach(context.Background(), "scratch", AttachMemory(), AttachOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	mainVersion := db.Version()
@@ -344,10 +344,10 @@ func TestAttachmentsCompactIndependently(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := info.Size()
-	if err := db.Compact("work"); err != nil {
+	if err := db.Compact(context.Background(), "work"); err != nil {
 		t.Fatalf("compact work: %v", err)
 	}
-	if err := db.Compact("scratch"); err != nil {
+	if err := db.Compact(context.Background(), "scratch"); err != nil {
 		t.Fatalf("compact scratch: %v", err)
 	}
 	if info, err = os.Stat(work); err != nil {
@@ -368,10 +368,10 @@ func TestAttachmentsCompactIndependently(t *testing.T) {
 	if err := db.Detach("work"); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Attach("frozen", AttachFile(work), true); err != nil {
+	if err := db.Attach(context.Background(), "frozen", AttachFile(work, AttachFileOptions{}), AttachOptions{ReadOnly: true}); err != nil {
 		t.Fatal(err)
 	}
-	if code := compactCode(t, db.Compact("frozen")); code != "25006" {
+	if code := compactCode(t, db.Compact(context.Background(), "frozen")); code != "25006" {
 		t.Fatalf("read-only attachment: %s, want 25006", code)
 	}
 	if got := countRows(t, db, "frozen.t"); got != 101 {
@@ -399,7 +399,7 @@ func TestAStaleTempFileIsIgnoredAndReplaced(t *testing.T) {
 	if got := countRows(t, db, "t"); got != 100 {
 		t.Fatalf("count = %d, want 100", got)
 	}
-	if err := db.Compact("main"); err != nil {
+	if err := db.Compact(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(path + ".jedtmp"); !os.IsNotExist(err) {
@@ -431,7 +431,7 @@ func TestCompactionKeepsSymlinksAndPermissionBits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Compact("main"); err != nil {
+	if err := db.Compact(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {

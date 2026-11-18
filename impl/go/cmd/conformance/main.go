@@ -1231,7 +1231,7 @@ func runFile(text string, disk bool) error {
 			// sees the attachment (refreshCommitted re-pins roots.attached per statement). In-memory
 			// attachments cannot survive the disk reopen, so # attach: files are # skip: disk.
 			if name, ok := parseAttachDirective(line); ok {
-				if err := db.Attach(name, jed.AttachMemory(), false); err != nil {
+				if err := db.Attach(context.Background(), name, jed.AttachMemory(), jed.AttachOptions{}); err != nil {
 					return fmt.Errorf("attach %q: %w", name, err)
 				}
 				i++
@@ -1282,7 +1282,7 @@ func runFile(text string, disk bool) error {
 			// DB — the privileged host op (db.UpgradeCollations) that clears a version-skew
 			// (collation.md §12); the records after it assert the table is read-write again.
 			if parseUpgradeCollationsDirective(line) {
-				if _, err := sess.UpgradeCollations(); err != nil {
+				if _, err := sess.UpgradeCollations(context.Background()); err != nil {
 					return fmt.Errorf("upgrade-collations: %s", err.Error())
 				}
 				i++

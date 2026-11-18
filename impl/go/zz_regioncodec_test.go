@@ -1135,7 +1135,7 @@ func TestRegionCodecExperiment(t *testing.T) {
 		os.RemoveAll(path + ".lock")
 		db := expBuild(t, path, ps)
 		expExtra(t, db)
-		if err := db.Compact("main"); err != nil {
+		if err := db.Compact(context.Background(), "main"); err != nil {
 			t.Fatal(err)
 		}
 		cols, pages := ccCollect(t, db)
@@ -1301,7 +1301,7 @@ func TestRegionEngineExperiment(t *testing.T) {
 			float64(symStats.trainNanos.Load())/1e9, float64(symStats.trainBytes.Load())/(1<<20))
 		st, _ := os.Stat(path)
 		loaded := st.Size()
-		if err := db.Compact("main"); err != nil {
+		if err := db.Compact(context.Background(), "main"); err != nil {
 			t.Fatal(err)
 		}
 		st, _ = os.Stat(path)
@@ -1473,7 +1473,7 @@ func TestTableSymExperiment(t *testing.T) {
 		os.RemoveAll(path + ".lock")
 		db := expBuild(t, path, ps)
 		expExtra(t, db)
-		if err := db.Compact("main"); err != nil {
+		if err := db.Compact(context.Background(), "main"); err != nil {
 			t.Fatal(err)
 		}
 		cols, _ := ccCollect(t, db)
@@ -1731,7 +1731,7 @@ func TestColumnSymbolTablesSurviveChange(t *testing.T) {
 	}
 	changed := fmt.Sprint(o.Rows)
 	check("after changes")
-	if err := db.Compact("main"); err != nil {
+	if err := db.Compact(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
 	check("after compaction")
@@ -1813,7 +1813,7 @@ func TestSymDriftExperiment(t *testing.T) {
 	rows := expScale(120000)
 	next := 0
 	compacted := func() float64 {
-		if err := db.Compact("main"); err != nil {
+		if err := db.Compact(context.Background(), "main"); err != nil {
 			t.Fatal(err)
 		}
 		st, _ := os.Stat(path)

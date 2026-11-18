@@ -142,7 +142,7 @@ func run() error {
 			_, err = db.Exec(context.Background(), sql(argument))
 		case "ATTACH":
 			parts := strings.SplitN(argument, "\t", 3)
-			err = db.Attach(parts[0], jed.AttachFile(parts[2]), parts[1] == "1")
+			err = db.Attach(context.Background(), parts[0], jed.AttachFile(parts[2], jed.AttachFileOptions{}), jed.AttachOptions{ReadOnly: parts[1] == "1"})
 		case "DETACH":
 			err = db.Detach(argument)
 		case "QUERY_I64":
@@ -178,7 +178,7 @@ func run() error {
 			if name == "" {
 				name = "main"
 			}
-			err = db.Compact(name)
+			err = db.Compact(context.Background(), name)
 		case "BACKUP":
 			// The backup test entry point (spec/design/page-service.md §9): BACKUP <form>\t<dest>.
 			form, dest, _ := strings.Cut(argument, "\t")
@@ -186,13 +186,13 @@ func run() error {
 		case "CHANGE_KEY":
 			// An encrypted database's credential change and rekey (spec/design/encryption.md §5):
 			// CHANGE_KEY <hex>, REKEY <hex> (empty: decrypt).
-			err = db.ChangeCredential("main", hostKey(argument), jed.Argon2Params{})
+			err = db.ChangeCredential(context.Background(), "main", hostKey(argument), jed.Argon2Params{})
 		case "REKEY":
 			var target *jed.Credential
 			if argument != "" {
 				target = hostKey(argument)
 			}
-			err = db.Rekey("main", target, jed.Argon2Params{})
+			err = db.Rekey(context.Background(), "main", target, jed.Argon2Params{})
 		case "MAX_STORAGE_BYTES":
 			bytes, parseErr := strconv.ParseInt(argument, 10, 64)
 			if parseErr != nil {

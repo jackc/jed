@@ -54,7 +54,8 @@ type fileCoordinator struct {
 	record bool
 }
 
-func prepareOpenCoordinator(path string, mode Locking, timeout *uint64) (*fileCoordinator, string, error) {
+// done, when non-nil, abandons the lock wait with 57014 once closed (Attach's ctx).
+func prepareOpenCoordinator(path string, mode Locking, timeout *uint64, done <-chan struct{}) (*fileCoordinator, string, error) {
 	mode, err := resolvedLocking(mode)
 	if err != nil {
 		return nil, "", err
@@ -80,7 +81,7 @@ func prepareOpenCoordinator(path string, mode Locking, timeout *uint64) (*fileCo
 	if multiple {
 		return nil, "", newError(ObjectInUse, "hard-linked database paths cannot use jed locking: "+real)
 	}
-	c, err := acquireCoordinator(osLocks, real, mode, timeout)
+	c, err := acquireCoordinator(osLocks, real, mode, timeout, done)
 	return c, real, err
 }
 
@@ -101,7 +102,7 @@ func prepareCreateCoordinator(path string, mode Locking, timeout *uint64) (*file
 		return nil, "", newError(IOError, "resolve database parent: "+err.Error())
 	}
 	real := filepath.Join(parent, filepath.Base(path))
-	c, err := acquireCoordinator(osLocks, real, mode, timeout)
+	c, err := acquireCoordinator(osLocks, real, mode, timeout, nil)
 	return c, real, err
 }
 
@@ -109,7 +110,7 @@ func prepareCreateCoordinator(path string, mode Locking, timeout *uint64) (*file
 // timeout (55006). A coordinator in mode LockingExclusive (an exclusive opener or a file attachment)
 // writes a non-serving owner record, so a page-service opener words its timeout as "owned by a
 // non-serving process"; a page-service creator writes its own record when it serves.
-func acquireCoordinator(host lockHost, path string, mode Locking, timeoutOpt *uint64) (*fileCoordinator, error) {
+func acquireCoordinator(host lockHost, path string, mode Locking, timeoutOpt *uint64, done <-chan struct{}) (*fileCoordinator, error) {
 	if !host.claimPath(path) {
 		return nil, newError(ObjectInUse, "database is already open in this process: "+path+" (share one Database handle)")
 	}
@@ -126,14 +127,14 @@ func acquireCoordinator(host lockHost, path string, mode Locking, timeoutOpt *ui
 		return fail(err)
 	}
 	deadline := fileLockDeadline(host, timeoutOpt)
-	if err := lockUntil(host, files.arrival, false, deadline, path, false); err != nil {
+	if err := lockUntil(host, files.arrival, false, deadline, path, false, done); err != nil {
 		return failClosing(err)
 	}
 	if err := host.validateMarker(path); err != nil {
 		_ = host.unlock(files.arrival)
 		return failClosing(err)
 	}
-	if err := lockUntil(host, files.presence, true, deadline, path, false); err != nil {
+	if err := lockUntil(host, files.presence, true, deadline, path, false, done); err != nil {
 		_ = host.unlock(files.arrival)
 		reason := ""
 		if record, ok := host.readOwnerRecord(path); ok {
@@ -284,8 +285,11 @@ func lockBlocking(host lockHost, h lockHandle, exclusive bool, path string) erro
 	}
 }
 
-func lockUntil(host lockHost, h lockHandle, exclusive bool, deadline time.Time, path string, writer bool) error {
+func lockUntil(host lockHost, h lockHandle, exclusive bool, deadline time.Time, path string, writer bool, done <-chan struct{}) error {
 	for {
+		if err := doneErr(done); err != nil {
+			return err
+		}
 		ok, err := host.tryLock(h, exclusive)
 		if err != nil {
 			return classifyLockError(err)

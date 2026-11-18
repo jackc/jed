@@ -30,7 +30,7 @@ func TestGistCommittedLoadHasNoPendingWrites(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			image, err := source.Serialize("main")
+			image, err := source.Serialize(context.Background(), "main")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -44,7 +44,7 @@ func TestGistCommittedLoadHasNoPendingWrites(t *testing.T) {
 			} else {
 				db, err = jed.Create(jed.CreateOptions{})
 				if err == nil {
-					err = db.Attach("aux", jed.AttachFileWithOptions(path, jed.AttachFileOptions{Locking: jed.LockingNone}), false)
+					err = db.Attach(context.Background(), "aux", jed.AttachFile(path, jed.AttachFileOptions{Locking: jed.LockingNone}), jed.AttachOptions{})
 				}
 				name = "aux.t"
 			}

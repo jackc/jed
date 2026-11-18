@@ -143,7 +143,7 @@ func (k *integrityChecker) checkColumns(table *catTable, store *tableStore, root
 // resolveCheck resolves a CHECK constraint as the write path does (resolveChecks), or names the skip
 // that prevents checking it (§3.5): its stored text does not parse; a host function it pinned is not
 // registered at that component and version; a column it reads has an unavailable collation.
-func (k *integrityChecker) resolveCheck(table *catTable, c *checkConstraint) (*rExpr, string, error) {
+func (k *integrityChecker) resolveCheck(table *catTable, c *checkConstraint) (*rExpr, IntegritySkipReason, error) {
 	if c.Unparsed {
 		return nil, IntegritySkipUnparsableDefinition, nil
 	}
@@ -216,7 +216,7 @@ func (k *integrityChecker) checkCheck(table *catTable, store *tableStore, root p
 // uniqueEntrySlots is each key element's resolved type and key form, for splitting a unique index's
 // entries into key prefix and storage key; reason names the skip when an expression key's type
 // cannot be resolved (§3.5).
-func (k *integrityChecker) uniqueEntrySlots(table *catTable, store *tableStore, def *indexDef) ([]colType, []bool, string, error) {
+func (k *integrityChecker) uniqueEntrySlots(table *catTable, store *tableStore, def *indexDef) ([]colType, []bool, IntegritySkipReason, error) {
 	types := make([]colType, len(def.Keys))
 	collated := make([]bool, len(def.Keys))
 	var rindex resolvedIndex
