@@ -328,3 +328,25 @@ input = "a\nb\n"
 matched = false
 caps = []
 steps = 25
+
+# Wide normalized classes: the last range, a gap and a point past the last range.
+[[case]]
+pattern = "[acegikmoα-γ]"
+input = "γ"
+matched = true
+caps = [[0, 1]]
+steps = 11
+
+[[case]]
+pattern = "[acegikmoα-γ]"
+input = "p"
+matched = false
+caps = []
+steps = 9
+
+[[case]]
+pattern = "[^acegikmoα-γ]"
+input = "δ"
+matched = true
+caps = [[0, 1]]
+steps = 11

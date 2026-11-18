@@ -82,6 +82,25 @@ timings and RSS remain diagnostics. In-memory/OPFS/WASI scratch limitations,
 upstream materializers, final scalar values, result collectors and whole-query
 admission are documented in [spill.md](spill.md) and [memory.md](memory.md).
 
+**Regex predicates (2026-11-18).** On a Core Ultra 9 285K, `mise run bench:regex-go` timed
+precompiled boolean matches with subjects already in each engine's input representation. The Go
+core accrued statement and lifetime costs. Median nanoseconds per match over three samples on Go
+1.27.1, with a separate Node 26.10.0 native RegExp comparison on the same inputs:
+
+| Input | Go before | Go after | Go regexp | V8 RegExp | jed cost per match |
+|---|---:|---:|---:|---:|---:|
+| Short vowel-pair filter | 218 | 156 | 41 | 8 | 34 |
+| Literal after 2,048 nonmatching characters | 67,798 | 39,298 | 60 | 20 | 10,281 |
+| Twelve capturing groups in a boolean predicate | 16,214 | 1,274 | 68 | 17 | 311 |
+| Misses in a 1,024-range class over 256 characters | 69,440 | 5,956 | 3,733 | 54 | 1,284 |
+
+All four optimized Go cases reported zero allocations per match after warmup. The twelve-group
+predicate previously allocated 364 times per match. Go regexp can skip to a literal prefix;
+jed visits and charges the unanchored search states at each input position. Native engine times
+provide throughput comparisons and have no jed cost meter. In the separate `regex_filter_scan`
+SQL lane, one 54-iteration run per revision over the 10k-row dataset measured 8.71 → 7.55 ms per
+query (−13.3%), with matching answer checksums.
+
 **Variable-width scan result (2026-10-13).** Track A4 ([packed-leaf.md §11](packed-leaf.md)) lets the
 columnar lanes read text, bytea, and array columns in place. The seven `varscan_*` lanes run over a
 100k-row scratch table (nullable text, `text[]`, `bytea`; no secondary index); `gin_stats_common_tag`

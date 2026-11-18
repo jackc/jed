@@ -921,3 +921,8 @@ run = "mkdir -p /tmp/jed-prepared-join && cd impl/go && JOIN_COUNTERS=1 go test 
 [tasks."bench:prepared_join_controls"]
 description = "Generate prepared JOIN control plans outside the repository"
 run = "ruby bench/prepared-join/control-plans.rb"
+
+[tasks."bench:regex-go"]
+description = "Compare precompiled Go regex predicates with Go regexp on shared inputs"
+dir = "impl/go"
+run = "go test -run '^$' -bench '^BenchmarkRegexPredicate$' -benchmem -count 3 -cpu 1 -benchtime 150ms"

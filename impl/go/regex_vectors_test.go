@@ -197,6 +197,11 @@ func TestRegexMatchVectors(t *testing.T) {
 			t.Errorf("caps for %q/%q: got %v want %v", pattern, input, gotCaps, wantCaps)
 		}
 		wantSteps, _ := strconv.ParseInt(c["steps"], 10, 64)
+		predMeter := newMeter()
+		got, err := prog.isMatch([]rune(subj), predMeter)
+		if err != nil || got != wantMatched || predMeter.Accrued != wantSteps {
+			t.Errorf("predicate for %q/%q: got %v, cost %d, err %v; want %v, cost %d", pattern, input, got, predMeter.Accrued, err, wantMatched, wantSteps)
+		}
 		if m.Accrued != wantSteps {
 			t.Errorf("steps for %q/%q: got %d want %d", pattern, input, m.Accrued, wantSteps)
 		}

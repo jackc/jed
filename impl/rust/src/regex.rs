@@ -62,7 +62,12 @@ pub struct CharClass {
 impl CharClass {
     fn admits(&self, c: char) -> bool {
         let cp = c as u32;
-        let inside = self.ranges.iter().any(|&(lo, hi)| cp >= lo && cp <= hi);
+        let inside = if self.ranges.len() <= 8 {
+            self.ranges.iter().any(|&(lo, hi)| cp >= lo && cp <= hi)
+        } else {
+            let i = self.ranges.partition_point(|&(_, hi)| hi < cp);
+            self.ranges.get(i).is_some_and(|&(lo, _)| lo <= cp)
+        };
         inside != self.negated
     }
 }
@@ -1246,7 +1251,7 @@ impl Program {
             gate: Some(gate),
             ends: Some(&mut ends),
         };
-        self.with_seen(|seen| self.gated_search(seen, input, 0, &mut gating, m))?;
+        self.with_seen(|seen| self.pike_search::<NoCaps>(seen, input, 0, &mut gating, m))?;
         Ok(ends)
     }
 

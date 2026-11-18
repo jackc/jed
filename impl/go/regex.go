@@ -13,6 +13,7 @@ package jed
 import (
 	"fmt"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -69,6 +70,11 @@ type regexClass struct {
 }
 
 func (c *regexClass) admits(r rune) bool {
+	if len(c.ranges) > 8 {
+		i := sort.Search(len(c.ranges), func(i int) bool { return c.ranges[i][1] >= r })
+		inside := i < len(c.ranges) && c.ranges[i][0] <= r
+		return inside != c.negated
+	}
 	inside := false
 	for _, rg := range c.ranges {
 		if r >= rg[0] && r <= rg[1] {
@@ -1150,6 +1156,14 @@ func (flatCaps) bufs(seen *regexSeen) *pikeBufs[[]int64] { return &seen.flat }
 
 func (flatCaps) reset(seen *regexSeen) { seen.slab = seen.slab[:0] }
 
+// noCaps visits every Save but carries no slots for a predicate or an ends run.
+type noCaps struct{}
+
+func (noCaps) bufs(seen *regexSeen) *pikeBufs[noCaps]                    { return &seen.noCaps }
+func (noCaps) reset(*regexSeen)                                          {}
+func (noCaps) with(*regexProgram, *regexSeen, noCaps, int, int64) noCaps { return noCaps{} }
+func (noCaps) result(noCaps) regexCaps                                   { return regexCaps{} }
+
 // treeCaps keeps the slots as a capture-slot tree; a Save copies the path to the slot it sets.
 type treeCaps struct{}
 
@@ -1164,8 +1178,8 @@ func (treeCaps) with(p *regexProgram, _ *regexSeen, caps *capNode, i int, v int6
 func (treeCaps) result(caps *capNode) regexCaps { return regexCaps{tree: caps} }
 
 type regexThread[C any] struct {
+	caps C // first so a zero-sized capture adds no trailing padding
 	pc   int
-	caps C
 }
 
 // regexSeen is the per-position dedup set (regex.md §4): marks[pc] == generation means pc was visited
@@ -1176,9 +1190,10 @@ type regexSeen struct {
 	marks      []uint32
 	generation uint32
 	// The search's reusable buffers, by capture representation, and the flat representation's slab.
-	flat pikeBufs[[]int64]
-	tree pikeBufs[*capNode]
-	slab []int64
+	noCaps pikeBufs[noCaps]
+	flat   pikeBufs[[]int64]
+	tree   pikeBufs[*capNode]
+	slab   []int64
 }
 
 // next starts a new generation. When the counter wraps, the stale marks could alias the new
@@ -1203,7 +1218,9 @@ func (p *regexProgram) takeSeen() *regexSeen {
 
 // isMatch reports whether the pattern matches somewhere in input (the `~` operator).
 func (p *regexProgram) isMatch(input []rune, m *costMeter) (bool, error) {
-	_, ok, err := p.run(input, m)
+	seen := p.takeSeen()
+	defer p.seenPool.Put(seen)
+	_, ok, err := pikeSearch[noCaps, noCaps](p, seen, input, 0, nil, nil, m)
 	return ok, err
 }
 
@@ -1251,7 +1268,7 @@ func (p *regexProgram) matchEnds(input []rune, gate []bool, m *costMeter) ([]boo
 	seen := p.takeSeen()
 	defer p.seenPool.Put(seen)
 	ends := make([]bool, len(input)+1)
-	if _, _, err := p.gatedSearch(seen, input, 0, gate, ends, m); err != nil {
+	if _, _, err := pikeSearch[noCaps, noCaps](p, seen, input, 0, gate, ends, m); err != nil {
 		return nil, err
 	}
 	return ends, nil
@@ -1335,7 +1352,7 @@ func pikeAddThread[C any, R capRep[C]](p *regexProgram, list *[]regexThread[C], 
 	var rep R
 	length := len(input)
 	bufs := rep.bufs(seen)
-	stack := append(bufs.stack[:0], regexThread[C]{pc0, caps0})
+	stack := append(bufs.stack[:0], regexThread[C]{pc: pc0, caps: caps0})
 	for len(stack) > 0 {
 		top := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
@@ -1347,32 +1364,32 @@ func pikeAddThread[C any, R capRep[C]](p *regexProgram, list *[]regexThread[C], 
 		in := p.insts[top.pc]
 		switch in.op {
 		case opJmp:
-			stack = append(stack, regexThread[C]{in.x, top.caps})
+			stack = append(stack, regexThread[C]{pc: in.x, caps: top.caps})
 		case opSplit:
 			// Push y first, then x, so x pops first = higher priority.
-			stack = append(stack, regexThread[C]{in.y, top.caps})
-			stack = append(stack, regexThread[C]{in.x, top.caps})
+			stack = append(stack, regexThread[C]{pc: in.y, caps: top.caps})
+			stack = append(stack, regexThread[C]{pc: in.x, caps: top.caps})
 		case opSave:
-			stack = append(stack, regexThread[C]{top.pc + 1, rep.with(p, seen, top.caps, in.x, int64(sp))})
+			stack = append(stack, regexThread[C]{pc: top.pc + 1, caps: rep.with(p, seen, top.caps, in.x, int64(sp))})
 		case opAssertStart:
 			if sp == 0 {
-				stack = append(stack, regexThread[C]{top.pc + 1, top.caps})
+				stack = append(stack, regexThread[C]{pc: top.pc + 1, caps: top.caps})
 			}
 		case opAssertEnd:
 			if sp == length {
-				stack = append(stack, regexThread[C]{top.pc + 1, top.caps})
+				stack = append(stack, regexThread[C]{pc: top.pc + 1, caps: top.caps})
 			}
 		case opAssertLineStart:
 			if sp == 0 || input[sp-1] == '\n' {
-				stack = append(stack, regexThread[C]{top.pc + 1, top.caps})
+				stack = append(stack, regexThread[C]{pc: top.pc + 1, caps: top.caps})
 			}
 		case opAssertLineEnd:
 			if sp == length || input[sp] == '\n' {
-				stack = append(stack, regexThread[C]{top.pc + 1, top.caps})
+				stack = append(stack, regexThread[C]{pc: top.pc + 1, caps: top.caps})
 			}
 		case opGate:
 			if gate != nil && gate[sp] {
-				stack = append(stack, regexThread[C]{top.pc + 1, top.caps})
+				stack = append(stack, regexThread[C]{pc: top.pc + 1, caps: top.caps})
 			}
 		default:
 			// Char / Any / Class / Match — parked for the consume loop.

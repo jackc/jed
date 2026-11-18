@@ -10,7 +10,7 @@
 # rejected with 54001 in every core (CLAUDE.md §8) — so this suite is the cross-core contract; it is
 # jed-specific, so it is NOT oracle-checked. The pattern is a constant, so the bound is checked at
 # resolve (no rows produced, no match cost metered) for the over-limit cases.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, expr.regex_match, types.i32, types.text, resource.regex_program_limit, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, expr.regex_match, types.i32, types.text, resource.regex_program_limit, resource.cost_metering, resource.cost_limit
 
 statement ok
 CREATE TABLE one (id i32 PRIMARY KEY)
@@ -39,3 +39,9 @@ SELECT 'a' ~ '(a{1000}){1000}' FROM one
 # parsing it cannot overflow either).
 statement error 54001
 SELECT 'a' ~ 'a{9999999999}' FROM one
+
+# The compiled predicate fits. A ceiling above compilation but below the search cost trips
+# while exploring states, including Save instructions whose captures the predicate discards.
+# max_cost: 60
+statement error 54P01
+SELECT 'aaaaaaaaaaaaaaaaaaaaaaaa' ~ '^(a|aa)*b$' FROM one

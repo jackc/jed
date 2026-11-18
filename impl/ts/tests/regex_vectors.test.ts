@@ -142,6 +142,13 @@ test("regex match vectors match spec/regex/match_vectors.toml", () => {
     const caps = regexRun(prog, cps, m);
     const wantMatched = c.get("matched") === "true";
     assert.equal(caps !== null, wantMatched, `matched for ${pattern}/${input}`);
+    const predMeter = new Meter();
+    assert.equal(
+      regexIsMatch(prog, cps, predMeter),
+      wantMatched,
+      `predicate for ${pattern}/${input}`,
+    );
+    assert.equal(predMeter.accrued, m.accrued, `predicate steps for ${pattern}/${input}`);
     const wantCaps = wantMatched ? parsePairs(c.get("caps")) : [];
     assert.deepEqual(
       caps === null ? [] : regexSlots(prog, caps),

@@ -259,6 +259,8 @@ Let `pc` be the next free index. Targets written `→Lk` are resolved by the ord
   flips semantics *and* the `regex_step` count, so it is pinned per node above and in the fixtures.
 - Class normalization (sort by `lo`, merge touching/overlapping ranges, then apply `negated` at
   match time — never by complementing the range list) is fixed so the class tables match byte-for-byte.
+  Binary search bounds membership work for wide classes to at most 20 bisections over disjoint
+  Unicode ranges. Small classes can be scanned directly.
 
 ---
 
@@ -355,6 +357,9 @@ header per version, and costs a garbage-collected core more than a pointer-free 
 therefore compiles its VM once per representation (Go and Rust generics; a branch in TS), so a
 small pattern's thread is a pc and its flat array. Against the flat-copy engine, per-row filter and
 capture workloads run at the same speed or faster in every core.
+
+A boolean search or a gated ends run can discard capture writes. It still visits and charges
+every `Save` and follows the normal thread priority through the same per-position cost checks.
 
 The representation is not observable. Matches, capture spans, `regex_step` counts, and abort points
 are those of the copying description above; the fixtures (§9) pin them, and

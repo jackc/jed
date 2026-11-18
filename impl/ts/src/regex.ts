@@ -53,6 +53,16 @@ type RegexClass = { negated: boolean; ranges: [number, number][] };
 
 function classAdmits(c: RegexClass, cp: number): boolean {
   const ranges = c.ranges;
+  if (ranges.length > 8) {
+    let lo = 0;
+    let hi = ranges.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (ranges[mid][1] < cp) lo = mid + 1;
+      else hi = mid;
+    }
+    return (lo < ranges.length && ranges[lo][0] <= cp) !== c.negated;
+  }
   let inside = false;
   for (let i = 0; i < ranges.length; i++) {
     const r = ranges[i];
@@ -1041,9 +1051,13 @@ function withSeen<T>(p: RegexProgram, f: (seen: RegexSeen) => T): T {
   }
 }
 
+// A distinct thread payload for searches that consume no captures. It passes through Save
+// unchanged and lets Match return a non-null result.
+const NO_CAPTURES: CapNode = [];
+
 // regexIsMatch reports whether the pattern matches somewhere in input (the `~` operator).
 export function regexIsMatch(p: RegexProgram, input: number[], m: Meter): boolean {
-  return regexRun(p, input, m) !== null;
+  return withSeen(p, (seen) => regexSearch(p, seen, input, 0, m, null, null, NO_CAPTURES)) !== null;
 }
 
 // regexRun executes the Pike VM from the start of the input (regex.md §4). Returns the winning
@@ -1079,7 +1093,7 @@ export function regexMatchEnds(
   m: Meter,
 ): boolean[] {
   const ends: boolean[] = new Array(input.length + 1).fill(false);
-  withSeen(p, (seen) => regexSearch(p, seen, input, 0, m, gate, ends));
+  withSeen(p, (seen) => regexSearch(p, seen, input, 0, m, gate, ends, NO_CAPTURES));
   return ends;
 }
 
@@ -1096,6 +1110,7 @@ function regexSearch(
   m: Meter,
   gate: boolean[] | null = null,
   ends: boolean[] | null = null,
+  initialCaps: CapNode | null = null,
 ): CapNode | null {
   const len = input.length;
   const n = p.ops.length;
@@ -1109,7 +1124,19 @@ function regexSearch(
   let nl = 2 * n;
   let ccaps = seen.capsA;
   let ncaps = seen.capsB;
-  let cn = addThread(p, seen, cl, ccaps, 0, nextGeneration(p, seen), 0, null, start, input, gate);
+  let cn = addThread(
+    p,
+    seen,
+    cl,
+    ccaps,
+    0,
+    nextGeneration(p, seen),
+    0,
+    initialCaps,
+    start,
+    input,
+    gate,
+  );
   let nn = 0;
   let matched: CapNode | null = null;
 
@@ -1211,7 +1238,7 @@ function addThread(
         depth++;
         pc = p.xs[pc];
       } else if (op === OP_SAVE) {
-        c = withSlot(p, c, p.xs[pc], sp);
+        if (c !== NO_CAPTURES) c = withSlot(p, c, p.xs[pc], sp);
         pc++;
       } else if (op === OP_ASSERT_START) {
         if (sp !== 0) break;
