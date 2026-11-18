@@ -1,0 +1,619 @@
+const ActiveSQLTransaction SQLState
+const AmbiguousAlias SQLState
+const AmbiguousColumn SQLState
+const AmbiguousFunction SQLState
+const ArraySubscriptError SQLState
+const CannotCoerce SQLState
+const CardinalityViolation SQLState
+const CharacterNotInRepertoire SQLState
+const CheckViolation SQLState
+const CollationFull CollationVerdict
+const CollationMismatch SQLState
+const CollationSkewed CollationVerdict
+const CollationVersionMismatch SQLState
+const ConnectionFailure SQLState
+const CostLimitExceeded SQLState
+const CredentialNotApplicable SQLState
+const CredentialRequired SQLState
+const DataCorrupted SQLState
+const DataException SQLState
+const DatatypeMismatch SQLState
+const DatetimeFieldOverflow SQLState
+const DefaultFlushInterval
+const DefaultMaxSQLLength
+const DefaultMaxTempStorageBytes
+const DefaultPageSize uint32
+const DefaultTempBuffers
+const DependentObjectsStillExist SQLState
+const DivisionByZero SQLState
+const DuplicateAlias SQLState
+const DuplicateColumn SQLState
+const DuplicateFile SQLState
+const DuplicateFunction SQLState
+const DuplicateJSONObjectKeyValue SQLState
+const DuplicateObject SQLState
+const DuplicateTable SQLState
+const ExclusionViolation SQLState
+const ExternalRoutineException SQLState
+const FeatureNotSupported SQLState
+const ForeignKeyViolation SQLState
+const GeneratedAlways SQLState
+const GroupingError SQLState
+const IOError SQLState
+const IdleInTransactionSessionTimeout SQLState
+const InFailedSQLTransaction SQLState
+const IndeterminateCollation SQLState
+const IndeterminateDatatype SQLState
+const InsufficientPrivilege SQLState
+const IntegrityCatalogMismatch IntegrityKind
+const IntegrityCatalogPageCorrupt IntegrityKind
+const IntegrityCheckError IntegrityKind
+const IntegrityCheckViolation IntegrityKind
+const IntegrityForeignKeyViolation IntegrityKind
+const IntegrityFreeListCorrupt IntegrityKind
+const IntegrityFreePageDuplicate IntegrityKind
+const IntegrityFreePageLive IntegrityKind
+const IntegrityFreePageManifestDependency IntegrityKind
+const IntegrityFreePageOutOfRange IntegrityKind
+const IntegrityFull IntegrityLevel
+const IntegrityGistBoundsViolation IntegrityKind
+const IntegrityIndexEntryCountMismatch IntegrityKind
+const IntegrityIndexEntryError IntegrityKind
+const IntegrityIndexEntryMissing IntegrityKind
+const IntegrityKeysUnordered IntegrityKind
+const IntegrityLiveCountMismatch IntegrityKind
+const IntegrityManifestPageMismatch IntegrityKind
+const IntegrityMetaInvalid IntegrityKind
+const IntegrityNotNullViolation IntegrityKind
+const IntegrityOverflowChainCorrupt IntegrityKind
+const IntegrityPageCorrupt IntegrityKind
+const IntegrityPageOutOfRange IntegrityKind
+const IntegrityPageReachedTwice IntegrityKind
+const IntegrityPageTypeWrong IntegrityKind
+const IntegrityQuick IntegrityLevel
+const IntegrityRowCountMismatch IntegrityKind
+const IntegrityRowKeyNotPrimaryKey IntegrityKind
+const IntegritySeparatorViolation IntegrityKind
+const IntegritySequenceOutOfRange IntegrityKind
+const IntegritySkipIndexUnreadable IntegritySkipReason
+const IntegritySkipMissingHostFunction IntegritySkipReason
+const IntegritySkipMissingLoadedData IntegritySkipReason
+const IntegritySkipTableUnreadable IntegritySkipReason
+const IntegritySkipUnparsableDefinition IntegritySkipReason
+const IntegrityTreeDepthUneven IntegrityKind
+const IntegrityTypmodViolation IntegrityKind
+const IntegrityUniqueViolation IntegrityKind
+const IntegrityValueUndecodable IntegrityKind
+const InvalidArgumentForLog SQLState
+const InvalidArgumentForNthValue SQLState
+const InvalidArgumentForNtile SQLState
+const InvalidArgumentForPowerFunction SQLState
+const InvalidArgumentForSQLJSONDatetimeFunction SQLState
+const InvalidArgumentForWidthBucketFunction SQLState
+const InvalidColumnDefinition SQLState
+const InvalidColumnReference SQLState
+const InvalidDatetimeFormat SQLState
+const InvalidEscapeSequence SQLState
+const InvalidForeignKey SQLState
+const InvalidName SQLState
+const InvalidObjectDefinition SQLState
+const InvalidParameterValue SQLState
+const InvalidPassword SQLState
+const InvalidPrecedingOrFollowingSize SQLState
+const InvalidRecursion SQLState
+const InvalidRegularExpression SQLState
+const InvalidRowCountInLimitClause SQLState
+const InvalidRowCountInOffsetClause SQLState
+const InvalidSQLJSONSubscript SQLState
+const InvalidSavepointSpecification SQLState
+const InvalidTableDefinition SQLState
+const InvalidTextRepresentation SQLState
+const InvalidTimeZoneDisplacementValue SQLState
+const InvalidTransactionTermination SQLState
+const InvalidUseOfEscapeCharacter SQLState
+const JArray JSONNodeKind
+const JBool JSONNodeKind
+const JNull JSONNodeKind
+const JNumber JSONNodeKind
+const JObject JSONNodeKind
+const JString JSONNodeKind
+const LockNotAvailable SQLState
+const LockingAuto Locking
+const LockingExclusive Locking
+const LockingNone Locking
+const MoreThanOneSQLJSONItem SQLState
+const NameTooLong SQLState
+const NoActiveSQLTransaction SQLState
+const NoSQLJSONItem SQLState
+const NonNumericSQLJSONItem SQLState
+const NotNullViolation SQLState
+const NullValueNotAllowed SQLState
+const NumericValueOutOfRange SQLState
+const ObjectInUse SQLState
+const ObjectNotInPrerequisiteState SQLState
+const OwnershipNever Ownership
+const OwnershipPrefer Ownership
+const OwnershipYield Ownership
+const PrivDelete Privilege
+const PrivExecute Privilege
+const PrivInsert Privilege
+const PrivSelect Privilege
+const PrivSetAllTable
+const PrivSetEmpty PrivilegeSet
+const PrivSetExecute
+const PrivUpdate Privilege
+const ProgramLimitExceeded SQLState
+const ProtocolViolation SQLState
+const QueryCanceled SQLState
+const QueryMemoryLimitExceeded SQLState
+const ReadOnly AccessMode
+const ReadOnlySQLTransaction SQLState
+const ReadWrite AccessMode
+const ReservedName SQLState
+const SQLJSONArrayNotFound SQLState
+const SQLJSONMemberNotFound SQLState
+const SQLJSONNumberNotFound SQLState
+const SQLJSONObjectNotFound SQLState
+const SQLJSONScalarRequired SQLState
+const ScalarMemoryLimitExceeded SQLState
+const ScratchEncryptionAuto ScratchEncryption
+const ScratchEncryptionOn ScratchEncryption
+const SequenceGeneratorLimitExceeded SQLState
+const SessionCostLimitExceeded SQLState
+const SingletonSQLJSONItemRequired SQLState
+const StaleKey SQLState
+const StatementTooComplex SQLState
+const StorageLimitExceeded SQLState
+const StringDataRightTruncation SQLState
+const SubstringError SQLState
+const SynchronousOff Synchronous
+const SynchronousOn Synchronous
+const SyntaxError SQLState
+const TempStorageLimitExceeded SQLState
+const TooManyColumns SQLState
+const TooManyConnections SQLState
+const TransactionResolutionUnknown SQLState
+const TxFailed TxStatus
+const TxIdle TxStatus
+const TxOpen TxStatus
+const UndefinedColumn SQLState
+const UndefinedFile SQLState
+const UndefinedFunction SQLState
+const UndefinedObject SQLState
+const UndefinedParameter SQLState
+const UndefinedTable SQLState
+const UniqueViolation SQLState
+const Unlimited
+const UnparsableStoredDefinition SQLState
+const UntranslatableCharacter SQLState
+const ValArray ValueKind
+const ValBool ValueKind
+const ValBytea ValueKind
+const ValComposite ValueKind
+const ValDate ValueKind
+const ValDecimal ValueKind
+const ValFloat32 ValueKind
+const ValFloat64 ValueKind
+const ValInt ValueKind
+const ValInterval ValueKind
+const ValJSON ValueKind
+const ValJSONB ValueKind
+const ValJSONPath ValueKind
+const ValNull ValueKind
+const ValRange ValueKind
+const ValText ValueKind
+const ValTimestamp ValueKind
+const ValTimestamptz ValueKind
+const ValUUID ValueKind
+const VolatilityImmutable Volatility
+const VolatilityStable Volatility
+const VolatilityVolatile Volatility
+const WindowingError SQLState
+const WithCheckOptionViolation SQLState
+const WrongObjectType SQLState
+field Argon2Params.Iterations uint32
+field Argon2Params.MemoryKiB uint32
+field Argon2Params.Parallelism uint32
+field ArrayVal.Dims []int
+field ArrayVal.Elements []Value
+field ArrayVal.Lbounds []int32
+field AttachFileOptions.FileLockTimeout *time.Duration
+field AttachFileOptions.Locking Locking
+field AttachOptions.ReadOnly bool
+field CollationInfo.CLDRVersion string
+field CollationInfo.ContentHash uint32
+field CollationInfo.Description string
+field CollationInfo.IsDefault bool
+field CollationInfo.Name string
+field CollationInfo.UnicodeVersion string
+field CollationInfo.Verdict CollationVerdict
+field CreateOptions.Credential *Credential
+field CreateOptions.Environment *Environment
+field CreateOptions.FileLockTimeout *time.Duration
+field CreateOptions.FlushInterval *time.Duration
+field CreateOptions.IdleInTransactionTimeout *time.Duration
+field CreateOptions.IdleSessionTimeout *time.Duration
+field CreateOptions.KDF Argon2Params
+field CreateOptions.Locking Locking
+field CreateOptions.MaxConnections int
+field CreateOptions.MaxStorageBytes int64
+field CreateOptions.Ownership Ownership
+field CreateOptions.PageSize uint32
+field CreateOptions.Path string
+field CreateOptions.ScratchEncryption ScratchEncryption
+field CreateOptions.ShutdownGrace *time.Duration
+field CreateOptions.SkipFsync bool
+field CreateOptions.Synchronous Synchronous
+field CreateOptions.YieldGrace *time.Duration
+field DeserializeOptions.Environment *Environment
+field DeserializeOptions.MaxStorageBytes int64
+field EngineError.ColumnName string
+field EngineError.ConstraintName string
+field EngineError.DataTypeName string
+field EngineError.DatabaseName string
+field EngineError.Detail string
+field EngineError.Hint string
+field EngineError.Message string
+field EngineError.Position int32
+field EngineError.State SQLState
+field EngineError.TableName string
+field IntegrityCheckOptions.Constraints bool
+field IntegrityCheckOptions.Level IntegrityLevel
+field IntegrityCheckOptions.MaxFindings int
+field IntegrityFinding.Database string
+field IntegrityFinding.Detail string
+field IntegrityFinding.Key []byte
+field IntegrityFinding.Kind IntegrityKind
+field IntegrityFinding.Object string
+field IntegrityFinding.Page *uint32
+field IntegrityReport.Findings []IntegrityFinding
+field IntegrityReport.Pages uint64
+field IntegrityReport.Rows uint64
+field IntegrityReport.Skipped []IntegritySkip
+field IntegrityReport.Truncated bool
+field IntegritySkip.Object string
+field IntegritySkip.Reason IntegritySkipReason
+field Interval.Days int32
+field Interval.Micros int64
+field Interval.Months int32
+field JSONMember.Key string
+field JSONMember.Val JSONNode
+field JSONNode.Arr []JSONNode
+field JSONNode.B bool
+field JSONNode.Kind JSONNodeKind
+field JSONNode.Num Decimal
+field JSONNode.Obj []JSONMember
+field JSONNode.S string
+field Null.Val T
+field Null.Valid bool
+field OpenOptions.CacheBytes int
+field OpenOptions.Credential *Credential
+field OpenOptions.Environment *Environment
+field OpenOptions.FileLockTimeout *time.Duration
+field OpenOptions.FlushInterval *time.Duration
+field OpenOptions.IdleInTransactionTimeout *time.Duration
+field OpenOptions.IdleSessionTimeout *time.Duration
+field OpenOptions.Locking Locking
+field OpenOptions.MaxConnections int
+field OpenOptions.MaxStorageBytes int64
+field OpenOptions.Ownership Ownership
+field OpenOptions.ReadOnly bool
+field OpenOptions.ScratchEncryption ScratchEncryption
+field OpenOptions.ShutdownGrace *time.Duration
+field OpenOptions.SkipFsync bool
+field OpenOptions.Synchronous Synchronous
+field OpenOptions.WorkMem int
+field OpenOptions.YieldGrace *time.Duration
+field RangeVal.Empty bool
+field RangeVal.Lower *Value
+field RangeVal.LowerInc bool
+field RangeVal.Upper *Value
+field RangeVal.UpperInc bool
+field ScriptSummary.Cost int64
+field ScriptSummary.RowsAffectedTotal int64
+field ScriptSummary.StatementsRun int64
+field SessionOptions.AllowDDL *bool
+field SessionOptions.AllowTempDDL *bool
+field SessionOptions.DefaultPrivileges *PrivilegeSet
+field SessionOptions.LifetimeMaxCost int64
+field SessionOptions.LockTimeout time.Duration
+field SessionOptions.MaxCost int64
+field SessionOptions.MaxQueryMemoryBytes int64
+field SessionOptions.MaxSQLLength int
+field SessionOptions.MaxScalarBytes int64
+field SessionOptions.MaxTempStorageBytes int
+field SessionOptions.TempBuffers int
+field SessionOptions.TimeZone string
+field SessionOptions.WorkMem int
+field StatementSpan.Offset int
+field StatementSpan.Text string
+field TimeZoneInfo.Name string
+field TimeZoneInfo.TzdataVersion string
+field TxOptions.AccessMode AccessMode
+func ArrayValue([]Value) Value
+func AttachFile(string, AttachFileOptions) AttachSource
+func AttachMemory() AttachSource
+func BoolValue(bool) Value
+func ByteaValue([]byte) Value
+func CompositeValue([]Value) Value
+func Create(CreateOptions) (*Database, error)
+func DateValue(int32) Value
+func DecimalValue(Decimal) Value
+func DefaultArgon2Params() Argon2Params
+func Deserialize([]byte, DeserializeOptions) (*Database, error)
+func Float32Value(float32) Value
+func Float64Value(float64) Value
+func IntValue(int64) Value
+func IntervalValue(Interval) Value
+func JSONBValue(JSONNode) Value
+func JSONPathValue(string) Value
+func JSONValue(string) Value
+func KeyCredential([32]byte) *Credential
+func MapRows[T any](*Rows, func(*Rows) (T, error)) iter.Seq2[T, error]
+func NewAdvancingClock(int64, int64) *AdvancingClock
+func NewEnvironment() *Environment
+func NewEnvironmentBuilder() *EnvironmentBuilder
+func NewHostBatchFunction(string, []string, string, HostBatchKernel) *HostFunction
+func NewHostFunction(string, []string, string, HostKernel) *HostFunction
+func NewManualClock(int64) *ManualClock
+func NewSeededRandom(uint64) *SeededRandom
+func NullValue() Value
+func OSRandomSource() RandomSource
+func Open(string, OpenOptions) (*Database, error)
+func OpenRemote([]string, string, OpenOptions) (*Database, error)
+func ParseDecimal(string) (Decimal, error)
+func PassphraseCredential(string) *Credential
+func PrivilegeFromName(string) (Privilege, bool)
+func RangeValue(*RangeVal) Value
+func RowToStructByName[T any](*Rows) (T, error)
+func RowTo[T any](*Rows) (T, error)
+func SplitStatements(string) iter.Seq[StatementSpan]
+func TextValue(string) Value
+func TimestampValue(int64) Value
+func TimestamptzValue(int64) Value
+func UUIDValue([]byte) Value
+func WallClock() ClockSource
+imethod ClockSource.NowMicros() int64
+imethod Queryer.Exec(context.Context, string, ...any) (Result, error)
+imethod Queryer.ExecPrepared(context.Context, *PreparedStatement, ...any) (Result, error)
+imethod Queryer.Query(context.Context, string, ...any) (*Rows, error)
+imethod Queryer.QueryPrepared(context.Context, *PreparedStatement, ...any) (*Rows, error)
+imethod Queryer.QueryRow(context.Context, string, ...any) *Row
+imethod Queryer.QueryRowPrepared(context.Context, *PreparedStatement, ...any) *Row
+imethod RandomSource.Fill([]byte) error
+imethod Scanner.ScanJed(Value) error
+imethod Valuer.JedValue() (Value, error)
+method (*AdvancingClock) NowMicros() int64
+method (*AdvancingClock) Reset(int64, int64)
+method (*ArrayVal) Ndim() int
+method (*ArrayVal) Ubound(int) int64
+method (*Database) Attach(context.Context, string, AttachSource, AttachOptions) error
+method (*Database) Begin(context.Context, TxOptions) (*Transaction, error)
+method (*Database) BeginFunc(context.Context, TxOptions, func(tx *Transaction) error) error
+method (*Database) ChangeCredential(context.Context, string, *Credential, Argon2Params) error
+method (*Database) Close() error
+method (*Database) Compact(context.Context, string) error
+method (*Database) Detach(string) error
+method (*Database) Environment() *Environment
+method (*Database) Exec(context.Context, string, ...any) (Result, error)
+method (*Database) ExecPrepared(context.Context, *PreparedStatement, ...any) (Result, error)
+method (*Database) ExecuteScript(context.Context, string) (ScriptSummary, error)
+method (*Database) IntegrityCheck(context.Context, string, IntegrityCheckOptions) (IntegrityReport, error)
+method (*Database) LoadedCollations() []CollationInfo
+method (*Database) LoadedTimeZones() []TimeZoneInfo
+method (*Database) PageSize() uint32
+method (*Database) Path() string
+method (*Database) Prepare(string) (*PreparedStatement, error)
+method (*Database) Query(context.Context, string, ...any) (*Rows, error)
+method (*Database) QueryPrepared(context.Context, *PreparedStatement, ...any) (*Rows, error)
+method (*Database) QueryRow(context.Context, string, ...any) *Row
+method (*Database) QueryRowPrepared(context.Context, *PreparedStatement, ...any) *Row
+method (*Database) ReadOnly() bool
+method (*Database) Rekey(context.Context, string, *Credential, Argon2Params) error
+method (*Database) Serialize(context.Context, string) ([]byte, error)
+method (*Database) Session(SessionOptions) (*Session, error)
+method (*Database) SetMaxStorageBytes(string, int64) error
+method (*Database) StorageBytes(string) (int64, error)
+method (*Database) UpgradeCollations(context.Context) (int, error)
+method (*Database) Version() uint64
+method (*EngineError) Code() string
+method (*EngineError) Error() string
+method (*EngineError) Unwrap() error
+method (*Environment) LoadedCollations() []CollationInfo
+method (*Environment) LoadedTimeZones() []TimeZoneInfo
+method (*Environment) ToBuilder() *EnvironmentBuilder
+method (*EnvironmentBuilder) Build() *Environment
+method (*EnvironmentBuilder) LoadTimeZoneData([]byte) error
+method (*EnvironmentBuilder) LoadUnicodeData([]byte) error
+method (*EnvironmentBuilder) RegisterFunction(*HostFunction) error
+method (*EnvironmentBuilder) SetClockSource(ClockSource)
+method (*EnvironmentBuilder) SetInsecureSeededKeyEntropy(uint64)
+method (*EnvironmentBuilder) SetRandomSource(RandomSource)
+method (*HostFunction) WithComponentID(string) *HostFunction
+method (*HostFunction) WithCost(int64) *HostFunction
+method (*HostFunction) WithCrossCore(bool) *HostFunction
+method (*HostFunction) WithSemanticVersion(uint32) *HostFunction
+method (*HostFunction) WithVolatility(Volatility) *HostFunction
+method (*ManualClock) Advance(int64)
+method (*ManualClock) NowMicros() int64
+method (*ManualClock) Set(int64)
+method (*Null[T]) ScanJed(Value) error
+method (*Privileges) AllowsFunction(string) bool
+method (*Privileges) AllowsTable(string, Privilege) bool
+method (*Privileges) IsPermissive() bool
+method (*Row) Scan(...any) error
+method (*Rows) All() iter.Seq[*Rows]
+method (*Rows) Bool(int) (bool, error)
+method (*Rows) Bytes(int) ([]byte, error)
+method (*Rows) Close() error
+method (*Rows) ColumnNames() []string
+method (*Rows) ColumnTypes() []string
+method (*Rows) Cost() int64
+method (*Rows) Err() error
+method (*Rows) Float(int) (float64, error)
+method (*Rows) Int(int) (int64, error)
+method (*Rows) IsNull(int) bool
+method (*Rows) Next() bool
+method (*Rows) Row() []Value
+method (*Rows) RowsAffected() (int64, bool)
+method (*Rows) Scan(...any) error
+method (*Rows) Text(int) (string, error)
+method (*Rows) Value(int) Value
+method (*Rows) Values() ([]any, error)
+method (*SeededRandom) Fill([]byte) error
+method (*SeededRandom) Reseed(uint64)
+method (*Session) AllowDDL() bool
+method (*Session) Begin(context.Context, TxOptions) (*Transaction, error)
+method (*Session) BeginFunc(context.Context, TxOptions, func(tx *Transaction) error) error
+method (*Session) Close() error
+method (*Session) Collations() []CollationInfo
+method (*Session) DefaultCollation() string
+method (*Session) Environment() *Environment
+method (*Session) Exec(context.Context, string, ...any) (Result, error)
+method (*Session) ExecPrepared(context.Context, *PreparedStatement, ...any) (Result, error)
+method (*Session) ExecuteScript(context.Context, string) (ScriptSummary, error)
+method (*Session) Grant(PrivilegeSet, string)
+method (*Session) InTransaction() bool
+method (*Session) LifetimeCost() int64
+method (*Session) LifetimeMaxCost() int64
+method (*Session) LoadedCollations() []CollationInfo
+method (*Session) LoadedTimeZones() []TimeZoneInfo
+method (*Session) LockTimeout() time.Duration
+method (*Session) MaxCost() int64
+method (*Session) MaxQueryMemoryBytes() int64
+method (*Session) MaxSQLLength() int
+method (*Session) MaxScalarBytes() int64
+method (*Session) MaxTempStorageBytes() int
+method (*Session) PageSize() uint32
+method (*Session) Path() string
+method (*Session) Prepare(string) (*PreparedStatement, error)
+method (*Session) Privileges() *Privileges
+method (*Session) Query(context.Context, string, ...any) (*Rows, error)
+method (*Session) QueryPrepared(context.Context, *PreparedStatement, ...any) (*Rows, error)
+method (*Session) QueryRow(context.Context, string, ...any) *Row
+method (*Session) QueryRowPrepared(context.Context, *PreparedStatement, ...any) *Row
+method (*Session) ReadOnly() bool
+method (*Session) Render(Value) (string, error)
+method (*Session) ResetPrivileges()
+method (*Session) ResetVar(string) error
+method (*Session) ResetVars()
+method (*Session) Revoke(PrivilegeSet, string)
+method (*Session) SetAllowDDL(bool)
+method (*Session) SetAllowTempDDL(bool)
+method (*Session) SetDefaultCollation(context.Context, string) error
+method (*Session) SetDefaultPrivileges(PrivilegeSet)
+method (*Session) SetLifetimeMaxCost(int64) error
+method (*Session) SetLockTimeout(time.Duration) error
+method (*Session) SetMaxCost(int64) error
+method (*Session) SetMaxQueryMemoryBytes(int64) error
+method (*Session) SetMaxSQLLength(int) error
+method (*Session) SetMaxScalarBytes(int64) error
+method (*Session) SetMaxTempStorageBytes(int) error
+method (*Session) SetTempBuffers(int) error
+method (*Session) SetTimeZone(string) error
+method (*Session) SetVar(string, string) error
+method (*Session) SetWorkMem(int) error
+method (*Session) Status() TxStatus
+method (*Session) TempBuffers() int
+method (*Session) UpgradeCollations(context.Context) (int, error)
+method (*Session) Var(string) (string, bool)
+method (*Session) Version() uint64
+method (*Session) WorkMem() int
+method (*Transaction) Commit(context.Context) error
+method (*Transaction) Exec(context.Context, string, ...any) (Result, error)
+method (*Transaction) ExecPrepared(context.Context, *PreparedStatement, ...any) (Result, error)
+method (*Transaction) Query(context.Context, string, ...any) (*Rows, error)
+method (*Transaction) QueryPrepared(context.Context, *PreparedStatement, ...any) (*Rows, error)
+method (*Transaction) QueryRow(context.Context, string, ...any) *Row
+method (*Transaction) QueryRowPrepared(context.Context, *PreparedStatement, ...any) *Row
+method (*Transaction) Render(Value) (string, error)
+method (*Transaction) Rollback(context.Context) error
+method (AttachSource) WithCredential(*Credential) AttachSource
+method (AttachSource) WithMaxStorageBytes(int64) AttachSource
+method (Credential) Format(fmt.State, rune)
+method (Credential) GoString() string
+method (Credential) String() string
+method (Decimal) Cmp(Decimal) int
+method (Decimal) IsZero() bool
+method (Decimal) String() string
+method (IntegrityReport) OK() bool
+method (Null[T]) JedValue() (Value, error)
+method (PrivilegeSet) Contains(Privilege) bool
+method (PrivilegeSet) IsEmpty() bool
+method (PrivilegeSet) Minus(PrivilegeSet) PrivilegeSet
+method (PrivilegeSet) Union(PrivilegeSet) PrivilegeSet
+method (PrivilegeSet) With(Privilege) PrivilegeSet
+method (Result) Cost() int64
+method (Result) RowsAffected() (int64, bool)
+method (SQLState) Code() string
+method (SQLState) String() string
+method (TxStatus) String() string
+method (Value) IsNull() bool
+method (Value) Kind() ValueKind
+method (Value) Scan(any) error
+method (Value) String() string
+type AccessMode uint8
+type AdvancingClock struct
+type Argon2Params struct
+type ArrayVal struct
+type AttachFileOptions struct
+type AttachOptions struct
+type AttachSource struct
+type ClockSource interface
+type CollationInfo struct
+type CollationVerdict int
+type CreateOptions struct
+type Credential struct
+type Database struct
+type Decimal struct
+type DeserializeOptions struct
+type EngineError struct
+type Environment struct
+type EnvironmentBuilder struct
+type HostBatchKernel func([][]Value, []Value) ([]Value, error)
+type HostFunction struct
+type HostKernel func([]Value) (Value, error)
+type IntegrityCheckOptions struct
+type IntegrityFinding struct
+type IntegrityKind string
+type IntegrityLevel int
+type IntegrityReport struct
+type IntegritySkip struct
+type IntegritySkipReason string
+type Interval struct
+type JSONMember struct
+type JSONNode struct
+type JSONNodeKind int
+type Locking uint8
+type ManualClock struct
+type Null[T any] struct
+type OpenOptions struct
+type Ownership uint8
+type PreparedStatement struct
+type Privilege int
+type PrivilegeSet uint8
+type Privileges struct
+type Queryer interface
+type RandomSource interface
+type RangeVal struct
+type Result struct
+type Row struct
+type Rows struct
+type SQLState int
+type Scanner interface
+type ScratchEncryption uint8
+type ScriptSummary struct
+type SeededRandom struct
+type Session struct
+type SessionOptions struct
+type StatementSpan struct
+type Synchronous uint8
+type TimeZoneInfo struct
+type Transaction struct
+type TxOptions struct
+type TxStatus int
+type Value struct
+type ValueKind int
+type Valuer interface
+type Volatility int
+var ErrNoRows

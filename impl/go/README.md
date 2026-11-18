@@ -28,4 +28,5 @@ go test -tags jedtooling ./cmd/...        # tooling tests
 The `jedtooling` build tag enables repository-only inspection and fault-injection hooks
 for `cmd/conformance` and `cmd/process_actor`. Normal library builds exclude those exports.
 Use `mise run unit:go` to run both library and tooling tests, and `mise run conformance:go`
-for the memory and disk SQL corpus. Run `go doc` to read the public embedding API.
+for the memory and disk SQL corpus. Run `go doc` to read the public embedding API. The exported API is pinned in `testdata/api.txt`;
+after an intended API change, regenerate it with `JED_UPDATE_API=1 go test -run TestAPIGolden .`.

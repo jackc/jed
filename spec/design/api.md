@@ -1486,6 +1486,15 @@ White-box catalog accessors (`table`, `compositeType`, `rowsInKeyOrder`) on `Dat
 (`CollationFull` / `CollationSkewed`), and `TimeZoneInfo` types. Compiled collation tables,
 resolved zone references, and unfetched storage values remain private implementation types.
 
+The exported API of an ordinary build is pinned in `impl/go/testdata/api.txt`, one line per
+exported declaration (types, struct fields, interface methods, functions, methods, constants and
+variables, with parameter names dropped). `TestAPIGolden` fails when the package's API differs from
+it, so a newly exported identifier, an engine internal included, or a changed signature cannot land
+unnoticed. An intended change regenerates the file with
+`JED_UPDATE_API=1 go test -run TestAPIGolden .` in the same change as its docs. This takes the place
+of an `internal/` package boundary: type aliases would hide the methods from `go doc`, and wrapper
+types would add a conversion to every `Scan`, argument and host-function batch.
+
 Standalone conformance and process actors require the `jedtooling` build tag. The tag enables
 repository-only fault injection, backup test entry points, page-service inspection, spill controls,
 and memory/storage invariant instrumentation. Ordinary builds export none of those hooks.
