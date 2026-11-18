@@ -24,7 +24,8 @@ func txTestDB(t *testing.T) *Database {
 
 func count(t *testing.T, q interface {
 	QueryRow(context.Context, string, ...any) *Row
-}) int64 {
+},
+) int64 {
 	t.Helper()
 	var n int64
 	if err := q.QueryRow(context.Background(), "SELECT count(*) FROM t").Scan(&n); err != nil {
