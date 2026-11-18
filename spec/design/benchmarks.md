@@ -208,6 +208,22 @@ The `regex_group_predicate` SQL benchmark counts 5,000 hits among 10,000 rows.
 Across 50 measured queries per revision, mean time fell from 14.81 to 1.28 ms
 with matching checksums.
 
+**Rust and TypeScript grouped literal predicates (2026-11-18).** Median ns per match
+over three timed samples after warmup on the same host, with release Rust 1.99.0 and
+Node 26.10.0. The inputs and compiled predicates match the four Go cases above.
+Each run accrued statement and lifetime cost with unlimited budgets and cancellation disarmed.
+
+| Twelve-group case | Rust before → after | TypeScript before → after | Steps |
+|---|---:|---:|---:|
+| Exact hit | 1,004 → 32 | 1,047 → 83 | 311 |
+| Eleven-character miss | 916 → 30 | 958 → 56 | 269 |
+| Partial match then hit | 640 → 54 | 1,061 → 86 | 230 |
+| Overlapping miss on 2,048 copies of `a` | 222,113 → 7,137 | 241,096 → 5,901 | 79,712 |
+
+Over 50 timed queries in the same 10,000-row `regex_group_predicate` SQL benchmark,
+Rust improved from 10.91 to 1.63 ms per query and TypeScript from 15.55 to 4.90 ms.
+Both checksums agreed with the baseline.
+
 **Variable-width scan result (2026-10-13).** Track A4 ([packed-leaf.md §11](packed-leaf.md)) lets the
 columnar lanes read text, bytea, and array columns in place. The seven `varscan_*` lanes run over a
 100k-row scratch table (nullable text, `text[]`, `bytea`; no secondary index); `gin_stats_common_tag`

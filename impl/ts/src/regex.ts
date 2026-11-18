@@ -155,6 +155,7 @@ export type RegexProgram = {
   capLeafLen: number;
   prefixPC: number;
   overlapWidth: number;
+  groupedLiteral: GroupedLiteral | null;
   seen: RegexSeen | null;
 };
 
@@ -926,6 +927,7 @@ function compileRegexWrapped(
     capLeafLen,
     prefixPC,
     overlapWidth,
+    groupedLiteral: ngroups > 0 && prefixPC > 0 ? compileGroupedLiteral(ops, chs, prefixPC) : null,
     seen: null,
   };
 }
@@ -1072,8 +1074,80 @@ function withSeen<T>(p: RegexProgram, f: (seen: RegexSeen) => T): T {
 // unchanged and lets Match return a non-null result.
 const NO_CAPTURES: CapNode = [];
 
+// Weighted KMP table (regex.md §4). Borders and state sums are indexed by
+// matched length, including the empty prefix, whose sum is zero.
+type GroupedLiteral = {
+  chars: Int32Array;
+  borders: Int32Array;
+  states: Int32Array;
+};
+
+function advanceLiteral(literal: GroupedLiteral, matched: number, ch: number): number {
+  while (matched > 0 && literal.chars[matched] !== ch) matched = literal.borders[matched];
+  return literal.chars[matched] === ch ? matched + 1 : 0;
+}
+
+function compileGroupedLiteral(
+  ops: Uint8Array,
+  chs: Int32Array,
+  first: number,
+): GroupedLiteral | null {
+  let count = 0;
+  let internalSave = false;
+  for (let pc = first; pc < ops.length - 1; pc++) {
+    if (ops[pc] === OP_CHAR) {
+      count++;
+      if (pc > first && ops[pc - 1] === OP_SAVE) internalSave = true;
+    } else if (ops[pc] !== OP_SAVE) return null;
+  }
+  if (!internalSave) return null;
+  const literal = {
+    chars: new Int32Array(count),
+    borders: new Int32Array(count + 1),
+    states: new Int32Array(count + 1),
+  };
+  let pc = first;
+  for (let i = 0; i < count; i++) {
+    let next = pc + 1;
+    while (ops[next] === OP_SAVE) next++;
+    const ch = chs[pc];
+    literal.chars[i] = ch;
+    const border = i === 0 ? 0 : advanceLiteral(literal, literal.borders[i], ch);
+    literal.borders[i + 1] = border;
+    literal.states[i + 1] = next - pc + literal.states[border];
+    pc = next;
+  }
+  return literal;
+}
+
+function matchGroupedLiteral(
+  literal: GroupedLiteral,
+  first: number,
+  input: number[],
+  m: Meter,
+): boolean {
+  m.charge(BigInt(first) * COSTS.regexStep);
+  // A one-position window retains every observable guard. Even an unlimited
+  // window accumulates at most 4096 * MAX_REGEX_PROGRAM states before charging.
+  const window = !hasCancellation() && m.isUnmetered() ? 4096 : 1;
+  let matched = 0;
+  for (let pos = 0; pos < input.length && matched < literal.chars.length; ) {
+    const end = Math.min(input.length, pos + window);
+    let states = 0;
+    while (pos < end && matched < literal.chars.length) {
+      matched = advanceLiteral(literal, matched, input[pos++]);
+      states += first + 1 + literal.states[matched];
+    }
+    m.charge(BigInt(states) * COSTS.regexStep);
+    m.guard();
+  }
+  m.guard(); // Match or EOF
+  return matched === literal.chars.length;
+}
+
 // regexIsMatch reports whether the pattern matches somewhere in input (the `~` operator).
 export function regexIsMatch(p: RegexProgram, input: number[], m: Meter): boolean {
+  if (p.groupedLiteral !== null) return matchGroupedLiteral(p.groupedLiteral, p.prefixPC, input, m);
   return withSeen(p, (seen) => regexSearch(p, seen, input, 0, m, null, null, NO_CAPTURES)) !== null;
 }
 

@@ -83,6 +83,7 @@ pub struct Program {
     cap_depth: usize,
     cap_leaf_len: usize,
     prefix: Option<LiteralPrefix>,
+    grouped_literal: Option<GroupedLiteral>,
     seen_pool: SeenPool,
 }
 
@@ -969,6 +970,98 @@ impl LiteralPrefix {
     }
 }
 
+// Weighted KMP table for a boolean predicate whose fixed literal contains capture Saves.
+// The border chain accounts for every overlapping start in the Pike VM (regex.md §4).
+#[derive(Clone, Debug)]
+struct LiteralStep {
+    ch: char,
+    border: usize,
+    states: usize,
+}
+
+#[derive(Clone, Debug)]
+struct GroupedLiteral {
+    first_pc: usize,
+    steps: Vec<LiteralStep>,
+}
+
+impl GroupedLiteral {
+    fn compile(insts: &[Inst], first_pc: usize) -> Option<Self> {
+        let mut count = 0;
+        let mut internal_save = false;
+        for pc in first_pc..insts.len() - 1 {
+            match insts[pc] {
+                Inst::Char(_) => {
+                    count += 1;
+                    internal_save |= pc > first_pc && matches!(insts[pc - 1], Inst::Save(_));
+                }
+                Inst::Save(_) => {}
+                _ => return None,
+            }
+        }
+        if !internal_save {
+            return None;
+        }
+        let mut steps: Vec<LiteralStep> = Vec::with_capacity(count);
+        let mut pc = first_pc;
+        while let Inst::Char(ch) = insts[pc] {
+            let mut next = pc + 1;
+            while matches!(insts[next], Inst::Save(_)) {
+                next += 1;
+            }
+            let border = steps
+                .last()
+                .map_or(0, |last| Self::advance(&steps, last.border, ch));
+            let mut states = next - pc;
+            if border > 0 {
+                states += steps[border - 1].states;
+            }
+            steps.push(LiteralStep { ch, border, states });
+            pc = next;
+        }
+        Some(Self { first_pc, steps })
+    }
+
+    fn advance(steps: &[LiteralStep], mut matched: usize, ch: char) -> usize {
+        while matched > 0 && steps[matched].ch != ch {
+            matched = steps[matched - 1].border;
+        }
+        matched + usize::from(steps[matched].ch == ch)
+    }
+
+    fn is_match(&self, input: &[char], m: &mut Meter) -> Result<bool> {
+        m.charge(self.first_pc as i64 * COSTS.regex_step);
+        // An armed meter guards every consumed position. Otherwise bound the
+        // accumulator by 4096 positions times MAX_REGEX_PROGRAM states.
+        let window = if m.can_batch_costs() && !m.has_cancellation() {
+            4096
+        } else {
+            1
+        };
+        let mut matched = 0;
+        for chunk in input.chunks(window) {
+            let mut states = 0;
+            for &ch in chunk {
+                matched = Self::advance(&self.steps, matched, ch);
+                states += self.first_pc + 1;
+                if matched > 0 {
+                    states += self.steps[matched - 1].states;
+                }
+                if matched == self.steps.len() {
+                    break;
+                }
+            }
+            m.charge(states as i64 * COSTS.regex_step);
+            m.checkpoint()?;
+            if matched == self.steps.len() {
+                break;
+            }
+        }
+        m.checkpoint()?; // Match or EOF
+        Ok(matched == self.steps.len())
+    }
+}
+
 fn compile_wrapped(pattern: &str, mode: Mode, wrapper: Wrapper) -> Result<Program> {
     let mut parser = Parser {
         chars: pattern.chars().collect(),
@@ -1004,8 +1097,13 @@ fn compile_wrapped(pattern: &str, mode: Mode, wrapper: Wrapper) -> Result<Progra
     c.push(Inst::Save(1))?;
     c.push(Inst::Match)?;
     let (cap_depth, cap_leaf_len) = cap_shape(2 * (ngroups + 1));
+    let prefix = LiteralPrefix::from_program(&c.insts, wrapper);
+    let grouped_literal = prefix
+        .filter(|_| ngroups > 0)
+        .and_then(|p| GroupedLiteral::compile(&c.insts, p.pc));
     Ok(Program {
-        prefix: LiteralPrefix::from_program(&c.insts, wrapper),
+        prefix,
+        grouped_literal,
         insts: c.insts,
         classes: c.classes,
         ngroups,
@@ -1245,6 +1343,9 @@ impl Program {
 
     /// Boolean match — TRUE iff the pattern matches somewhere in `input` (the `~` operator).
     pub fn is_match(&self, input: &[char], m: &mut Meter) -> Result<bool> {
+        if let Some(literal) = &self.grouped_literal {
+            return literal.is_match(input, m);
+        }
         let matched = self.with_seen(|seen| {
             self.pike_search::<NoCaps>(seen, input, 0, &mut Gating::default(), m)
         })?;
@@ -2078,10 +2179,6 @@ mod tests {
 
     #[test]
     fn prefix_shortcuts_preserve_meter_boundaries() {
-        use crate::cancel::CancellationToken;
-        use crate::cost::Lifetime;
-        use std::cell::Cell;
-
         for (pattern, text) in [
             ("needle", "xxxneedxneedle".to_owned()),
             ("needle[0-9]+", "nxxxxxnxxxxxn".to_owned()),
@@ -2095,48 +2192,79 @@ mod tests {
             ("((((((((aaab))))))))", "a".repeat(8200) + "b"),
         ] {
             let fast = compile(pattern).unwrap();
-            let mut slow = fast.clone();
-            slow.prefix = None;
-            let input: Vec<char> = text.chars().collect();
-            let run = |p: &Program, limit, life_limit, token| {
-                let lifetime = Lifetime {
-                    total: Rc::new(Cell::new(12)),
-                    limit: life_limit,
-                };
-                let mut m = Meter::for_session(limit, lifetime.clone(), token);
-                let result = p.run(&input, &mut m).map(|caps| caps.map(|c| p.slots(&c)));
-                (result, m.accrued, lifetime.total.get())
+            check_search_boundaries(pattern, &text, fast, |p, input, m| {
+                p.run(input, m).map(|caps| caps.map(|c| p.slots(&c)))
+            });
+        }
+    }
+
+    #[test]
+    fn grouped_literal_predicate_preserves_meter_boundaries() {
+        for (pattern, text) in [
+            ("(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)", "a".repeat(12) + "x"),
+            ("(ab)(aba)(c)", "abababababac".to_owned()),
+            ("()((猫)犬)()(猫)()", "😀猫猫犬猫".to_owned()),
+            ("(aaa)(b)", String::new()),
+            ("(a)(aa)(b)", "a".repeat(8200) + "b"),
+        ] {
+            let p = compile(pattern).unwrap();
+            assert!(p.grouped_literal.is_some());
+            check_search_boundaries(pattern, &text, p, Program::is_match);
+        }
+    }
+
+    fn check_search_boundaries<T: std::fmt::Debug + PartialEq>(
+        pattern: &str,
+        text: &str,
+        fast: Program,
+        search: impl Fn(&Program, &[char], &mut Meter) -> Result<T>,
+    ) {
+        use crate::cancel::CancellationToken;
+        use crate::cost::Lifetime;
+        use std::cell::Cell;
+
+        let mut slow = fast.clone();
+        slow.prefix = None;
+        slow.grouped_literal = None;
+        let input: Vec<char> = text.chars().collect();
+        let run = |p: &Program, limit, life_limit, token| {
+            let lifetime = Lifetime {
+                total: Rc::new(Cell::new(12)),
+                limit: life_limit,
             };
-            let check = |limit, life_limit, token: Option<CancellationToken>| {
-                assert_eq!(
-                    run(&fast, limit, life_limit, token.clone()),
-                    run(&slow, limit, life_limit, token),
-                    "{pattern}: {limit}/{life_limit}"
-                );
-            };
-            check(0, 0, None);
-            check(0, 0, Some(CancellationToken::new()));
-            let cancelled = CancellationToken::new();
-            cancelled.cancel();
-            check(1, 13, Some(cancelled));
-            if pattern == "needle[0-9]+" && input.len() > 4096 {
-                // Four seed states, then 31 per full block. Trip just before,
-                // at, or just after its first literal advances.
-                for block in [682, 683, 1365] {
-                    for offset in [5, 6, 7] {
-                        let cost = 4 + 31 * block + offset;
-                        check(cost, 0, None);
-                        check(0, cost + 12, None);
-                    }
+            let mut m = Meter::for_session(limit, lifetime.clone(), token);
+            let result = search(p, &input, &mut m);
+            (result, m.accrued, lifetime.total.get())
+        };
+        let check = |limit, life_limit, token: Option<CancellationToken>| {
+            assert_eq!(
+                run(&fast, limit, life_limit, token.clone()),
+                run(&slow, limit, life_limit, token),
+                "{pattern}: {limit}/{life_limit}"
+            );
+        };
+        check(0, 0, None);
+        check(0, 0, Some(CancellationToken::new()));
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        check(1, 13, Some(cancelled));
+        if pattern == "needle[0-9]+" && input.len() > 4096 {
+            // Four seed states, then 31 per full block. Trip just before,
+            // at, or just after its first literal advances.
+            for block in [682, 683, 1365] {
+                for offset in [5, 6, 7] {
+                    let cost = 4 + 31 * block + offset;
+                    check(cost, 0, None);
+                    check(0, cost + 12, None);
                 }
             }
-            if input.len() < 100 {
-                for limit in 1..=run(&slow, 0, 0, None).1 + 1 {
-                    for delta in [11, 12, 13] {
-                        check(limit, limit + delta, None);
-                    }
-                    check(0, limit + 12, None);
+        }
+        if input.len() < 100 {
+            for limit in 1..=run(&slow, 0, 0, None).1 + 1 {
+                for delta in [11, 12, 13] {
+                    check(limit, limit + delta, None);
                 }
+                check(0, limit + 12, None);
             }
         }
     }

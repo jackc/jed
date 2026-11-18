@@ -235,58 +235,79 @@ test("literal prefix transitions preserve partial cost, captures and every cance
     ["(?:aaab)+c", "aaabaaaaabaaabc"],
     ["((((((((aaab))))))))", "a".repeat(8200) + "b"],
   ]) {
-    const fast = compileRegex(pattern);
-    const slow = compileRegex(pattern);
-    slow.prefixPC = 0;
-    const input = Array.from(text, (ch) => ch.codePointAt(0) as number);
-    function run(p: typeof fast, limit: bigint, lifeLimit: bigint, cancelAt?: number) {
-      const life = new LifetimeBudget(lifeLimit);
-      life.total = 12n;
-      const m = new Meter(limit, life);
-      const polls: bigint[] = [];
-      const poll =
-        cancelAt === undefined
-          ? undefined
-          : () => {
-              polls.push(m.accrued);
-              return polls.length === cancelAt;
-            };
-      let result: number[] | string | null;
-      try {
-        const caps = withCancellationScope(poll, () => regexRun(p, input, m));
-        result = caps === null ? null : regexSlots(p, caps);
-      } catch (err) {
-        if (!(err instanceof EngineError)) throw err;
-        result = err.state;
-      }
-      return { result, cost: m.accrued, lifetime: life.total, polls };
-    }
-    function check(limit: bigint, lifeLimit: bigint, cancelAt?: number) {
-      assert.deepEqual(
-        run(fast, limit, lifeLimit, cancelAt),
-        run(slow, limit, lifeLimit, cancelAt),
-        pattern,
-      );
-    }
-    check(0n, 0n);
-    check(0n, 0n, -1);
-    check(0n, 0n, 7);
-    if (pattern === "needle[0-9]+" && input.length > 4096) {
-      for (const block of [682n, 683n, 1365n]) {
-        for (const offset of [5n, 6n, 7n]) {
-          const cost = 4n + 31n * block + offset;
-          check(cost, 0n);
-          check(0n, cost + 12n);
-        }
-      }
-    }
-    if (input.length < 100) {
-      const full = run(slow, 0n, 0n, -1);
-      for (let limit = 1n; limit <= full.cost + 1n; limit++) {
-        for (const delta of [11n, 12n, 13n]) check(limit, limit + delta);
-        check(0n, limit + 12n);
-      }
-      for (const [i, cost] of full.polls.entries()) check(cost, cost + 12n, i + 1);
-    }
+    checkSearchBoundaries(pattern, text, false);
   }
 });
+
+test("grouped literal predicates preserve partial cost and every cancellation poll", () => {
+  for (const [pattern, text] of [
+    ["(a)".repeat(12), "a".repeat(12) + "x"],
+    ["(ab)(aba)(c)", "abababababac"],
+    ["()((猫)犬)()(猫)()", "😀猫猫犬猫"],
+    ["(aaa)(b)", ""],
+    ["(a)(aa)(b)", "a".repeat(8200) + "b"],
+  ]) {
+    checkSearchBoundaries(pattern, text, true);
+  }
+});
+
+function checkSearchBoundaries(pattern: string, text: string, predicate: boolean) {
+  const fast = compileRegex(pattern);
+  if (predicate) assert.ok(fast.groupedLiteral);
+  const slow = compileRegex(pattern);
+  slow.prefixPC = 0;
+  slow.groupedLiteral = null;
+  const input = Array.from(text, (ch) => ch.codePointAt(0) as number);
+  function run(p: typeof fast, limit: bigint, lifeLimit: bigint, cancelAt?: number) {
+    const life = new LifetimeBudget(lifeLimit);
+    life.total = 12n;
+    const m = new Meter(limit, life);
+    const polls: bigint[] = [];
+    const poll =
+      cancelAt === undefined
+        ? undefined
+        : () => {
+            polls.push(m.accrued);
+            return polls.length === cancelAt;
+          };
+    let result: boolean | number[] | string | null;
+    try {
+      result = withCancellationScope(poll, () => {
+        if (predicate) return regexIsMatch(p, input, m);
+        const caps = regexRun(p, input, m);
+        return caps === null ? null : regexSlots(p, caps);
+      });
+    } catch (err) {
+      if (!(err instanceof EngineError)) throw err;
+      result = err.state;
+    }
+    return { result, cost: m.accrued, lifetime: life.total, polls };
+  }
+  function check(limit: bigint, lifeLimit: bigint, cancelAt?: number) {
+    assert.deepEqual(
+      run(fast, limit, lifeLimit, cancelAt),
+      run(slow, limit, lifeLimit, cancelAt),
+      pattern,
+    );
+  }
+  check(0n, 0n);
+  check(0n, 0n, -1);
+  check(0n, 0n, 7);
+  if (pattern === "needle[0-9]+" && input.length > 4096) {
+    for (const block of [682n, 683n, 1365n]) {
+      for (const offset of [5n, 6n, 7n]) {
+        const cost = 4n + 31n * block + offset;
+        check(cost, 0n);
+        check(0n, cost + 12n);
+      }
+    }
+  }
+  if (input.length < 100) {
+    const full = run(slow, 0n, 0n, -1);
+    for (let limit = 1n; limit <= full.cost + 1n; limit++) {
+      for (const delta of [11n, 12n, 13n]) check(limit, limit + delta);
+      check(0n, limit + 12n);
+    }
+    for (const [i, cost] of full.polls.entries()) check(cost, cost + 12n, i + 1);
+  }
+}
