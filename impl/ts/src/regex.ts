@@ -11,7 +11,7 @@
 
 import { hasCancellation } from "./cancel.ts";
 import { COSTS, MEMORY_ARRAY_DIM, MEMORY_VALUE } from "./costs.ts";
-import type { Meter } from "./cost.ts";
+import { type Meter, smallMultiples } from "./cost.ts";
 import { foldLowerSimple, type PropertyTable } from "./collation.ts";
 import { engineError } from "./errors.ts";
 
@@ -1120,25 +1120,37 @@ function compileGroupedLiteral(
   return literal;
 }
 
+const regexStepCost = smallMultiples(COSTS.regexStep);
+
 function matchGroupedLiteral(
   literal: GroupedLiteral,
-  first: number,
+  program: RegexProgram,
   input: number[],
   m: Meter,
 ): boolean {
-  m.charge(BigInt(first) * COSTS.regexStep);
-  // A one-position window retains every observable guard. Even an unlimited
-  // window accumulates at most 4096 * MAX_REGEX_PROGRAM states before charging.
-  const window = !hasCancellation() && m.isUnmetered() ? 4096 : 1;
+  const first = program.prefixPC;
+  m.charge(regexStepCost(first));
+  const cancel = hasCancellation();
+  const maxUnits = regexStepCost(program.insts.length);
   let matched = 0;
   for (let pos = 0; pos < input.length && matched < literal.chars.length; ) {
-    const end = Math.min(input.length, pos + window);
+    let n = Math.min(4096, input.length - pos);
+    if (cancel) n = 1;
+    else {
+      const room = m.headroom();
+      // The VM visits each instruction at most once per position. A position
+      // that could reach either ceiling always executes with its own guard.
+      if (room !== undefined && room <= BigInt(n) * maxUnits) {
+        n = room <= maxUnits ? 1 : Number((room - 1n) / maxUnits);
+      }
+    }
+    const end = pos + n;
     let states = 0;
     while (pos < end && matched < literal.chars.length) {
       matched = advanceLiteral(literal, matched, input[pos++]);
       states += first + 1 + literal.states[matched];
     }
-    m.charge(BigInt(states) * COSTS.regexStep);
+    m.charge(regexStepCost(states));
     m.guard();
   }
   m.guard(); // Match or EOF
@@ -1147,7 +1159,7 @@ function matchGroupedLiteral(
 
 // regexIsMatch reports whether the pattern matches somewhere in input (the `~` operator).
 export function regexIsMatch(p: RegexProgram, input: number[], m: Meter): boolean {
-  if (p.groupedLiteral !== null) return matchGroupedLiteral(p.groupedLiteral, p.prefixPC, input, m);
+  if (p.groupedLiteral !== null) return matchGroupedLiteral(p.groupedLiteral, p, input, m);
   return withSeen(p, (seen) => regexSearch(p, seen, input, 0, m, null, null, NO_CAPTURES)) !== null;
 }
 

@@ -293,6 +293,17 @@ function checkSearchBoundaries(pattern: string, text: string, predicate: boolean
   check(0n, 0n);
   check(0n, 0n, -1);
   check(0n, 0n, 7);
+  if (predicate && input.length > 8192) {
+    for (const pos of [4095, 4096, 4097, 8192]) {
+      const meter = new Meter();
+      regexIsMatch(slow, input.slice(0, pos), meter);
+      for (const limit of [meter.accrued - 1n, meter.accrued, meter.accrued + 1n]) {
+        check(limit, 0n);
+        check(0n, limit + 12n);
+        for (const delta of [11n, 12n, 13n]) check(limit, limit + delta);
+      }
+    }
+  }
   if (pattern === "needle[0-9]+" && input.length > 4096) {
     for (const block of [682n, 683n, 1365n]) {
       for (const offset of [5n, 6n, 7n]) {

@@ -1029,17 +1029,24 @@ impl GroupedLiteral {
         matched + usize::from(steps[matched].ch == ch)
     }
 
-    fn is_match(&self, input: &[char], m: &mut Meter) -> Result<bool> {
+    fn is_match(&self, input: &[char], program_size: usize, m: &mut Meter) -> Result<bool> {
         m.charge(self.first_pc as i64 * COSTS.regex_step);
-        // An armed meter guards every consumed position. Otherwise bound the
-        // accumulator by 4096 positions times MAX_REGEX_PROGRAM states.
-        let window = if m.can_batch_costs() && !m.has_cancellation() {
-            4096
-        } else {
-            1
-        };
+        let max_units = program_size as i64 * COSTS.regex_step;
+        let mut remaining = input;
         let mut matched = 0;
-        for chunk in input.chunks(window) {
+        while !remaining.is_empty() {
+            // Each instruction is visited at most once per position. Keep the
+            // entire window below both ceilings, or guard one position normally.
+            let mut n = remaining.len().min(4096);
+            if m.has_cancellation() {
+                n = 1;
+            } else if let Some(room) = m.headroom()
+                && room <= n as i64 * max_units
+            {
+                n = (room.saturating_sub(1) / max_units).max(1) as usize;
+            }
+            let (chunk, rest) = remaining.split_at(n);
+            remaining = rest;
             let mut states = 0;
             for &ch in chunk {
                 matched = Self::advance(&self.steps, matched, ch);
@@ -1344,7 +1351,7 @@ impl Program {
     /// Boolean match — TRUE iff the pattern matches somewhere in `input` (the `~` operator).
     pub fn is_match(&self, input: &[char], m: &mut Meter) -> Result<bool> {
         if let Some(literal) = &self.grouped_literal {
-            return literal.is_match(input, m);
+            return literal.is_match(input, self.insts.len(), m);
         }
         let matched = self.with_seen(|seen| {
             self.pike_search::<NoCaps>(seen, input, 0, &mut Gating::default(), m)
@@ -2248,6 +2255,20 @@ mod tests {
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         check(1, 13, Some(cancelled));
+        if fast.grouped_literal.is_some() && input.len() > 8192 {
+            for pos in [4095, 4096, 4097, 8192] {
+                let mut meter = Meter::new();
+                slow.is_match(&input[..pos], &mut meter).unwrap();
+                for limit in [meter.accrued - 1, meter.accrued, meter.accrued + 1] {
+                    check(limit, 0, None);
+                    check(0, limit + 12, None);
+                    // Lifetime starts 12 units ahead. Exercise both crossing orders and a tie.
+                    for delta in [11, 12, 13] {
+                        check(limit, limit + delta, None);
+                    }
+                }
+            }
+        }
         if pattern == "needle[0-9]+" && input.len() > 4096 {
             // Four seed states, then 31 per full block. Trip just before,
             // at, or just after its first literal advances.
@@ -2406,3 +2427,6 @@ mod tests {
         assert_eq!(p.slots(&caps), vec![1, 6, 2, 5]);
     }
 }
+
+#[cfg(test)]
+mod benchmarks;

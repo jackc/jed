@@ -224,6 +224,32 @@ Over 50 timed queries in the same 10,000-row `regex_group_predicate` SQL benchma
 Rust improved from 10.91 to 1.63 ms per query and TypeScript from 15.55 to 4.90 ms.
 Both checksums agreed with the baseline.
 
+**Grouped literals with cost limits (2026-11-19).** `mise run bench:regex-limits` runs the
+same precompiled 12-group hit and 2,048-character overlap miss across Go, Rust and
+TypeScript. Statement and lifetime totals are tracked in every mode. Finite ceilings
+allow all measured matches to complete. The cancellation case arms a token that stays
+open in Go, an atomic flag in Rust, and a shared atomic load in TypeScript. Median of
+three samples on the same host and toolchains as above, in ns per match:
+
+| Meter | Rust hit before → after | Rust miss before → after | TS hit before → after | TS miss before → after |
+|---|---:|---:|---:|---:|
+| Unlimited | 32 → 33 | 6,484 → 6,353 | 53 → 58 | 6,173 → 5,976 |
+| Statement | 44 → 25 | 7,763 → 6,346 | 287 → 78 | 45,642 → 5,972 |
+| Lifetime | 45 → 25 | 7,792 → 6,313 | 291 → 77 | 46,558 → 5,921 |
+| Both | 45 → 25 | 7,838 → 6,311 | 308 → 84 | 49,997 → 5,948 |
+| Both and cancellation | 45 → 45 | 7,749 → 7,684 | 386 → 329 | 62,172 → 51,916 |
+
+Go already bounds batches by both budgets and the next cancellation poll. With both
+limits its control measured 18 ns for the hit and 2,818 ns for the miss, or 19 ns and
+2,927 ns with cancellation armed. Every configuration charged 311 units for the hit and
+79,712 for the miss to both counters. Rust and TypeScript retain a checkpoint at each
+position with cancellation armed. TypeScript reuses precomputed small cost multiples.
+
+In the 10,000-row `regex_group_predicate` SQL lane the benchmark sessions used a
+10,000,000-unit statement limit and 1,000,000,000-unit lifetime limit, with cancellation
+disarmed. Across 50 timed queries per revision, Rust averaged 3.10 → 2.88 ms and
+TypeScript 11.07 → 8.46 ms. Both result checksums matched.
+
 **Variable-width scan result (2026-10-13).** Track A4 ([packed-leaf.md §11](packed-leaf.md)) lets the
 columnar lanes read text, bytea, and array columns in place. The seven `varscan_*` lanes run over a
 100k-row scratch table (nullable text, `text[]`, `bytea`; no secondary index); `gin_stats_common_tag`

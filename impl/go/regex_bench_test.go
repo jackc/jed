@@ -64,3 +64,48 @@ func BenchmarkRegexPredicate(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkRegexLimits(b *testing.B) {
+	const budget = int64(1 << 60)
+	for _, tc := range []struct {
+		name, pattern, subject string
+		hit                    bool
+		cost                   int64
+	}{
+		{"hit", strings.Repeat("(a)", 12), strings.Repeat("a", 12), true, 311},
+		{"overlap", strings.Repeat("(a)", 11) + "(b)", strings.Repeat("a", 2048), false, 79712},
+	} {
+		p, err := compileRegex(tc.pattern)
+		if err != nil {
+			b.Fatal(err)
+		}
+		input := []rune(tc.subject)
+		for _, mode := range []struct {
+			name       string
+			stmt, life int64
+			cancel     bool
+		}{
+			{"unlimited", 0, 0, false},
+			{"statement", budget, 0, false},
+			{"lifetime", 0, budget, false},
+			{"both", budget, budget, false},
+			{"both+cancel", budget, budget, true},
+		} {
+			b.Run(tc.name+"/"+mode.name, func(b *testing.B) {
+				var total int64
+				m := costMeter{Limit: mode.stmt, lifetimeLimit: mode.life, lifetimeTotal: &total}
+				if mode.cancel {
+					m.cancel = make(chan struct{})
+				}
+				for b.Loop() {
+					if hit, err := p.isMatch(input, &m); hit != tc.hit || err != nil {
+						b.Fatalf("hit %v, err %v", hit, err)
+					}
+				}
+				if total != m.Accrued || total != tc.cost*int64(b.N) {
+					b.Fatalf("cost %d lifetime %d", m.Accrued, total)
+				}
+			})
+		}
+	}
+}

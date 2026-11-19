@@ -389,9 +389,12 @@ for the advanced starts are disjoint. Seed the search at cost `k` and charge eac
 position `k+1` wrapper states plus the precomputed sum for its new longest prefix.
 A full match has the earliest surviving start because every match has the same length.
 Both a full match and exhaustion still perform the VM's final zero-charge checkpoint.
-Rust and TypeScript charge and guard each position individually whenever cancellation
-or either cost ceiling is armed. With all three disabled they sum the same costs over
-windows of at most 4,096 code points, stopping at the first complete match.
+Rust and TypeScript guard each position individually when cancellation is armed.
+Otherwise they may sum at most 4,096 positions at a time, stopping at the first complete
+match. Each position visits at most the program size in states. After charging the seed,
+bound each window so even this upper bound costs strictly less than the smaller remaining
+statement and lifetime budget. If one position could reach a ceiling, charge its actual
+states and guard it individually. This also covers a ceiling already reached by the seed.
 
 ### 4.1 Capture slots — a persistent array
 

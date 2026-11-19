@@ -926,3 +926,11 @@ run = "ruby bench/prepared-join/control-plans.rb"
 description = "Compare precompiled Go regex predicates with Go regexp on shared inputs"
 dir = "impl/go"
 run = "go test -run '^$' -bench '^BenchmarkRegexPredicate$' -benchmem -count 3 -cpu 1 -benchtime 150ms"
+
+[tasks."bench:regex-limits"]
+description = "Compare grouped literal predicates with statement, lifetime and cancellation controls"
+run = [
+  "cd impl/go && go test -run '^$' -bench '^BenchmarkRegexLimits$' -count 3 -cpu 1 -benchtime 150ms",
+  "cargo test --release --manifest-path impl/rust/Cargo.toml --lib grouped_literal_meter_benchmark -- --ignored --nocapture",
+  "node bench/ts/src/regex-limits.ts",
+]
